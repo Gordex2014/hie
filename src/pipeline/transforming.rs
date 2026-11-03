@@ -28,7 +28,7 @@ impl FeedRunner {
             let outcomes = match self.transformer.transform_many(&requests).await {
                 Ok(o) => o,
                 Err(e) => {
-                    tracing::error!(feed = %self.feed.id, "transform unavailable, will retry: {e:#}");
+                    tracing::error!(target: "hie::pipeline", feed = %self.feed.id, "transform unavailable, will retry: {e:#}");
                     return Ok(());
                 }
             };

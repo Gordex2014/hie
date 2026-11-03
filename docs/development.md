@@ -49,7 +49,7 @@ Where a source's data comes from. Interface (`connectors/mod.rs`):
 | `database` | `database/mod.rs` (runs past the cursor), `database/connection.rs` (the URL `url_env` names), `database/driver.rs` (pools, binding per engine), `database/rows.rs` (row decoding), `database/cursor.rs` (`Cursor`) | PostgreSQL, MySQL, SQLite (sqlx), SQL Server (tiberius) |
 | `mllp` | `mllp/mod.rs` (connector over a spool `FolderSource`), `mllp/listener.rs` (MLLP framing, ACK, listener) | spool before ACK |
 
-`hie::source`, `hie::sqs` and `hie::hl7` re-export what was reached there before these modules existed.
+`hie::source`, `hie::sqs` and `hie::hl7` re-export what was reached there before these modules existed. Log lines moved out of the old modules keep their old `tracing` targets (`hie::source`, `hie::database`, `hie::hl7`, `hie::pipeline`), so an `HIE_LOG` filter written for them still applies.
 
 ### Formats: `src/formats/`
 

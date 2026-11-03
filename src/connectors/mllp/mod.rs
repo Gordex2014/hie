@@ -88,7 +88,7 @@ impl Connector for MllpSource {
         let listener = tokio::net::TcpListener::bind(&self.listen)
             .await
             .with_context(|| format!("cannot listen for MLLP on {}", self.listen))?;
-        tracing::info!(feed = %self.feed_id, listen = %self.listen, spool = %self.folder.dir().display(), "listening for MLLP");
+        tracing::info!(target: "hie::source", feed = %self.feed_id, listen = %self.listen, spool = %self.folder.dir().display(), "listening for MLLP");
         tokio::spawn(serve(
             self.feed_id.clone(),
             listener,

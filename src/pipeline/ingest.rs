@@ -21,7 +21,7 @@ impl FeedRunner {
                 Ok(incoming) => incoming,
                 // Announced, then gone before this pass reached it: nothing to take.
                 Err(e) if connectors::is_gone(&e) => {
-                    tracing::warn!(feed = %self.feed.id, key, "object no longer there, skipped");
+                    tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, key, "object no longer there, skipped");
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -57,7 +57,7 @@ impl FeedRunner {
                 Some(original),
                 None,
             )?;
-            tracing::info!(feed, file = %name, duplicate_of = original, "same content already received; not reprocessed");
+            tracing::info!(target: "hie::pipeline", feed, file = %name, duplicate_of = original, "same content already received; not reprocessed");
             let archived = self
                 .source
                 .acknowledge(&key, &format!("{id}-{name}"))
@@ -101,7 +101,7 @@ impl FeedRunner {
                     .map(|r| (r.line, r.raw, r.parse_error))
                     .collect();
                 self.db.insert_records(file_id, feed, &rows)?;
-                tracing::info!(feed, file = %name, records = rows.len(), "received");
+                tracing::info!(target: "hie::pipeline", feed, file = %name, records = rows.len(), "received");
                 Ok(true)
             }
             Err(e) => {
@@ -154,7 +154,7 @@ impl FeedRunner {
         let mut taken = 0;
         for (path, data) in entries {
             if !formats::zip::takes(self.feed.format, &path) {
-                tracing::debug!(feed, file = %name, entry = %path, "entry skipped: not a {:?} file", self.feed.format);
+                tracing::debug!(target: "hie::pipeline", feed, file = %name, entry = %path, "entry skipped: not a {:?} file", self.feed.format);
                 continue;
             }
             let entry_name = format!("{name}!/{path}");
@@ -202,7 +202,7 @@ impl FeedRunner {
             self.admit(file_id, &entry_name, &data)?;
             taken += 1;
         }
-        tracing::info!(feed, file = %name, entries = taken, "unpacked");
+        tracing::info!(target: "hie::pipeline", feed, file = %name, entries = taken, "unpacked");
         let archived = self
             .source
             .acknowledge(key, &format!("{container}-{name}"))

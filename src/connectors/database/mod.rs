@@ -200,6 +200,7 @@ impl DatabaseSource {
                 // A run whose rows all share one cursor value may have been cut by
                 // LIMIT in the middle of that value; the rest would never be read.
                 tracing::warn!(
+                    target: "hie::database",
                     feed = %self.feed_id,
                     cursor = %newest.as_ref().map(Cursor::text).unwrap_or_default(),
                     "every row of a run shares the cursor value; rows beyond LIMIT with that value are skipped. Use a unique cursor column (an id) or a finer timestamp"
@@ -222,7 +223,7 @@ impl Connector for DatabaseSource {
         if pulled.count == 0 {
             return Ok(vec![]);
         }
-        tracing::debug!(feed = %self.feed_id, rows = pulled.count, newest = %pulled.newest.text(), "pulled");
+        tracing::debug!(target: "hie::database", feed = %self.feed_id, rows = pulled.count, newest = %pulled.newest.text(), "pulled");
         *self.pulled.lock().expect("pulled mutex") = Some(pulled);
         Ok(vec![Listed::from_key(KEY)])
     }

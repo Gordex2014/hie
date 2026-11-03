@@ -63,16 +63,16 @@ pub async fn serve(feed_id: String, listener: TcpListener, spool: PathBuf) {
         let (socket, peer) = match listener.accept().await {
             Ok(x) => x,
             Err(e) => {
-                tracing::error!(feed = %feed_id, "MLLP accept failed: {e}");
+                tracing::error!(target: "hie::hl7", feed = %feed_id, "MLLP accept failed: {e}");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
         };
-        tracing::info!(feed = %feed_id, %peer, "MLLP connection");
+        tracing::info!(target: "hie::hl7", feed = %feed_id, %peer, "MLLP connection");
         let (feed_id, spool, seq) = (feed_id.clone(), spool.clone(), seq.clone());
         tokio::spawn(async move {
             if let Err(e) = connection(&feed_id, socket, &spool, &seq).await {
-                tracing::warn!(feed = %feed_id, %peer, "MLLP connection ended: {e:#}");
+                tracing::warn!(target: "hie::hl7", feed = %feed_id, %peer, "MLLP connection ended: {e:#}");
             }
         });
     }
@@ -120,14 +120,14 @@ fn receive(feed_id: &str, body: &[u8], spool: &Path, seq: &AtomicU64) -> Result<
     let text = match std::str::from_utf8(body) {
         Ok(t) => t,
         Err(_) => {
-            tracing::warn!(feed = feed_id, "MLLP message is not UTF-8; rejected");
+            tracing::warn!(target: "hie::hl7", feed = feed_id, "MLLP message is not UTF-8; rejected");
             return Ok(reject("message is not UTF-8", &now));
         }
     };
     let message = match parse(text) {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!(feed = feed_id, "MLLP message rejected: {e:#}");
+            tracing::warn!(target: "hie::hl7", feed = feed_id, "MLLP message rejected: {e:#}");
             return Ok(reject(&format!("{e:#}"), &now));
         }
     };
@@ -152,12 +152,12 @@ fn receive(feed_id: &str, body: &[u8], spool: &Path, seq: &AtomicU64) -> Result<
     };
     match store() {
         Ok(()) => {
-            tracing::info!(feed = feed_id, control_id = %message.control_id, kind = %message.message_type, file = %name, "message spooled");
+            tracing::info!(target: "hie::hl7", feed = feed_id, control_id = %message.control_id, kind = %message.message_type, file = %name, "message spooled");
             Ok(ack(&message, "AA", "", &now))
         }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
-            tracing::error!(feed = feed_id, "cannot spool a message: {e}");
+            tracing::error!(target: "hie::hl7", feed = feed_id, "cannot spool a message: {e}");
             // Not stored, so not accepted: the sender keeps it and retries.
             Ok(ack(
                 &message,

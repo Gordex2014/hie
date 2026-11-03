@@ -18,7 +18,7 @@ impl FeedRunner {
         match outcome {
             Outcome::Transient(message) => {
                 // Not the row's fault: leave it and the rest for the next pass.
-                tracing::warn!(feed = %self.feed.id, line = item.line, "transform cannot finish now, will retry: {message}");
+                tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, line = item.line, "transform cannot finish now, will retry: {message}");
                 return Ok(false);
             }
             Outcome::Rejected { kind, message } => {

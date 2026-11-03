@@ -17,7 +17,7 @@ use super::{FeedRunner, human};
 impl FeedRunner {
     pub(super) fn finish(&self) -> Result<()> {
         for f in self.db.finish_files(&self.feed.id)? {
-            tracing::info!(feed = %self.feed.id, file = %f.name, total = f.total, sent = f.sent, rejected = f.rejected, "file done");
+            tracing::info!(target: "hie::pipeline", feed = %self.feed.id, file = %f.name, total = f.total, sent = f.sent, rejected = f.rejected, "file done");
             // The rules say whether a few rejected rows are worth an alert; without
             // one, every rejection is.
             let share_rules = self.rules("rejected_share")?;

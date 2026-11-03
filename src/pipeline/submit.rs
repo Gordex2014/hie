@@ -66,7 +66,7 @@ impl FeedRunner {
                 &manifest,
                 &file_ids,
             )?;
-            tracing::info!(feed = %self.feed.id, submission = %submission_id, files = files.len(), records, "submission opened");
+            tracing::info!(target: "hie::pipeline", feed = %self.feed.id, submission = %submission_id, files = files.len(), records, "submission opened");
         }
     }
 
@@ -133,7 +133,7 @@ impl FeedRunner {
                 }
                 Err(SendError::Refused(status, body)) => {
                     let reason = format!("HTTP {status}: {}", fhir::outcome_text(&body));
-                    tracing::warn!(feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
+                    tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
                     for (record_id, _, _) in self.db.submitted_records(&sub.token)? {
                         self.db
                             .mark_rejected(record_id, "server", &reason, Some(&body))?;
@@ -225,10 +225,10 @@ impl FeedRunner {
         if dir.is_dir()
             && let Err(e) = std::fs::remove_dir_all(&dir)
         {
-            tracing::warn!(feed = %self.feed.id, "cannot remove {}: {e}", dir.display());
+            tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, "cannot remove {}: {e}", dir.display());
         }
         if let Err(e) = self.source.remove_submission_files(token).await {
-            tracing::warn!(feed = %self.feed.id, "cannot remove submission files at the source: {e:#}");
+            tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, "cannot remove submission files at the source: {e:#}");
         }
     }
 
@@ -299,7 +299,7 @@ impl FeedRunner {
                 &manifest,
                 &record_ids,
             )?;
-            tracing::info!(feed = %self.feed.id, submission = %submission_id, files = entries.len(), records = record_ids.len(), "submission opened (transformed)");
+            tracing::info!(target: "hie::pipeline", feed = %self.feed.id, submission = %submission_id, files = entries.len(), records = record_ids.len(), "submission opened (transformed)");
         }
     }
 
@@ -316,7 +316,7 @@ impl FeedRunner {
                 let archived = if self.is_staged_locally(&key) {
                     // An unpacked entry the engine served: nothing to move, it goes.
                     if let Err(e) = std::fs::remove_file(&key) {
-                        tracing::warn!(feed = %self.feed.id, "cannot remove {key}: {e}");
+                        tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, "cannot remove {key}: {e}");
                     } else if let Some(dir) = Path::new(&key).parent() {
                         // The container's directory goes with its last entry.
                         let _ = std::fs::remove_dir(dir);

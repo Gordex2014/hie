@@ -44,6 +44,7 @@ pub(super) fn pg_row(row: &PgRow) -> Map<String, Value> {
             column.name().to_string(),
             value.unwrap_or_else(|| {
                 tracing::warn!(
+                    target: "hie::database",
                     column = column.name(),
                     kind = name,
                     "column type not decoded; null"
@@ -84,6 +85,7 @@ pub(super) fn mysql_row(row: &MySqlRow) -> Map<String, Value> {
             column.name().to_string(),
             value.unwrap_or_else(|| {
                 tracing::warn!(
+                    target: "hie::database",
                     column = column.name(),
                     kind = name,
                     "column type not decoded; null"
@@ -197,7 +199,7 @@ pub(super) fn mssql_row(row: &tiberius::Row) -> Map<String, Value> {
         out.insert(
             column.name().to_string(),
             value.unwrap_or_else(|| {
-                tracing::warn!(column = column.name(), kind = ?kind, "column type not decoded; null");
+                tracing::warn!(target: "hie::database", column = column.name(), kind = ?kind, "column type not decoded; null");
                 Value::Null
             }),
         );

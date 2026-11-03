@@ -81,7 +81,7 @@ impl FeedRunner {
                 Ok(false)
             }
             Err(SendError::Refused(status, _)) if items.len() > 1 => {
-                tracing::warn!(feed = %self.feed.id, status, "batch refused as a whole; sending records one by one");
+                tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, status, "batch refused as a whole; sending records one by one");
                 for item in items {
                     if !Box::pin(self.deliver(std::slice::from_ref(item))).await? {
                         return Ok(false);

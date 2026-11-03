@@ -198,7 +198,7 @@ impl Connector for FhirServerSource {
             if pulled.count == 0 {
                 continue;
             }
-            tracing::debug!(feed = %self.feed_id, resource_type, resources = pulled.count, newest = %pulled.newest, "pulled");
+            tracing::debug!(target: "hie::source", feed = %self.feed_id, resource_type, resources = pulled.count, newest = %pulled.newest, "pulled");
             self.pulled
                 .lock()
                 .expect("pulled mutex")
