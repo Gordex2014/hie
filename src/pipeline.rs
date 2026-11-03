@@ -10,10 +10,10 @@ use chrono::Timelike;
 
 use crate::alerts::{Alerter, parse_clock};
 use crate::bulk::{self, BulkSubmitter, Poll};
-use crate::config::{DeliveryMethod, FeedConfig, Format, parse_duration};
+use crate::config::{DeliveryMethod, FeedConfig, parse_duration};
 use crate::db::{Db, Rule, WorkItem, now_ms};
 use crate::fhir::{self, DeliveryKey, EntryResult, FhirClient, SendError};
-use crate::reader;
+use crate::formats;
 use crate::runtime::RuntimeSettings;
 use crate::source::{Incoming, Source};
 use crate::transform::{self, Outcome, Transformer};
@@ -303,7 +303,7 @@ impl FeedRunner {
     async fn ingest(&self, incoming: Incoming) -> Result<()> {
         let feed = &self.feed.id;
         let Incoming { key, name, bytes } = incoming;
-        let sha = reader::sha256_hex(&bytes);
+        let sha = formats::sha256_hex(&bytes);
 
         if let Some(original) = self.db.find_file_by_hash(feed, &sha)? {
             if self.source.is_read_only() {
@@ -331,7 +331,7 @@ impl FeedRunner {
             return self.db.mark_file_archived(id, &archived);
         }
 
-        if name.to_ascii_lowercase().ends_with(".zip") {
+        if formats::zip::is_container(&name) {
             return self.unpack(&key, &name, &sha, bytes).await;
         }
 
@@ -360,7 +360,7 @@ impl FeedRunner {
     /// Reads a file's records into the store; `false` when the file could not be read.
     fn admit(&self, file_id: i64, name: &str, bytes: &[u8]) -> Result<bool> {
         let feed = &self.feed.id;
-        match reader::read(self.feed.format, bytes) {
+        match formats::read(self.feed.format, bytes) {
             Ok(records) => {
                 let rows: Vec<_> = records
                     .into_iter()
@@ -390,31 +390,9 @@ impl FeedRunner {
         let container =
             self.db
                 .insert_file(feed, name, sha, bytes.len() as u64, "unpacked", None, None)?;
-        let wanted = match self.feed.format {
-            Format::Csv => &["csv"][..],
-            Format::Ndjson => &["ndjson", "jsonl"][..],
-            Format::FhirBundle => &["json"][..],
-            Format::Hl7v2 => &["hl7", "txt"][..],
-        };
         let entries =
             match tokio::task::spawn_blocking(move || -> Result<Vec<(String, Vec<u8>)>> {
-                let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
-                let mut out = Vec::new();
-                for i in 0..archive.len() {
-                    let mut entry = archive.by_index(i)?;
-                    if entry.is_dir() {
-                        continue;
-                    }
-                    let path = entry.name().to_string();
-                    let base = path.rsplit('/').next().unwrap_or(&path).to_string();
-                    if base.starts_with('.') || path.starts_with("__MACOSX") {
-                        continue;
-                    }
-                    let mut data = Vec::with_capacity(entry.size() as usize);
-                    std::io::Read::read_to_end(&mut entry, &mut data)?;
-                    out.push((path, data));
-                }
-                Ok(out)
+                formats::zip::entries(bytes)
             })
             .await?
             {
@@ -435,13 +413,12 @@ impl FeedRunner {
             };
         let mut taken = 0;
         for (path, data) in entries {
-            let extension = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-            if !wanted.contains(&extension.as_str()) {
+            if !formats::zip::takes(self.feed.format, &path) {
                 tracing::debug!(feed, file = %name, entry = %path, "entry skipped: not a {:?} file", self.feed.format);
                 continue;
             }
             let entry_name = format!("{name}!/{path}");
-            let entry_sha = reader::sha256_hex(&data);
+            let entry_sha = formats::sha256_hex(&data);
             if let Some(original) = self.db.find_file_by_hash(feed, &entry_sha)? {
                 self.db.insert_file(
                     feed,

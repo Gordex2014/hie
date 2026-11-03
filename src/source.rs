@@ -190,7 +190,7 @@ impl Source {
             .await
             .with_context(|| format!("cannot listen for MLLP on {}", m.listen))?;
         tracing::info!(feed = %m.feed_id, listen = %m.listen, spool = %m.folder.dir.display(), "listening for MLLP");
-        tokio::spawn(crate::hl7::serve(
+        tokio::spawn(crate::connectors::mllp::serve(
             m.feed_id.clone(),
             listener,
             m.folder.dir.clone(),
