@@ -1,8 +1,10 @@
 //! Sources and transforms as resources: created, replaced, paused and tested
 //! through the API, persisted as the files `config::load` reads, and run without
 //! a restart. `transforms` holds the transform files' side: listing, saving
-//! (and restarting the sources that use one) and trying one on records.
+//! (and restarting the sources that use one) and trying one on records;
+//! `probe` the connection test of a definition that is not a source yet.
 
+mod probe;
 mod transforms;
 
 use std::collections::BTreeMap;
@@ -14,8 +16,8 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::alerts::Alerter;
-use crate::config::{Config, FeedConfig, RuntimeConfig, SourceConfig};
-use crate::connectors::{Probe, Source};
+use crate::config::{Config, FeedConfig, RuntimeConfig};
+use crate::connectors::Source;
 use crate::db::{Db, Rule};
 use crate::fhir::FhirClient;
 use crate::pipeline::{FeedRunner, RunnerControl};
@@ -289,36 +291,5 @@ impl SourceManager {
             return Err(ManagerError::NotFound(format!("source {id} not found")));
         }
         Ok(())
-    }
-
-    /// Tests a connection before a source exists: the body is a full definition or
-    /// just `{"source": {...}}`. Nothing is taken from the source.
-    pub async fn test(&self, body: &Value) -> Result<Probe, ManagerError> {
-        let source_value = body.get("source").unwrap_or(body);
-        let mut source: SourceConfig = serde_json::from_value(source_value.clone())
-            .map_err(|e| ManagerError::Invalid(e.to_string()))?;
-        source.resolve(&self.base_dir);
-        let feed = FeedConfig {
-            id: "test".into(),
-            name: "test".into(),
-            source,
-            format: Default::default(),
-            transform: PathBuf::new(),
-            delivery: Default::default(),
-            expect_every_text: None,
-            expect_every: None,
-        };
-        let source =
-            Source::from_config(&feed).map_err(|e| ManagerError::Invalid(format!("{e:#}")))?;
-        match source.probe().await {
-            Ok(probe) => Ok(probe),
-            Err(e) => Ok(Probe {
-                reachable: false,
-                elapsed_ms: 0,
-                objects: 0,
-                newest: None,
-                newest_at: Some(format!("{e:#}")),
-            }),
-        }
     }
 }

@@ -1,16 +1,11 @@
-//! Running the transform over received records, or, on the source-objects bulk
-//! path, only checking them.
+//! Running the transform over received records, a chunk at a time; what each
+//! record became is recorded by `outcomes`.
 
 use anyhow::Result;
 use serde_json::{Value, json};
-
-use crate::fhir::DeliveryKey;
-use crate::transform::{self, Outcome};
 use tokio::sync::Notify;
 
-use super::FeedRunner;
-
-const TRANSFORM_CHUNK: usize = 200;
+use super::{FeedRunner, TRANSFORM_CHUNK};
 
 impl FeedRunner {
     /// Transforms what was received, a chunk at a time; `progress` is told after
@@ -38,75 +33,13 @@ impl FeedRunner {
                 }
             };
             for (item, outcome) in items.iter().zip(outcomes) {
-                match outcome {
-                    Outcome::Transient(message) => {
-                        // Not the row's fault: leave it and the rest for the next pass.
-                        tracing::warn!(feed = %self.feed.id, line = item.line, "transform cannot finish now, will retry: {message}");
-                        return Ok(());
-                    }
-                    Outcome::Rejected { kind, message } => {
-                        self.db.mark_rejected(item.id, &kind, &message, None)?
-                    }
-                    Outcome::Resources(resources) if resources.is_empty() => {
-                        self.db.mark_rejected(
-                            item.id,
-                            "filtered",
-                            "transform returned no resources",
-                            None,
-                        )?
-                    }
-                    Outcome::Resources(mut resources) => {
-                        // On the transformed bulk path a resource must carry an id:
-                        // one is derived from the identifier when there is none.
-                        let checked = if self.bulk_transformed {
-                            resources
-                                .iter_mut()
-                                .map(transform::derive_id)
-                                .collect::<Result<Vec<_>, _>>()
-                        } else {
-                            resources
-                                .iter()
-                                .map(transform::check_resource)
-                                .collect::<Result<Vec<_>, _>>()
-                        };
-                        match checked {
-                            Ok(_) => self
-                                .db
-                                .mark_transformed(item.id, &Value::Array(resources))?,
-                            Err(msg) => self.db.mark_rejected(item.id, "validation", &msg, None)?,
-                        }
-                    }
+                if !self.record_outcome(item, outcome)? {
+                    return Ok(());
                 }
             }
             if let Some(progress) = progress {
                 progress.notify_one();
             }
-        }
-    }
-
-    /// The bulk path has no transform: a record is the resource HFS will read. The
-    /// engine only predicts what HFS will refuse (no resourceType, no id); the receipt
-    /// is what decides.
-    pub(super) fn preflight_received(&self) -> Result<()> {
-        loop {
-            let items = self.db.received_records(&self.feed.id, TRANSFORM_CHUNK)?;
-            if items.is_empty() {
-                return Ok(());
-            }
-            let mut good = Vec::with_capacity(items.len());
-            for item in &items {
-                match transform::check_resource(&item.raw) {
-                    Ok(DeliveryKey::Id { .. }) => good.push(item.id),
-                    Ok(DeliveryKey::Identifier { resource_type, .. }) => self.db.mark_rejected(
-                        item.id,
-                        "validation",
-                        &format!("{resource_type} has no id; $bulk-submit stores resources by id"),
-                        None,
-                    )?,
-                    Err(msg) => self.db.mark_rejected(item.id, "validation", &msg, None)?,
-                }
-            }
-            self.db.mark_passthrough(&good)?;
         }
     }
 }

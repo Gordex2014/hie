@@ -38,7 +38,7 @@ Where a source's data comes from. Interface (`connectors/mod.rs`):
 - `Connector`: `start` (listen; a no-op once started), `list(&Cursors) -> Vec<Listed>` (key, name, size), `fetch(key) -> Incoming`, `acknowledge(key, archived_name, &Cursors)` (archive the object or move the cursor; returns where it is now), `settle` (delete the SQS notifications of what the pass took), `probe(&Cursors) -> Probe` (the connection test; takes nothing), `read_only`, `staging() -> Option<&dyn Staging>`, and the optional `describe(&Cursors)` and `sample(&Cursors, limit)`, which answer `CapabilityError::Unsupported` until a connector implements them.
 - `Staging` (bulk object staging): `share` (pre-signed URL), `put_submission_file`, `put_unpacked`, `remove_submission_files`. Every `ObjectSource` has it and keeps each operation's own condition: sharing needs a signer (and works on a read-only bucket), writing needs a signer and a writable bucket, cleaning up needs a writable bucket; otherwise the operation answers `None` or does nothing and the engine serves the file itself. Other connectors have no staging.
 - `Cursors`: how far a pulling source has read, per key, in the store; without a store (`Source::from_config` before `with_db`, the connection test) nothing is kept and every read starts from the configured start.
-- `Source` (`connectors/source.rs`): the handle the pipeline and the manager hold, one connector bound to its cursors; capabilities a connector lacks answer as before (nothing to start or settle, no URL, nowhere to stage).
+- `Source` (`connectors/source.rs`): the handle the pipeline and the manager hold, one connector bound to its cursors; capabilities a connector lacks answer as before (nothing to start or settle, no URL, nowhere to stage). `Source::from_config` gets its connector from `connectors/build.rs`, the one place a connector comes into being: where an admission policy goes, ahead of the registry's `build`.
 - Registry: `kind(&SourceConfig) -> &Kind`, one `Kind` per `type:`: `check` (what the type cannot check), `resolve` (paths against `hie.yaml`), `describe` (for logs and the API), `format` (the record format a server, query or MLLP sender imposes), `build` (the connector; checks only what building needs, such as environment variables and URLs, and does not connect). `SourceConfig::{check, resolve, describe}` and `FeedConfig::resolve` delegate to it; `SourceConfig` stays in `config.rs` as the YAML schema.
 - `is_gone(&error)`: whether a fetch failed because the object is no longer there.
 
@@ -46,7 +46,7 @@ Where a source's data comes from. Interface (`connectors/mod.rs`):
 | --- | --- | --- |
 | `folder`, `s3` | `object/mod.rs` (kinds, S3 builder), `object/folder.rs` (`FolderSource`), `object/store.rs` (`ObjectSource`, staging), `object/sqs.rs` (`SqsQueue`) | listing, age guard, archive rename, SQS-announced listing with periodic relist, signing |
 | `fhir_server` | `fhir_server/mod.rs` (pull per type, cursors), `fhir_server/client.rs` (remote auth, GET) | `_lastUpdated` paging, one cursor per resource type |
-| `database` | `database/mod.rs` (runs past the cursor), `database/driver.rs` (pools, binding per engine), `database/rows.rs` (row decoding), `database/cursor.rs` (`Cursor`) | PostgreSQL, MySQL, SQLite (sqlx), SQL Server (tiberius) |
+| `database` | `database/mod.rs` (runs past the cursor), `database/connection.rs` (the URL `url_env` names), `database/driver.rs` (pools, binding per engine), `database/rows.rs` (row decoding), `database/cursor.rs` (`Cursor`) | PostgreSQL, MySQL, SQLite (sqlx), SQL Server (tiberius) |
 | `mllp` | `mllp/mod.rs` (connector over a spool `FolderSource`), `mllp/listener.rs` (MLLP framing, ACK, listener) | spool before ACK |
 
 `hie::source`, `hie::sqs` and `hie::hl7` re-export what was reached there before these modules existed.
@@ -57,11 +57,11 @@ How a fetched object becomes records: `read(format, bytes) -> Vec<SourceRecord>`
 
 ### Pipeline: `src/pipeline/`
 
-`FeedRunner` and its pass (`mod.rs`: lease, start, tick, poll loop), with each stage an `impl FeedRunner` block of its own: `ingest.rs` (list, fetch, duplicates, zips, admit, acknowledge), `transforming.rs` (transform or preflight received records), `deliver.rs` (REST batches, retries, backoff), `submit.rs` (`$bulk-submit` submissions, receipts, archive), `alerting.rs` (rejected share, outage and recovery, silence, missing by). It uses connectors only through `Source`.
+`FeedRunner` and its pass (`mod.rs`: lease, start, tick, poll loop), with each stage an `impl FeedRunner` block of its own: `ingest.rs` (list, fetch, duplicates, zips, admit, acknowledge), `transforming.rs` (run the transform over received records), `outcomes.rs` (what each record became: rejected, filtered, failing validation, transformed, passed through by the bulk preflight, or left for the next pass), `deliver.rs` (REST batches, retries, backoff), `submit.rs` (`$bulk-submit` submissions, receipts, archive), `alerting.rs` (rejected share, outage and recovery, silence, missing by). It uses connectors only through `Source`.
 
 ### Manager: `src/manager/`
 
-`SourceManager`: `mod.rs` holds the source lifecycle (start, create, replace, delete, pause, resume, check now) and the connection test (`test`: resolve without check, no store attached, a probe error is `reachable: false`, a build error is a 400); `transforms.rs` holds the transform files (list, read, save and restart the sources using one, try).
+`SourceManager`: `mod.rs` holds the source lifecycle (start, create, replace, delete, pause, resume, check now); `probe.rs` the connection test (`test`: resolve without check, no store attached, a probe error is `reachable: false`, a build error is a 400); `transforms.rs` holds the transform files (list, read, save and restart the sources using one, try).
 
 ### API: `src/api/`
 
@@ -80,9 +80,9 @@ How a fetched object becomes records: `read(format, bytes) -> Vec<SourceRecord>`
 | Change | Owns | Adds |
 | --- | --- | --- |
 | H-versions: transform versions and their store and API | `src/transform.rs`, `src/runtime.rs`, `src/manager/transforms.rs`, `src/api/transforms.rs`, `src/pipeline/transforming.rs` (which version a load runs) | `src/db/versions.rs` |
-| H-connectors: describe, sample, test evidence, first-load progress | `src/connectors/**` except `fhir_server/client.rs` and `source.rs::from_config`; `src/api/sources.rs`; `Source`'s `describe`/`sample`/`probe` | describe/sample files per kind (for example `connectors/database/sample.rs`); `src/db/connectors.rs` if evidence is kept |
-| H-history: failures, attempts, retry, usage, validation, delivery | `src/db/loads.rs`, `src/api/loads.rs`, `src/api/records.rs`, `src/pipeline/deliver.rs`, `src/pipeline/submit.rs`, `src/pipeline/ingest.rs` (admit), `src/pipeline/alerting.rs` | `src/db/history.rs` |
-| H-secrets: secrets and admission | `src/secrets.rs` (becomes `src/secrets/`), `src/connectors/fhir_server/client.rs`, the URL lookup in `DatabaseSource::new`, `Source::from_config` (the admission hook, before a connector is built), `src/manager/mod.rs` (`create`, `replace`, `test`) | `src/db/secrets.rs`, `src/api/secrets.rs` |
+| H-connectors: describe, sample, test evidence, first-load progress | `src/connectors/**` except the three H-secrets files below; `src/manager/probe.rs`; `src/api/sources.rs` | describe/sample files per kind (for example `connectors/database/sample.rs`); `src/db/connectors.rs` if evidence is kept |
+| H-history: failures, attempts, retry, usage, validation, delivery | `src/db/loads.rs`, `src/api/loads.rs`, `src/api/records.rs`, `src/pipeline/outcomes.rs`, `src/pipeline/deliver.rs`, `src/pipeline/submit.rs`, `src/pipeline/ingest.rs`, `src/pipeline/alerting.rs` | `src/db/history.rs` |
+| H-secrets: secrets and admission | `src/secrets.rs` (may become `src/secrets/`), `src/connectors/build.rs` (admission, before any connector is built), `src/connectors/database/connection.rs`, `src/connectors/fhir_server/client.rs`, `src/manager/mod.rs` (`create`, `replace`) | `src/db/secrets.rs`, `src/api/secrets.rs` |
 
 Registration points, each a one-line append: `src/lib.rs` (`pub mod`), `src/api/mod.rs` (`mod` and `.merge(…::router())`), `src/db/mod.rs` (`mod`, `TABLES`, `ADDED_COLUMNS`), `src/connectors/mod.rs` (`kind()`, only for a new kind of source). A new column on an existing table is appended to that area's `ADDED_COLUMNS` and, so a new store has it too, to its DDL.
 

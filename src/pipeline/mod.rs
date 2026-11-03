@@ -1,11 +1,12 @@
 //! The pipeline: one runner per feed moves its data through, source -> stored
 //! rows -> transform -> HFS. `mod.rs` holds the runner and its pass; each stage
-//! is a file of its own: `ingest`, `transforming`, `deliver` (REST), `submit`
+//! is a file of its own: `ingest`, `transforming`, `outcomes`, `deliver` (REST), `submit`
 //! (`$bulk-submit`) and `alerting`.
 
 mod alerting;
 mod deliver;
 mod ingest;
+mod outcomes;
 mod submit;
 mod transforming;
 
@@ -24,6 +25,9 @@ use crate::db::{Db, now_ms};
 use crate::fhir::FhirClient;
 use crate::runtime::RuntimeSettings;
 use crate::transform::Transformer;
+
+/// Records transformed or checked per chunk.
+const TRANSFORM_CHUNK: usize = 200;
 
 /// How the manager drives a running feed: `poke` makes it pass now, `stopped` ends it.
 #[derive(Default)]

@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::object::ObjectSource;
-use super::{Capability, Connector, Cursors, Incoming, Listed, Probe, kind};
+use super::{Capability, Connector, Cursors, Incoming, Listed, Probe};
 use crate::config::FeedConfig;
 use crate::db::Db;
 
@@ -25,7 +25,7 @@ impl Source {
     /// not kept until `with_db`.
     pub fn from_config(feed: &FeedConfig) -> Result<Self> {
         Ok(Self {
-            connector: (kind(&feed.source).build)(feed)?,
+            connector: super::build::connector(feed)?,
             cursors: Cursors::new(&feed.id, None),
         })
     }

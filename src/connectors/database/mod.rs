@@ -3,10 +3,11 @@
 //! hands them on as one NDJSON load; the cursor becomes the largest value of the
 //! cursor column once the records are stored.
 //!
-//! `driver` holds the connection and runs the query per engine (PostgreSQL,
-//! MySQL, SQLite, SQL Server), `rows` decodes their rows, `cursor` is the value
-//! followed.
+//! `connection` resolves the URL `url_env` names, `driver` holds the connection
+//! and runs the query per engine (PostgreSQL, MySQL, SQLite, SQL Server), `rows`
+//! decodes their rows, `cursor` is the value followed.
 
+mod connection;
 mod cursor;
 mod driver;
 mod rows;
@@ -132,23 +133,7 @@ impl DatabaseSource {
         cursor_start: Option<String>,
         max_runs: usize,
     ) -> Result<Self> {
-        let url = crate::secrets::named(url_env).with_context(|| {
-            format!(
-                "environment variable {url_env} (the database URL named by the source) is not set"
-            )
-        })?;
-        if !(url.starts_with("postgres://")
-            || url.starts_with("postgresql://")
-            || url.starts_with("mysql://")
-            || url.starts_with("sqlite:")
-            || url.starts_with("sqlserver://")
-            || url.starts_with("mssql://"))
-        {
-            bail!("{url_env} must be a postgres://, mysql://, sqlserver:// or sqlite: URL");
-        }
-        if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
-            driver::mssql_config(&url)?;
-        }
+        let url = connection::url(url_env)?;
         Ok(Self {
             feed_id: feed_id.to_string(),
             query: query.to_string(),

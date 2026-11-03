@@ -14,6 +14,7 @@
 //! How a fetched object is cut into records is not a connector's business; see
 //! `crate::formats`.
 
+mod build;
 pub mod database;
 pub mod fhir_server;
 pub mod mllp;
