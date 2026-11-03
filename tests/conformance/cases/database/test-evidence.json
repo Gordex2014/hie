@@ -1,7 +1,6 @@
 {
   "id": "database/test-evidence",
   "title": "A Test answers bound evidence, replays by key, and fails a read that cannot run",
-  "covers": [],
   "fixtures": {
     "sqlite": {
       "labs": [

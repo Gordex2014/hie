@@ -1,7 +1,6 @@
 {
   "id": "transforms/legacy-put-creates-version",
   "title": "The 0.1 save by name now saves a version, and only when the code changed",
-  "covers": [],
   "steps": [
     {
       "request": {

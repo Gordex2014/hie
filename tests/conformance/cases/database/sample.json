@@ -1,9 +1,6 @@
 {
   "id": "database/sample",
   "title": "Sample rows of a tested read, in order, no-store, bounded",
-  "covers": [
-    "POST /api/evidence/{id}/sample"
-  ],
   "fixtures": {
     "sqlite": {
       "labs": [

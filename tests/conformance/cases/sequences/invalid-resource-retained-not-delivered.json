@@ -1,7 +1,6 @@
 {
   "id": "sequences/invalid-resource-retained-not-delivered",
   "title": "A resource the destination's $validate finds invalid is kept as a failed row and never delivered",
-  "covers": [],
   "fixtures": {
     "hie": {
       "validation": "required"
@@ -52,7 +51,7 @@
                 "written": 2,
                 "failed": 1
               },
-              "validation": "ok"
+              "waiting": null
             }
           ]
         }
@@ -90,6 +89,7 @@
         "body": {
           "failures": [
             {
+              "group": "{{$g}}",
               "kind": "validation",
               "count": 1,
               "reason": "{{contains:bogus}}",
@@ -97,6 +97,179 @@
             }
           ]
         }
+      }
+    },
+    {
+      "name": "a retry with the same program",
+      "request": {
+        "method": "POST",
+        "path": "/api/loads/{{$load}}/retries",
+        "headers": {
+          "Idempotency-Key": "r1"
+        },
+        "body": {
+          "group": "{{$g}}",
+          "version": null
+        }
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "retry": {
+            "id": "{{$rt1}}",
+            "transform": {
+              "version": 1
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/retries/{{$rt1}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "retry": {
+            "status": "done",
+            "written": 0,
+            "failed": 1
+          }
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "destination": {
+        "resources": {
+          "Observation": 2
+        },
+        "not_stored": [
+          {
+            "status": "bogus"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/lab_csv/versions",
+        "headers": {
+          "Idempotency-Key": "fix"
+        },
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v2\"}],\n    }\n",
+          "base_version": 1
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "version": 2
+        }
+      }
+    },
+    {
+      "set_destination": {
+        "validate": "unavailable"
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/loads/{{$load}}/retries",
+        "headers": {
+          "Idempotency-Key": "r2"
+        },
+        "body": {
+          "group": "{{$g}}",
+          "version": null
+        }
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "retry": {
+            "id": "{{$rt2}}",
+            "transform": {
+              "version": 2
+            },
+            "previous": "{{$rt1}}"
+          }
+        }
+      }
+    },
+    {
+      "name": "the retry waits on validation",
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/retries/{{$rt2}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "retry": {
+            "waiting": "validation_unavailable",
+            "written": 0,
+            "failed": 0
+          }
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "sleep_ms": 1000
+    },
+    {
+      "destination": {
+        "resources": {
+          "Observation": 2
+        },
+        "not_stored": [
+          {
+            "id": "obs-2"
+          }
+        ]
+      }
+    },
+    {
+      "set_destination": {
+        "validate": "valid"
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/retries/{{$rt2}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "retry": {
+            "status": "done",
+            "written": 1,
+            "waiting": null
+          }
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "destination": {
+        "stored": [
+          {
+            "id": "obs-2",
+            "status": "final",
+            "note": [
+              {
+                "text": "v2"
+              }
+            ]
+          }
+        ]
       }
     }
   ]

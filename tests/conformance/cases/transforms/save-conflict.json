@@ -1,9 +1,6 @@
 {
   "id": "transforms/save-conflict",
   "title": "A save on a stale base is a conflict; a replayed save is the same version",
-  "covers": [
-    "POST /api/transforms/{id}/versions"
-  ],
   "steps": [
     {
       "name": "create Lab results",

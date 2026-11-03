@@ -1,9 +1,6 @@
 {
   "id": "admission/policy-read",
   "title": "The policy in force is reported normalized",
-  "covers": [
-    "GET /api/admission"
-  ],
   "fixtures": {
     "hie": {
       "admission": {

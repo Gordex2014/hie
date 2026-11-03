@@ -1,13 +1,6 @@
 {
   "id": "compat/alert-rules-crud",
   "title": "Alert rules are created, read, replaced and removed",
-  "covers": [
-    "GET /api/alert-rules",
-    "POST /api/alert-rules",
-    "GET /api/alert-rules/{id}",
-    "PUT /api/alert-rules/{id}",
-    "DELETE /api/alert-rules/{id}"
-  ],
   "steps": [
     {
       "request": {

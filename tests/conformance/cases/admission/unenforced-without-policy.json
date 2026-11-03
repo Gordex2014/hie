@@ -1,7 +1,6 @@
 {
   "id": "admission/unenforced-without-policy",
   "title": "Without a policy nothing is enforced, and the engine says so",
-  "covers": [],
   "steps": [
     {
       "request": {

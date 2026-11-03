@@ -1,10 +1,6 @@
 {
   "id": "transforms/try-cancel",
   "title": "A running Try is cancelled: its answer reads stopped; a finished one cannot be cancelled",
-  "covers": [
-    "POST /api/transforms/try-runs/{run}/cancel",
-    "GET /api/transforms/try-runs/{run}"
-  ],
   "fixtures": {
     "hie": {
       "runtime": {
@@ -64,7 +60,36 @@
       "background": "slow"
     },
     {
-      "sleep_ms": 500
+      "name": "the run is executing",
+      "request": {
+        "method": "GET",
+        "path": "/api/transforms/try-runs/c-1"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "run": {
+            "id": "c-1",
+            "status": "running",
+            "outcome": null,
+            "termination": null
+          },
+          "coverage": {
+            "requested": 2,
+            "reported": 0,
+            "complete": false
+          }
+        }
+      },
+      "until_ms": 5000
+    },
+    {
+      "runtime": {
+        "calls": {
+          "try": 1
+        }
+      },
+      "until_ms": 5000
     },
     {
       "request": {
@@ -86,6 +111,7 @@
         "body": {
           "run": {
             "id": "c-1",
+            "status": "finished",
             "outcome": "stopped",
             "reason": "cancelled",
             "termination": "{{string}}"

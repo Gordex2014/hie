@@ -1,7 +1,6 @@
 {
   "id": "sequences/lost-try-not-replayed",
   "title": "An answer lost after dispatch is indeterminate and unconfirmed; HIE does not send it again, and the run id cannot be reused",
-  "covers": [],
   "fixtures": {
     "hie": {
       "runtime": {
@@ -131,6 +130,7 @@
         "status": 200,
         "body": {
           "run": {
+            "status": "finished",
             "outcome": "indeterminate",
             "termination": "unconfirmed"
           },

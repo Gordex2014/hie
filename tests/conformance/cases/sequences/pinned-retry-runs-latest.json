@@ -1,7 +1,6 @@
 {
   "id": "sequences/pinned-retry-runs-latest",
   "title": "Pinned to v2, save v3: the retry runs v3 and the next ordinary load still runs v2",
-  "covers": [],
   "fixtures": {
     "files": {
       "inbox/a.csv": "id,value\n1,5.4\n2,alto\n3,6.1\n"

@@ -1,7 +1,6 @@
 {
   "id": "database/start-binds-evidence",
   "title": "Start needs passing evidence for exactly the tested read, replays by key, and refuses a second create",
-  "covers": [],
   "fixtures": {
     "sqlite": {
       "labs": [

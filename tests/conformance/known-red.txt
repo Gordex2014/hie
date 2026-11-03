@@ -15,12 +15,14 @@ sequences/secret-never-echoed H-secrets                   # also H-connectors: d
 # H-connectors: database connection shape, Test evidence, describe, sample, Start binding, first-load
 # progress, destination facts, passes, validation before delivery, namespacing, transaction delivery.
 database/describe H-connectors
+database/sqlserver-credential-binding H-connectors       # also H-secrets; runs only with HIE_TEST_MSSQL_URL
 database/first-load-progress H-connectors                 # also H-history: rows and progress on loads
 database/sample H-connectors
 database/start-binds-evidence H-connectors
 database/test-evidence H-connectors
 delivery/transaction-for-conditional-references H-connectors   # also H-history: rows on loads, kind reference
-sequences/invalid-resource-retained-not-delivered H-connectors # also H-history: rows on loads, content state
+delivery/transaction-uncertain-not-split H-connectors     # also H-history: rows, waiting and outcome unknown on loads
+sequences/invalid-resource-retained-not-delivered H-connectors # also H-history and H-versions: rows, retries, a saved version
 sequences/sources-namespaced-apart H-connectors            # also H-history: rows on loads
 sequences/validation-unavailable-delivers-nothing H-connectors # also H-history: rows and outcome on loads and records
 sources/check-now-pass H-connectors
@@ -29,6 +31,7 @@ transforms/try-validation-issues H-connectors              # also H-history: the
 
 # H-versions: transform ids and immutable versions, save conflicts, environments, pins, load-start snapshot.
 sequences/save-during-load-keeps-version H-versions        # also H-history: transform and rows on loads
+sequences/runtime-environment-pinned H-versions           # also H-history: waiting on loads and retries, retries
 sources/pin-and-follow H-versions
 transforms/create-idempotent H-versions
 transforms/delete H-versions
@@ -43,6 +46,7 @@ transforms/versions-and-metadata H-versions
 loads/failed-content-purge-keeps-totals H-history
 loads/failure-groups-and-samples H-history
 loads/history-and-period-counts H-history                  # also H-versions: saving a version of a file transform
+loads/legacy-retry-creates-retries H-history
 loads/outcome-unknown H-history
 loads/paging-cursor H-history
 loads/retry-lifecycle H-history                            # also H-versions: saving a version of a file transform

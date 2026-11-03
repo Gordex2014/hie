@@ -1,11 +1,6 @@
 {
   "id": "loads/failure-groups-and-samples",
   "title": "Failures group by reason and version with their content state; record ids without content; samples no-store",
-  "covers": [
-    "GET /api/loads/{id}/failures/{group}",
-    "GET /api/loads/{id}/failures/{group}/samples",
-    "GET /api/records/{id}/history"
-  ],
   "fixtures": {
     "files": {
       "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",

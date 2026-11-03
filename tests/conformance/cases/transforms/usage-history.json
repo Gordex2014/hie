@@ -1,9 +1,6 @@
 {
   "id": "transforms/usage-history",
   "title": "Usage per version: pin periods, ended ones included, and the loads each version ran",
-  "covers": [
-    "GET /api/transforms/{id}/usage"
-  ],
   "fixtures": {
     "files": {
       "inbox/a.csv": "id,value\n1,5.4\n"

@@ -1,9 +1,6 @@
 {
   "id": "compat/health",
   "title": "The health answer is unchanged",
-  "covers": [
-    "GET /health"
-  ],
   "steps": [
     {
       "request": {

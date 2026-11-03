@@ -1,7 +1,6 @@
 {
   "id": "conventions/error-codes",
   "title": "Every error carries a stable code beside its sentence",
-  "covers": [],
   "steps": [
     {
       "request": {

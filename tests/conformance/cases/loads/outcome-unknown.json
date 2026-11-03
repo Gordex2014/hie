@@ -1,9 +1,6 @@
 {
   "id": "loads/outcome-unknown",
   "title": "Rows sent without a confirming answer read outcome unknown until a later attempt settles them",
-  "covers": [
-    "GET /api/records"
-  ],
   "fixtures": {
     "destination": {
       "writes": "unavailable"

@@ -1,12 +1,6 @@
 {
   "id": "compat/legacy-transform-put-and-try",
   "title": "Saving and trying a transform by name, as in 0.1",
-  "covers": [
-    "PUT /api/transforms/{name}",
-    "GET /api/transforms",
-    "GET /api/transforms/{id}",
-    "POST /api/transforms/{id}/try"
-  ],
   "steps": [
     {
       "request": {
@@ -49,7 +43,10 @@
             "{{contains}}",
             {
               "name": "t1",
-              "used_by": []
+              "used_by": [],
+              "path": "{{string}}",
+              "size": "{{int}}",
+              "modified_at": "{{any}}"
             }
           ]
         }

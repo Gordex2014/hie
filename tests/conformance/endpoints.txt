@@ -1,5 +1,5 @@
-# Every route of the 0.2.0 contract (docs/api.md) that at least one case covers.
-# The runner fails when a route listed here has no case naming it in "covers".
+# Every route of the 0.2.0 contract (docs/api.md), 0.1 routes it keeps included.
+# The runner fails when no case sends a request to one of them.
 GET /api/admission
 GET /api/alert-rules
 POST /api/alert-rules
@@ -38,6 +38,7 @@ GET /api/sources/{id}
 PUT /api/sources/{id}
 POST /api/sources/{id}/check-now
 GET /api/sources/{id}/destination
+GET /api/sources/{id}/files
 GET /api/sources/{id}/loads
 GET /api/sources/{id}/passes/{pass}
 POST /api/sources/{id}/pause
@@ -58,3 +59,4 @@ GET /api/transforms/{id}/versions
 POST /api/transforms/{id}/versions
 PUT /api/transforms/{name}
 GET /health
+GET /metrics

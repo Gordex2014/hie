@@ -1,9 +1,6 @@
 {
   "id": "database/describe",
   "title": "Through passing evidence: the tables, then one table's columns, key and row count",
-  "covers": [
-    "POST /api/evidence/{id}/describe"
-  ],
   "fixtures": {
     "sqlite": {
       "labs": [

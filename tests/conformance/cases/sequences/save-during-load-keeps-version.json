@@ -1,7 +1,6 @@
 {
   "id": "sequences/save-during-load-keeps-version",
   "title": "A version saved while a load runs does not change that load; the next load takes it",
-  "covers": [],
   "fixtures": {
     "files": {
       "inbox/a.csv": "id,value\n1,5.1\n2,5.2\n3,5.3\n4,5.4\n5,5.5\n6,5.6\n7,5.7\n8,5.8\n"

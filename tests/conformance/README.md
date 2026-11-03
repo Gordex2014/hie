@@ -13,10 +13,10 @@ HIE_CONFORMANCE_ONLY=sequences/ HIE_CONFORMANCE_VERBOSE=1 cargo test --test conf
 |---|---|
 | `cases/<area>/<name>.json` | One case. Its id is the path without `cases/` and `.json`, such as `sequences/lost-try-not-replayed` |
 | `known-red.txt` | Cases expected to fail until the front named beside each implements them |
-| `endpoints.txt` | Every route of the contract; each must appear in some case's `covers` |
+| `endpoints.txt` | Every route of the contract; some case must send a request to each |
 | `SHA256SUMS` | SHA-256 of every other file here; consumers that vendor the corpus check it |
 
-The runner (`tests/conformance.rs`) fails on any failure of an unlisted case, on a listed case that passes (take it off the list), on a route nobody covers, and on a checksum that does not match. After editing any file here:
+The runner (`tests/conformance.rs`) fails on any failure of an unlisted case, on a listed case that passes (take it off the list), on a route no case requests (a request counts for the most specific route its method and path match), and on a checksum that does not match. Each case runs on a runtime of its own, which is shut down when the case ends, so nothing it started outlives it. A case whose requirement is missing is skipped and counted as such. After editing any file here:
 
 ```sh
 cd tests/conformance && find . -type f ! -name SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
@@ -28,7 +28,6 @@ cd tests/conformance && find . -type f ! -name SHA256SUMS | sed 's|^\./||' | LC_
 {
   "id": "area/name",
   "title": "One sentence: what the case proves",
-  "covers": ["POST /api/transforms"],
   "fixtures": {...},
   "forbid": ["values that must never appear"],
   "steps": [...]
@@ -41,13 +40,14 @@ Each case gets an engine of its own in an empty directory, its store in `data/hi
 
 | Member | Sets up |
 |---|---|
+| `requires` | `["mssql"]`: the case runs only when `HIE_TEST_MSSQL_URL` names a SQL Server holding the `lab_results` table of `sources/lab-database.yaml.example` with at least three rows, and is skipped otherwise. It provides `{{mssql:host}}`, `{{mssql:port}}`, `{{mssql:database}}`, `{{mssql:user}}`, `{{mssql:password}}`, `{{mssql:encrypt}}` and `{{mssql:trust_cert}}` |
 | `hie` | Merged into `hie.yaml` (for example `admission`, `validation`, `retention`, `runtime`, `destination`) |
 | `secrets_key` | `true` writes a 32-byte key file and sets `secrets.key_file` |
 | `files` | Files written under the engine's directory before it starts: transforms, `sources/*.yaml`, inbox files |
 | `sqlite` | `{"<name>": ["<SQL>", ...]}`: a SQLite database at `<name>.db`, built by those statements |
 | `tcp` | `["<name>", ...]`: TCP listeners on free ports that accept and close every connection, and count them |
 | `destination` | The stand-in FHIR server: `validate` (`valid` or `unavailable`), `invalid` (rules `{resourceType, field, equals, expression, message}` that make `$validate` answer an error issue), `writes` (`ok` or `unavailable`: every write answers `503`), `seed` (resources it holds from the start) |
-| `runtime` | A stand-in of python-runtime's HIE facade. `try` is the list of answers to `POST /transforms/try`, used in order: `{"status", "headers", "body", "delay_ms"}`, or `{"drop": true}` to close the connection without answering. Replies get the request ids by position. `PUT /transforms/{name}` answers its sha256; a run answers `503 busy` |
+| `runtime` | A stand-in of python-runtime's HIE facade. `environment` holds the `Python-Runtime-Environment-*` headers it answers with, and `GET /v1/capabilities` reports that environment as the default. `try` is the list of answers to `POST /transforms/try`, used in order: `{"status", "headers", "body", "delay_ms"}`, or `{"drop": true}` to close the connection without answering; a `200` without `headers` carries the environment. `run`, `{"marker", "diagnostics"?}`, makes `POST /transforms/{name}/run` answer as a fixed lab program would (`{id, value, status?}` to an Observation `obs-<id>` whose note is the marker, or a `data` error when `value` is not a number), with those diagnostics on every reply; without it a run answers `503 busy`. Replies get the request ids by position. `PUT /transforms/{name}` answers its sha256 |
 
 The stand-in destination serves `GET /metadata` (FHIR `4.0.1`), `POST /` for `batch` and `transaction` Bundles (a transaction resolves `Type?identifier=` references against what it holds, and fails whole when one matches nothing or several), `PUT /{type}/{id}`, conditional `PUT /{type}?identifier=`, and `POST /{type}/$validate` (the resource, or a `Parameters` with a `resource` parameter).
 
@@ -66,6 +66,7 @@ The stand-in destination serves `GET /metadata` (FHIR `4.0.1`), `POST /` for `ba
 | `{"tcp": {"<name>": 0}}` | Checks how many connections a listener accepted |
 | `{"sql": {"db", "statements"}}` | Runs SQL on a fixture database |
 | `{"set_destination": {...}}` | Changes the stand-in destination's `validate` or `writes` |
+| `{"set_runtime": {"environment": {...}}}` | Changes the environment the stand-in runtime reports |
 | `{"write_files": {"<path>": "<content>"}}` | Writes files under the engine's directory |
 | `{"sleep_ms": 500}` | Waits |
 
@@ -92,6 +93,6 @@ Any other string matches itself after placeholders are filled in (`"Patient/{{$p
 
 ### Forbidden values
 
-Every value in `forbid` must never appear in any answer's body or headers, nor in any file under the engine's directory when the case ends: the store, the source files and anything else the engine wrote.
+Every value in `forbid` must never appear in any answer's body or headers, nor in any file under the engine's directory when the case ends (the store, the source files and anything else the engine wrote), nor in the engine's log, which the runner captures at `debug`. Custody is checked whether or not the steps passed.
 
-`forbid_at_rest`, `{"values": [...], "under": ["data"]}`, names values an answer may carry (failed rows' content, for example) that must not be stored in plaintext in any file under those directories of the engine's when the case ends.
+`forbid_at_rest`, `{"values": [...], "under": ["data"]}`, names values an answer may carry (failed rows' content, Try's stdout) that must not be stored in plaintext in any file under those directories of the engine's (all of it when `under` is left out) when the case ends, nor logged. Placeholders are filled in both lists.

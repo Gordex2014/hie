@@ -1,7 +1,6 @@
 {
   "id": "transforms/try-saved-version",
   "title": "Try runs one exact saved version, the current one by default",
-  "covers": [],
   "steps": [
     {
       "name": "create Lab results",

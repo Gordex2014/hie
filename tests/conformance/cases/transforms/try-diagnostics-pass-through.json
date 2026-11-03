@@ -1,7 +1,6 @@
 {
   "id": "transforms/try-diagnostics-pass-through",
   "title": "The executor's per-item diagnostics come back unchanged, stdout and stderr included, in Try only",
-  "covers": [],
   "fixtures": {
     "hie": {
       "runtime": {
@@ -46,7 +45,7 @@
                       }
                     }
                   ],
-                  "stdout": "looking at row 1\n",
+                  "stdout": "zq-try-stdout-marker\n",
                   "stderr": "",
                   "truncated": false
                 }
@@ -61,7 +60,7 @@
                     "line": 9,
                     "column": 9
                   },
-                  "stderr": "Traceback (most recent call last): ...\n",
+                  "stderr": "zq-try-stderr-marker\n",
                   "truncated": true
                 }
               }
@@ -70,6 +69,15 @@
         }
       ]
     }
+  },
+  "forbid_at_rest": {
+    "values": [
+      "zq-try-stdout-marker",
+      "zq-try-stderr-marker"
+    ],
+    "under": [
+      "data"
+    ]
   },
   "steps": [
     {
@@ -129,7 +137,7 @@
                     }
                   }
                 ],
-                "stdout": "looking at row 1\n",
+                "stdout": "zq-try-stdout-marker\n",
                 "stderr": "",
                 "truncated": false
               },
@@ -148,7 +156,7 @@
                   "line": 9,
                   "column": 9
                 },
-                "stderr": "Traceback (most recent call last): ...\n",
+                "stderr": "zq-try-stderr-marker\n",
                 "truncated": true
               }
             }

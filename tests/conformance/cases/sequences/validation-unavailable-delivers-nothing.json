@@ -1,7 +1,6 @@
 {
   "id": "sequences/validation-unavailable-delivers-nothing",
   "title": "While the destination cannot validate nothing is delivered and no row fails; once it can, the rows go",
-  "covers": [],
   "fixtures": {
     "hie": {
       "validation": "required"
@@ -39,7 +38,7 @@
             "{{contains}}",
             {
               "name": "a.csv",
-              "validation": "unavailable"
+              "waiting": "validation_unavailable"
             }
           ]
         }
@@ -128,7 +127,7 @@
             {
               "name": "a.csv",
               "status": "done",
-              "validation": "ok",
+              "waiting": null,
               "rows": {
                 "written": 3,
                 "failed": 0

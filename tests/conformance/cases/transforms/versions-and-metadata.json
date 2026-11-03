@@ -1,9 +1,6 @@
 {
   "id": "transforms/versions-and-metadata",
   "title": "Versions are immutable and read with their metadata; one exact version is read back",
-  "covers": [
-    "GET /api/transforms/{id}/versions"
-  ],
   "steps": [
     {
       "name": "create Lab results",

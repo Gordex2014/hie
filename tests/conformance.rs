@@ -180,29 +180,60 @@ fn load_known_red(dir: &Path, cases: &[Case]) -> BTreeMap<String, String> {
     out
 }
 
-/// Every endpoint in `endpoints.txt` is covered by at least one case.
+/// Every route in `endpoints.txt` is requested by some case's steps. A request
+/// counts for the most specific route its method and path match.
 fn check_coverage(dir: &Path, cases: &[Case]) -> Result<(), String> {
     let text = std::fs::read_to_string(dir.join("endpoints.txt")).unwrap_or_default();
-    let covered: BTreeSet<String> = cases
-        .iter()
-        .flat_map(|c| {
-            c.doc["covers"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-        })
-        .collect();
-    let missing: Vec<&str> = text
+    let routes: Vec<(String, Vec<String>)> = text
         .lines()
         .map(|l| l.split('#').next().unwrap().trim())
-        .filter(|l| !l.is_empty() && !covered.contains(*l))
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| l.split_once(' '))
+        .map(|(m, p)| {
+            let segments = p
+                .trim()
+                .trim_start_matches('/')
+                .split('/')
+                .map(str::to_string)
+                .collect();
+            (m.to_string(), segments)
+        })
+        .collect();
+    let is_param = |t: &str| t.starts_with('{') && t.ends_with('}');
+    let mut covered = BTreeSet::new();
+    for case in cases {
+        for step in case.doc["steps"].as_array().into_iter().flatten() {
+            let Some(request) = step.get("request") else {
+                continue;
+            };
+            let method = request["method"].as_str().unwrap_or("GET");
+            let path = request["path"].as_str().unwrap_or_default();
+            let path = path.split('?').next().unwrap_or_default();
+            let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+            let best = routes
+                .iter()
+                .enumerate()
+                .filter(|(_, (m, t))| {
+                    m == method
+                        && t.len() == segments.len()
+                        && t.iter().zip(&segments).all(|(t, s)| is_param(t) || t == s)
+                })
+                .max_by_key(|(_, (_, t))| t.iter().filter(|t| !is_param(t)).count());
+            if let Some((i, _)) = best {
+                covered.insert(i);
+            }
+        }
+    }
+    let missing: Vec<String> = routes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !covered.contains(i))
+        .map(|(_, (m, t))| format!("{m} /{}", t.join("/")))
         .collect();
     if missing.is_empty() {
         Ok(())
     } else {
-        Err(format!("endpoints no case covers: {missing:?}"))
+        Err(format!("routes no case requests: {missing:?}"))
     }
 }
 
@@ -349,9 +380,11 @@ async fn dest_bundle(State(d): State<Dest>, Json(bundle): Json<Value>) -> Respon
     if d.writes_mode == "unavailable" {
         return (StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response();
     }
-    let mut entries = Vec::new();
+    let mut staged = Vec::new();
     for e in bundle["entry"].as_array().cloned().unwrap_or_default() {
         let mut resource = e["resource"].clone();
+        // A transaction resolves its conditional references against what the
+        // server holds before anything executes, and commits all or nothing.
         if kind == "transaction"
             && let Err(message) = d.resolve_conditional(&mut resource)
         {
@@ -361,9 +394,12 @@ async fn dest_bundle(State(d): State<Dest>, Json(bundle): Json<Value>) -> Respon
         }
         let method = e["request"]["method"].as_str().unwrap_or("PUT").to_string();
         let url = e["request"]["url"].as_str().unwrap_or_default().to_string();
-        let status = d.write(&method, &url, resource);
-        entries.push(json!({"response": {"status": status}}));
+        staged.push((method, url, resource));
     }
+    let entries: Vec<Value> = staged
+        .into_iter()
+        .map(|(method, url, resource)| json!({"response": {"status": d.write(&method, &url, resource)}}))
+        .collect();
     Json(json!({"resourceType": "Bundle", "type": format!("{kind}-response"), "entry": entries}))
         .into_response()
 }
@@ -470,15 +506,71 @@ async fn start_destination(cfg: &Value) -> (String, Dest) {
 struct Runtime {
     tries: VecDeque<Value>,
     calls: BTreeMap<String, usize>,
+    /// The `Python-Runtime-Environment-*` headers it answers with.
+    environment: Map<String, Value>,
+    /// How `/run` answers: absent is `503 busy`; `{"marker", "diagnostics"?}`
+    /// runs a fixed lab program (see the README).
+    run: Value,
+}
+
+impl Runtime {
+    fn configure(&mut self, cfg: &Value) {
+        if let Some(env) = cfg["environment"].as_object() {
+            self.environment = env.clone();
+        }
+        if let Some(run) = cfg.get("run") {
+            self.run = run.clone();
+        }
+    }
+
+    fn capabilities(&self) -> Value {
+        let id = self
+            .environment
+            .get("Python-Runtime-Environment-Id")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let digest = self
+            .environment
+            .get("Python-Runtime-Environment-Digest")
+            .cloned()
+            .unwrap_or(Value::Null);
+        json!({"protocols": [1], "bindings": ["hie-record@1"], "default_environment": id,
+               "environments": [{"id": id, "digest": digest, "bindings": ["hie-record@1"], "state": "ready"}]})
+    }
+
+    /// The fixed lab program: `{id, value, status?}` to one Observation, or a
+    /// data error when `value` is not a number.
+    fn run_one(&self, record: &Value) -> Value {
+        let value = match &record["value"] {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let mut reply = match value.parse::<f64>() {
+            Ok(n) => json!({"resources": [{
+                "resourceType": "Observation", "id": format!("obs-{}", match &record["id"] { Value::String(s) => s.clone(), v => v.to_string() }),
+                "status": record["status"].as_str().filter(|s| !s.is_empty()).unwrap_or("final"),
+                "code": {"text": "glucose"}, "valueQuantity": {"value": n},
+                "note": [{"text": self.run["marker"].as_str().unwrap_or("runtime")}]}]}),
+            Err(_) => {
+                json!({"error": {"kind": "data", "message": format!("value '{value}' is not a number")}})
+            }
+        };
+        if let Some(diagnostics) = self.run.get("diagnostics") {
+            reply["diagnostics"] = diagnostics.clone();
+        }
+        reply
+    }
 }
 
 type Rt = Arc<Mutex<Runtime>>;
 
 async fn start_runtime(cfg: &Value) -> (String, Rt) {
-    let rt: Rt = Arc::new(Mutex::new(Runtime {
+    let mut state = Runtime {
         tries: cfg["try"].as_array().cloned().unwrap_or_default().into(),
         ..Default::default()
-    }));
+    };
+    state.configure(cfg);
+    let rt: Rt = Arc::new(Mutex::new(state));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state = rt.clone();
@@ -550,6 +642,8 @@ async fn runtime_connection(mut stream: tokio::net::TcpStream, rt: Rt) {
     let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let kind = if method == "PUT" {
         "put"
+    } else if path.ends_with("/v1/capabilities") {
+        "capabilities"
     } else if path.ends_with("/transforms/try") {
         "try"
     } else if path.ends_with("/run") {
@@ -557,16 +651,48 @@ async fn runtime_connection(mut stream: tokio::net::TcpStream, rt: Rt) {
     } else {
         "other"
     };
-    let script = {
+    let (script, environment) = {
         let mut rt = rt.lock().unwrap();
         *rt.calls.entry(kind.to_string()).or_default() += 1;
-        if kind == "try" {
+        let script = if kind == "try" {
             rt.tries.pop_front()
         } else {
             None
-        }
+        };
+        (script, rt.environment.clone())
     };
     match kind {
+        "capabilities" => {
+            let caps = rt.lock().unwrap().capabilities();
+            write_response(&mut stream, 200, &Map::new(), &caps).await;
+        }
+        "run" => {
+            let answer = {
+                let rt = rt.lock().unwrap();
+                if rt.run.is_null() {
+                    None
+                } else {
+                    let replies: Vec<Value> = request["requests"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|r| {
+                            let mut reply = rt.run_one(&r["record"]);
+                            reply["id"] = r["id"].clone();
+                            reply
+                        })
+                        .collect();
+                    Some(json!({"replies": replies}))
+                }
+            };
+            match answer {
+                Some(body) => write_response(&mut stream, 200, &environment, &body).await,
+                None => {
+                    write_response(&mut stream, 503, &Map::new(), &json!({"error": "busy"})).await
+                }
+            }
+        }
         "put" => {
             let code = request["code"].as_str().unwrap_or_default();
             let name = path.rsplit('/').next().unwrap_or_default();
@@ -602,7 +728,13 @@ async fn runtime_connection(mut stream: tokio::net::TcpStream, rt: Rt) {
                 }
             }
             let status = script["status"].as_u64().unwrap_or(200) as u16;
-            let headers = script["headers"].as_object().cloned().unwrap_or_default();
+            // A scripted answer names its own headers; a 200 without them
+            // carries the runtime's current environment.
+            let headers = match script["headers"].as_object() {
+                Some(h) => h.clone(),
+                None if status == 200 => environment,
+                None => Map::new(),
+            };
             write_response(&mut stream, status, &headers, &answer).await;
         }
         _ => {
@@ -1173,6 +1305,14 @@ impl Run {
             self.dest.lock().unwrap().configure(cfg);
             return Ok(());
         }
+        if let Some(cfg) = step.get("set_runtime") {
+            let rt = self
+                .runtime
+                .as_ref()
+                .ok_or_else(|| format!("{at}: the case has no runtime"))?;
+            rt.lock().unwrap().configure(cfg);
+            return Ok(());
+        }
         if let Some(files) = step["write_files"].as_object() {
             for (rel, content) in files {
                 let content = self.env.subst(content, &self.caps)?;
@@ -1187,32 +1327,20 @@ impl Run {
         Err(format!("{at}: unknown step {}", short(Some(step))))
     }
 
-    /// Pauses every source through the API, so an engine whose case is over
-    /// stops passing before its directory is removed.
-    async fn quiesce(&self) {
-        let Ok(listed) = send(
-            self.http.clone(),
-            self.api.clone(),
-            json!({"method": "GET", "path": "/api/sources"}),
-        )
-        .await
-        else {
-            return;
-        };
-        for source in listed.body["sources"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-        {
-            if let Some(id) = source["id"].as_str() {
-                let pause = json!({"method": "POST", "path": format!("/api/sources/{id}/pause"), "body": {"by": "conformance"}});
-                let _ = send(self.http.clone(), self.api.clone(), pause).await;
+    /// Nothing the case marks as secret may be written anywhere under the
+    /// engine's directory, nor logged; values forbidden at rest may not be in
+    /// the directories named, nor logged.
+    fn check_custody(&self) -> Result<(), String> {
+        let log = LOG.lock().unwrap();
+        for value in self.forbid.iter().chain(&self.at_rest.0) {
+            if log.windows(value.len()).any(|w| w == value.as_bytes()) {
+                return Err("the engine's log holds a forbidden value".into());
             }
         }
+        drop(log);
+        self.check_files()
     }
 
-    /// Nothing the case marks as secret may be written anywhere under the
-    /// engine's directory: not the store, the source files or the logs.
     fn check_files(&self) -> Result<(), String> {
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -1272,13 +1400,21 @@ fn merge(base: &mut Value, extra: &Value) {
     }
 }
 
-async fn run_case(case: &Case, python: &str) -> Result<(), String> {
+/// `Ok(true)` passed, `Ok(false)` skipped for a missing requirement.
+async fn run_case(case: &Case, python: &str, root: PathBuf) -> Result<bool, String> {
     let fixtures = case.doc.get("fixtures").cloned().unwrap_or(json!({}));
-    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let root = dir.path().to_path_buf();
 
     let mut vars: HashMap<String, Value> = HashMap::new();
     vars.insert("root".into(), json!(root.to_string_lossy()));
+    for requirement in fixtures["requires"].as_array().cloned().unwrap_or_default() {
+        match requirement.as_str() {
+            Some("mssql") => match mssql_vars() {
+                Some(v) => vars.extend(v),
+                None => return Ok(false),
+            },
+            other => return Err(format!("unknown requirement {other:?}")),
+        }
+    }
 
     let (dest_url, dest) =
         start_destination(fixtures.get("destination").unwrap_or(&json!({}))).await;
@@ -1359,6 +1495,26 @@ async fn run_case(case: &Case, python: &str) -> Result<(), String> {
         .map_err(|e| format!("building the engine: {e:#}"))?;
     let api = serve(hie::api::router(state)).await;
 
+    let strings = |v: &Value| -> Result<Vec<String>, String> {
+        v.as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|v| {
+                env.subst(v, &caps)
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+            })
+            .collect()
+    };
+    let forbid = strings(&case.doc["forbid"])?;
+    let at_rest = {
+        let spec = &case.doc["forbid_at_rest"];
+        let mut under = strings(&spec["under"])?;
+        if under.is_empty() {
+            under.push(".".into());
+        }
+        (strings(&spec["values"])?, under)
+    };
     let mut run = Run {
         api,
         http: reqwest::Client::builder()
@@ -1372,39 +1528,97 @@ async fn run_case(case: &Case, python: &str) -> Result<(), String> {
         runtime,
         tcp,
         sqlite,
-        forbid: case.doc["forbid"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        at_rest: {
-            let strings = |v: &Value| -> Vec<String> {
-                v.as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            };
-            let spec = &case.doc["forbid_at_rest"];
-            (strings(&spec["values"]), strings(&spec["under"]))
-        },
+        forbid,
+        at_rest,
         background: HashMap::new(),
     };
+    let mut failure = None;
     for (i, step) in case.doc["steps"].as_array().unwrap().iter().enumerate() {
         let label = step["name"]
             .as_str()
             .map(|n| format!("step {i} ({n})"))
             .unwrap_or(format!("step {i}"));
         if let Err(e) = run.step(step, &label).await {
-            run.quiesce().await;
-            return Err(e);
+            failure = Some(e);
+            break;
         }
     }
-    let outcome = run.check_files();
-    run.quiesce().await;
+    // Custody is checked whether the steps passed or not.
+    match (failure, run.check_custody()) {
+        (None, Ok(())) => Ok(true),
+        (Some(e), Ok(())) => Err(e),
+        (None, Err(c)) => Err(c),
+        (Some(e), Err(c)) => Err(format!("{e}; and {c}")),
+    }
+}
+
+/// Placeholders for a SQL Server named by `HIE_TEST_MSSQL_URL`
+/// (`sqlserver://user:password@host:port/database?trust_cert=true`).
+fn mssql_vars() -> Option<HashMap<String, Value>> {
+    let url = url::Url::parse(&std::env::var("HIE_TEST_MSSQL_URL").ok()?).ok()?;
+    let decode = |s: &str| {
+        url::form_urlencoded::parse(format!("x={s}").as_bytes())
+            .next()
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default()
+    };
+    let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    let flag = |k: &str, default: bool| {
+        query
+            .get(k)
+            .map(|v| matches!(v.as_str(), "true" | "on" | "yes" | "1"))
+            .unwrap_or(default)
+    };
+    Some(HashMap::from([
+        ("mssql:host".to_string(), json!(url.host_str()?)),
+        ("mssql:port".to_string(), json!(url.port().unwrap_or(1433))),
+        (
+            "mssql:database".to_string(),
+            json!(url.path().trim_start_matches('/')),
+        ),
+        ("mssql:user".to_string(), json!(decode(url.username()))),
+        ("mssql:password".to_string(), json!(decode(url.password()?))),
+        ("mssql:encrypt".to_string(), json!(flag("encrypt", true))),
+        (
+            "mssql:trust_cert".to_string(),
+            json!(flag("trust_cert", false)),
+        ),
+    ]))
+}
+
+/// The engine's log, from every case; scanned for forbidden values.
+static LOG: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+struct LogWriter;
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        LOG.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// One case on a runtime of its own, so that when it ends, or runs out of time,
+/// every task it started (the engine's runners, its API, the stand-ins, their
+/// Python workers) goes with the runtime, before its directory is removed.
+fn run_isolated(case: Case, python: Arc<String>) -> Result<bool, String> {
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let root = dir.path().to_path_buf();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let outcome = runtime.block_on(async {
+        match tokio::time::timeout(CASE_BUDGET, run_case(&case, &python, root)).await {
+            Ok(r) => r,
+            Err(_) => Err(format!("ran past {}s", CASE_BUDGET.as_secs())),
+        }
+    });
+    runtime.shutdown_timeout(Duration::from_secs(5));
     drop(dir);
     outcome
 }
@@ -1416,8 +1630,9 @@ async fn the_conformance_corpus() {
         return;
     };
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("hie=error")
-        .with_test_writer()
+        .with_env_filter("hie=debug")
+        .with_ansi(false)
+        .with_writer(|| LogWriter)
         .try_init();
     let dir = corpus_dir();
     let mut problems = Vec::new();
@@ -1436,19 +1651,14 @@ async fn the_conformance_corpus() {
         .filter(|c| only.as_ref().is_none_or(|o| c.id.contains(o.as_str())))
         .collect();
     let python = Arc::new(python);
-    let results: Vec<(String, Result<(), String>)> = futures::stream::iter(selected)
+    let results: Vec<(String, Result<bool, String>)> = futures::stream::iter(selected)
         .map(|case| {
             let python = python.clone();
             async move {
                 let id = case.id.clone();
-                let outcome = tokio::spawn(async move {
-                    match tokio::time::timeout(CASE_BUDGET, run_case(&case, &python)).await {
-                        Ok(r) => r,
-                        Err(_) => Err(format!("ran past {}s", CASE_BUDGET.as_secs())),
-                    }
-                })
-                .await
-                .unwrap_or_else(|e| Err(format!("panicked: {e}")));
+                let outcome = tokio::task::spawn_blocking(move || run_isolated(case, python))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("panicked: {e}")));
                 (id, outcome)
             }
         })
@@ -1458,24 +1668,25 @@ async fn the_conformance_corpus() {
 
     let mut results = results;
     results.sort_by(|a, b| a.0.cmp(&b.0));
-    let (mut green, mut red) = (0, 0);
+    let (mut green, mut red, mut skipped) = (0, 0, 0);
     for (id, outcome) in &results {
         match (outcome, known.get(id)) {
-            (Ok(()), None) => green += 1,
+            (Ok(false), _) => skipped += 1,
+            (Ok(true), None) => green += 1,
             (Err(e), Some(front)) => {
                 red += 1;
                 if verbose {
                     eprintln!("known red ({front}) {id}: {e}");
                 }
             }
-            (Ok(()), Some(front)) => problems.push(format!(
+            (Ok(true), Some(front)) => problems.push(format!(
                 "{id} passes but known-red.txt lists it for {front}: remove it from the list"
             )),
             (Err(e), None) => problems.push(format!("{id} failed: {e}")),
         }
     }
     eprintln!(
-        "conformance: {} cases run, {green} green, {red} known red",
+        "conformance: {} cases run, {green} green, {red} known red, {skipped} skipped for a missing requirement",
         results.len()
     );
     assert!(problems.is_empty(), "\n{}", problems.join("\n"));

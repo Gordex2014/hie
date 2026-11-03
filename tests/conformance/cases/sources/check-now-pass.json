@@ -1,9 +1,6 @@
 {
   "id": "sources/check-now-pass",
   "title": "Check now names its pass, which reports what it found, or that it was skipped while paused",
-  "covers": [
-    "GET /api/sources/{id}/passes/{pass}"
-  ],
   "fixtures": {
     "files": {
       "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
@@ -12,6 +9,34 @@
     }
   },
   "steps": [
+    {
+      "name": "a pass over the empty inbox",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "pass": "{{$p0}}"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/passes/{{$p0}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "status": "done",
+          "new_rows": 0,
+          "loads": []
+        }
+      },
+      "until_ms": 15000
+    },
     {
       "write_files": {
         "inbox/a.csv": "id,value\n1,5.4\n"
@@ -41,8 +66,8 @@
         "body": {
           "id": "{{$p1}}",
           "status": "done",
+          "error": null,
           "loads": [
-            "{{contains}}",
             "{{int}}"
           ],
           "new_rows": 1,

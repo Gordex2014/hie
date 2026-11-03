@@ -1,9 +1,6 @@
 {
   "id": "transforms/rename-keeps-id",
   "title": "A rename keeps the id and the versions as saved",
-  "covers": [
-    "PATCH /api/transforms/{id}"
-  ],
   "steps": [
     {
       "name": "create Lab results",

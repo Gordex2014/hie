@@ -1,9 +1,6 @@
 {
   "id": "transforms/try-inline",
   "title": "Try on inline code: per-item dispositions, validation, coverage, nothing written",
-  "covers": [
-    "POST /api/transforms/try"
-  ],
   "steps": [
     {
       "request": {
@@ -34,6 +31,7 @@
         "body": {
           "run": {
             "id": "try-1",
+            "status": "finished",
             "outcome": "completed",
             "reason": null,
             "termination": "confirmed",
@@ -492,6 +490,7 @@
         "body": {
           "run": {
             "id": "try-1",
+            "status": "finished",
             "outcome": "completed"
           },
           "coverage": {

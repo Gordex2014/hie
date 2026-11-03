@@ -1,9 +1,6 @@
 {
   "id": "transforms/create-idempotent",
   "title": "Creating a transform needs a key, replays by it, refuses a reused name and unknown members",
-  "covers": [
-    "POST /api/transforms"
-  ],
   "steps": [
     {
       "request": {

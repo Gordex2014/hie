@@ -201,8 +201,8 @@ A database source names a connection and what to read. The legacy shape (`url_en
 ```
 
 - `verdict` is `passed` only when every check is `passed`; `reachable` alone never means a passing Test. A check is `passed`, `failed` (with a secret-safe `message`) or `not_verified` (an earlier check failed). A failed connection still answers `200`, with `verdict: failed`.
-- `definition_sha256` is the SHA-256 of the canonical JSON of `source.connection` and `source.read` (keys sorted, no whitespace, the password as its reference). `read` is checked and counted only when the definition has one; `read.rows` is its row count at the time of the Test, or `null` when counting is not possible.
-- `credential` is the revision used, or `null` without a secret. A revision left out of the reference is resolved to the current one and recorded.
+- `definition_sha256` fingerprints what was tested, apart from the credential's revision. It is the SHA-256 of the canonical JSON (keys sorted, no whitespace, UTF-8) of `{"connection": ..., "read": ...}` taken from the definition after normalization: the engine, host and port normalized as [admission](#admission-policy) does, every defaulted member filled in (`encrypt: true`, `trust_cert: false`, a table read's `key` as the table's primary key), and the password reduced to `{"secret": "<id>"}` without its revision. `read` is `null` when the definition has none; it is checked and counted only when present, and `read.rows` is its row count at the time of the Test, or `null` when counting is not possible.
+- `credential` is the revision used, `{"secret", "revision"}`, or `null` without a secret. A revision left out of the reference is resolved to the secret's current revision when the Test starts, and that revision is what the evidence records and binds.
 - A refused connection is `403 admission_refused` and creates no evidence.
 - Evidence is kept for 24 hours, and for as long as a source refers to it. `GET /api/evidence/{id}` answers the `evidence` object.
 
@@ -239,10 +239,12 @@ Rows are read from the start of the read, in its order, as the transform will re
 | `400 evidence_required` | No `evidence` |
 | `404 evidence_not_found` | Unknown or expired |
 | `409 evidence_not_passed` | Its verdict is not `passed` |
-| `409 evidence_mismatch`, `field` | Its `definition_sha256` differs from the definition's (`field: definition`), or its credential revision from the definition's (`field: credential`) |
+| `409 evidence_mismatch`, `field` | The definition's fingerprint, computed as the Test computes it, differs from the evidence's (`field: definition`); otherwise, the definition names another secret revision than the evidence's (`field: credential`). A definition that leaves the revision out takes the evidence's |
 | `409 read_not_admitted` | A table read without a key |
 | `403 admission_refused` | The policy refuses the connection |
 | `409 source_exists` | The id exists and the key is new or absent |
+
+A source keeps the credential revision it started with; a later revision of the secret reaches it only through a replace with new evidence.
 
 `201` answers the source as `GET /api/sources/{id}` does, with `first_load: {"id": <load id>}`. The first load exists from that moment, `status: queued`, so a client can follow it at once. `delivery.initial_method: bulk_submit` sends that first load through `$bulk-submit` (`bulk_from: transformed`) and every later one by `delivery.method`.
 
@@ -265,9 +267,9 @@ Rows are read from the start of the read, in its order, as the transform will re
 
 A transform has a stable `id`, a mutable `display_name`, and immutable numbered versions (1, 2, …). A version holds its code, `code_sha256`, `note`, `author`, `display_name` (the transform's name when the version was saved), `base_version`, `created_at` and `environment`. Nothing changes a version once it exists.
 
-`environment` is the identity of the place the version runs: `{"executor": "python-runtime", "id": "cpython-3.14@2-env-<32 hex>", "digest": "<64 hex>"}` from the runtime (its `Python-Runtime-Environment-Id` and `-Digest`), or `{"executor": "local", "id": "local", "digest": null}` for the engine's own worker. It is the executor's default environment when the version is saved, unless the request names one. A version only runs in its environment: when the executor reports another one, the run is not applied, the records stay where they were, a load reports `environment_unavailable` and Try answers `409 environment_unavailable`.
+`environment` is the identity of the place the version runs: `{"executor": "python-runtime", "id": "cpython-3.14@2-env-<32 hex>", "digest": "<64 hex>"}` from the runtime (its `Python-Runtime-Environment-Id` and `-Digest`), or `{"executor": "local", "id": "local", "digest": null}` for the engine's own worker. It is the executor's default environment when the version is saved, unless the request names one: for python-runtime, HIE reads its own consumer's `GET /v1/capabilities`, takes `default_environment` and the `digest` of that entry in `environments`. A version only runs in its environment: when the executor reports another one (python-runtime's environment headers on a run or Try answer), the run is not applied and nothing it returned is kept or delivered. A load or retry then keeps its rows where they were and reads `waiting: environment_unavailable` until the environment is back; Try answers `409 environment_unavailable`.
 
-`GET /api/transforms` → `{"transforms": [...]}`, each with the 0.1 members (`name` is the id, `path`, `size`, `modified`, `used_by`) plus `id`, `display_name`, `current_version`, `created_at`, `updated_at`.
+`GET /api/transforms` → `{"transforms": [...]}`, each with the 0.1 members (`name` is the id, `path`, `size`, `modified_at`, `used_by`) plus `id`, `display_name`, `current_version`, `created_at`, `updated_at`.
 
 `POST /api/transforms` (key required):
 
@@ -347,7 +349,7 @@ Try runs code on a few records without storing anything or writing to the destin
 
 ```json
 {
-  "run": {"id": "try-01HF", "outcome": "completed", "reason": null,
+  "run": {"id": "try-01HF", "status": "finished", "outcome": "completed", "reason": null,
           "termination": "confirmed", "cleanup": "confirmed",
           "transform": {"id": "lab-results", "version": 3}, "code_sha256": "<64 hex>",
           "environment": {"executor": "python-runtime", "id": "...", "digest": "..."},
@@ -363,8 +365,9 @@ Try runs code on a few records without storing anything or writing to the destin
 }
 ```
 
+- `run.status` is `running` until HIE has the run's answer, then `finished`; only a finished run has an `outcome`, `termination` and `cleanup` (they are `null` while running).
 - `run.outcome`: `completed` (the executor answered for every item), `stopped` (cancelled, or the deadline passed), `indeterminate` (anything else after the run was dispatched, including an answer that never came), `not_started` (refused before it started, or the code did not load; `load_error` then holds `{"message", "trace"}`). `reason` is a content-free label: `null`, `cancelled`, `deadline`, `response_lost`, `busy`, `load_failed`, or the executor's own outcome label (`timed_out`, `limited:memory`, …).
-- `termination` and `cleanup` are `confirmed` or `unconfirmed`, as the executor reports them. HIE never reports `confirmed` for something the executor did not confirm; a lost answer is `unconfirmed` for both.
+- `termination` and `cleanup` are `confirmed` or `unconfirmed`, as the executor reports them. HIE never reports `confirmed` for something the executor did not confirm; a lost answer is `unconfirmed` for both. From python-runtime's facade, only two answers confirm both: a `200` with its replies, and a `422 transform_load_failed` that carries the facade's `Python-Runtime-Error` header. Any other status, and any non-`200` without that header (a proxy's answer cannot be attributed to the facade), is `indeterminate` with both `unconfirmed`, and is not sent again.
 - `items[i].disposition`: `reported` (with `result`), `not_reported` (dispatched, no answer), `not_started`. `result` is `{"resources": [...]}` or `{"error": {"kind": "data" | "transform" | "validation", "message", "trace"?}}`.
 - `items[i].validation` lists one entry per resource with the `OperationOutcome`'s issues (`severity`, `code`, `diagnostics`, `expression`); `valid` is false when an issue is `error` or `fatal`. It is `null` when validation was not run. `run.validation` is `completed`, `unavailable` (the destination could not validate; results are kept, validation `null`) or `skipped`.
 - `coverage.complete` is true only when every requested item is `reported`.
@@ -381,7 +384,7 @@ Try runs code on a few records without storing anything or writing to the destin
   `location` is relative to the transform's own code. `stdout` and `stderr` appear only in Try answers: HIE never stores or logs them, and drops them from load and retry diagnostics.
 - `results` is the 0.1 answer, kept for compatibility.
 
-`GET /api/transforms/try-runs/{run}` → `{"run": {...}, "coverage": {...}}` as above, without items or results; kept 24 hours. `POST /api/transforms/try-runs/{run}/cancel` → `202 {"run": "<id>", "cancelling": true}`; `409 run_finished` once it has an answer; `404 run_not_found`. The run's own answer then reads `stopped`, with `termination` as the executor confirms it.
+`GET /api/transforms/try-runs/{run}` → `200 {"run": {...}, "coverage": {...}}` as above, without items or results, kept 24 hours. While the run executes it reads `{"run": {"id", "status": "running", "outcome": null, "termination": null, "cleanup": null, "started_at"}, "coverage": {"requested": n, "reported": 0, "complete": false}}`; once HIE has the answer, `status: finished` and the members of the POST's answer. A client whose POST answer was lost polls this route until `finished`. `POST /api/transforms/try-runs/{run}/cancel` → `202 {"run": "<id>", "cancelling": true}`; `409 run_finished` once it has an answer; `404 run_not_found`. The run's own answer then reads `stopped`, with `termination` as the executor confirms it.
 
 ### Loads
 
@@ -395,7 +398,7 @@ Try runs code on a few records without storing anything or writing to the destin
   "rows": {"read": 10, "written": 8, "failed": 2, "outcome_unknown": 0, "in_progress": 0, "filtered": 0},
   "resources": {"written": 8},
   "progress": {"phase": "done", "rows_admitted": 10, "rows_processed": 10, "total_rows": 10},
-  "validation": "ok",
+  "waiting": null,
   "environment": {"executor": "local", "id": "local", "digest": null}
 }
 ```
@@ -404,7 +407,7 @@ Try runs code on a few records without storing anything or writing to the destin
 - `rows` counts the load's rows by their current outcome; `resources` counts resources, apart from rows.
 - `progress` is derived from the store: `rows_admitted` rows stored for the load, `rows_processed` of them with an outcome (written, failed, filtered or outcome unknown), `phase` one of `queued`, `reading`, `transforming`, `delivering`, `settling`, `done`. `total_rows` is the evidence's `read.rows` for a source's first load, `null` for other loads and once more rows were admitted than were counted.
 - **Outcome unknown** is explicit: a row whose write was sent and not confirmed counts in `rows.outcome_unknown`, and its record reads `outcome: outcome_unknown`. That is any write without a confirming answer: a transport error or timeout after the request was sent, a `429` or `5xx` for the Bundle or for the row's entry, and a bulk submission whose receipts have not settled. It is never counted as written or failed until a later attempt settles it.
-- `validation`: `ok`, or `unavailable` while the destination cannot validate and the load waits.
+- `waiting`: `null`, or why the load's rows are held without failing: `validation_unavailable` (the destination cannot validate), `environment_unavailable` (the executor runs another environment than the load's version), `destination_unavailable` (writes are not confirmed and are retried). Retries carry the same member.
 - `GET /api/records` and `GET /api/records/{id}` add `outcome`: `in_progress`, `written`, `failed`, `filtered` or `outcome_unknown`; `status` keeps its 0.1 values.
 
 ### Failures
@@ -427,7 +430,7 @@ Try runs code on a few records without storing anything or writing to the destin
 
 **History.** Every attempt on a row is an immutable event: admitted, transformed, failed (kind, reason, version, location), validated, delivered, outcome unknown, settled, retried. A retry or a reprocess adds events; it never removes or rewrites one. `GET /api/records/{id}/history` → `{"record": 7, "events": [{"at", "kind", "attempt", "load", "retry", "transform": {"id", "version"}, "error": {"kind", "reason"}?}]}`, oldest first; `retry` is `null` for the load's own attempts. Events never hold row content or diagnostics output.
 
-**Failed content.** A failed row's content (its raw input, the resources it became) is stored encrypted with authenticated encryption under a key HIE holds (`content.key_file` or `HIE_CONTENT_KEY`; a random key in the store's directory when neither is set), never in plaintext in the store, the history, logs or errors. It is kept for `retention.failed_content` (default `30d`) and purged earlier when the row is written by a retry or reprocess, or its source is deleted. A purge removes only content: counts, groups, events and period counts stay as they were. HIE purges every hour; `POST /api/failed-content/purge` runs it now and answers `{"purged": <rows>}`.
+**Failed content.** A failed row's content (its raw input, the resources it became) is stored encrypted with authenticated encryption under a key HIE holds (`content.key_file` or `HIE_CONTENT_KEY`; a random key in the store's directory when neither is set), never in plaintext in the store, the history, logs or errors. It is kept for `retention.failed_content` (default `30d`) and purged earlier when the row is written by a retry or reprocess, or its source is deleted. A purge removes only content: counts, groups, events and period counts stay as they were. HIE purges every hour; `POST /api/failed-content/purge` runs it now and answers `{"purged": <rows>}`. Its optional body `{"before": "<time>"}` also removes the content of rows that failed before that instant, as if their retention had run out (`content: expired`); an operator uses it to shorten retention at once.
 
 ### Retries
 
@@ -445,16 +448,16 @@ Try runs code on a few records without storing anything or writing to the destin
            "previous": null, "accepted_at": "...", "finished_at": null}}
 ```
 
-- `group` names one failure group; `null` retries every failed row of the load, each group with its own transform.
+- `group` (required) names one failure group of the load. A retry covers exactly that group's failing rows when it is accepted, and runs one transform version.
 - `version: null` is the **latest saved version** of the group's transform at the moment HIE accepts the retry. A number names that version (`404 version_not_found`). The version is recorded on the retry when it is accepted and never changes after; the source's pin never moves because of a retry.
 - The retry re-runs the group's failed rows through that version, validates and delivers them like a load, and survives a restart.
 - Refusals are checked in this order: the body (`400`), the load and group (`404`), the version (`404 version_not_found`), the content (`410 content_expired`), then `409`.
 - `409 retry_in_progress` with `retry` while an unfinished retry covers the same rows. `409 nothing_to_retry` when the group has no failing rows. `410 content_expired` when their content is gone. A replayed key answers `202` with the same retry.
-- `previous` is the retry this one follows for the same group, so retries of a group form a chain.
+- `previous` is the latest earlier retry of the same group, or `null`, so retries of a group form a chain. Two retries never cover the same row at once, so the chain is linear.
 
 `GET /api/loads/{id}/retries` → `{"retries": [...]}`, newest first. `GET /api/loads/{id}/retries/latest` and `GET /api/loads/{id}/retries/{retry}` → `{"retry": {...}}`; `status` is `queued`, `running`, `done` or `failed`, `written` and `failed` count its rows.
 
-`POST /api/loads/{id}/retry` (0.1) stays: it is a retry with `version: null` over the rows with `reason` (or all failed rows), answering its 0.1 body `{"load", "retried", "reason"}` plus `retry`. It no longer erases the earlier failure.
+`POST /api/loads/{id}/retry` (0.1) stays: it creates one retry with `version: null` for each failure group that has rows with `reason` (all groups without one), skipping groups that already have an unfinished retry, and answers its 0.1 body `{"load", "retried", "reason"}` plus `retries`, the ids it created. It no longer erases the earlier failure.
 
 ### Period counts
 
@@ -472,12 +475,15 @@ Try runs code on a few records without storing anything or writing to the destin
 **Validation before delivery.** With `validation: required` in `hie.yaml`, every resource a load or retry produces is checked with the destination's `POST /{type}/$validate` before it is delivered, by REST or `$bulk-submit`:
 
 - An `OperationOutcome` with an `error` or `fatal` issue fails the row with kind `validation` and the first such issue as reason (`diagnostics` and `expression`); the row is kept as failed and none of its resources is delivered. Warnings do not fail it.
-- When the destination cannot validate (unreachable, a timeout, a `5xx`, or an answer that is not an `OperationOutcome`), nothing of that batch is delivered: the rows wait with their outcome unchanged, the load reads `validation: unavailable`, and they are tried again with the delivery backoff. An outage is never a row failure.
+- When the destination cannot validate (unreachable, a timeout, a `5xx`, or an answer that is not an `OperationOutcome`), nothing of that batch is delivered: the rows wait with their outcome unchanged, the load or retry reads `waiting: validation_unavailable`, and they are tried again with the delivery backoff. An outage is never a row failure.
 - `validation: off` (the default when the setting is absent, as in 0.1) skips it.
 
 **Source namespacing.** With `delivery.ids: namespaced` on a source, every resource that carries an `id` is written under a derived id: the first 48 hex characters of SHA-256 over `{source id}|{resourceType}|{origin id}`. Every relative reference `Type/id` in the source's resources is rewritten to the derived id of the same source; absolute, conditional (`Type?…`), contained (`#…`) and `urn:` references are left as written. Each resource also gets `meta.tag` `{"system": "urn:helios:hie:source", "code": "<source id>"}`. The same origin record always maps to the same resource, two sources never share one, and replaying records creates nothing. `delivery.ids: as_sent`, the default, delivers ids as the transform returns them, as in 0.1. Resources with only an `identifier` keep their conditional update.
 
-**Bundle type.** `delivery.bundle` is `batch`, `transaction` or `auto` (default). With `auto` a chunk goes as a `transaction` when one of its resources holds a conditional reference (`Type?query`), so the destination resolves it, and as a `batch` otherwise. A transaction the destination refuses is split and each row re-sent in a transaction of its own, so one bad reference fails only its own row, with kind `reference`.
+**Bundle type.** `delivery.bundle` is `batch`, `transaction` or `auto` (default). With `auto` a chunk goes as a `transaction` when one of its resources holds a conditional reference (`Type?query`), so the destination resolves it, and as a `batch` otherwise. How a transaction's answer is read:
+
+- A definitive refusal (`400`, `404`, `409`, `412` or `422` with an `OperationOutcome`) means the destination committed nothing. HIE then sends each row of it in a transaction of its own. A row whose own transaction is refused with an issue about a conditional reference (zero or several matches) fails with kind `reference`; any other definitive refusal fails it with kind `server`.
+- A `429`, a `5xx`, a timeout or a lost answer is not a refusal: the transaction may have committed. Its rows are `outcome_unknown`, the transaction is not split, and the same transaction is sent again with the delivery backoff until an answer settles it.
 
 ### Destination facts
 
@@ -495,7 +501,7 @@ From the destination's `/metadata`, read at most once a minute. `display_name` i
 
 ### Check now and passes
 
-`POST /api/sources/{id}/check-now` keeps `202 {"id", "checking": true}` and adds `pass`, the id of the pass it asked for. `GET /api/sources/{id}/passes/{pass}` → `{"id": "ps_2", "status": "queued" | "running" | "done" | "skipped", "skipped_reason": "paused" | null, "loads": [42], "new_rows": 3, "finished_at": "..."}`. A paused source answers `skipped` with `paused`.
+`POST /api/sources/{id}/check-now` keeps `202 {"id", "checking": true}` and adds `pass`, the id of the pass it asked for. `GET /api/sources/{id}/passes/{pass}` → `{"id": "ps_2", "status": "queued" | "running" | "done" | "skipped" | "failed", "skipped_reason": "paused" | null, "error": null, "loads": [42], "new_rows": 3, "finished_at": "..."}`. A paused source answers `skipped` with `paused`. A pass that could not read its source (the connection or the credential refused) is `failed` with a secret-safe `error`.
 
 ### Monitoring
 

@@ -1,10 +1,6 @@
 {
   "id": "sources/destination-facts",
   "title": "The destination's facts, and what one source has written to it",
-  "covers": [
-    "GET /api/destination",
-    "GET /api/sources/{id}/destination"
-  ],
   "fixtures": {
     "hie": {
       "destination": {

@@ -1,7 +1,6 @@
 {
   "id": "transforms/try-validation-issues",
   "title": "Try reports the destination's validation issues per resource, and says when validation was unavailable",
-  "covers": [],
   "fixtures": {
     "destination": {
       "invalid": [

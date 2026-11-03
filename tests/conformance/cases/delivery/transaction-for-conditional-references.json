@@ -1,7 +1,6 @@
 {
   "id": "delivery/transaction-for-conditional-references",
   "title": "A conditional reference goes in a transaction and is resolved; one that matches nothing fails only its row",
-  "covers": [],
   "fixtures": {
     "destination": {
       "seed": [
@@ -63,6 +62,7 @@
           "{{contains}}",
           "transaction"
         ],
+        "writes": 1,
         "stored": [
           {
             "id": "obs-1",

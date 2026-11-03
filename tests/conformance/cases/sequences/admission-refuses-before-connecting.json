@@ -1,9 +1,6 @@
 {
   "id": "sequences/admission-refuses-before-connecting",
   "title": "On an allowed host, another port, database, host spelling or engine is refused before any connection; the allowed one is tried",
-  "covers": [
-    "POST /api/sources/test"
-  ],
   "fixtures": {
     "secrets_key": true,
     "tcp": [

@@ -1,7 +1,6 @@
 {
   "id": "database/first-load-progress",
   "title": "The first load reports rows admitted against processed with the tested total; a later load has no total",
-  "covers": [],
   "fixtures": {
     "sqlite": {
       "labs": [

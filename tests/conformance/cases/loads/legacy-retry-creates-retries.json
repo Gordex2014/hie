@@ -1,0 +1,115 @@
+{
+  "id": "loads/legacy-retry-creates-retries",
+  "title": "The 0.1 retry of every failure creates one retry per failure group",
+  "fixtures": {
+    "files": {
+      "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+      "sources/lab.yaml": "id: lab\nname: Lab lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\ntransform: transforms/lab_csv.py\ndelivery:\n  initial_backoff_ms: 300\n  max_backoff_ms: 600\n",
+      "inbox/a.csv": "id,value\n1,alto\n2,5.4\n3,xyz\n"
+    }
+  },
+  "steps": [
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "wait for the load",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "id": "{{$load}}",
+              "status": "done",
+              "rows": {
+                "failed": 2
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "failures": [
+            "{{contains}}",
+            {
+              "group": "{{$ga}}",
+              "reason": "value 'alto' is not a number"
+            },
+            {
+              "group": "{{$gx}}",
+              "reason": "value 'xyz' is not a number"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/loads/{{$load}}/retry"
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "load": "{{$load}}",
+          "retried": 2,
+          "retries": [
+            "{{string}}",
+            "{{string}}"
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/retries"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "retries": [
+            "{{contains}}",
+            {
+              "group": "{{$ga}}",
+              "transform": {
+                "id": "lab_csv",
+                "version": 1
+              },
+              "rows": 1
+            },
+            {
+              "group": "{{$gx}}",
+              "transform": {
+                "id": "lab_csv",
+                "version": 1
+              },
+              "rows": 1
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

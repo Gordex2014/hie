@@ -1,7 +1,6 @@
 {
   "id": "sequences/sources-namespaced-apart",
   "title": "Two sources sending Patient/1 stay apart with their references intact, and a replay creates nothing",
-  "covers": [],
   "fixtures": {
     "files": {
       "transforms/passthrough.py": "from hie import DataError\n\n\ndef transform(record, context):\n    if not record.get(\"resourceType\"):\n        raise DataError(\"record is not a FHIR resource (no resourceType)\")\n    return record\n",

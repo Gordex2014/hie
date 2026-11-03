@@ -1,9 +1,6 @@
 {
   "id": "sources/pin-and-follow",
   "title": "A pinned source stays on its version; a following one takes the current; only the pin route moves it",
-  "covers": [
-    "PUT /api/sources/{id}/pin"
-  ],
   "fixtures": {
     "files": {
       "in-a/.keep": "",
