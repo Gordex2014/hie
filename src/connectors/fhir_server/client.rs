@@ -19,12 +19,9 @@ pub(super) struct Client {
 impl Client {
     pub(super) fn new(auth: Option<&RemoteAuth>) -> Result<Self> {
         let env = |name: &str| {
-            std::env::var(name)
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .with_context(|| {
-                    format!("environment variable {name} (named in the source's auth) is not set")
-                })
+            crate::secrets::named(name).with_context(|| {
+                format!("environment variable {name} (named in the source's auth) is not set")
+            })
         };
         let (credentials, bearer) = match auth {
             None => (None, None),

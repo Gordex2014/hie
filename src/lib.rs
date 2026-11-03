@@ -14,6 +14,7 @@ pub mod formats;
 pub mod manager;
 pub mod pipeline;
 pub mod runtime;
+pub mod secrets;
 pub mod transform;
 
 /// The source handle and the object connector, as they were reached before

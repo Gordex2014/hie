@@ -132,12 +132,11 @@ impl DatabaseSource {
         cursor_start: Option<String>,
         max_runs: usize,
     ) -> Result<Self> {
-        let url = std::env::var(url_env)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .with_context(|| {
-                format!("environment variable {url_env} (the database URL named by the source) is not set")
-            })?;
+        let url = crate::secrets::named(url_env).with_context(|| {
+            format!(
+                "environment variable {url_env} (the database URL named by the source) is not set"
+            )
+        })?;
         if !(url.starts_with("postgres://")
             || url.starts_with("postgresql://")
             || url.starts_with("mysql://")
