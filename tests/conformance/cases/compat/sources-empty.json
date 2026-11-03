@@ -1,0 +1,21 @@
+{
+  "id": "compat/sources-empty",
+  "title": "An engine with no sources lists none",
+  "covers": [
+    "GET /api/sources"
+  ],
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "sources": []
+        }
+      }
+    }
+  ]
+}

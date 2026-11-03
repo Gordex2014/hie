@@ -1,0 +1,70 @@
+{
+  "id": "compat/monitoring-status",
+  "title": "The monitoring aggregate: all receiving, then a paused source needs someone",
+  "covers": [
+    "GET /api/monitoring/status"
+  ],
+  "fixtures": {
+    "files": {
+      "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+      "sources/lab.yaml": "id: lab\nname: Lab lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\ntransform: transforms/lab_csv.py\nexpect_every: 24h\n"
+    }
+  },
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/monitoring/status"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "state": "all_receiving",
+          "needs_you": [],
+          "sources": [
+            {
+              "id": "lab"
+            }
+          ],
+          "last_24h": {
+            "files": 0,
+            "sent": 0,
+            "rejected": 0,
+            "alerts": "{{int}}"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/pause",
+        "body": {
+          "by": "sam"
+        }
+      },
+      "expect": {
+        "status": 200
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/monitoring/status"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "state": "needs_you",
+          "needs_you": [
+            {
+              "id": "lab",
+              "state": "paused",
+              "reason": "{{contains:paused by sam}}"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

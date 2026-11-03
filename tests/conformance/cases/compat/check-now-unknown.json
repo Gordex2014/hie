@@ -1,0 +1,19 @@
+{
+  "id": "compat/check-now-unknown",
+  "title": "Check now on an unknown source is 404",
+  "covers": [],
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/nope/check-now"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}"
+        }
+      }
+    }
+  ]
+}

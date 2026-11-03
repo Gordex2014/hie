@@ -1,0 +1,158 @@
+{
+  "id": "loads/paging-cursor",
+  "title": "Loads page by an opaque cursor both ways, and a page can be found around one load",
+  "covers": [
+    "GET /api/sources/{id}/loads"
+  ],
+  "fixtures": {
+    "files": {
+      "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+      "sources/lab.yaml": "id: lab\nname: Lab lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\ntransform: transforms/lab_csv.py\ndelivery:\n  initial_backoff_ms: 300\n  max_backoff_ms: 600\n",
+      "inbox/a.csv": "id,value\n1,5.1\n",
+      "inbox/b.csv": "id,value\n2,5.2\n",
+      "inbox/c.csv": "id,value\n3,5.3\n",
+      "inbox/d.csv": "id,value\n4,5.4\n",
+      "inbox/e.csv": "id,value\n5,5.5\n"
+    }
+  },
+  "steps": [
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "five loads settle",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            {
+              "status": "done"
+            },
+            {
+              "status": "done"
+            },
+            {
+              "status": "done"
+            },
+            {
+              "status": "done"
+            },
+            {
+              "status": "done",
+              "id": "{{$oldest}}"
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads?limit=2"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            {
+              "id": "{{int}}"
+            },
+            {
+              "id": "{{int}}"
+            }
+          ],
+          "files": "{{array}}",
+          "page": {
+            "next": "{{$c1}}",
+            "previous": null
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads?limit=2&cursor={{$c1}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            {
+              "id": "{{int}}"
+            },
+            {
+              "id": "{{int}}"
+            }
+          ],
+          "page": {
+            "next": "{{$c2}}",
+            "previous": "{{string}}"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads?limit=2&cursor={{$c2}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            {
+              "id": "{{$oldest}}"
+            }
+          ],
+          "page": {
+            "next": null,
+            "previous": "{{string}}"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads?limit=2&around={{$oldest}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "id": "{{$oldest}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads?cursor=not-a-cursor"
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_cursor"
+        }
+      }
+    }
+  ]
+}

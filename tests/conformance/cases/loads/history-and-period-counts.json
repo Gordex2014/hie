@@ -1,0 +1,356 @@
+{
+  "id": "loads/history-and-period-counts",
+  "title": "A failure counts on its day even after a retry writes the row; the record's history keeps both attempts",
+  "covers": [
+    "POST /api/loads/{id}/retries"
+  ],
+  "fixtures": {
+    "files": {
+      "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+      "sources/lab.yaml": "id: lab\nname: Lab lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\ntransform: transforms/lab_csv.py\ndelivery:\n  initial_backoff_ms: 300\n  max_backoff_ms: 600\n",
+      "inbox/a.csv": "id,value\n1,alto\n2,5.4\n"
+    }
+  },
+  "steps": [
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "wait for the load",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "id": "{{$load}}",
+              "status": "done",
+              "rows": {
+                "written": 1,
+                "failed": 1
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/stats?days=1&tz=UTC"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "today": {
+            "rows_read": 2,
+            "written": 1,
+            "failed": 1,
+            "resources_written": 1,
+            "complete": true
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/monitoring/status"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "last_24h": {
+            "failed": 1
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "failures": [
+            {
+              "group": "{{$g}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/failures/{{$g}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "records": [
+            {
+              "id": "{{$rec}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a retry before any fix",
+      "request": {
+        "method": "POST",
+        "path": "/api/loads/{{$load}}/retries",
+        "headers": {
+          "Idempotency-Key": "r0"
+        },
+        "body": {
+          "group": "{{$g}}",
+          "version": null
+        }
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "retry": {
+            "id": "{{$rt0}}",
+            "transform": {
+              "version": 1
+            },
+            "previous": null
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/retries/{{$rt0}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "retry": {
+            "status": "done",
+            "written": 0,
+            "failed": 1
+          }
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "name": "a row failing twice in a day counts once",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/stats?days=1&tz=UTC"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "today": {
+            "failed": 1
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/lab_csv/versions",
+        "headers": {
+          "Idempotency-Key": "fix"
+        },
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        number = 0.0\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"fixed\"}],\n    }\n",
+          "base_version": 1
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "version": 2
+        }
+      }
+    },
+    {
+      "name": "the row that failed again stays in its group",
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "failures": [
+            {
+              "group": "{{$g}}",
+              "count": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/loads/{{$load}}/retries",
+        "headers": {
+          "Idempotency-Key": "r1"
+        },
+        "body": {
+          "group": "{{$g}}",
+          "version": null
+        }
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "retry": {
+            "id": "{{$rt}}",
+            "transform": {
+              "version": 2
+            },
+            "previous": "{{$rt0}}"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/retries/{{$rt}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "retry": {
+            "status": "done",
+            "written": 1
+          }
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "name": "the retry does not lower the failures",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/stats?days=1&tz=UTC"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "today": {
+            "written": 2,
+            "failed": 1
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/monitoring/status"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "last_24h": {
+            "failed": 1
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/records/{{$rec}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "outcome": "written"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/records/{{$rec}}/history"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "events": [
+            "{{contains}}",
+            {
+              "kind": "failed",
+              "transform": {
+                "version": 1
+              },
+              "retry": null
+            },
+            {
+              "kind": "failed",
+              "transform": {
+                "version": 1
+              },
+              "retry": "{{$rt0}}"
+            },
+            {
+              "kind": "delivered",
+              "retry": "{{$rt}}",
+              "transform": {
+                "version": 2
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/stats?days=2&tz=Europe/Madrid"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "days": 2,
+          "by_day": [
+            {},
+            {}
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/stats?tz=Mars/Olympus"
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_tz"
+        }
+      }
+    }
+  ]
+}

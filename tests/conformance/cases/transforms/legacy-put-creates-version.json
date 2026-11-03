@@ -1,0 +1,87 @@
+{
+  "id": "transforms/legacy-put-creates-version",
+  "title": "The 0.1 save by name now saves a version, and only when the code changed",
+  "covers": [],
+  "steps": [
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/api/transforms/t1",
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"a\"}],\n    }\n"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "name": "t1",
+          "saved": true,
+          "version": 1
+        }
+      }
+    },
+    {
+      "name": "the same code saves nothing",
+      "request": {
+        "method": "PUT",
+        "path": "/api/transforms/t1",
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"a\"}],\n    }\n"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "version": 1
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/api/transforms/t1",
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"b\"}],\n    }\n"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "version": 2
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/transforms/t1/versions"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "versions": [
+            {
+              "version": 2,
+              "base_version": 1
+            },
+            {
+              "version": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/transforms/t1?version=1"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"a\"}],\n    }\n"
+        }
+      }
+    }
+  ]
+}

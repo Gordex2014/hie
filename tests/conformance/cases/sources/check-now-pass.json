@@ -1,0 +1,106 @@
+{
+  "id": "sources/check-now-pass",
+  "title": "Check now names its pass, which reports what it found, or that it was skipped while paused",
+  "covers": [
+    "GET /api/sources/{id}/passes/{pass}"
+  ],
+  "fixtures": {
+    "files": {
+      "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+      "sources/lab.yaml": "id: lab\nname: Lab lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\ntransform: transforms/lab_csv.py\n",
+      "inbox/.keep": ""
+    }
+  },
+  "steps": [
+    {
+      "write_files": {
+        "inbox/a.csv": "id,value\n1,5.4\n"
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "id": "lab",
+          "checking": true,
+          "pass": "{{$p1}}"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/passes/{{$p1}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "id": "{{$p1}}",
+          "status": "done",
+          "loads": [
+            "{{contains}}",
+            "{{int}}"
+          ],
+          "new_rows": 1,
+          "finished_at": "{{time}}"
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/pause",
+        "body": {
+          "by": "sam"
+        }
+      },
+      "expect": {
+        "status": 200
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "pass": "{{$p2}}"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/passes/{{$p2}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "status": "skipped",
+          "skipped_reason": "paused"
+        }
+      },
+      "until_ms": 8000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/passes/ps_nope"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "pass_not_found"
+        }
+      }
+    }
+  ]
+}

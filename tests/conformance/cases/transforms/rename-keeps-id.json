@@ -1,0 +1,105 @@
+{
+  "id": "transforms/rename-keeps-id",
+  "title": "A rename keeps the id and the versions as saved",
+  "covers": [
+    "PATCH /api/transforms/{id}"
+  ],
+  "steps": [
+    {
+      "name": "create Lab results",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms",
+        "headers": {
+          "Idempotency-Key": "c1"
+        },
+        "body": {
+          "display_name": "Lab results",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "note": "First version",
+          "author": "Sam Whitaker"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": "{{$tid}}",
+          "current_version": 1
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "PATCH",
+        "path": "/api/transforms/{{$tid}}",
+        "body": {
+          "display_name": "Glucose results"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "id": "{{$tid}}",
+          "display_name": "Glucose results",
+          "current_version": 1
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/transforms/{{$tid}}/versions"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "versions": [
+            {
+              "version": 1,
+              "display_name": "Lab results"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "create Other",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms",
+        "headers": {
+          "Idempotency-Key": "c2"
+        },
+        "body": {
+          "display_name": "Other",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "note": "First version",
+          "author": "Sam Whitaker"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": "{{$other}}",
+          "current_version": 1
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "PATCH",
+        "path": "/api/transforms/{{$tid}}",
+        "body": {
+          "display_name": "other"
+        }
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}",
+          "code": "name_in_use"
+        }
+      }
+    }
+  ]
+}

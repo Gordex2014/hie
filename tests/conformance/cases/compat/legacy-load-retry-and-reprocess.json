@@ -1,0 +1,187 @@
+{
+  "id": "compat/legacy-load-retry-and-reprocess",
+  "title": "A load's failures grouped with samples, the 0.1 retry by reason, and a reprocess with a corrected row",
+  "covers": [
+    "GET /api/sources/{id}/loads",
+    "GET /api/loads/{id}",
+    "POST /api/loads/{id}/retry",
+    "GET /api/records/{id}",
+    "POST /api/records/{id}/reprocess"
+  ],
+  "fixtures": {
+    "files": {
+      "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+      "sources/lab.yaml": "id: lab\nname: Lab lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\ntransform: transforms/lab_csv.py\n",
+      "inbox/a.csv": "id,value\n1,5.4\n2,alto\n3,6.1\n"
+    }
+  },
+  "steps": [
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "the load settles",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            {
+              "id": "{{$load}}",
+              "name": "a.csv",
+              "status": "done",
+              "method": "rest",
+              "records": 3,
+              "sent": 2,
+              "rejected": 1
+            }
+          ],
+          "files": [
+            {
+              "name": "a.csv"
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "failures": [
+            {
+              "kind": "data",
+              "reason": "{{contains:'alto'}}",
+              "count": 1,
+              "first_line": "{{int}}",
+              "samples": [
+                {
+                  "raw": {
+                    "value": "alto"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/loads/{{$load}}/retry",
+        "body": {
+          "reason": "value 'alto' is not a number"
+        }
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "load": "{{$load}}",
+          "retried": 1
+        }
+      }
+    },
+    {
+      "name": "the retried row fails again, unchanged",
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "status": "done",
+          "rejected": 1
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/records?source=lab&status=rejected"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "records": [
+            {
+              "id": "{{$rec}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/records/{{$rec}}/reprocess",
+        "body": {
+          "raw": {
+            "id": "2",
+            "value": "6.0"
+          }
+        }
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "id": "{{$rec}}",
+          "status": "received",
+          "corrected": true
+        }
+      }
+    },
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/records/{{$rec}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "status": "sent"
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/999999"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}"
+        }
+      }
+    }
+  ]
+}

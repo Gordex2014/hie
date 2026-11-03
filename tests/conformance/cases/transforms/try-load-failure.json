@@ -1,0 +1,78 @@
+{
+  "id": "transforms/try-load-failure",
+  "title": "Code that does not load: not started, with the load error, nothing reported",
+  "covers": [],
+  "fixtures": {
+    "hie": {
+      "runtime": {
+        "url": "{{runtime}}",
+        "token_env": "HIE_CONFORMANCE_NO_TOKEN"
+      }
+    },
+    "runtime": {
+      "try": [
+        {
+          "status": 422,
+          "body": {
+            "error": "transform_load_failed",
+            "load_error": {
+              "message": "SyntaxError: invalid syntax",
+              "trace": "  File \"<program>\", line 1\n"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "l-1",
+          "code": "def transform(record, context:\n",
+          "input": {
+            "records": [
+              {
+                "id": 1,
+                "value": "5.4"
+              },
+              {
+                "id": 2,
+                "value": "alto"
+              }
+            ]
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "run": {
+            "outcome": "not_started",
+            "reason": "load_failed",
+            "termination": "confirmed",
+            "load_error": {
+              "message": "{{contains:SyntaxError}}"
+            }
+          },
+          "items": [
+            {
+              "disposition": "not_started",
+              "result": "{{absent}}"
+            },
+            {
+              "disposition": "not_started"
+            }
+          ],
+          "coverage": {
+            "requested": 2,
+            "reported": 0,
+            "complete": false
+          }
+        }
+      }
+    }
+  ]
+}

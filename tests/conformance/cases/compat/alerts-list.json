@@ -1,0 +1,33 @@
+{
+  "id": "compat/alerts-list",
+  "title": "Alerts list, all and open only",
+  "covers": [
+    "GET /api/alerts"
+  ],
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/alerts"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "alerts": []
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/alerts?open=true"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "alerts": []
+        }
+      }
+    }
+  ]
+}

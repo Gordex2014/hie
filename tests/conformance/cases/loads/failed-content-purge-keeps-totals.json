@@ -1,0 +1,201 @@
+{
+  "id": "loads/failed-content-purge-keeps-totals",
+  "title": "Expired failed content is purged; samples answer 410 while counts, groups and history stay",
+  "covers": [
+    "POST /api/failed-content/purge"
+  ],
+  "fixtures": {
+    "hie": {
+      "retention": {
+        "failed_content": "1s"
+      }
+    },
+    "files": {
+      "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+      "sources/lab.yaml": "id: lab\nname: Lab lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\ntransform: transforms/lab_csv.py\ndelivery:\n  initial_backoff_ms: 300\n  max_backoff_ms: 600\n",
+      "inbox/a.csv": "id,value\n1,alto\n2,5.4\n"
+    }
+  },
+  "steps": [
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "wait for the load",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "id": "{{$load}}",
+              "status": "done",
+              "rows": {
+                "failed": 1
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "failures": [
+            {
+              "group": "{{$g}}",
+              "content": "kept"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/failures/{{$g}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "records": [
+            {
+              "id": "{{$rec}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "sleep_ms": 1500
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/failed-content/purge"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "purged": "{{gte:0}}"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/failures/{{$g}}/samples"
+      },
+      "expect": {
+        "status": 410,
+        "body": {
+          "error": "{{string}}",
+          "code": "content_expired"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "rows": {
+            "failed": 1
+          },
+          "failures": [
+            {
+              "group": "{{$g}}",
+              "count": 1,
+              "content": "expired",
+              "samples": []
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/records/{{$rec}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "raw": null,
+          "outcome": "failed"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/records/{{$rec}}/history"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "events": [
+            "{{contains}}",
+            {
+              "kind": "failed"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/stats?days=1"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "today": {
+            "failed": 1
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/loads/{{$load}}/retries",
+        "headers": {
+          "Idempotency-Key": "r1"
+        },
+        "body": {
+          "group": "{{$g}}",
+          "version": null
+        }
+      },
+      "expect": {
+        "status": 410,
+        "body": {
+          "error": "{{string}}",
+          "code": "content_expired"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "admission/unenforced-without-policy",
+  "title": "Without a policy nothing is enforced, and the engine says so",
+  "covers": [],
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/admission"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "enforced": false
+        }
+      }
+    }
+  ]
+}

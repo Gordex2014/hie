@@ -1,0 +1,185 @@
+{
+  "id": "sequences/sources-namespaced-apart",
+  "title": "Two sources sending Patient/1 stay apart with their references intact, and a replay creates nothing",
+  "covers": [],
+  "fixtures": {
+    "files": {
+      "transforms/passthrough.py": "from hie import DataError\n\n\ndef transform(record, context):\n    if not record.get(\"resourceType\"):\n        raise DataError(\"record is not a FHIR resource (no resourceType)\")\n    return record\n",
+      "sources/alpha.yaml": "id: alpha\nname: Source alpha\nsource:\n  type: folder\n  path: in-alpha\n  pattern: \"*.ndjson\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\nformat: ndjson\ntransform: transforms/passthrough.py\ndelivery:\n  ids: namespaced\n",
+      "sources/beta.yaml": "id: beta\nname: Source beta\nsource:\n  type: folder\n  path: in-beta\n  pattern: \"*.ndjson\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\nformat: ndjson\ntransform: transforms/passthrough.py\ndelivery:\n  ids: namespaced\n",
+      "in-alpha/one.ndjson": "{\"resourceType\": \"Patient\", \"id\": \"1\", \"name\": [{\"family\": \"Doe\"}]}\n{\"resourceType\": \"Observation\", \"id\": \"o1\", \"status\": \"final\", \"code\": {\"text\": \"glucose\"}, \"subject\": {\"reference\": \"Patient/1\"}}\n",
+      "in-beta/one.ndjson": "{\"resourceType\": \"Patient\", \"id\": \"1\", \"name\": [{\"family\": \"Doe\"}]}\n{\"resourceType\": \"Observation\", \"id\": \"o1\", \"status\": \"final\", \"code\": {\"text\": \"glucose\"}, \"subject\": {\"reference\": \"Patient/1\"}}\n"
+    }
+  },
+  "steps": [
+    {
+      "name": "check alpha now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/alpha/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "check beta now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/beta/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "wait for the load",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/alpha/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "status": "done",
+              "rows": {
+                "written": 2
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "name": "wait for the load",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/beta/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "status": "done",
+              "rows": {
+                "written": 2
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "destination": {
+        "resources": {
+          "Patient": 2,
+          "Observation": 2
+        },
+        "stored": [
+          {
+            "resourceType": "Patient",
+            "id": "dc5b31240df4416c42a9972426cc8ac89697b75b8851b742",
+            "meta": {
+              "tag": [
+                "{{contains}}",
+                {
+                  "system": "urn:helios:hie:source",
+                  "code": "alpha"
+                }
+              ]
+            }
+          },
+          {
+            "resourceType": "Patient",
+            "id": "12ae6e7cb1a116e6a8f01d7df299723b02c2797a4243b439",
+            "meta": {
+              "tag": [
+                "{{contains}}",
+                {
+                  "system": "urn:helios:hie:source",
+                  "code": "beta"
+                }
+              ]
+            }
+          },
+          {
+            "resourceType": "Observation",
+            "id": "29ac243485e44122e3965cd6ee39467acafd49c00a91592c",
+            "subject": {
+              "reference": "Patient/dc5b31240df4416c42a9972426cc8ac89697b75b8851b742"
+            }
+          },
+          {
+            "resourceType": "Observation",
+            "id": "80b8ef043760d04c89ed64bfdd3b2b76e34979446d4ab668",
+            "subject": {
+              "reference": "Patient/12ae6e7cb1a116e6a8f01d7df299723b02c2797a4243b439"
+            }
+          }
+        ],
+        "not_stored": [
+          {
+            "id": "1"
+          },
+          {
+            "id": "o1"
+          }
+        ]
+      }
+    },
+    {
+      "write_files": {
+        "in-alpha/again.ndjson": "{\"id\": \"1\", \"resourceType\": \"Patient\", \"name\": [{\"family\": \"Doe\"}]}\n{\"id\": \"o1\", \"resourceType\": \"Observation\", \"status\": \"final\", \"code\": {\"text\": \"glucose\"}, \"subject\": {\"reference\": \"Patient/1\"}}\n"
+      }
+    },
+    {
+      "name": "check alpha now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/alpha/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "wait for the load",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/alpha/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "name": "again.ndjson",
+              "status": "done",
+              "rows": {
+                "written": 2
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "name": "the replay created nothing",
+      "destination": {
+        "resources": {
+          "Patient": 2,
+          "Observation": 2
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "id": "admission/policy-read",
+  "title": "The policy in force is reported normalized",
+  "covers": [
+    "GET /api/admission"
+  ],
+  "fixtures": {
+    "hie": {
+      "admission": {
+        "synthetic_only": true,
+        "databases": [
+          {
+            "engine": "mssql",
+            "host": "DB.Lab.Internal.",
+            "database": "labs"
+          }
+        ]
+      }
+    }
+  },
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/admission"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "enforced": true,
+          "synthetic_only": true,
+          "databases": [
+            {
+              "{{exact}}": true,
+              "engine": "sqlserver",
+              "host": "db.lab.internal",
+              "port": 1433,
+              "database": "labs"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

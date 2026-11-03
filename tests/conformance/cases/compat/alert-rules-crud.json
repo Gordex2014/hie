@@ -1,0 +1,129 @@
+{
+  "id": "compat/alert-rules-crud",
+  "title": "Alert rules are created, read, replaced and removed",
+  "covers": [
+    "GET /api/alert-rules",
+    "POST /api/alert-rules",
+    "GET /api/alert-rules/{id}",
+    "PUT /api/alert-rules/{id}",
+    "DELETE /api/alert-rules/{id}"
+  ],
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/alert-rules",
+        "body": {
+          "condition": "silence",
+          "threshold": "2h",
+          "notify": [
+            "ops@example.org"
+          ],
+          "channels": [
+            "app"
+          ]
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": "{{$rule}}",
+          "source_id": null,
+          "condition": "silence",
+          "threshold": "2h",
+          "enabled": true
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/alert-rules/{{$rule}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "threshold": "2h",
+          "notify": [
+            "ops@example.org"
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/api/alert-rules/{{$rule}}",
+        "body": {
+          "condition": "silence",
+          "threshold": "3h",
+          "notify": [
+            "ops@example.org"
+          ],
+          "channels": [
+            "app"
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "id": "{{$rule}}",
+          "threshold": "3h"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/alert-rules"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "rules": [
+            "{{contains}}",
+            {
+              "id": "{{$rule}}",
+              "threshold": "3h"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/alert-rules",
+        "body": {
+          "condition": "loud",
+          "threshold": "1"
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{contains:unknown condition}}"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "DELETE",
+        "path": "/api/alert-rules/{{$rule}}"
+      },
+      "expect": {
+        "status": 204
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/alert-rules/{{$rule}}"
+      },
+      "expect": {
+        "status": 404
+      }
+    }
+  ]
+}

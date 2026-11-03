@@ -1,0 +1,117 @@
+{
+  "id": "transforms/try-validation-issues",
+  "title": "Try reports the destination's validation issues per resource, and says when validation was unavailable",
+  "covers": [],
+  "fixtures": {
+    "destination": {
+      "invalid": [
+        {
+          "resourceType": "Observation",
+          "field": "status",
+          "equals": "bogus",
+          "expression": "Observation.status",
+          "message": "Observation.status: 'bogus' is not in the value set"
+        }
+      ]
+    }
+  },
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "v-1",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v\"}],\n    }\n",
+          "input": {
+            "records": [
+              {
+                "id": 1,
+                "value": "5.4",
+                "status": "bogus"
+              }
+            ]
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "run": {
+            "validation": "completed"
+          },
+          "items": [
+            {
+              "disposition": "reported",
+              "validation": [
+                {
+                  "resource": 0,
+                  "valid": false,
+                  "issues": [
+                    "{{contains}}",
+                    {
+                      "severity": "error",
+                      "expression": [
+                        "Observation.status"
+                      ],
+                      "diagnostics": "{{contains:bogus}}"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "set_destination": {
+        "validate": "unavailable"
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "v-2",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v\"}],\n    }\n",
+          "input": {
+            "records": [
+              {
+                "id": 1,
+                "value": "5.4"
+              }
+            ]
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "run": {
+            "outcome": "completed",
+            "validation": "unavailable"
+          },
+          "items": [
+            {
+              "result": {
+                "resources": [
+                  {
+                    "resourceType": "Observation"
+                  }
+                ]
+              },
+              "validation": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "destination": {
+        "writes": 0
+      }
+    }
+  ]
+}
