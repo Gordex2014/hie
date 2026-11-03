@@ -155,7 +155,9 @@ fn load_cases(dir: &Path) -> Vec<Case> {
     cases
 }
 
-fn load_known_red(dir: &Path, cases: &[Case]) -> BTreeMap<String, String> {
+/// Each listed case with its front, and whether its custody check is also
+/// expected to fail (a third word, `custody`).
+fn load_known_red(dir: &Path, cases: &[Case]) -> BTreeMap<String, (String, bool)> {
     let text = std::fs::read_to_string(dir.join("known-red.txt")).unwrap_or_default();
     let ids: BTreeSet<&str> = cases.iter().map(|c| c.id.as_str()).collect();
     let mut out = BTreeMap::new();
@@ -166,6 +168,11 @@ fn load_known_red(dir: &Path, cases: &[Case]) -> BTreeMap<String, String> {
         }
         let mut parts = line.split_whitespace();
         let (id, front) = (parts.next().unwrap(), parts.next().unwrap_or(""));
+        let custody = match parts.next() {
+            None => false,
+            Some("custody") => true,
+            Some(other) => panic!("known-red.txt:{}: {id}: unknown flag {other:?}", n + 1),
+        };
         assert!(
             FRONTS.contains(&front),
             "known-red.txt:{}: {id} names front {front:?}; use one of {FRONTS:?}",
@@ -173,7 +180,8 @@ fn load_known_red(dir: &Path, cases: &[Case]) -> BTreeMap<String, String> {
         );
         assert!(ids.contains(id), "known-red.txt:{}: no case {id}", n + 1);
         assert!(
-            out.insert(id.to_string(), front.to_string()).is_none(),
+            out.insert(id.to_string(), (front.to_string(), custody))
+                .is_none(),
             "known-red.txt: {id} listed twice"
         );
     }
@@ -248,6 +256,8 @@ struct Destination {
     writes: usize,
     validations: usize,
     bundle_types: Vec<String>,
+    /// The entry urls of every Bundle received, in order, answered or not.
+    bundles: Vec<Vec<String>>,
     next_id: usize,
 }
 
@@ -374,9 +384,24 @@ impl Destination {
 }
 
 async fn dest_bundle(State(d): State<Dest>, Json(bundle): Json<Value>) -> Response {
-    let mut d = d.lock().unwrap();
     let kind = bundle["type"].as_str().unwrap_or("batch").to_string();
-    d.bundle_types.push(kind.clone());
+    let urls: Vec<String> = bundle["entry"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| e["request"]["url"].as_str().unwrap_or_default().to_string())
+        .collect();
+    {
+        let mut d = d.lock().unwrap();
+        d.bundle_types.push(kind.clone());
+        d.bundles.push(urls);
+    }
+    // `writes: hold` keeps every write waiting until the mode changes.
+    let started = Instant::now();
+    while d.lock().unwrap().writes_mode == "hold" && started.elapsed() < Duration::from_secs(60) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut d = d.lock().unwrap();
     if d.writes_mode == "unavailable" {
         return (StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response();
     }
@@ -384,7 +409,8 @@ async fn dest_bundle(State(d): State<Dest>, Json(bundle): Json<Value>) -> Respon
     for e in bundle["entry"].as_array().cloned().unwrap_or_default() {
         let mut resource = e["resource"].clone();
         // A transaction resolves its conditional references against what the
-        // server holds before anything executes, and commits all or nothing.
+        // server holds before anything executes, as HFS does, and commits all
+        // or nothing.
         if kind == "transaction"
             && let Err(message) = d.resolve_conditional(&mut resource)
         {
@@ -400,6 +426,10 @@ async fn dest_bundle(State(d): State<Dest>, Json(bundle): Json<Value>) -> Respon
         .into_iter()
         .map(|(method, url, resource)| json!({"response": {"status": d.write(&method, &url, resource)}}))
         .collect();
+    // `writes: commit_then_fail` stores the Bundle and loses the answer.
+    if d.writes_mode == "commit_then_fail" {
+        return (StatusCode::SERVICE_UNAVAILABLE, "answer lost").into_response();
+    }
     Json(json!({"resourceType": "Bundle", "type": format!("{kind}-response"), "entry": entries}))
         .into_response()
 }
@@ -523,19 +553,29 @@ impl Runtime {
         }
     }
 
+    /// A consumer's `GET /v1/capabilities`, shaped as python-runtime's
+    /// published answer, with the current environment as the default.
     fn capabilities(&self) -> Value {
-        let id = self
-            .environment
-            .get("Python-Runtime-Environment-Id")
-            .cloned()
-            .unwrap_or(Value::Null);
-        let digest = self
-            .environment
-            .get("Python-Runtime-Environment-Digest")
-            .cloned()
-            .unwrap_or(Value::Null);
-        json!({"protocols": [1], "bindings": ["hie-record@1"], "default_environment": id,
-               "environments": [{"id": id, "digest": digest, "bindings": ["hie-record@1"], "state": "ready"}]})
+        let header = |k: &str| self.environment.get(k).cloned().unwrap_or(Value::Null);
+        let id = header("Python-Runtime-Environment-Id");
+        json!({
+            "protocols": [1],
+            "bindings": ["hie-record@1"],
+            "runtimes": ["cpython-3.14@2", id],
+            "profiles": [{"id": "hie-batch@1", "bindings": ["hie-record@1"], "limits": {
+                "max_items": 100, "max_source_bytes": 262144, "max_input_bytes": 8388608,
+                "max_result_bytes": 16777216, "max_resources": 10000, "max_json_depth": 64,
+                "max_diagnostic_bytes": 2097152, "max_output_bytes": 1048576, "deadline_ceiling_ms": 30000,
+                "grace_ms": 2000, "cpu_millis": 1000, "memory_bytes": 536870912, "pids": 64,
+                "scratch_bytes": 67108864}}],
+            "environments": [{"id": id, "digest": header("Python-Runtime-Environment-Digest"),
+                              "tree_sha256": "5".repeat(64), "base": header("Python-Runtime-Environment-Image-Digest"),
+                              "bindings": ["hie-record@1"], "state": "ready", "last_qualified_at_ms": 1800000000000u64}],
+            "aliases": {"cpython-3.14@2": id},
+            "default_environment": id,
+            "lifecycle": {"hie-batch@1": {"status": "supported"}, "hie-record@1": {"status": "supported"}},
+            "canary_test_floor": false
+        })
     }
 
     /// The fixed lab program: `{id, value, status?}` to one Observation, or a
@@ -567,6 +607,7 @@ type Rt = Arc<Mutex<Runtime>>;
 async fn start_runtime(cfg: &Value) -> (String, Rt) {
     let mut state = Runtime {
         tries: cfg["try"].as_array().cloned().unwrap_or_default().into(),
+        environment: default_environment(),
         ..Default::default()
     };
     state.configure(cfg);
@@ -580,6 +621,20 @@ async fn start_runtime(cfg: &Value) -> (String, Rt) {
         }
     });
     (format!("http://{addr}"), rt)
+}
+
+/// The environment a runtime stand-in reports unless its fixture names one.
+fn default_environment() -> Map<String, Value> {
+    json!({
+        "Python-Runtime-Environment-Id": "cpython-3.14@2-env-0123456789abcdef0123456789abcdef",
+        "Python-Runtime-Environment-Digest": "a".repeat(64),
+        "Python-Runtime-Environment-Image-Digest": format!("sha256:{}", "b".repeat(64)),
+        "Python-Runtime-Environment-Binding": "hie-record@1",
+        "Python-Runtime-Environment-Profile": "hie-batch@1"
+    })
+    .as_object()
+    .cloned()
+    .unwrap()
 }
 
 async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<(String, String, Vec<u8>)> {
@@ -717,6 +772,12 @@ async fn runtime_connection(mut stream: tokio::net::TcpStream, rt: Rt) {
                 drop(stream);
                 return;
             }
+            // `hold`: never answer; wait until the client goes away (a cancel).
+            if script["hold"] == true {
+                let mut byte = [0u8; 1];
+                let _ = tokio::time::timeout(Duration::from_secs(60), stream.read(&mut byte)).await;
+                return;
+            }
             let mut answer = script["body"].clone();
             // Replies match requests by position; give them the ids HIE sent.
             if let (Some(replies), Some(requests)) = (
@@ -746,6 +807,11 @@ async fn runtime_connection(mut stream: tokio::net::TcpStream, rt: Rt) {
 // ---- Patterns -------------------------------------------------------------------
 
 type Captures = HashMap<String, Value>;
+
+/// Values forbidden at rest, and the directories they are checked under.
+type AtRest = (Vec<String>, Vec<String>);
+/// A case's outcome (`Ok(false)`: skipped) and its custody check.
+type CaseResult = (Result<bool, String>, Result<(), String>);
 
 /// What placeholders resolve to outside captures.
 struct Env {
@@ -1028,9 +1094,6 @@ struct Run {
     tcp: HashMap<String, Arc<AtomicUsize>>,
     sqlite: HashMap<String, PathBuf>,
     forbid: Vec<String>,
-    /// Values that may be answered but must not be stored in plaintext, and
-    /// the directories (under the engine's) that are checked.
-    at_rest: (Vec<String>, Vec<String>),
     background: HashMap<String, tokio::task::JoinHandle<Result<Answer, String>>>,
 }
 
@@ -1211,6 +1274,7 @@ impl Run {
             ("writes", json!(d.writes)),
             ("validations", json!(d.validations)),
             ("bundle_types", json!(d.bundle_types)),
+            ("bundles", json!(d.bundles)),
         ] {
             if let Some(p) = expect.get(key) {
                 matches(
@@ -1260,16 +1324,29 @@ impl Run {
         if let Some(expect) = step.get("runtime") {
             let rt = self
                 .runtime
-                .as_ref()
+                .clone()
                 .ok_or_else(|| format!("{at}: the case has no runtime"))?;
-            let calls = json!(rt.lock().unwrap().calls);
-            return try_match(
-                &expect["calls"],
-                Some(&calls),
-                &mut self.caps,
-                &self.env,
-                &format!("{at} runtime calls"),
-            );
+            let until = step["until_ms"].as_u64();
+            let started = Instant::now();
+            loop {
+                let calls = json!(rt.lock().unwrap().calls);
+                match (
+                    try_match(
+                        &expect["calls"],
+                        Some(&calls),
+                        &mut self.caps,
+                        &self.env,
+                        &format!("{at} runtime calls"),
+                    ),
+                    until,
+                ) {
+                    (Ok(()), _) => return Ok(()),
+                    (Err(_), Some(ms)) if started.elapsed() < Duration::from_millis(ms) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    (Err(e), _) => return Err(e),
+                }
+            }
         }
         if let Some(expect) = step["tcp"].as_object() {
             for (name, p) in expect {
@@ -1326,59 +1403,72 @@ impl Run {
         }
         Err(format!("{at}: unknown step {}", short(Some(step))))
     }
+}
 
-    /// Nothing the case marks as secret may be written anywhere under the
-    /// engine's directory, nor logged; values forbidden at rest may not be in
-    /// the directories named, nor logged.
-    fn check_custody(&self) -> Result<(), String> {
-        let log = LOG.lock().unwrap();
-        for value in self.forbid.iter().chain(&self.at_rest.0) {
-            if log.windows(value.len()).any(|w| w == value.as_bytes()) {
-                return Err("the engine's log holds a forbidden value".into());
+/// Nothing a case forbids may be in any file under the engine's directory nor
+/// in the log; values forbidden at rest may not be in the directories named,
+/// nor in the log. Checked after the case's runtime is gone, on every exit.
+fn custody(root: &Path, forbid: &[String], at_rest: &AtRest) -> Result<(), String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out)
+            } else {
+                out.push(p)
             }
         }
-        drop(log);
-        self.check_files()
     }
-
-    fn check_files(&self) -> Result<(), String> {
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out)
-                } else {
-                    out.push(p)
-                }
-            }
+    let contains = |bytes: &[u8], value: &str| {
+        !value.is_empty() && bytes.windows(value.len()).any(|w| w == value.as_bytes())
+    };
+    {
+        let log = LOG.lock().unwrap();
+        if forbid.iter().chain(&at_rest.0).any(|v| contains(&log, v)) {
+            return Err("the engine's log holds a forbidden value".into());
         }
-        let holds = |f: &Path, values: &[String]| -> Result<(), String> {
-            let bytes = std::fs::read(f).unwrap_or_default();
-            for value in values {
-                if bytes.windows(value.len()).any(|w| w == value.as_bytes()) {
-                    return Err(format!(
-                        "{} holds a forbidden value in plaintext",
-                        f.display()
-                    ));
-                }
-            }
-            Ok(())
-        };
+    }
+    let holds = |dir: &Path, values: &[String]| -> Result<(), String> {
         let mut files = Vec::new();
-        walk(&self.root, &mut files);
-        for f in &files {
-            holds(f, &self.forbid)?;
-        }
-        let (values, under) = &self.at_rest;
-        for dir in under {
-            let mut files = Vec::new();
-            walk(&self.root.join(dir), &mut files);
-            for f in &files {
-                holds(f, values)?;
+        walk(dir, &mut files);
+        for f in files {
+            let bytes = std::fs::read(&f).unwrap_or_default();
+            if values.iter().any(|v| contains(&bytes, v)) {
+                return Err(format!(
+                    "{} holds a forbidden value in plaintext",
+                    f.display()
+                ));
             }
         }
         Ok(())
+    };
+    holds(root, forbid)?;
+    for dir in &at_rest.1 {
+        holds(&root.join(dir), &at_rest.0)?;
     }
+    Ok(())
+}
+
+/// A case's forbidden values, with the placeholders they may use filled in.
+fn forbidden(case: &Case, env: &Env) -> Result<(Vec<String>, AtRest), String> {
+    let caps = Captures::new();
+    let list = |v: &Value| -> Result<Vec<String>, String> {
+        v.as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|v| {
+                env.subst(v, &caps)
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+            })
+            .collect()
+    };
+    let spec = &case.doc["forbid_at_rest"];
+    let mut under = list(&spec["under"])?;
+    if under.is_empty() {
+        under.push(".".into());
+    }
+    Ok((list(&case.doc["forbid"])?, (list(&spec["values"])?, under)))
 }
 
 fn write_file(root: &Path, rel: &str, content: &str) -> Result<(), String> {
@@ -1408,7 +1498,7 @@ async fn run_case(case: &Case, python: &str, root: PathBuf) -> Result<bool, Stri
     vars.insert("root".into(), json!(root.to_string_lossy()));
     for requirement in fixtures["requires"].as_array().cloned().unwrap_or_default() {
         match requirement.as_str() {
-            Some("mssql") => match mssql_vars() {
+            Some("mssql") => match mssql_vars()? {
                 Some(v) => vars.extend(v),
                 None => return Ok(false),
             },
@@ -1495,26 +1585,7 @@ async fn run_case(case: &Case, python: &str, root: PathBuf) -> Result<bool, Stri
         .map_err(|e| format!("building the engine: {e:#}"))?;
     let api = serve(hie::api::router(state)).await;
 
-    let strings = |v: &Value| -> Result<Vec<String>, String> {
-        v.as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|v| {
-                env.subst(v, &caps)
-                    .map(|v| v.as_str().unwrap_or_default().to_string())
-            })
-            .collect()
-    };
-    let forbid = strings(&case.doc["forbid"])?;
-    let at_rest = {
-        let spec = &case.doc["forbid_at_rest"];
-        let mut under = strings(&spec["under"])?;
-        if under.is_empty() {
-            under.push(".".into());
-        }
-        (strings(&spec["values"])?, under)
-    };
+    let (forbid, _) = forbidden(case, &env)?;
     let mut run = Run {
         api,
         http: reqwest::Client::builder()
@@ -1529,7 +1600,6 @@ async fn run_case(case: &Case, python: &str, root: PathBuf) -> Result<bool, Stri
         tcp,
         sqlite,
         forbid,
-        at_rest,
         background: HashMap::new(),
     };
     let mut failure = None;
@@ -1543,25 +1613,30 @@ async fn run_case(case: &Case, python: &str, root: PathBuf) -> Result<bool, Stri
             break;
         }
     }
-    // Custody is checked whether the steps passed or not.
-    match (failure, run.check_custody()) {
-        (None, Ok(())) => Ok(true),
-        (Some(e), Ok(())) => Err(e),
-        (None, Err(c)) => Err(c),
-        (Some(e), Err(c)) => Err(format!("{e}; and {c}")),
+    match failure {
+        None => Ok(true),
+        Some(e) => Err(e),
     }
 }
 
 /// Placeholders for a SQL Server named by `HIE_TEST_MSSQL_URL`
-/// (`sqlserver://user:password@host:port/database?trust_cert=true`).
-fn mssql_vars() -> Option<HashMap<String, Value>> {
-    let url = url::Url::parse(&std::env::var("HIE_TEST_MSSQL_URL").ok()?).ok()?;
-    let decode = |s: &str| {
-        url::form_urlencoded::parse(format!("x={s}").as_bytes())
-            .next()
-            .map(|(_, v)| v.into_owned())
-            .unwrap_or_default()
+/// (`sqlserver://user:password@host:port/database?trust_cert=true`):
+/// `Ok(None)` when it is not set, an error when it is set and unusable.
+fn mssql_vars() -> Result<Option<HashMap<String, Value>>, String> {
+    let Ok(text) = std::env::var("HIE_TEST_MSSQL_URL") else {
+        return Ok(None);
     };
+    let bad = |what: &str| format!("HIE_TEST_MSSQL_URL is set but {what}");
+    let url = url::Url::parse(&text).map_err(|e| bad(&format!("is not a URL: {e}")))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| bad("has no host"))?
+        .to_string();
+    let password = url.password().ok_or_else(|| bad("has no password"))?;
+    let database = url.path().trim_start_matches('/');
+    if url.username().is_empty() || database.is_empty() {
+        return Err(bad("needs a user and a database"));
+    }
     let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
     let flag = |k: &str, default: bool| {
         query
@@ -1569,21 +1644,47 @@ fn mssql_vars() -> Option<HashMap<String, Value>> {
             .map(|v| matches!(v.as_str(), "true" | "on" | "yes" | "1"))
             .unwrap_or(default)
     };
-    Some(HashMap::from([
-        ("mssql:host".to_string(), json!(url.host_str()?)),
+    Ok(Some(HashMap::from([
+        ("mssql:host".to_string(), json!(host)),
         ("mssql:port".to_string(), json!(url.port().unwrap_or(1433))),
         (
             "mssql:database".to_string(),
-            json!(url.path().trim_start_matches('/')),
+            json!(percent_decode(database)),
         ),
-        ("mssql:user".to_string(), json!(decode(url.username()))),
-        ("mssql:password".to_string(), json!(decode(url.password()?))),
+        (
+            "mssql:user".to_string(),
+            json!(percent_decode(url.username())),
+        ),
+        (
+            "mssql:password".to_string(),
+            json!(percent_decode(password)),
+        ),
         ("mssql:encrypt".to_string(), json!(flag("encrypt", true))),
         (
             "mssql:trust_cert".to_string(),
             json!(flag("trust_cert", false)),
         ),
-    ]))
+    ])))
+}
+
+/// URL percent-decoding, without form rules (a `+` stays a `+`).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The engine's log, from every case; scanned for forbidden values.
@@ -1604,23 +1705,39 @@ impl std::io::Write for LogWriter {
 /// One case on a runtime of its own, so that when it ends, or runs out of time,
 /// every task it started (the engine's runners, its API, the stand-ins, their
 /// Python workers) goes with the runtime, before its directory is removed.
-fn run_isolated(case: Case, python: Arc<String>) -> Result<bool, String> {
-    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+fn run_isolated(case: Case, python: Arc<String>) -> CaseResult {
+    let env = Env {
+        vars: mssql_vars().ok().flatten().unwrap_or_default(),
+    };
+    let (forbid, at_rest) = match forbidden(&case, &env) {
+        Ok(f) => f,
+        Err(e) => return (Err(e.clone()), Err(e)),
+    };
+    let dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => return (Err(e.to_string()), Ok(())),
+    };
     let root = dir.path().to_path_buf();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(r) => r,
+        Err(e) => return (Err(e.to_string()), Ok(())),
+    };
     let outcome = runtime.block_on(async {
-        match tokio::time::timeout(CASE_BUDGET, run_case(&case, &python, root)).await {
+        match tokio::time::timeout(CASE_BUDGET, run_case(&case, &python, root.clone())).await {
             Ok(r) => r,
             Err(_) => Err(format!("ran past {}s", CASE_BUDGET.as_secs())),
         }
     });
     runtime.shutdown_timeout(Duration::from_secs(5));
+    // After the runtime is gone nothing can write any more; before the
+    // directory goes, custody is checked whatever the outcome.
+    let custody = custody(&root, &forbid, &at_rest);
     drop(dir);
-    outcome
+    (outcome, custody)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1651,14 +1768,14 @@ async fn the_conformance_corpus() {
         .filter(|c| only.as_ref().is_none_or(|o| c.id.contains(o.as_str())))
         .collect();
     let python = Arc::new(python);
-    let results: Vec<(String, Result<bool, String>)> = futures::stream::iter(selected)
+    let results: Vec<(String, CaseResult)> = futures::stream::iter(selected)
         .map(|case| {
             let python = python.clone();
             async move {
                 let id = case.id.clone();
                 let outcome = tokio::task::spawn_blocking(move || run_isolated(case, python))
                     .await
-                    .unwrap_or_else(|e| Err(format!("panicked: {e}")));
+                    .unwrap_or_else(|e| (Err(format!("panicked: {e}")), Ok(())));
                 (id, outcome)
             }
         })
@@ -1669,8 +1786,25 @@ async fn the_conformance_corpus() {
     let mut results = results;
     results.sort_by(|a, b| a.0.cmp(&b.0));
     let (mut green, mut red, mut skipped) = (0, 0, 0);
-    for (id, outcome) in &results {
-        match (outcome, known.get(id)) {
+    for (id, (outcome, custody)) in &results {
+        // Custody is expected to hold unless the list flags it for the case;
+        // a flag on a case that keeps custody must go too.
+        let custody_red = known.get(id).is_some_and(|(_, c)| *c);
+        match (custody, custody_red) {
+            (Err(e), false) => problems.push(format!("{id} broke custody: {e}")),
+            (Ok(()), true) if !matches!(outcome, Ok(false)) => problems.push(format!(
+                "{id} keeps custody but known-red.txt flags it: remove the custody flag"
+            )),
+            _ => {}
+        }
+        // A requirement that is configured but unusable is never expected.
+        if let Err(e) = outcome
+            && e.contains("HIE_TEST_MSSQL_URL is set but")
+        {
+            problems.push(format!("{id}: {e}"));
+            continue;
+        }
+        match (outcome, known.get(id).map(|(f, _)| f)) {
             (Ok(false), _) => skipped += 1,
             (Ok(true), None) => green += 1,
             (Err(e), Some(front)) => {

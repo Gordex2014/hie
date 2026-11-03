@@ -60,7 +60,7 @@
       }
     },
     {
-      "name": "save a fix that takes a while",
+      "name": "save a fix",
       "request": {
         "method": "POST",
         "path": "/api/transforms/lab_csv/versions",
@@ -68,7 +68,7 @@
           "Idempotency-Key": "fix"
         },
         "body": {
-          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    time.sleep(1.0)\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        number = 0.0\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"fixed\"}],\n    }\n",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        number = 0.0\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"fixed\"}],\n    }\n",
           "base_version": 1
         }
       },
@@ -77,6 +77,12 @@
         "body": {
           "version": 2
         }
+      }
+    },
+    {
+      "name": "hold the destination's writes",
+      "set_destination": {
+        "writes": "hold"
       }
     },
     {
@@ -238,6 +244,12 @@
             }
           ]
         }
+      }
+    },
+    {
+      "name": "release the writes",
+      "set_destination": {
+        "writes": "ok"
       }
     },
     {

@@ -1,5 +1,7 @@
 # Cases expected to fail until the front named beside each implements them.
-# Format: <case id> <front>   # what else it needs, when another front's work is also required.
+# Format: <case id> <front> [custody]   # what else it needs, when another front's work is also required.
+# `custody` marks a case whose custody check (forbidden values in files or logs) is also expected to fail;
+# without it a custody violation fails the run even for a listed case.
 # Remove a line in the same change that makes its case pass; the runner fails on a listed case that passes.
 
 # H-secrets: write-only secrets, admission policy, secret-safe errors and the error code convention.
@@ -44,7 +46,7 @@ transforms/versions-and-metadata H-versions
 # H-history: immutable failure and attempt history, retries, period counts, loads paging and rows,
 # outcome unknown, failed-content custody, usage history, Try answers with dispositions.
 loads/failed-content-purge-keeps-totals H-history
-loads/failure-groups-and-samples H-history
+loads/failure-groups-and-samples H-history custody          # failed rows are stored in plaintext today
 loads/history-and-period-counts H-history                  # also H-versions: saving a version of a file transform
 loads/legacy-retry-creates-retries H-history
 loads/outcome-unknown H-history

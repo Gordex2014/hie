@@ -119,7 +119,7 @@ A secret is a write-only value, such as a database password, kept by HIE. Nothin
 
 `DELETE /api/secrets/{id}`: `204`, every revision destroyed. `409 secret_in_use` with `sources` while a source refers to it.
 
-**Binding.** A Test records the revision it used. A Start (or replace) with a definition that refers to a secret must name the same revision as its evidence (see [Start](#start-creating-a-database-source)). A source keeps using the revision it started with until it is replaced with a new definition and evidence; a new revision never reaches a running source by itself.
+**Binding.** A Test records the revision it used. A Start (or replace) with a definition that refers to a secret uses the revision its evidence recorded: a reference that names a revision must name that one, and a reference that leaves the revision out takes it (see [Start](#start-creating-a-database-source)). A source keeps using the revision it started with until it is replaced with a new definition and evidence; a new revision never reaches a running source by itself.
 
 ### Admission policy
 

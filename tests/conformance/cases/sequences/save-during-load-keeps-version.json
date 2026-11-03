@@ -2,6 +2,9 @@
   "id": "sequences/save-during-load-keeps-version",
   "title": "A version saved while a load runs does not change that load; the next load takes it",
   "fixtures": {
+    "destination": {
+      "writes": "hold"
+    },
     "files": {
       "inbox/a.csv": "id,value\n1,5.1\n2,5.2\n3,5.3\n4,5.4\n5,5.5\n6,5.6\n7,5.7\n8,5.8\n"
     }
@@ -17,7 +20,7 @@
         },
         "body": {
           "display_name": "Lab results",
-          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    time.sleep(0.4)\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    time.sleep(0.2)\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
           "note": "First version",
           "author": "Sam Whitaker"
         }
@@ -103,6 +106,12 @@
           "version": 2,
           "base_version": 1
         }
+      }
+    },
+    {
+      "name": "release the writes",
+      "set_destination": {
+        "writes": "ok"
       }
     },
     {

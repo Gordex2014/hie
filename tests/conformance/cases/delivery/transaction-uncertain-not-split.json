@@ -65,7 +65,45 @@
         "bundle_types": [
           "{{each}}",
           "transaction"
-        ]
+        ],
+        "resources": {
+          "Observation": 0
+        }
+      }
+    },
+    {
+      "name": "the destination commits and the answer is lost",
+      "set_destination": {
+        "writes": "commit_then_fail"
+      }
+    },
+    {
+      "destination": {
+        "resources": {
+          "Observation": 2
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "name": "a commit without an answer is still unknown",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            {
+              "rows": {
+                "outcome_unknown": 2,
+                "written": 0,
+                "failed": 0
+              }
+            }
+          ]
+        }
       }
     },
     {
@@ -98,6 +136,21 @@
         }
       },
       "until_ms": 15000
+    },
+    {
+      "name": "every transaction kept both rows: never split",
+      "destination": {
+        "bundles": [
+          "{{each}}",
+          [
+            "{{string}}",
+            "{{string}}"
+          ]
+        ],
+        "resources": {
+          "Observation": 2
+        }
+      }
     },
     {
       "destination": {

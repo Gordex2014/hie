@@ -11,25 +11,7 @@
     "runtime": {
       "try": [
         {
-          "delay_ms": 5000,
-          "status": 200,
-          "headers": {
-            "Python-Runtime-Environment-Id": "cpython-3.14@2-env-0123456789abcdef0123456789abcdef",
-            "Python-Runtime-Environment-Digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "Python-Runtime-Environment-Image-Digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "Python-Runtime-Environment-Binding": "hie-record@1",
-            "Python-Runtime-Environment-Profile": "hie-batch@1"
-          },
-          "body": {
-            "replies": [
-              {
-                "resources": []
-              },
-              {
-                "resources": []
-              }
-            ]
-          }
+          "hold": true
         }
       ]
     }

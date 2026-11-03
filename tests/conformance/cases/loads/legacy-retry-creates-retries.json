@@ -1,6 +1,6 @@
 {
   "id": "loads/legacy-retry-creates-retries",
-  "title": "The 0.1 retry of every failure creates one retry per failure group",
+  "title": "The 0.1 retry creates one retry per failure group, skips a group already being retried, and links each to its group's chain",
   "fixtures": {
     "files": {
       "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
@@ -65,6 +65,100 @@
       }
     },
     {
+      "name": "a first retry of one group, before any fix",
+      "request": {
+        "method": "POST",
+        "path": "/api/loads/{{$load}}/retries",
+        "headers": {
+          "Idempotency-Key": "a1"
+        },
+        "body": {
+          "group": "{{$ga}}",
+          "version": null
+        }
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "retry": {
+            "id": "{{$a1}}",
+            "previous": null,
+            "transform": {
+              "version": 1
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/retries/{{$a1}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "retry": {
+            "status": "done",
+            "failed": 1
+          }
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/lab_csv/versions",
+        "headers": {
+          "Idempotency-Key": "fix"
+        },
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        number = 0.0\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"fixed\"}],\n    }\n",
+          "base_version": 1
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "version": 2
+        }
+      }
+    },
+    {
+      "name": "hold the destination's writes",
+      "set_destination": {
+        "writes": "hold"
+      }
+    },
+    {
+      "name": "the other group's retry stays active",
+      "request": {
+        "method": "POST",
+        "path": "/api/loads/{{$load}}/retries",
+        "headers": {
+          "Idempotency-Key": "x1"
+        },
+        "body": {
+          "group": "{{$gx}}",
+          "version": null
+        }
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "retry": {
+            "id": "{{$x1}}",
+            "previous": null,
+            "transform": {
+              "version": 2
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "the 0.1 retry skips the active group",
       "request": {
         "method": "POST",
         "path": "/api/loads/{{$load}}/retry"
@@ -73,13 +167,70 @@
         "status": 202,
         "body": {
           "load": "{{$load}}",
-          "retried": 2,
+          "retried": 1,
           "retries": [
-            "{{string}}",
-            "{{string}}"
+            "{{$a2}}"
           ]
         }
       }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/retries/{{$a2}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "retry": {
+            "group": "{{$ga}}",
+            "previous": "{{$a1}}",
+            "transform": {
+              "id": "lab_csv",
+              "version": 2
+            },
+            "rows": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "release the writes",
+      "set_destination": {
+        "writes": "ok"
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/retries/{{$a2}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "retry": {
+            "status": "done",
+            "written": 1
+          }
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/retries/{{$x1}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "retry": {
+            "status": "done",
+            "written": 1
+          }
+        }
+      },
+      "until_ms": 15000
     },
     {
       "request": {
@@ -92,22 +243,30 @@
           "retries": [
             "{{contains}}",
             {
-              "group": "{{$ga}}",
-              "transform": {
-                "id": "lab_csv",
-                "version": 1
-              },
-              "rows": 1
+              "id": "{{$a1}}",
+              "group": "{{$ga}}"
             },
             {
-              "group": "{{$gx}}",
-              "transform": {
-                "id": "lab_csv",
-                "version": 1
-              },
-              "rows": 1
+              "id": "{{$x1}}",
+              "group": "{{$gx}}"
+            },
+            {
+              "id": "{{$a2}}",
+              "group": "{{$ga}}"
             }
           ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "failures": []
         }
       }
     }
