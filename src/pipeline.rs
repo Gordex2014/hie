@@ -11,11 +11,11 @@ use chrono::Timelike;
 use crate::alerts::{Alerter, parse_clock};
 use crate::bulk::{self, BulkSubmitter, Poll};
 use crate::config::{DeliveryMethod, FeedConfig, parse_duration};
+use crate::connectors::{self, Incoming, Listed, Source};
 use crate::db::{Db, Rule, WorkItem, now_ms};
 use crate::fhir::{self, DeliveryKey, EntryResult, FhirClient, SendError};
 use crate::formats;
 use crate::runtime::RuntimeSettings;
-use crate::source::{Incoming, Source};
 use crate::transform::{self, Outcome, Transformer};
 use tokio::sync::Notify;
 
@@ -252,7 +252,7 @@ impl FeedRunner {
 
     async fn scan(&self) -> Result<()> {
         let read_only = self.source.is_read_only();
-        for (key, name, size) in self.source.list_meta().await? {
+        for Listed { key, name, size } in self.source.list_meta().await? {
             // Someone else's bucket keeps what we took: known by name and size,
             // it is not downloaded again just to recognise its hash.
             if read_only && size > 0 && self.db.has_file(&self.feed.id, &name, size)? {
@@ -261,7 +261,7 @@ impl FeedRunner {
             let incoming = match self.source.fetch(&key).await {
                 Ok(incoming) => incoming,
                 // Announced, then gone before this pass reached it: nothing to take.
-                Err(e) if is_not_found(&e) => {
+                Err(e) if connectors::is_gone(&e) => {
                     tracing::warn!(feed = %self.feed.id, key, "object no longer there, skipped");
                     continue;
                 }
@@ -1187,16 +1187,4 @@ pub fn human(d: Duration) -> String {
         7200..=172_799 => format!("{}h", s / 3600),
         _ => format!("{}d", s / 86_400),
     }
-}
-
-/// Whether an error from a source says the object is not there any more.
-fn is_not_found(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<object_store::Error>(),
-            Some(object_store::Error::NotFound { .. })
-        ) || cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
-    })
 }

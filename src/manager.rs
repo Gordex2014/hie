@@ -13,11 +13,11 @@ use serde_json::{Value, json};
 
 use crate::alerts::Alerter;
 use crate::config::{Config, FeedConfig, RuntimeConfig, SourceConfig};
+use crate::connectors::{Probe, Source};
 use crate::db::{Db, Rule};
 use crate::fhir::FhirClient;
 use crate::pipeline::{FeedRunner, RunnerControl};
 use crate::runtime::RuntimeSettings;
-use crate::source::{Probe, Source};
 use crate::transform::{Outcome, Transformer, check_resource};
 
 #[derive(Debug)]

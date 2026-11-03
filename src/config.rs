@@ -387,21 +387,7 @@ fn default_public_url() -> String {
 impl SourceConfig {
     /// Where the source reads from, for logs and the API.
     pub fn describe(&self) -> String {
-        match self {
-            SourceConfig::Folder { path, .. } => path.display().to_string(),
-            SourceConfig::S3 { bucket, prefix, .. } => format!("s3://{bucket}/{prefix}"),
-            SourceConfig::FhirServer { url, types, .. } => {
-                format!("{url} ({})", types.join(", "))
-            }
-            SourceConfig::Database {
-                url_env,
-                cursor_column,
-                ..
-            } => format!("database ${url_env} by {cursor_column}"),
-            SourceConfig::Mllp { listen, spool, .. } => {
-                format!("mllp://{listen} (spool {})", spool.display())
-            }
-        }
+        (crate::connectors::kind(self).describe)(self)
     }
 
     pub fn poll_interval(&self) -> Duration {
@@ -414,100 +400,17 @@ impl SourceConfig {
         }
     }
 
-    /// Checks what the type itself cannot: a FHIR server source needs at least one
-    /// resource type, sane paging, and a URL that looks like one.
+    /// Checks what the type itself cannot, as the source's connector says: a
+    /// FHIR server source needs at least one resource type, a database query a
+    /// `{cursor}`, an MLLP listener an address, an SQS queue its URL.
     pub fn check(&self) -> Result<()> {
-        if let SourceConfig::FhirServer {
-            url,
-            types,
-            page_size,
-            max_pages,
-            ..
-        } = self
-        {
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
-                bail!("fhir_server url must start with http:// or https://");
-            }
-            if types.is_empty() {
-                bail!("fhir_server needs at least one resource type in types");
-            }
-            if let Some(bad) = types
-                .iter()
-                .find(|t| t.is_empty() || !t.chars().all(|c| c.is_ascii_alphanumeric()))
-            {
-                bail!("fhir_server: {bad:?} is not a resource type");
-            }
-            if *page_size == 0 || *max_pages == 0 {
-                bail!("fhir_server: page_size and max_pages must be at least 1");
-            }
-        }
-        if let SourceConfig::Database {
-            url_env,
-            query,
-            cursor_column,
-            max_runs,
-            ..
-        } = self
-        {
-            if url_env.trim().is_empty() {
-                bail!(
-                    "database: url_env names the environment variable holding the connection URL"
-                );
-            }
-            if !query.contains("{cursor}") {
-                bail!(
-                    "database: the query must use {{cursor}} where the cursor value goes, e.g. WHERE updated_at > {{cursor}}"
-                );
-            }
-            if cursor_column.trim().is_empty()
-                || !cursor_column
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                bail!("database: cursor_column must be a column name");
-            }
-            if *max_runs == 0 {
-                bail!("database: max_runs must be at least 1");
-            }
-        }
-        if let SourceConfig::Mllp { listen, .. } = self
-            && listen.parse::<std::net::SocketAddr>().is_err()
-        {
-            bail!("mllp: listen must be an address such as 0.0.0.0:2575, not {listen:?}");
-        }
-        if let SourceConfig::S3 {
-            queue: Some(queue),
-            anonymous,
-            relist_seconds,
-            ..
-        } = self
-        {
-            if !(queue.starts_with("http://") || queue.starts_with("https://")) {
-                bail!("s3: queue must be the SQS queue URL, not {queue:?}");
-            }
-            if *anonymous {
-                bail!(
-                    "s3: a queue is read with credentials; anonymous and queue do not go together"
-                );
-            }
-            if *relist_seconds == 0 {
-                bail!("s3: relist_seconds must be at least 1");
-            }
-        }
-        Ok(())
+        (crate::connectors::kind(self).check)(self)
     }
 
-    /// Makes a folder's paths absolute against the directory holding `hie.yaml`.
+    /// Makes a folder's (or a spool's) paths absolute against the directory
+    /// holding `hie.yaml`.
     pub fn resolve(&mut self, base: &Path) {
-        if let SourceConfig::Folder { path, archive, .. } = self {
-            *path = base.join(&*path);
-            if let Some(a) = archive {
-                *a = base.join(&*a);
-            }
-        }
-        if let SourceConfig::Mllp { spool, .. } = self {
-            *spool = base.join(&*spool);
-        }
+        (crate::connectors::kind(self).resolve)(self, base)
     }
 }
 
@@ -534,13 +437,9 @@ impl FeedConfig {
             .with_context(|| format!("source {}", self.id))?;
         // What a server, a query or an MLLP sender hands over has its own shape,
         // whatever the file says; and there is no object for $bulk-submit to fetch.
-        let fixed = match self.source {
-            SourceConfig::FhirServer { .. } => Some(("fhir_server", Format::Ndjson)),
-            SourceConfig::Database { .. } => Some(("database", Format::Ndjson)),
-            SourceConfig::Mllp { .. } => Some(("mllp", Format::Hl7v2)),
-            _ => None,
-        };
-        if let Some((kind, format)) = fixed {
+        let kind = crate::connectors::kind(&self.source);
+        if let Some(format) = kind.format {
+            let kind = kind.name;
             self.format = format;
             if self.delivery.method == DeliveryMethod::BulkSubmit
                 && self.delivery.bulk_from == BulkFrom::SourceObjects
