@@ -240,11 +240,12 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
         .unwrap();
     let mut raw = alto[0]["raw"].clone();
     raw["value"] = json!("101");
-    assert!(
+    assert_eq!(
         state
             .db
             .reprocess(alto[0]["id"].as_i64().unwrap(), Some(&raw))
-            .unwrap()
+            .unwrap(),
+        hie::db::Reprocess::Done
     );
     runner.tick().await.unwrap();
     assert_eq!(count(&state, "sent"), 8);
@@ -301,6 +302,8 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
 #[derive(Default)]
 struct Recorder {
     down: bool,
+    /// Answers this many Bundles with a bare `200 {}`, confirming nothing.
+    unconfirming: u32,
     bundles: Vec<(String, Vec<String>)>,
     stored: HashMap<String, Value>,
 }
@@ -319,6 +322,10 @@ async fn record_bundle(
         .map(|e| e["request"]["url"].as_str().unwrap_or_default().to_string())
         .collect();
     s.bundles.push((kind.clone(), urls));
+    if s.unconfirming > 0 {
+        s.unconfirming -= 1;
+        return (axum::http::StatusCode::OK, Json(json!({})));
+    }
     if s.down {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -580,4 +587,122 @@ async fn retries_chain_and_keep_the_failures_of_their_day() {
     };
     assert_eq!(runs(2), ["retry written"]);
     assert_eq!(runs(1), ["retry failed", "load partial"]);
+}
+
+fn lab_source(root: &Path) {
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::write(
+        root.join("transforms/cond.py"),
+        "def transform(record, context):\n    return {\"resourceType\": \"Observation\", \"id\": f\"obs-{record['id']}\", \"status\": \"final\",\n            \"code\": {\"text\": \"glucose\"}, \"subject\": {\"reference\": f\"Patient?identifier=urn:mrn|{record['mrn']}\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sources/lab.yaml"),
+        "id: lab\nname: Lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  min_file_age_ms: 0\n\
+         transform: transforms/cond.py\ndelivery:\n  initial_backoff_ms: 10\n  max_backoff_ms: 20\n",
+    )
+    .unwrap();
+}
+
+fn event_kinds(state: &hie::api::AppState, record: i64) -> Vec<String> {
+    state.db.record_history(record).unwrap().unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A success that does not confirm every entry of a transaction (here a bare
+/// `{}`) is no confirmation: the rows are outcome unknown and the same
+/// transaction goes again.
+#[tokio::test]
+async fn a_transaction_answer_that_confirms_nothing_leaves_the_outcome_unknown() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let (base, dest) = recorder().await;
+    dest.lock().unwrap().unconfirming = 1;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    lab_source(root);
+    drop_file(&root.join("inbox"), "a.csv", "id,mrn\n1,123\n2,123\n");
+    let (manager, state) = engine(root, &base, &python);
+    let runner = manager.runner("lab").unwrap();
+    runner.tick().await.unwrap();
+    let load = state.db.load_views("lab", None, None, false, 1).unwrap()[0].clone();
+    assert_eq!(load["rows"]["outcome_unknown"], 2, "{load}");
+    assert_eq!(load["rows"]["written"], 0);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    runner.tick().await.unwrap();
+    let load = state.db.load_views("lab", None, None, false, 1).unwrap()[0].clone();
+    assert_eq!(load["rows"]["written"], 2, "{load}");
+    let bundles = dest.lock().unwrap().bundles.clone();
+    assert!(
+        bundles.len() >= 2
+            && bundles
+                .iter()
+                .all(|(k, u)| k == "transaction" && *u == bundles[0].1)
+    );
+}
+
+/// A transaction is kept before it is sent: one found still `sending` (the
+/// engine stopped mid-send) is outcome unknown, and goes again as it was.
+#[tokio::test]
+async fn a_transaction_kept_while_sending_is_unknown_and_sent_again() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let (base, dest) = recorder().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    lab_source(root);
+    let (manager, state) = engine(root, &base, &python);
+    // What an engine stopped mid-send left: a transformed row in a stored
+    // transaction still marked `sending`.
+    let db = &state.db;
+    let load = db.open_load("lab", "a.csv", "sha", 3, None, None).unwrap();
+    db.insert_records(load, "lab", &[(1, json!({"id": "1", "mrn": "123"}), None)])
+        .unwrap();
+    let item = db.received_records("lab", 1).unwrap()[0].clone();
+    let resource = json!({"resourceType": "Observation", "id": "obs-1", "status": "final",
+        "code": {"text": "glucose"}, "subject": {"reference": "Patient?identifier=urn:mrn|123"}});
+    db.mark_transformed(item.id, item.run, &json!([resource.clone()]))
+        .unwrap();
+    let bundle = hie::fhir::bundle("transaction", &[("Observation/obs-1".into(), resource)]);
+    db.create_dispatch(
+        "lab",
+        &json!({"bundle": bundle, "owners": [item.id]}),
+        &[(item.id, item.run)],
+    )
+    .unwrap()
+    .unwrap();
+    manager.runner("lab").unwrap().tick().await.unwrap();
+    let load = db.load_view(load).unwrap().unwrap();
+    assert_eq!(load["rows"]["written"], 1, "{load}");
+    assert_eq!(
+        event_kinds(&state, item.id),
+        [
+            "admitted",
+            "transformed",
+            "outcome_unknown",
+            "settled",
+            "delivered"
+        ]
+    );
+    assert_eq!(
+        dest.lock().unwrap().bundles,
+        [(
+            "transaction".to_string(),
+            vec!["Observation/obs-1".to_string()]
+        )]
+    );
+    assert!(
+        db.query_json("SELECT id FROM dispatches", [])
+            .unwrap()
+            .is_empty()
+    );
 }

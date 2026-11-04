@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::history::append_submission_events;
+use super::loads::Column;
 use super::{Db, Param, now_ms, params};
 
 /// One row per submission, with its manifest and where its status is read.
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS dispatches (
   id TEXT PRIMARY KEY,
   feed_id TEXT NOT NULL,
   payload TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'sending',
   created_at INTEGER NOT NULL
 );
 ";
@@ -62,7 +64,7 @@ impl Db {
         let rows = self.query(
             "SELECT r.file_id, f.name, f.source_key, COUNT(*)
              FROM records r JOIN files f ON f.id = r.file_id
-             WHERE r.feed_id = $1 AND r.status = 'pending' AND r.submission IS NULL
+             WHERE r.feed_id = $1 AND r.status = 'pending' AND r.submission IS NULL AND r.exec_retry IS NULL
              GROUP BY r.file_id, f.name, f.source_key
              ORDER BY r.file_id LIMIT $2",
             &params![feed, limit],
@@ -72,11 +74,12 @@ impl Db {
             let file_id = r.i64(0);
             let resource_type = self
                 .query_one(
-                    "SELECT resources FROM records
-                     WHERE file_id = $1 AND status = 'pending' AND submission IS NULL ORDER BY id LIMIT 1",
+                    "SELECT id, resources FROM records
+                     WHERE file_id = $1 AND status = 'pending' AND submission IS NULL AND exec_retry IS NULL
+                     ORDER BY id LIMIT 1",
                     &params![file_id],
                 )?
-                .and_then(|row| self.unseal(row.get(0)))
+                .and_then(|row| self.open_record(Some(row.i64(0)), Column::Resources, row.get(1)))
                 .and_then(|v| {
                     v.get(0)
                         .and_then(|res| res.get("resourceType"))
@@ -117,7 +120,8 @@ impl Db {
                 for file_id in file_ids {
                     c.execute(
                         "UPDATE records SET status = 'submitted', submission = $1, uncertain = 1, updated_at = $2
-                         WHERE file_id = $3 AND feed_id = $4 AND status = 'pending' AND submission IS NULL",
+                         WHERE file_id = $3 AND feed_id = $4 AND status = 'pending' AND submission IS NULL
+                           AND exec_retry IS NULL",
                         &params![token, now, file_id, feed],
                     )?;
                 }
@@ -233,8 +237,8 @@ impl Db {
         .map(drop)
     }
 
-    /// The records a submission holds: (record id, file id, resources).
-    pub fn submitted_records(&self, token: &str) -> Result<Vec<(i64, i64, Value)>> {
+    /// The records a submission holds: (record id, attempt, file id, resources).
+    pub fn submitted_records(&self, token: &str) -> Result<Vec<(i64, i64, i64, Value)>> {
         self.submitted_records_after(token, 0, usize::MAX)
     }
 
@@ -245,22 +249,41 @@ impl Db {
         token: &str,
         after_id: i64,
         limit: usize,
-    ) -> Result<Vec<(i64, i64, Value)>> {
+    ) -> Result<Vec<(i64, i64, i64, Value)>> {
         Ok(self
             .query(
-                "SELECT id, file_id, resources FROM records
+                "SELECT id, run, file_id, resources FROM records
                  WHERE submission = $1 AND status = 'submitted' AND id > $2 ORDER BY id LIMIT $3",
                 &params![token, after_id, limit.min(i64::MAX as usize) as i64],
             )?
             .iter()
             .map(|r| {
+                let id = r.i64(0);
                 (
-                    r.i64(0),
+                    id,
                     r.i64(1),
-                    self.unseal(r.get(2)).unwrap_or(Value::Null),
+                    r.i64(2),
+                    self.open_record(Some(id), Column::Resources, r.get(3))
+                        .unwrap_or(Value::Null),
                 )
             })
             .collect())
+    }
+
+    /// Takes rows of a settled submission whose receipts did not confirm them
+    /// back to `pending`, outcome unknown, to be submitted again when due.
+    pub fn resubmit(&self, rows: &[(i64, i64)], next_attempt_at: i64, reason: &str) -> Result<()> {
+        let reason = super::loads::bounded(reason);
+        for (id, run) in rows {
+            self.execute(
+                "UPDATE records SET status = 'pending', submission = NULL, attempts = attempts + 1,
+                        next_attempt_at = $3, error_kind = 'transient', error = $4, waiting = 'destination_unavailable',
+                        uncertain = 1, updated_at = $5
+                 WHERE id = $1 AND run = $2 AND status = 'submitted'",
+                &params![id, run, next_attempt_at, reason, now_ms()],
+            )?;
+        }
+        Ok(())
     }
 
     /// The source key of a file, only when that file is part of the submission.
@@ -277,22 +300,60 @@ impl Db {
 
     // ---- stored transactions ---------------------------------------------------
 
-    /// Keeps a transaction whose answer did not confirm it, sealed (it holds the
-    /// rows' resources), so the same one is sent again until it settles.
-    pub fn create_dispatch(&self, feed: &str, payload: &Value) -> Result<String> {
+    /// Keeps a transaction before it is sent: its payload sealed for its id
+    /// (it holds the rows' resources), its members `(id, run)` and the state
+    /// `sending`. A transaction found still `sending` after a restart may have
+    /// committed: its rows are outcome unknown, and the same one goes again.
+    /// `None` when none of the rows is pending any more.
+    pub fn create_dispatch(
+        &self,
+        feed: &str,
+        payload: &Value,
+        members: &[(i64, i64)],
+    ) -> Result<Option<String>> {
         let id = format!("tx_{}", &crate::ids::new(crate::ids::Kind::Group)[2..]);
-        self.execute(
-            "INSERT INTO dispatches (id, feed_id, payload, created_at) VALUES ($1, $2, $3, $4)",
-            &params![id, feed, self.seal(payload), now_ms()],
-        )?;
-        Ok(id)
+        let sealed = self.seal_dispatch(&id, payload);
+        self.atomically(|c| {
+            c.execute(
+                "INSERT INTO dispatches (id, feed_id, payload, state, created_at) VALUES ($1, $2, $3, 'sending', $4)",
+                &params![id, feed, sealed, now_ms()],
+            )?;
+            let mut joined = 0;
+            for (record, run) in members {
+                joined += c.execute(
+                    "UPDATE records SET dispatch = $1 WHERE id = $2 AND run = $3 AND status = 'pending' AND dispatch IS NULL",
+                    &params![id, record, run],
+                )?;
+            }
+            if joined == 0 {
+                c.execute("DELETE FROM dispatches WHERE id = $1", &params![id])?;
+                return Ok(None);
+            }
+            Ok(Some(id.clone()))
+        })
     }
 
-    /// A stored transaction, opened.
-    pub fn dispatch_payload(&self, id: &str) -> Result<Option<Value>> {
+    /// A stored transaction, opened, and its state (`sending` or `held`).
+    pub fn dispatch_payload(&self, id: &str) -> Result<Option<(Value, String)>> {
         Ok(self
-            .query_one("SELECT payload FROM dispatches WHERE id = $1", &params![id])?
-            .and_then(|r| self.unseal(r.get(0))))
+            .query_one(
+                "SELECT payload, state FROM dispatches WHERE id = $1",
+                &params![id],
+            )?
+            .and_then(|r| {
+                self.open_dispatch(id, &r.string(0))
+                    .map(|payload| (payload, r.string(1)))
+            }))
+    }
+
+    /// Marks a stored transaction `sending` (about to go) or `held` (it went
+    /// without a confirming answer, or never left).
+    pub fn set_dispatch_state(&self, id: &str, state: &str) -> Result<()> {
+        self.execute(
+            "UPDATE dispatches SET state = $2 WHERE id = $1",
+            &params![id, state],
+        )
+        .map(drop)
     }
 
     /// Drops a stored transaction once no pending row belongs to it.
@@ -303,5 +364,18 @@ impl Db {
             &params![id],
         )
         .map(drop)
+    }
+
+    /// Open submissions' tokens and when they were created, all sources or one.
+    pub fn submission_tokens(&self, feed: Option<&str>) -> Result<Vec<(String, String, i64)>> {
+        Ok(self
+            .query(
+                "SELECT token, status, created_at FROM submissions
+                 WHERE CAST($1 AS TEXT) IS NULL OR feed_id = CAST($1 AS TEXT)",
+                &params![feed],
+            )?
+            .iter()
+            .map(|r| (r.string(0), r.string(1), r.i64(2)))
+            .collect())
     }
 }

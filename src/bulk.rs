@@ -7,11 +7,16 @@
 //! carries.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::Duration;
+
+use anyhow::Context;
 
 use serde_json::{Value, json};
 
+use crate::config::{DeliveryIds, DeliveryMethod, FeedConfig, Validation};
 use crate::credentials::Credentials;
+use crate::db::Db;
 use crate::fhir::{self, SendError};
 
 /// What a status poll found.
@@ -23,6 +28,8 @@ pub enum Poll {
         references: HashSet<String>,
         /// What HFS said about the lines it could not store.
         errors: Vec<String>,
+        /// Receipt lines that could not be read: the receipts are incomplete.
+        malformed: usize,
     },
 }
 
@@ -174,6 +181,7 @@ impl BulkSubmitter {
     pub async fn poll(&self, status_url: &str) -> Result<Poll, SendError> {
         let mut references = HashSet::new();
         let mut errors = Vec::new();
+        let mut malformed = 0;
         let mut next = Some(status_url.to_string());
         while let Some(url) = next.take() {
             let response = self.get(&url, "application/json").await?;
@@ -197,16 +205,23 @@ impl BulkSubmitter {
                 .map_err(|e| SendError::Transient(format!("status manifest at {url}: {e}")))?;
             for entry in manifest["output"].as_array().into_iter().flatten() {
                 if let Some(file_url) = entry["url"].as_str() {
-                    for line in self.lines(file_url).await? {
-                        if let Some(reference) = line.get("reference").and_then(Value::as_str) {
-                            references.insert(reference.to_string());
+                    let (lines, bad) = self.lines(file_url).await?;
+                    malformed += bad;
+                    for line in lines {
+                        match line.get("reference").and_then(Value::as_str) {
+                            Some(reference) => {
+                                references.insert(reference.to_string());
+                            }
+                            None => malformed += 1,
                         }
                     }
                 }
             }
             for entry in manifest["outcome"].as_array().into_iter().flatten() {
                 if let Some(file_url) = entry["url"].as_str() {
-                    for line in self.lines(file_url).await? {
+                    let (lines, bad) = self.lines(file_url).await?;
+                    malformed += bad;
+                    for line in lines {
                         errors.push(fhir::outcome_text(&line));
                     }
                 }
@@ -219,10 +234,15 @@ impl BulkSubmitter {
                 .and_then(|l| l["url"].as_str())
                 .map(str::to_string);
         }
-        Ok(Poll::Done { references, errors })
+        Ok(Poll::Done {
+            references,
+            errors,
+            malformed,
+        })
     }
 
-    async fn lines(&self, url: &str) -> Result<Vec<Value>, SendError> {
+    /// The JSON lines of an NDJSON file, and how many lines were not JSON.
+    async fn lines(&self, url: &str) -> Result<(Vec<Value>, usize), SendError> {
         let text = self
             .get(url, "application/fhir+ndjson, application/x-ndjson, */*")
             .await?
@@ -231,12 +251,58 @@ impl BulkSubmitter {
             .text()
             .await
             .map_err(|e| SendError::Transient(format!("reading {url}: {e}")))?;
-        Ok(text
+        let mut bad = 0;
+        let lines = text
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect())
+            .filter_map(|l| {
+                let parsed = serde_json::from_str(l).ok();
+                bad += usize::from(parsed.is_none());
+                parsed
+            })
+            .collect();
+        Ok((lines, bad))
     }
+}
+
+/// Writes a file the engine serves itself for the destination to fetch (the
+/// transformed NDJSON, a staged zip entry), sealed for its path: no row
+/// content is written to disk in plaintext.
+pub fn write_served(db: &Db, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let sealed = db.seal_file(&path.to_string_lossy(), bytes);
+    std::fs::write(path, sealed).with_context(|| format!("writing {}", path.display()))
+}
+
+/// A file as `/bulk` serves it: opened when the engine wrote it under
+/// `bulk_dir`, as it is when it is the source's own object.
+pub fn read_served(db: &Db, bulk_dir: &Path, path: &Path) -> anyhow::Result<Vec<u8>> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if !path.starts_with(bulk_dir) {
+        return Ok(bytes);
+    }
+    db.open_file(&path.to_string_lossy(), &String::from_utf8_lossy(&bytes))
+}
+
+/// Refuses a definition whose `$bulk-submit` reads the source objects
+/// themselves (`bulk_from: source_objects`, or `auto` resolving to it) where
+/// the engine must see each resource first: `validation: required` (nothing is
+/// validated before HFS reads the objects) or `delivery.ids: namespaced` (the
+/// objects' ids cannot be rewritten).
+pub fn check_delivery(feed: &FeedConfig, validation: Validation) -> anyhow::Result<()> {
+    let objects = feed.delivery.method == DeliveryMethod::BulkSubmit && !feed.bulk_transformed();
+    if objects && validation == Validation::Required {
+        anyhow::bail!(
+            "source {}: $bulk-submit of the source objects cannot validate resources first; with validation: required use bulk_from: transformed or method: rest",
+            feed.id
+        );
+    }
+    if objects && feed.delivery.ids == DeliveryIds::Namespaced {
+        anyhow::bail!(
+            "source {}: $bulk-submit of the source objects cannot namespace ids; with ids: namespaced use bulk_from: transformed or method: rest",
+            feed.id
+        );
+    }
+    Ok(())
 }
 
 /// A stable id for a drop: the same files submitted again get the same id, so HFS
@@ -273,6 +339,23 @@ mod tests {
         );
         assert_ne!(submission_id("lab", &["a"]), submission_id("other", &["a"]));
         assert!(submission_id("lab", &[]).starts_with("hie-"));
+    }
+
+    #[test]
+    fn the_source_objects_path_refuses_what_it_cannot_do() {
+        let feed = |extra: &str| -> FeedConfig {
+            serde_yaml::from_str(&format!(
+                "id: x\nname: X\nsource:\n  type: folder\n  path: in\nformat: ndjson\ntransform: transforms/fhir_passthrough.py\ndelivery:\n  method: bulk_submit\n{extra}"
+            ))
+            .unwrap()
+        };
+        let objects = feed("");
+        assert!(!objects.bulk_transformed());
+        assert!(check_delivery(&objects, Validation::Off).is_ok());
+        assert!(check_delivery(&objects, Validation::Required).is_err());
+        assert!(check_delivery(&feed("  ids: namespaced\n"), Validation::Off).is_err());
+        let transformed = feed("  bulk_from: transformed\n  ids: namespaced\n");
+        assert!(check_delivery(&transformed, Validation::Required).is_ok());
     }
 
     #[test]

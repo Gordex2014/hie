@@ -1,29 +1,44 @@
 //! Loads: the files (objects) taken from sources and the records cut from them,
 //! and the custody of the records' content.
 //!
-//! **Custody.** A record's content (its raw row, the corrected row's original,
-//! the resources it became, the destination's answers) is sealed with the
-//! engine's content key (AES-256-GCM, `crate::crypto::Keyring`) before it is
-//! first written, so the store's files (SQLite pages and WAL included) never
-//! hold it in plaintext. It is opened only in memory, to transform, deliver or
-//! serve it. A store written before custody keeps its plaintext rows readable.
-//! Failed content goes when its retention runs out, when its row is written by
-//! a retry or reprocess, or when its source is deleted (`crate::purge`); the
-//! row keeps `raw: null` and its `content` state (`expired` or `purged`).
+//! **Custody** (`custody.rs`). A record's content (its raw row, the corrected
+//! row's original, the resources it became, the destination's answers) is
+//! sealed before it is first written, bound to its record and column, so the
+//! store's files (SQLite pages and WAL included) never hold it in plaintext.
+//! It is opened only in memory, to transform, deliver or serve it. Failed
+//! content goes when its retention runs out, when its row is written by a
+//! retry or reprocess, or when its source is deleted (`crate::purge`); the row
+//! keeps `raw: null` and its `content` state (`expired` or `purged`).
+//!
+//! **Attempts.** Every outcome a stage records names the attempt it worked on
+//! (`run`): a result of an attempt that a reprocess or retry replaced since is
+//! dropped, never written over the newer one.
 //!
 //! Every change of a record's fate appends to its history (`history.rs`).
 
+mod custody;
+
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 
 use super::engine::Conn;
 use super::history::{Failure, OUTCOME_SQL, append_events, group_for};
-use super::{Db, Param, now_ms, params};
-use crate::crypto::{Key, Keyring, OpenError};
+use super::{Db, Param, Tx, now_ms, params};
 use crate::versions::{VersionKey, VersionRef};
+pub(super) use custody::{Column, ContentKeys};
+
+/// The longest error or reason text kept in plaintext; longer ones are cut.
+pub const REASON_MAX_CHARS: usize = 500;
+
+/// `text` cut to [`REASON_MAX_CHARS`] characters.
+pub(super) fn bounded(text: &str) -> String {
+    match text.char_indices().nth(REASON_MAX_CHARS) {
+        None => text.to_string(),
+        Some((at, _)) => format!("{}…", &text[..at]),
+    }
+}
 
 /// One row per object taken from a source: a load.
 pub(super) const FILES: &str = "CREATE TABLE IF NOT EXISTS files (
@@ -138,6 +153,9 @@ pub struct WorkItem {
     pub dispatch: Option<String>,
     /// Whether its resources passed the destination's `$validate`.
     pub validated: bool,
+    /// The attempt this is (1 for the load's own; each retry or reprocess
+    /// adds one): what an outcome of it is recorded against.
+    pub run: i64,
 }
 
 /// One failed row whose content is still kept, as Try's `failures` input and
@@ -216,105 +234,22 @@ const WORK_COLUMNS: &str =
     "r.id, r.file_id, r.line, f.name, r.raw, r.resources, r.attempts, r.exec_retry,
     COALESCE(r.exec_transform_id, f.transform_id),
     CASE WHEN r.exec_transform_id IS NULL THEN f.transform_version ELSE r.exec_version END,
-    r.uncertain, r.dispatch, r.validated";
+    r.uncertain, r.dispatch, r.validated, r.run";
 
 /// Rows per multi-row statement: well under both engines' parameter limits.
 const INSERT_ROWS_PER_STATEMENT: usize = 200;
 
-/// What every sealed record column is bound to.
-const CONTENT_AD: &[u8] = b"hie:records:content";
-
-/// The record columns that hold content, sealed.
-const CONTENT_COLUMNS: [&str; 4] = ["raw", "original_raw", "resources", "response"];
-
-// ---- custody ----------------------------------------------------------------------
-
-/// The keys the store seals content with: the engine's (`content.key_file`,
-/// `HIE_CONTENT_KEY`, or the key in the store's directory) once
-/// [`Db::use_content_keys`] gives them, and until then a key of this process,
-/// for stores opened without an engine (tests, tools).
-#[derive(Default)]
-pub(super) struct ContentKeys {
-    engine: RwLock<Option<Arc<Keyring>>>,
-}
-
-fn process_keys() -> &'static Keyring {
-    static KEYS: OnceLock<Keyring> = OnceLock::new();
-    KEYS.get_or_init(|| Keyring::new(vec![Key::generate()]).expect("one key"))
-}
-
-impl ContentKeys {
-    fn seal(&self, plaintext: &[u8]) -> String {
-        match &*self.engine.read().expect("content keys") {
-            Some(keys) => keys.seal(plaintext, CONTENT_AD),
-            None => process_keys().seal(plaintext, CONTENT_AD),
-        }
-    }
-
-    fn open(&self, sealed: &str) -> Result<Vec<u8>, OpenError> {
-        if let Some(keys) = &*self.engine.read().expect("content keys") {
-            match keys.open(sealed, CONTENT_AD) {
-                Err(OpenError::UnknownKey(_)) => {}
-                other => return other,
-            }
-        }
-        process_keys().open(sealed, CONTENT_AD)
-    }
-}
-
-/// Whether a stored value is sealed (`v1.<key id>.<base64url>`); plaintext
-/// content is JSON, which never starts so.
-fn is_sealed(text: &str) -> bool {
-    text.starts_with("v1.")
-}
-
 impl Db {
-    /// Seals record content with these keys from now on (the engine's content
-    /// keys); content sealed before stays readable.
-    pub fn use_content_keys(&self, keys: Arc<Keyring>) {
-        *self.content.engine.write().expect("content keys") = Some(keys);
-    }
-
-    /// Content as it is stored: sealed JSON.
-    pub(super) fn seal(&self, value: &Value) -> String {
-        self.content.seal(value.to_string().as_bytes())
-    }
-
-    /// A stored content value opened: sealed or (from before custody) plain
-    /// JSON; `None` for null or what cannot be opened.
-    pub(super) fn unseal(&self, stored: &Value) -> Option<Value> {
-        let text = stored.as_str()?;
-        if is_sealed(text) {
-            match self.content.open(text) {
-                Ok(bytes) => serde_json::from_slice(&bytes).ok(),
-                Err(e) => {
-                    tracing::error!(target: "hie::store", "record content cannot be opened: {e}");
-                    None
-                }
-            }
-        } else {
-            serde_json::from_str(text).ok()
-        }
-    }
-
-    /// A row read by [`Db::query_json`] with its sealed content columns opened.
-    pub(super) fn reveal(&self, mut row: Value) -> Value {
-        if let Value::Object(members) = &mut row {
-            for column in CONTENT_COLUMNS {
-                if let Some(value) = members.get_mut(column)
-                    && value.as_str().is_some_and(is_sealed)
-                {
-                    *value = self.unseal(value).unwrap_or(Value::Null);
-                }
-            }
-        }
-        row
-    }
-
-    /// Runs `f` as one transaction on the store's connection.
+    /// Runs `f` as one transaction on the store's connection, as a writer
+    /// from its start (SQLite `BEGIN IMMEDIATE`), so a transaction that read
+    /// first never fails to write because another connection wrote meanwhile.
     pub(super) fn atomically<T>(&self, f: impl FnOnce(&mut Conn) -> Result<T>) -> Result<T> {
         self.with(|c| {
-            c.batch("BEGIN")?;
+            let begin = match c {
+                Conn::Sqlite(_) => "BEGIN IMMEDIATE",
+                Conn::Postgres(_) => "BEGIN",
+            };
+            c.batch(begin)?;
             match f(c) {
                 Ok(value) => {
                     c.batch("COMMIT")?;
@@ -350,21 +285,68 @@ fn resource_types(resources: &Value) -> (i64, String) {
     (n, Value::Object(types).to_string())
 }
 
+/// Holds a transform live for the rest of the transaction (the version
+/// store's lock, which its deletion takes too); `false` when it was deleted.
+/// A transform the version store has never seen (a store used without one)
+/// is not held.
+pub(super) fn live_transform(tx: &mut Tx<'_>, id: &str) -> Result<bool> {
+    match tx.transform(id)? {
+        None => Ok(true),
+        Some(t) if t.deleted => Ok(false),
+        Some(_) => tx.lock_live_transform(id),
+    }
+}
+
+/// What a reprocess did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reprocess {
+    Done,
+    NotFound,
+    /// A write of the record is unresolved, or a retry runs it (`409 record_in_flight`).
+    InFlight,
+}
+
+/// The part of a diagnostics `location` kept with a failure: its line and
+/// column, nothing else the program reported.
+fn stored_location(location: &Value) -> Option<String> {
+    let kept: Map<String, Value> = ["line", "column"]
+        .into_iter()
+        .filter_map(|k| {
+            location
+                .get(k)
+                .and_then(Value::as_i64)
+                .map(|n| (k.to_string(), json!(n)))
+        })
+        .collect();
+    (!kept.is_empty()).then(|| Value::Object(kept).to_string())
+}
+
 /// Fails one record inside a transaction: its group, its fields, its events.
-fn fail_in(c: &mut Conn, id: i64, failure: &Failure, response: Option<String>) -> Result<()> {
+/// With `run`, only that attempt of it (a newer one is left alone); `false`
+/// when nothing was failed.
+fn fail_in(
+    c: &mut Conn,
+    id: i64,
+    run: Option<i64>,
+    failure: &Failure,
+    response: Option<String>,
+) -> Result<bool> {
     let Some(row) = c
         .query(
             "SELECT r.file_id, COALESCE(r.exec_transform_id, f.transform_id),
                     CASE WHEN r.exec_transform_id IS NULL THEN f.transform_version ELSE r.exec_version END,
-                    r.uncertain, r.status
+                    r.uncertain, r.status, r.run
              FROM records r JOIN files f ON f.id = r.file_id WHERE r.id = $1",
             &params![id],
         )?
         .into_iter()
         .next()
     else {
-        return Ok(());
+        return Ok(false);
     };
+    if run.is_some_and(|run| run != row.i64(5)) || matches!(row.string(4).as_str(), "sent") {
+        return Ok(false);
+    }
     let filtered = failure.kind == "filtered";
     let group = if filtered {
         None
@@ -382,13 +364,14 @@ fn fail_in(c: &mut Conn, id: i64, failure: &Failure, response: Option<String>) -
         "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, response = $4, group_id = $5,
                 failed_at = CASE WHEN CAST($6 AS BIGINT) = 1 THEN failed_at ELSE $7 END,
                 uncertain = 0, waiting = NULL, dispatch = NULL, updated_at = $7
-         WHERE id = $1",
-        &params![id, failure.kind, failure.reason, response, group, filtered, now],
+         WHERE id = $1 AND run = $8",
+        &params![id, failure.kind, failure.reason, response, group, filtered, now, row.i64(5)],
     )?;
     if row.i64(3) == 1 {
         append_events(c, &[id], "settled", None)?;
     }
-    append_events(c, &[id], "failed", Some(failure))
+    append_events(c, &[id], "failed", Some(failure))?;
+    Ok(true)
 }
 
 impl Db {
@@ -399,7 +382,7 @@ impl Db {
     pub fn has_file(&self, feed: &str, name: &str, size: u64) -> Result<bool> {
         Ok(self
             .query_one(
-                "SELECT 1 FROM files WHERE feed_id = $1 AND name = $2 AND size = $3 AND status <> 'duplicate' LIMIT 1",
+                "SELECT 1 FROM files WHERE feed_id = $1 AND name = $2 AND size = $3 AND status NOT IN ('duplicate', 'unpacking') LIMIT 1",
                 &params![feed, name, size],
             )?
             .is_some())
@@ -408,7 +391,7 @@ impl Db {
     pub fn find_file_by_hash(&self, feed: &str, sha: &str) -> Result<Option<i64>> {
         Ok(self
             .query_one(
-                "SELECT id FROM files WHERE feed_id = $1 AND sha256 = $2 AND status <> 'duplicate' ORDER BY id LIMIT 1",
+                "SELECT id FROM files WHERE feed_id = $1 AND sha256 = $2 AND status NOT IN ('duplicate', 'unpacking') ORDER BY id LIMIT 1",
                 &params![feed, sha],
             )?
             .map(|r| r.i64(0)))
@@ -470,27 +453,91 @@ impl Db {
             ),
             None => (None, None, None),
         };
-        let now = now_ms();
-        if let Some(queued) = self.query_one(
-            "SELECT id FROM files WHERE feed_id = $1 AND status = 'queued' ORDER BY id LIMIT 1",
-            &params![feed],
-        )? {
-            let id = queued.i64(0);
-            let adopted = self.execute(
-                "UPDATE files SET name = $2, sha256 = $3, size = $4, status = 'processing', received_at = $5,
-                        source_key = $6, transform_id = $7, transform_version = $8, environment = $9
-                 WHERE id = $1 AND status = 'queued'",
-                &params![id, name, sha, size, now, source_key, transform_id, transform_version, environment],
-            )?;
-            if adopted == 1 {
-                return Ok(id);
+        // The version is fixed in the same transaction that holds the
+        // transform live, so its deletion cannot slip between them.
+        self.transaction(|tx: &mut Tx<'_>| -> Result<i64> {
+            if let Some(v) = version
+                && !live_transform(tx, &v.transform_id)?
+            {
+                anyhow::bail!(
+                    "transform {} was deleted; the load waits for a version that can run",
+                    v.transform_id
+                );
             }
-        }
-        self.insert_returning_id(
-            "INSERT INTO files (feed_id, name, sha256, size, status, received_at, source_key, transform_id, transform_version, environment)
-             VALUES ($1, $2, $3, $4, 'processing', $5, $6, $7, $8, $9)",
-            &params![feed, name, sha, size, now, source_key, transform_id, transform_version, environment],
+            let now = now_ms();
+            if let Some(queued) = tx
+                .query_json(
+                    "SELECT id FROM files WHERE feed_id = $1 AND status = 'queued' ORDER BY id LIMIT 1",
+                    &params![feed],
+                )?
+                .first()
+                .and_then(|r| r["id"].as_i64())
+            {
+                let adopted = tx.execute(
+                    "UPDATE files SET name = $2, sha256 = $3, size = $4, status = 'processing', received_at = $5,
+                            source_key = $6, transform_id = $7, transform_version = $8, environment = $9
+                     WHERE id = $1 AND status = 'queued'",
+                    &params![queued, name, sha, size, now, source_key, transform_id, transform_version, environment],
+                )?;
+                if adopted == 1 {
+                    return Ok(queued);
+                }
+            }
+            tx.insert_returning_id(
+                "INSERT INTO files (feed_id, name, sha256, size, status, received_at, source_key, transform_id, transform_version, environment)
+                 VALUES ($1, $2, $3, $4, 'processing', $5, $6, $7, $8, $9)",
+                &params![feed, name, sha, size, now, source_key, transform_id, transform_version, environment],
+            )
+        })
+    }
+
+    /// Every load id of a source.
+    pub fn source_load_ids(&self, feed: &str) -> Result<Vec<i64>> {
+        Ok(self
+            .query("SELECT id FROM files WHERE feed_id = $1", &params![feed])?
+            .iter()
+            .map(|r| r.i64(0))
+            .collect())
+    }
+
+    /// A zip of the source still `unpacking` (a pass stopped half-way through it).
+    pub fn unfinished_container(&self, feed: &str, name: &str, sha: &str) -> Result<Option<i64>> {
+        Ok(self
+            .query_one(
+                "SELECT id FROM files WHERE feed_id = $1 AND name = $2 AND sha256 = $3 AND status = 'unpacking'
+                 ORDER BY id LIMIT 1",
+                &params![feed, name, sha],
+            )?
+            .map(|r| r.i64(0)))
+    }
+
+    /// The load an entry of `container` already has (made after it, by an
+    /// expansion that stopped half-way), and whether its rows are in.
+    pub fn entry_load(
+        &self,
+        container: i64,
+        feed: &str,
+        name: &str,
+        sha: &str,
+    ) -> Result<Option<(i64, bool)>> {
+        Ok(self
+            .query_one(
+                "SELECT f.id, f.status, (SELECT COUNT(*) FROM records r WHERE r.file_id = f.id)
+                 FROM files f WHERE f.feed_id = $1 AND f.name = $2 AND f.sha256 = $3 AND f.id > $4
+                   AND f.status NOT IN ('duplicate', 'unpacking')
+                 ORDER BY f.id LIMIT 1",
+                &params![feed, name, sha, container],
+            )?
+            .map(|r| (r.i64(0), r.i64(2) > 0 || r.string(1) != "processing")))
+    }
+
+    /// Every entry of a zip was admitted: it is `unpacked`, read once.
+    pub fn finish_container(&self, container: i64) -> Result<()> {
+        self.execute(
+            "UPDATE files SET status = 'unpacked', finished_at = $2 WHERE id = $1 AND status = 'unpacking'",
+            &params![container, now_ms()],
         )
+        .map(drop)
     }
 
     /// The source of a load; `None` when there is no such load.
@@ -521,27 +568,64 @@ impl Db {
         if group.count > 0 && group.content != "kept" {
             return Err(FailedRowsError::ContentExpired);
         }
-        let failing: Vec<i64> = self
-            .group_records(&group, usize::MAX >> 1)?
-            .iter()
-            .filter_map(|r| r["id"].as_i64())
-            .collect();
-        if let Some(selection) = selection
-            && let Some(missing) = selection.iter().find(|id| !failing.contains(id))
-        {
-            return Err(FailedRowsError::RecordNotInGroup(*missing));
-        }
         let (feed, name) = (file.string(0), file.string(1));
+        let selected =
+            selection.map(|ids| ids.iter().map(|id| Param::Int(*id)).collect::<Vec<_>>());
+        if let Some(ids) = &selected
+            && !ids.is_empty()
+        {
+            // Every record named must be one of the group's failing rows.
+            let mut p: Vec<Param> = params![group.load_id, group.id].to_vec();
+            p.extend(ids.iter().cloned());
+            let found: Vec<i64> = self
+                .query(
+                    &format!(
+                        "SELECT id FROM records WHERE file_id = $1 AND group_id = $2 AND status = 'rejected'
+                           AND id IN ({})",
+                        marks(3, ids.len())
+                    ),
+                    &p,
+                )?
+                .iter()
+                .map(|r| r.i64(0))
+                .collect();
+            if let Some(missing) = selection
+                .into_iter()
+                .flatten()
+                .find(|id| !found.contains(id))
+            {
+                return Err(FailedRowsError::RecordNotInGroup(*missing));
+            }
+        }
+        let mut p: Vec<Param> = params![group.load_id, group.id].to_vec();
+        let only = match &selected {
+            Some(ids) if !ids.is_empty() => {
+                p.extend(ids.iter().cloned());
+                format!("AND id IN ({})", marks(3, ids.len()))
+            }
+            Some(_) => return Ok(Vec::new()),
+            None => String::new(),
+        };
         Ok(self
-            .group_rows(&group, usize::MAX >> 1)?
-            .into_iter()
-            .filter(|(id, _, _)| selection.is_none_or(|s| s.contains(id)))
-            .take(100)
-            .map(|(record_id, line, raw)| FailedRow {
-                record_id,
-                line,
-                raw,
-                context: json!({"feed": feed, "file": name, "line": line}),
+            .query(
+                &format!(
+                    "SELECT id, line, raw FROM records
+                     WHERE file_id = $1 AND group_id = $2 AND status = 'rejected' AND content IS NULL {only}
+                     ORDER BY line, id LIMIT 100"
+                ),
+                &p,
+            )?
+            .iter()
+            .map(|r| {
+                let (record_id, line) = (r.i64(0), r.i64(1));
+                FailedRow {
+                    record_id,
+                    line,
+                    raw: self
+                        .open_record(Some(record_id), Column::Raw, r.get(2))
+                        .unwrap_or(Value::Null),
+                    context: json!({"feed": feed, "file": name, "line": line}),
+                }
             })
             .collect())
     }
@@ -651,7 +735,7 @@ impl Db {
     pub fn first_load_id(&self, feed: &str) -> Result<Option<i64>> {
         Ok(self
             .query_one(
-                "SELECT MIN(id) FROM files WHERE feed_id = $1 AND status NOT IN ('duplicate', 'unpacked')",
+                "SELECT MIN(id) FROM files WHERE feed_id = $1 AND status NOT IN ('duplicate', 'unpacked', 'unpacking')",
                 &params![feed],
             )?
             .and_then(|r| r.opt_i64(0)))
@@ -779,7 +863,8 @@ impl Db {
 
     // ---- records -----------------------------------------------------------
 
-    /// Stores a load's rows, sealed, each with its `admitted` event; rows the
+    /// Stores a load's rows, each sealed for its own record (ids are taken
+    /// first, in the same transaction) with its `admitted` event; rows the
     /// format could not parse fail at once (kind `parse`).
     pub fn insert_records(
         &self,
@@ -787,24 +872,40 @@ impl Db {
         feed: &str,
         rows: &[(i64, Value, Option<String>)],
     ) -> Result<()> {
-        let sealed: Vec<String> = rows.iter().map(|(_, raw, _)| self.seal(raw)).collect();
+        if rows.is_empty() {
+            return Ok(());
+        }
         self.atomically(|c| {
             let now = now_ms();
-            let before = c
-                .query("SELECT COALESCE(MAX(id), 0) FROM records", &[])?
-                .first()
-                .map_or(0, |r| r.i64(0));
+            let ids: Vec<i64> = match c {
+                Conn::Postgres(_) => c
+                    .query(
+                        "SELECT nextval(pg_get_serial_sequence('records', 'id')) FROM generate_series(1, $1)",
+                        &params![rows.len()],
+                    )?
+                    .iter()
+                    .map(|r| r.i64(0))
+                    .collect(),
+                // A writer from the transaction's start: nobody else inserts meanwhile.
+                Conn::Sqlite(_) => {
+                    let top = c
+                        .query("SELECT COALESCE(MAX(id), 0) FROM records", &[])?
+                        .first()
+                        .map_or(0, |r| r.i64(0));
+                    (1..=rows.len() as i64).map(|n| top + n).collect()
+                }
+            };
             // Rows go in by the hundred per statement: one round trip each
             // over a million rows is an hour; this is minutes.
-            for (chunk, raws) in rows
+            for (chunk, ids) in rows
                 .chunks(INSERT_ROWS_PER_STATEMENT)
-                .zip(sealed.chunks(INSERT_ROWS_PER_STATEMENT))
+                .zip(ids.chunks(INSERT_ROWS_PER_STATEMENT))
             {
                 let mut sql = String::from(
-                    "INSERT INTO records (file_id, feed_id, line, raw, status, error_kind, error, updated_at) VALUES ",
+                    "INSERT INTO records (id, file_id, feed_id, line, raw, status, error_kind, error, updated_at) VALUES ",
                 );
-                let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 8);
-                for (i, ((line, _, parse_error), raw)) in chunk.iter().zip(raws).enumerate() {
+                let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 9);
+                for (i, ((line, raw, parse_error), id)) in chunk.iter().zip(ids).enumerate() {
                     let (status, kind) = match parse_error {
                         Some(_) => ("rejected", Some("parse")),
                         None => ("received", None),
@@ -812,21 +913,32 @@ impl Db {
                     if i > 0 {
                         sql.push_str(", ");
                     }
-                    sql.push_str(&format!("({})", marks(i * 8 + 1, 8)));
-                    values.extend(params![file_id, feed, line, raw, status, kind, parse_error, now]);
+                    sql.push_str(&format!("({})", marks(i * 9 + 1, 9)));
+                    values.extend(params![
+                        id,
+                        file_id,
+                        feed,
+                        line,
+                        self.seal_record(*id, Column::Raw, raw),
+                        status,
+                        kind,
+                        parse_error.as_deref().map(bounded),
+                        now
+                    ]);
                 }
                 c.execute(&sql, &values)?;
             }
+            let (first, last) = (ids[0], ids[ids.len() - 1]);
             c.execute(
                 "INSERT INTO record_events (record_id, load_id, feed_id, kind, attempt, transform_id, transform_version, at)
-                 SELECT r.id, r.file_id, r.feed_id, 'admitted', r.run, f.transform_id, f.transform_version, $3
+                 SELECT r.id, r.file_id, r.feed_id, 'admitted', r.run, f.transform_id, f.transform_version, $4
                  FROM records r JOIN files f ON f.id = r.file_id
-                 WHERE r.file_id = $1 AND r.id > $2 ORDER BY r.id",
-                &params![file_id, before, now],
+                 WHERE r.file_id = $1 AND r.id >= $2 AND r.id <= $3 ORDER BY r.id",
+                &params![file_id, first, last, now],
             )?;
             let unparsed = c.query(
-                "SELECT id, error FROM records WHERE file_id = $1 AND id > $2 AND status = 'rejected' ORDER BY id",
-                &params![file_id, before],
+                "SELECT id, error FROM records WHERE file_id = $1 AND id >= $2 AND id <= $3 AND status = 'rejected' ORDER BY id",
+                &params![file_id, first, last],
             )?;
             for r in unparsed {
                 let reason = r.string(1);
@@ -835,7 +947,7 @@ impl Db {
                     reason: &reason,
                     location: None,
                 };
-                fail_in(c, r.i64(0), &failure, None)?;
+                fail_in(c, r.i64(0), None, &failure, None)?;
             }
             Ok(())
         })
@@ -845,25 +957,31 @@ impl Db {
         Ok(self
             .query(sql, p)?
             .iter()
-            .map(|r| WorkItem {
-                id: r.i64(0),
-                file_id: r.i64(1),
-                line: r.i64(2),
-                file_name: r.string(3),
-                raw: self.unseal(r.get(4)).unwrap_or(Value::Null),
-                resources: self.unseal(r.get(5)),
-                attempts: r.i64(6) as u32,
-                retry: r.opt_string(7),
-                version: match (r.opt_string(8), r.opt_i64(9)) {
-                    (Some(transform_id), Some(version)) => Some(VersionKey {
-                        transform_id,
-                        version,
-                    }),
-                    _ => None,
-                },
-                uncertain: r.i64(10) == 1,
-                dispatch: r.opt_string(11),
-                validated: r.i64(12) == 1,
+            .map(|r| {
+                let id = r.i64(0);
+                WorkItem {
+                    id,
+                    file_id: r.i64(1),
+                    line: r.i64(2),
+                    file_name: r.string(3),
+                    raw: self
+                        .open_record(Some(id), Column::Raw, r.get(4))
+                        .unwrap_or(Value::Null),
+                    resources: self.open_record(Some(id), Column::Resources, r.get(5)),
+                    attempts: r.i64(6) as u32,
+                    retry: r.opt_string(7),
+                    version: match (r.opt_string(8), r.opt_i64(9)) {
+                        (Some(transform_id), Some(version)) => Some(VersionKey {
+                            transform_id,
+                            version,
+                        }),
+                        _ => None,
+                    },
+                    uncertain: r.i64(10) == 1,
+                    dispatch: r.opt_string(11),
+                    validated: r.i64(12) == 1,
+                    run: r.i64(13),
+                }
             })
             .collect())
     }
@@ -889,12 +1007,14 @@ impl Db {
         )
     }
 
-    /// Pending records due for delivery, but those of `except_load`.
+    /// Pending records due for delivery, but those of `except_load`; only those
+    /// a retry runs when `retries_only`.
     pub fn due_records(
         &self,
         feed: &str,
         limit: usize,
         except_load: Option<i64>,
+        retries_only: bool,
     ) -> Result<Vec<WorkItem>> {
         self.work_items(
             &format!(
@@ -902,9 +1022,10 @@ impl Db {
              FROM records r JOIN files f ON f.id = r.file_id
              WHERE r.feed_id = $1 AND r.status = 'pending' AND r.next_attempt_at <= $2
                AND (CAST($4 AS BIGINT) IS NULL OR r.file_id <> CAST($4 AS BIGINT))
+               AND (CAST($5 AS BIGINT) = 0 OR r.exec_retry IS NOT NULL)
              ORDER BY r.id LIMIT $3"
             ),
-            &params![feed, now_ms(), limit, except_load],
+            &params![feed, now_ms(), limit, except_load, retries_only],
         )
     }
 
@@ -960,43 +1081,42 @@ impl Db {
         })
     }
 
-    /// Marks records whose source row is the resource to deliver as transformed:
+    /// Marks records whose source row is the resource to deliver as checked:
     /// each one's resources are its row.
-    pub fn mark_passthrough(&self, ids: &[i64]) -> Result<()> {
+    pub fn mark_passthrough(&self, items: &[&WorkItem]) -> Result<()> {
         let now = now_ms();
-        for chunk in ids.chunks(INSERT_ROWS_PER_STATEMENT) {
-            let mut values: Vec<Param> = chunk.iter().map(|id| Param::Int(*id)).collect();
-            let rows = self.query(
-                &format!(
-                    "SELECT id, raw FROM records WHERE id IN ({})",
-                    marks(1, chunk.len())
-                ),
-                &values,
-            )?;
-            values.clear();
-            values.push(Param::Int(now));
-            let mut tuples = Vec::with_capacity(rows.len());
-            for (i, r) in rows.iter().enumerate() {
-                let resources = Value::Array(vec![self.unseal(r.get(1)).unwrap_or(Value::Null)]);
+        for chunk in items.chunks(INSERT_ROWS_PER_STATEMENT) {
+            let mut values: Vec<Param> = vec![Param::Int(now)];
+            let mut tuples = Vec::with_capacity(chunk.len());
+            for (i, item) in chunk.iter().enumerate() {
+                let resources = Value::Array(vec![item.raw.clone()]);
                 let (count, types) = resource_types(&resources);
                 tuples.push(format!(
-                    "(CAST(${} AS BIGINT), CAST(${} AS TEXT), CAST(${} AS BIGINT), CAST(${} AS TEXT))",
-                    i * 4 + 2,
-                    i * 4 + 3,
-                    i * 4 + 4,
-                    i * 4 + 5
+                    "(CAST(${} AS BIGINT), CAST(${} AS BIGINT), CAST(${} AS TEXT), CAST(${} AS BIGINT), CAST(${} AS TEXT))",
+                    i * 5 + 2,
+                    i * 5 + 3,
+                    i * 5 + 4,
+                    i * 5 + 5,
+                    i * 5 + 6
                 ));
-                values.extend(params![r.i64(0), self.seal(&resources), count, types]);
+                values.extend(params![
+                    item.id,
+                    item.run,
+                    self.seal_record(item.id, Column::Resources, &resources),
+                    count,
+                    types
+                ]);
             }
             if tuples.is_empty() {
                 continue;
             }
             self.execute(
                 &format!(
-                    "UPDATE records SET status = 'pending', resources = v.column2, resource_count = v.column3,
-                            resource_types = v.column4, error_kind = NULL, error = NULL,
+                    "UPDATE records SET status = 'pending', resources = v.column3, resource_count = v.column4,
+                            resource_types = v.column5, error_kind = NULL, error = NULL,
                             attempts = 0, next_attempt_at = 0, validated = 0, updated_at = $1
-                     FROM (VALUES {}) AS v WHERE records.id = v.column1",
+                     FROM (VALUES {}) AS v
+                     WHERE records.id = v.column1 AND records.run = v.column2 AND records.status = 'received'",
                     tuples.join(", ")
                 ),
                 &values,
@@ -1005,93 +1125,104 @@ impl Db {
         Ok(())
     }
 
-    /// The transform made `resources` of the record: they wait for delivery.
-    pub fn mark_transformed(&self, id: i64, resources: &Value) -> Result<()> {
-        let sealed = self.seal(resources);
+    /// The transform made `resources` of attempt `run` of the record: they
+    /// wait for delivery. Dropped when a newer attempt replaced that one.
+    pub fn mark_transformed(&self, id: i64, run: i64, resources: &Value) -> Result<()> {
+        let sealed = self.seal_record(id, Column::Resources, resources);
         let (count, types) = resource_types(resources);
         self.atomically(|c| {
-            c.execute(
+            let n = c.execute(
                 "UPDATE records SET status = 'pending', resources = $2, resource_count = $3, resource_types = $4,
                         error_kind = NULL, error = NULL, waiting = NULL, validated = 0,
-                        attempts = 0, next_attempt_at = 0, updated_at = $5 WHERE id = $1",
-                &params![id, sealed, count, types, now_ms()],
+                        attempts = 0, next_attempt_at = 0, updated_at = $5
+                 WHERE id = $1 AND run = $6 AND status = 'received'",
+                &params![id, sealed, count, types, now_ms(), run],
             )?;
-            append_events(c, &[id], "transformed", None)
+            if n == 1 {
+                append_events(c, &[id], "transformed", None)?;
+            }
+            Ok(())
         })
     }
 
-    /// The record failed: kind, reason and, for a transform's failure, the
-    /// diagnostics' location. It joins its load's failure group for that kind,
-    /// reason and version (`filtered` rows join none).
+    /// Attempt `run` of the record failed: kind, reason (cut to
+    /// [`REASON_MAX_CHARS`]) and, for a transform's failure, the diagnostics'
+    /// location. It joins its load's failure group for that kind, reason and
+    /// version (`filtered` rows join none). The destination's answer, when
+    /// there is one, is kept sealed with the row.
     pub fn mark_failed(
         &self,
         id: i64,
+        run: i64,
         kind: &str,
         reason: &str,
         response: Option<&Value>,
         location: Option<&Value>,
     ) -> Result<()> {
-        let response = response.map(|r| self.seal(r));
+        let response = response.map(|r| self.seal_record(id, Column::Response, r));
+        let reason = bounded(reason);
         let failure = Failure {
             kind,
-            reason,
-            location: location.filter(|l| !l.is_null()).map(Value::to_string),
+            reason: &reason,
+            location: location.and_then(stored_location),
         };
-        self.atomically(|c| fail_in(c, id, &failure, response))
+        self.atomically(|c| fail_in(c, id, Some(run), &failure, response).map(drop))
     }
 
-    pub fn mark_rejected(
-        &self,
-        id: i64,
-        kind: &str,
-        error: &str,
-        response: Option<&Value>,
-    ) -> Result<()> {
-        self.mark_failed(id, kind, error, response, None)
-    }
-
-    /// The resources of these records passed the destination's `$validate`.
-    pub fn mark_validated(&self, ids: &[i64]) -> Result<()> {
-        if ids.is_empty() {
+    /// The resources of these attempts `(id, run)` passed the destination's `$validate`.
+    pub fn mark_validated(&self, rows: &[(i64, i64)]) -> Result<()> {
+        if rows.is_empty() {
             return Ok(());
         }
         self.atomically(|c| {
-            for chunk in ids.chunks(INSERT_ROWS_PER_STATEMENT) {
-                let values: Vec<Param> = chunk.iter().map(|id| Param::Int(*id)).collect();
-                c.execute(
-                    &format!(
-                        "UPDATE records SET validated = 1, waiting = NULL WHERE id IN ({})",
-                        marks(1, chunk.len())
-                    ),
-                    &values,
-                )?;
+            for chunk in rows.chunks(INSERT_ROWS_PER_STATEMENT) {
+                let mut done = Vec::new();
+                for (id, run) in chunk {
+                    if c.execute(
+                        "UPDATE records SET validated = 1, waiting = NULL WHERE id = $1 AND run = $2 AND status = 'pending'",
+                        &params![id, run],
+                    )? == 1
+                    {
+                        done.push(*id);
+                    }
+                }
+                append_events(c, &done, "validated", None)?;
             }
-            append_events(c, ids, "validated", None)
+            Ok(())
         })
     }
 
-    /// Marks many records sent, each with its own response, in one statement per
-    /// hundreds of records: `UPDATE ... FROM (VALUES ...)`, which both engines
-    /// take with the columns named `column1` and `column2`. Each gets its
-    /// `delivered` event (and `settled` when its outcome was unknown); a row
-    /// that had failed before, written now by a retry or reprocess, loses its
-    /// failed content.
-    pub fn mark_sent_many(&self, items: &[(i64, Value)]) -> Result<()> {
-        let sealed: Vec<(i64, String)> = items
+    /// Marks attempts `(id, run, response)` written, in one statement per
+    /// hundreds of records: `UPDATE ... FROM (VALUES ...)`, which both
+    /// engines take with the columns named `column1`, `column2`, ... Each gets
+    /// its `delivered` event (and `settled` when its outcome was unknown); a
+    /// row that had failed before, written now by a retry or reprocess, loses
+    /// all its content (counts and types stay).
+    pub fn mark_sent_many(&self, items: &[(i64, i64, Value)]) -> Result<()> {
+        let sealed: Vec<(i64, i64, String)> = items
             .iter()
-            .map(|(id, response)| (*id, self.seal(response)))
+            .map(|(id, run, response)| {
+                (*id, *run, self.seal_record(*id, Column::Response, response))
+            })
             .collect();
         self.atomically(|c| {
             let now = now_ms();
             for chunk in sealed.chunks(INSERT_ROWS_PER_STATEMENT) {
-                let ids: Vec<Param> = chunk.iter().map(|(id, _)| Param::Int(*id)).collect();
+                let keys: Vec<Param> = chunk
+                    .iter()
+                    .flat_map(|(id, run, _)| [Param::Int(*id), Param::Int(*run)])
+                    .collect();
+                let pairs: Vec<String> = (0..chunk.len())
+                    .map(|i| format!("(id = ${} AND run = ${})", i * 2 + 1, i * 2 + 2))
+                    .collect();
                 let settled: Vec<i64> = c
                     .query(
                         &format!(
-                            "SELECT id FROM records WHERE uncertain = 1 AND id IN ({}) ORDER BY id",
-                            marks(1, chunk.len())
+                            "SELECT id FROM records WHERE uncertain = 1 AND status IN ('pending', 'submitted')
+                               AND ({}) ORDER BY id",
+                            pairs.join(" OR ")
                         ),
-                        &ids,
+                        &keys,
                     )?
                     .iter()
                     .map(|r| r.i64(0))
@@ -1100,96 +1231,105 @@ impl Db {
                 let rows: Vec<String> = (0..chunk.len())
                     .map(|i| {
                         format!(
-                            "(CAST(${} AS BIGINT), CAST(${} AS TEXT))",
-                            i * 2 + 2,
-                            i * 2 + 3
+                            "(CAST(${} AS BIGINT), CAST(${} AS BIGINT), CAST(${} AS TEXT))",
+                            i * 3 + 2,
+                            i * 3 + 3,
+                            i * 3 + 4
                         )
                     })
                     .collect();
-                let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 2 + 1);
+                let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 3 + 1);
                 values.push(Param::Int(now));
-                for (id, response) in chunk {
-                    values.push(Param::Int(*id));
-                    values.push(Param::Text(response.clone()));
+                for (id, run, response) in chunk {
+                    values.extend(params![id, run, response]);
                 }
-                c.execute(
-                    &format!(
-                        "UPDATE records SET status = 'sent', response = v.column2, error_kind = NULL, error = NULL,
-                                uncertain = 0, waiting = NULL, dispatch = NULL, updated_at = $1
-                         FROM (VALUES {}) AS v WHERE records.id = v.column1",
-                        rows.join(", ")
-                    ),
-                    &values,
-                )?;
-                let ids: Vec<i64> = chunk.iter().map(|(id, _)| *id).collect();
-                append_events(c, &ids, "delivered", None)?;
-                let values: Vec<Param> = ids.iter().map(|id| Param::Int(*id)).collect();
-                c.execute(
-                    &format!(
-                        "UPDATE records SET raw = 'null', original_raw = NULL, content = 'purged'
-                         WHERE failed_at IS NOT NULL AND content IS NULL AND id IN ({})",
-                        marks(1, ids.len())
-                    ),
-                    &values,
-                )?;
-            }
-            Ok(())
-        })
-    }
-
-    pub fn mark_sent(&self, id: i64, response: &Value) -> Result<()> {
-        self.mark_sent_many(&[(id, response.clone())])
-    }
-
-    /// Holds records after a delivery attempt that did not settle them, each
-    /// `(id, attempts, next attempt at)`: they wait, and when the write was
-    /// sent their outcome is unknown until a later attempt settles it.
-    pub fn defer_many(&self, items: &[(i64, u32, i64)], deferral: &Deferral) -> Result<()> {
-        if items.is_empty() {
-            return Ok(());
-        }
-        self.atomically(|c| {
-            let now = now_ms();
-            if deferral.sent {
-                let values: Vec<Param> = items.iter().map(|(id, _, _)| Param::Int(*id)).collect();
-                let newly: Vec<i64> = c
+                let written: Vec<i64> = c
                     .query(
                         &format!(
-                            "SELECT id FROM records WHERE uncertain = 0 AND id IN ({}) ORDER BY id",
-                            marks(1, items.len())
+                            "UPDATE records SET status = 'sent', response = v.column3, error_kind = NULL, error = NULL,
+                                    uncertain = 0, waiting = NULL, dispatch = NULL, updated_at = $1
+                             FROM (VALUES {}) AS v
+                             WHERE records.id = v.column1 AND records.run = v.column2
+                               AND records.status IN ('pending', 'submitted')
+                             RETURNING records.id",
+                            rows.join(", ")
                         ),
                         &values,
                     )?
                     .iter()
                     .map(|r| r.i64(0))
                     .collect();
-                for chunk in newly.chunks(INSERT_ROWS_PER_STATEMENT) {
-                    let values: Vec<Param> = chunk.iter().map(|id| Param::Int(*id)).collect();
+                append_events(c, &written, "delivered", None)?;
+                if !written.is_empty() {
+                    let values: Vec<Param> = written.iter().map(|id| Param::Int(*id)).collect();
                     c.execute(
                         &format!(
-                            "UPDATE records SET uncertain = 1 WHERE id IN ({})",
-                            marks(1, chunk.len())
+                            "UPDATE records SET raw = 'null', original_raw = NULL, resources = NULL, response = NULL,
+                                    content = 'purged'
+                             WHERE failed_at IS NOT NULL AND content IS NULL AND id IN ({})",
+                            marks(1, written.len())
                         ),
                         &values,
                     )?;
                 }
-                append_events(c, &newly, "outcome_unknown", None)?;
             }
-            for (id, attempts, next) in items {
-                c.execute(
-                    "UPDATE records SET attempts = $2, next_attempt_at = $3, error_kind = 'transient', error = $4,
-                            waiting = $5, dispatch = COALESCE(CAST($6 AS TEXT), dispatch), updated_at = $7
-                     WHERE id = $1",
+            Ok(())
+        })
+    }
+
+    /// Holds attempts after a delivery attempt that did not settle them, each
+    /// `(id, run, attempts, next attempt at)`: they wait, and when the write was
+    /// sent their outcome is unknown until a later attempt settles it.
+    pub fn defer_many(&self, items: &[(i64, i64, u32, i64)], deferral: &Deferral) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let reason = bounded(deferral.reason);
+        self.atomically(|c| {
+            let now = now_ms();
+            let mut newly = Vec::new();
+            for (id, run, attempts, next) in items {
+                let updated = c.query(
+                    "UPDATE records SET attempts = $3, next_attempt_at = $4, error_kind = 'transient', error = $5,
+                            waiting = $6, dispatch = COALESCE(CAST($7 AS TEXT), dispatch),
+                            uncertain = CASE WHEN CAST($8 AS BIGINT) = 1 THEN 1 ELSE uncertain END,
+                            updated_at = $9
+                     WHERE id = $1 AND run = $2 AND status = 'pending'
+                     RETURNING uncertain",
                     &params![
                         id,
+                        run,
                         attempts,
                         next,
-                        deferral.reason,
+                        reason,
                         deferral.waiting.as_str(),
                         deferral.dispatch,
+                        deferral.sent,
                         now
                     ],
                 )?;
+                if !updated.is_empty() {
+                    newly.push(*id);
+                }
+            }
+            if deferral.sent && !newly.is_empty() {
+                // `outcome_unknown` once per attempt: when it first became unknown.
+                let values: Vec<Param> = newly.iter().map(|id| Param::Int(*id)).collect();
+                let first: Vec<i64> = c
+                    .query(
+                        &format!(
+                            "SELECT r.id FROM records r WHERE r.id IN ({}) AND r.uncertain = 1
+                               AND NOT EXISTS (SELECT 1 FROM record_events e WHERE e.record_id = r.id
+                                                 AND e.attempt = r.run AND e.kind = 'outcome_unknown')
+                             ORDER BY r.id",
+                            marks(1, newly.len())
+                        ),
+                        &values,
+                    )?
+                    .iter()
+                    .map(|r| r.i64(0))
+                    .collect();
+                append_events(c, &first, "outcome_unknown", None)?;
             }
             Ok(())
         })
@@ -1211,22 +1351,55 @@ impl Db {
     }
 
     /// Puts a record back at the start of the pipeline, optionally with corrected
-    /// source data, as a new attempt of its load's version; appended to its history.
-    pub fn reprocess(&self, id: i64, raw: Option<&Value>) -> Result<bool> {
-        let sealed = raw.map(|r| self.seal(r));
+    /// source data, as a new attempt of its load's version; appended to its
+    /// history. Refused while a write of it is unresolved (a stored
+    /// transaction, a submission, an unknown outcome) or a retry runs it.
+    pub fn reprocess(&self, id: i64, raw: Option<&Value>) -> Result<Reprocess> {
         self.atomically(|c| {
+            let Some(row) = c
+                .query(
+                    "SELECT r.raw, r.original_raw, r.status, r.dispatch, r.uncertain, r.submission,
+                            EXISTS (SELECT 1 FROM retry_claims k WHERE k.record_id = r.id)
+                     FROM records r WHERE r.id = $1",
+                    &params![id],
+                )?
+                .into_iter()
+                .next()
+            else {
+                return Ok(Reprocess::NotFound);
+            };
+            let claimed = match row.get(6) {
+                Value::Bool(b) => *b,
+                other => other.as_i64().unwrap_or(0) != 0,
+            };
+            let in_flight = row.string(2) == "submitted"
+                || row.opt_string(3).is_some()
+                || row.i64(4) == 1
+                || claimed;
+            if in_flight {
+                return Ok(Reprocess::InFlight);
+            }
             let now = now_ms();
-            let n = match &sealed {
-                Some(raw) => c.execute(
-                    "UPDATE records SET status = 'received', original_raw = COALESCE(original_raw, raw), raw = $2,
-                            content = NULL, resources = NULL, resource_count = NULL, resource_types = NULL,
-                            error_kind = NULL, error = NULL, response = NULL, attempts = 0, next_attempt_at = 0,
-                            run = run + 1, exec_retry = NULL, exec_transform_id = NULL, exec_version = NULL,
-                            uncertain = 0, waiting = NULL, dispatch = NULL, validated = 0, submission = NULL,
-                            updated_at = $3
-                     WHERE id = $1",
-                    &params![id, raw, now],
-                )?,
+            match raw {
+                Some(raw) => {
+                    // The row as received is kept once, sealed for its own column.
+                    let original = match row.opt_string(1) {
+                        Some(original) => Some(original),
+                        None => self
+                            .open_record(Some(id), Column::Raw, row.get(0))
+                            .map(|v| self.seal_record(id, Column::OriginalRaw, &v)),
+                    };
+                    c.execute(
+                        "UPDATE records SET status = 'received', original_raw = $2, raw = $3,
+                                content = NULL, resources = NULL, resource_count = NULL, resource_types = NULL,
+                                error_kind = NULL, error = NULL, response = NULL, attempts = 0, next_attempt_at = 0,
+                                run = run + 1, exec_retry = NULL, exec_transform_id = NULL, exec_version = NULL,
+                                uncertain = 0, waiting = NULL, dispatch = NULL, validated = 0, submission = NULL,
+                                updated_at = $4
+                         WHERE id = $1",
+                        &params![id, original, self.seal_record(id, Column::Raw, raw), now],
+                    )?
+                }
                 None => c.execute(
                     "UPDATE records SET status = 'received', resources = NULL, resource_count = NULL, resource_types = NULL,
                             error_kind = NULL, error = NULL, response = NULL, attempts = 0, next_attempt_at = 0,
@@ -1237,14 +1410,12 @@ impl Db {
                     &params![id, now],
                 )?,
             };
-            if n > 0 {
-                append_events(c, &[id], "retried", None)?;
-                c.execute(
-                    "UPDATE files SET status = 'processing', finished_at = NULL WHERE id = (SELECT file_id FROM records WHERE id = $1)",
-                    &params![id],
-                )?;
-            }
-            Ok(n > 0)
+            append_events(c, &[id], "retried", None)?;
+            c.execute(
+                "UPDATE files SET status = 'processing', finished_at = NULL WHERE id = (SELECT file_id FROM records WHERE id = $1)",
+                &params![id],
+            )?;
+            Ok(Reprocess::Done)
         })
     }
 
@@ -1339,5 +1510,225 @@ impl Db {
         counts.insert("files".into(), json!(files));
         counts.insert("duplicate_files".into(), json!(duplicates));
         Ok(Value::Object(counts))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A load of `n` rows that all failed in one group.
+    fn failed_load(db: &Db, n: i64) -> (i64, super::super::Group) {
+        let load = db.open_load("src", "a.csv", "sha", 3, None, None).unwrap();
+        let rows: Vec<(i64, Value, Option<String>)> =
+            (1..=n).map(|l| (l, json!({"v": l}), None)).collect();
+        db.insert_records(load, "src", &rows).unwrap();
+        for item in db.received_records("src", 1000).unwrap() {
+            db.mark_failed(
+                item.id,
+                item.run,
+                "data",
+                "bad",
+                Some(&json!({"issue": 1})),
+                None,
+            )
+            .unwrap();
+        }
+        let failures = db.load_failures(load).unwrap();
+        let group = db
+            .failure_group(load, failures[0]["group"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        (load, group)
+    }
+
+    #[test]
+    fn a_row_written_after_failing_loses_every_content_column() {
+        let db = Db::in_memory().unwrap();
+        let (_, _) = failed_load(&db, 1);
+        let id = db.query("SELECT id FROM records", &[]).unwrap()[0].i64(0);
+        assert_eq!(
+            db.reprocess(id, Some(&json!({"v": 9}))).unwrap(),
+            Reprocess::Done
+        );
+        let item = &db.received_records("src", 10).unwrap()[0];
+        db.mark_transformed(
+            item.id,
+            item.run,
+            &json!([{"resourceType": "Patient", "id": "p"}]),
+        )
+        .unwrap();
+        db.mark_sent_many(&[(item.id, item.run, json!([{"status": "201"}]))])
+            .unwrap();
+        let row = &db
+            .query(
+                "SELECT raw, original_raw, resources, response, content, resource_count, resource_types FROM records",
+                &[],
+            )
+            .unwrap()[0];
+        assert_eq!(
+            (
+                row.string(0),
+                row.opt_string(1),
+                row.opt_string(2),
+                row.opt_string(3)
+            ),
+            ("null".to_string(), None, None, None)
+        );
+        assert_eq!(row.string(4), "purged");
+        assert_eq!(
+            (row.i64(5), row.string(6)),
+            (1, r#"{"Patient":1}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn a_record_in_flight_is_not_reprocessed_and_stale_results_are_dropped() {
+        let db = Db::in_memory().unwrap();
+        let load = db.open_load("src", "a.csv", "sha", 3, None, None).unwrap();
+        db.insert_records(load, "src", &[(1, json!({}), None), (2, json!({}), None)])
+            .unwrap();
+        let items = db.received_records("src", 10).unwrap();
+        for i in &items {
+            db.mark_transformed(
+                i.id,
+                i.run,
+                &json!([{"resourceType": "Patient", "id": "p"}]),
+            )
+            .unwrap();
+        }
+        // In a stored transaction: refused.
+        let d = db
+            .create_dispatch(
+                "src",
+                &json!({"bundle": {}}),
+                &[(items[0].id, items[0].run)],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            db.reprocess(items[0].id, None).unwrap(),
+            Reprocess::InFlight
+        );
+        // Outcome unknown: refused.
+        db.defer_many(
+            &[(items[1].id, items[1].run, 1, 0)],
+            &Deferral {
+                waiting: Waiting::Destination,
+                reason: "lost",
+                sent: true,
+                dispatch: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.reprocess(items[1].id, None).unwrap(),
+            Reprocess::InFlight
+        );
+        db.leave_dispatch(&[items[0].id]).unwrap();
+        db.drop_dispatch_if_settled(&d).unwrap();
+        assert_eq!(db.reprocess(items[0].id, None).unwrap(), Reprocess::Done);
+        // The delivery of the replaced attempt cannot settle the new one.
+        db.mark_sent_many(&[(items[0].id, items[0].run, json!([]))])
+            .unwrap();
+        db.mark_failed(items[0].id, items[0].run, "server", "late", None, None)
+            .unwrap();
+        let status = db
+            .query(
+                "SELECT status, run FROM records WHERE id = $1",
+                &params![items[0].id],
+            )
+            .unwrap();
+        assert_eq!(
+            (status[0].string(0), status[0].i64(1)),
+            ("received".into(), 2)
+        );
+        assert_eq!(db.reprocess(9999, None).unwrap(), Reprocess::NotFound);
+    }
+
+    #[test]
+    fn failed_rows_are_limited_in_the_store_and_checked_for_membership() {
+        let db = Db::in_memory().unwrap();
+        let (load, group) = failed_load(&db, 150);
+        let rows = db.failed_rows(load, &group.id, None).unwrap();
+        assert_eq!(rows.len(), 100);
+        assert_eq!(rows[0].raw, json!({"v": 1}));
+        assert_eq!(rows[0].context["line"], 1);
+        let picked = db
+            .failed_rows(load, &group.id, Some(&[rows[5].record_id]))
+            .unwrap();
+        assert_eq!(picked.len(), 1);
+        assert!(matches!(
+            db.failed_rows(load, &group.id, Some(&[rows[5].record_id, 999_999])),
+            Err(FailedRowsError::RecordNotInGroup(999_999))
+        ));
+        assert!(matches!(
+            db.failed_rows(load, "g_none", None),
+            Err(FailedRowsError::GroupNotFound)
+        ));
+    }
+
+    #[test]
+    fn group_records_page_in_line_order_both_ways() {
+        let db = Db::in_memory().unwrap();
+        let (_, group) = failed_load(&db, 5);
+        let lines = |rows: Vec<Value>| -> Vec<i64> {
+            rows.iter().map(|r| r["line"].as_i64().unwrap()).collect()
+        };
+        assert_eq!(
+            lines(db.group_records(&group, None, None, 2).unwrap()),
+            [1, 2]
+        );
+        let second = db.group_records(&group, None, None, 2).unwrap()[1].clone();
+        let key = (
+            second["line"].as_i64().unwrap(),
+            second["id"].as_i64().unwrap(),
+        );
+        assert_eq!(
+            lines(db.group_records(&group, Some(key), None, 2).unwrap()),
+            [3, 4]
+        );
+        let fourth = db.group_records(&group, Some(key), None, 2).unwrap()[1].clone();
+        let key = (
+            fourth["line"].as_i64().unwrap(),
+            fourth["id"].as_i64().unwrap(),
+        );
+        assert_eq!(
+            lines(db.group_records(&group, None, Some(key), 2).unwrap()),
+            [2, 3]
+        );
+    }
+
+    #[test]
+    fn reasons_are_cut_and_responses_stay_sealed() {
+        let db = Db::in_memory().unwrap();
+        let load = db.open_load("src", "a.csv", "sha", 3, None, None).unwrap();
+        db.insert_records(load, "src", &[(1, json!({}), None)])
+            .unwrap();
+        let item = &db.received_records("src", 1).unwrap()[0];
+        let long = "x".repeat(2000);
+        db.mark_failed(
+            item.id,
+            item.run,
+            "server",
+            &long,
+            Some(&json!({"zq": "body"})),
+            None,
+        )
+        .unwrap();
+        let row = &db
+            .query("SELECT error, response FROM records", &[])
+            .unwrap()[0];
+        assert_eq!(row.string(0).chars().count(), REASON_MAX_CHARS + 1);
+        assert!(row.string(1).starts_with("c1.") && !row.string(1).contains("zq"));
+        let reasons = db
+            .query(
+                "SELECT reason FROM record_events WHERE kind = 'failed'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(reasons[0].string(0).chars().count(), REASON_MAX_CHARS + 1);
+        let groups = db.query("SELECT reason FROM failure_groups", &[]).unwrap();
+        assert_eq!(groups[0].string(0).chars().count(), REASON_MAX_CHARS + 1);
     }
 }

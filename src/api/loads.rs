@@ -2,7 +2,6 @@
 //! failure groups and their samples; durable retries of a group; the 0.1
 //! retry; and purging expired failed content.
 
-use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -14,7 +13,7 @@ use serde_json::{Value, json};
 use super::body::{LooseJson, StrictJson};
 use super::paging::{self, Direction};
 use super::{ApiError, ApiResult, AppState, not_found};
-use crate::db::{Group, RetryRefusal};
+use crate::db::{Db, Group, RetryRefusal};
 use crate::idempotency::Idempotent;
 use crate::versions::VersionRef;
 
@@ -185,14 +184,58 @@ fn group_or_404(s: &AppState, load_id: i64, group: &str) -> Result<Group, ApiErr
         .ok_or_else(|| not_found("group_not_found", &format!("failure group {group}")))
 }
 
-/// One failure group with its failing records' ids, lines and attempts.
+#[derive(Deserialize)]
+struct GroupQuery {
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+/// One failure group with its failing records' ids, lines and attempts,
+/// paged by `limit` and `cursor` in line order.
 async fn get_group(
     State(s): State<AppState>,
     Path((file_id, group)): Path<(i64, String)>,
+    Query(q): Query<GroupQuery>,
 ) -> Result<Response, ApiError> {
     let group = group_or_404(&s, file_id, &group)?;
+    let list = format!("failures:load={file_id}:group={}", group.id);
+    let request = paging::request::<(i64, i64)>(&s.db, &list, q.limit, q.cursor.as_deref())?;
+    let limit = request.limit;
+    let (after, before) = match &request.position {
+        Some(p) if p.dir == Direction::Previous => (None, Some(p.after)),
+        Some(p) => (Some(p.after), None),
+        None => (None, None),
+    };
+    let mut records = s.db.group_records(&group, after, before, limit + 1)?;
+    let more = records.len() > limit;
+    if before.is_some() {
+        if more {
+            records.remove(0);
+        }
+    } else {
+        records.truncate(limit);
+    }
+    let key = |r: &Value| {
+        (
+            r["line"].as_i64().unwrap_or(0),
+            r["id"].as_i64().unwrap_or(0),
+        )
+    };
+    let next = match records.last() {
+        Some(last) if more || before.is_some() => {
+            Some(paging::cursor(&s.db, &list, Direction::Next, &key(last))?)
+        }
+        _ => None,
+    };
+    let previous = match records.first() {
+        Some(first) if request.position.is_some() && (after.is_some() || more) => Some(
+            paging::cursor(&s.db, &list, Direction::Previous, &key(first))?,
+        ),
+        _ => None,
+    };
     let mut body = group.to_json();
-    body["records"] = Value::Array(s.db.group_records(&group, 1000)?);
+    body["records"] = Value::Array(records);
+    body["page"] = paging::page(next, previous);
     Ok(no_store(body))
 }
 
@@ -286,6 +329,10 @@ fn retry_version(
 
 fn refusal(e: RetryRefusal) -> ApiError {
     match e {
+        RetryRefusal::GroupNotFound => not_found("group_not_found", "the failure group"),
+        RetryRefusal::TransformDeleted => {
+            ApiError::conflict("transform_deleted", "the retry's transform was deleted")
+        }
         RetryRefusal::ContentExpired => content_expired(),
         RetryRefusal::InProgress(retry) => {
             ApiError::conflict("retry_in_progress", "an unfinished retry covers these rows")
@@ -299,26 +346,48 @@ fn refusal(e: RetryRefusal) -> ApiError {
 }
 
 /// `POST /api/loads/{id}/retries` (key required): a durable retry of one
-/// failure group, running the version named or the latest saved one.
+/// failure group, running the version named or the latest saved one. The
+/// acceptance and its idempotency answer commit in one transaction, so a
+/// replay never finds a retry without its answer or an answer without its
+/// retry (a claim taken over after a crash therefore never finds work done).
 async fn create_retry(
     State(s): State<AppState>,
     Path(file_id): Path<i64>,
     request: Idempotent,
 ) -> Result<Response, ApiError> {
+    // What the work needs from outside the store's transaction, read first
+    // as data only: the refusals are decided inside, in the contract's order.
+    let body = super::body::strict::<RetryBody>(request.body());
+    let source_id = s.db.load_source(file_id).ok().flatten();
+    let group = match (&body, &source_id) {
+        (Ok(b), Some(_)) => s.db.failure_group(file_id, &b.group).ok().flatten(),
+        _ => None,
+    };
+    let version = match (&body, &group, &source_id) {
+        (Ok(b), Some(g), Some(src)) => Some(retry_version(&s, g, src, b.version)),
+        _ => None,
+    };
     let db = s.db.clone();
-    request
-        .run(&db, true, move |_attempt, body: Bytes| async move {
-            let RetryBody { group, version } = super::body::strict(&body)?;
-            let source_id =
-                s.db.load_source(file_id)?
-                    .ok_or_else(|| not_found("load_not_found", &format!("load {file_id}")))?;
-            let group = group_or_404(&s, file_id, &group)?;
-            let version = retry_version(&s, &group, &source_id, version)?;
-            let retry = s.db.create_retry(&group, &version).map_err(refusal)?;
-            let _ = s.manager.check_now(&source_id);
+    let response = request
+        .run_in_tx(&db, true, move |tx, _attempt, _bytes| {
+            let body = body?;
+            if source_id.is_none() {
+                return Err(not_found("load_not_found", &format!("load {file_id}")));
+            }
+            let group = group.ok_or_else(|| {
+                not_found("group_not_found", &format!("failure group {}", body.group))
+            })?;
+            let version = version.expect("resolved with the group")?;
+            let retry = Db::create_retry_in(tx, file_id, &group.id, &version)?.map_err(refusal)?;
             Ok((StatusCode::ACCEPTED, json!({"retry": retry})))
         })
-        .await
+        .await?;
+    if response.status() == StatusCode::ACCEPTED
+        && let Some(source_id) = s.db.load_source(file_id)?
+    {
+        let _ = s.manager.check_now(&source_id);
+    }
+    Ok(response)
 }
 
 async fn list_retries(State(s): State<AppState>, Path(file_id): Path<i64>) -> ApiResult {

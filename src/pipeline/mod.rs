@@ -333,7 +333,7 @@ impl FeedRunner {
             if self.bulk_transformed {
                 self.transform_received(None).await?;
             } else {
-                self.preflight_received()?;
+                self.preflight_received().await?;
             }
             self.submit_pending().await?;
             self.poll_submissions().await?;

@@ -254,3 +254,111 @@ async fn a_zip_in_a_folder_is_unpacked_and_archived() {
         .unwrap();
     assert_eq!(alerts[0]["kind"], "unreadable_file");
 }
+
+/// A pass that stopped half-way through a zip (the container `unpacking`, one
+/// entry admitted) is resumed by the next: the entry already in is not taken
+/// again, the rest are, and the zip is not mistaken for a duplicate of itself.
+#[tokio::test]
+async fn a_zip_unpacked_half_way_is_resumed_not_skipped() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found");
+        return;
+    };
+    let urls: Urls = Arc::default();
+    let app = Router::new()
+        .route("/", post(batch))
+        .with_state(urls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hfs = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let feed: hie::config::FeedConfig = serde_yaml::from_str(&format!(
+        "id: drops\nname: Drops\nsource:\n  type: s3\n  bucket: unused\nformat: ndjson\ntransform: {}\n",
+        repo.join("transforms/fhir_passthrough.py").display().to_string().replace('\\', "/")
+    ))
+    .unwrap();
+    let zip = export_zip();
+    let store = Arc::new(InMemory::new());
+    store
+        .put(
+            &ObjectPath::from("in/drop.zip"),
+            PutPayload::from(zip.clone()),
+        )
+        .await
+        .unwrap();
+    let source = Source::Object(ObjectSource::new(
+        store.clone(),
+        "in",
+        "processed",
+        "*.zip",
+        Duration::ZERO,
+    ));
+    let db = Arc::new(Db::in_memory().unwrap());
+
+    // What the stopped pass left: the container, and its first entry admitted.
+    let container = db
+        .insert_file(
+            "drops",
+            "drop.zip",
+            &hie::formats::sha256_hex(&zip),
+            zip.len() as u64,
+            "unpacking",
+            None,
+            None,
+        )
+        .unwrap();
+    let patients = b"{\"resourceType\":\"Patient\",\"id\":\"p1\"}\n{\"resourceType\":\"Patient\",\"id\":\"p2\"}\n";
+    let entry = db
+        .open_load(
+            "drops",
+            "drop.zip!/out/Patient.ndjson",
+            &hie::formats::sha256_hex(patients),
+            patients.len() as u64,
+            None,
+            None,
+        )
+        .unwrap();
+    db.insert_records(
+        entry,
+        "drops",
+        &[
+            (1, json!({"resourceType": "Patient", "id": "p1"}), None),
+            (2, json!({"resourceType": "Patient", "id": "p2"}), None),
+        ],
+    )
+    .unwrap();
+
+    let runner = FeedRunner::with_source(
+        feed,
+        source,
+        db.clone(),
+        Arc::new(FhirClient::new(&hfs)),
+        Arc::new(Alerter::new(db.clone(), None)),
+        python,
+        &repo.join("hie_runtime"),
+        &hfs,
+        "http://127.0.0.1:0",
+    );
+    runner.tick().await.unwrap();
+
+    let files = db
+        .query_json("SELECT id, name, status FROM files ORDER BY id", [])
+        .unwrap();
+    assert!(
+        files.iter().all(|f| f["status"] != "duplicate"),
+        "nothing is a duplicate of the zip itself: {files:?}"
+    );
+    let named = |n: &str| files.iter().filter(|f| f["name"] == n).count();
+    assert_eq!(named("drop.zip"), 1);
+    assert_eq!(named("drop.zip!/out/Patient.ndjson"), 1, "{files:?}");
+    assert_eq!(named("drop.zip!/out/Observation.ndjson"), 1, "{files:?}");
+    assert_ne!(files[0]["status"], "unpacking");
+    assert_eq!(files[0]["id"], container);
+    let counts = db.feed_counts("drops").unwrap();
+    assert_eq!(counts["sent"], 3, "{counts}");
+    assert!(
+        store.head(&ObjectPath::from("in/drop.zip")).await.is_err(),
+        "the zip is archived once every entry is in"
+    );
+}
