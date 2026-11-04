@@ -120,11 +120,15 @@ impl FeedRunner {
 
     /// A runner over a given source and the engine's shared services.
     pub fn from_services(feed: FeedConfig, source: Source, services: &Services) -> Self {
-        let feed_bulk_transformed = feed.bulk_transformed();
-        let bulk = (feed.delivery.method == DeliveryMethod::BulkSubmit).then(|| {
-            BulkSubmitter::new(&services.fhir_base_url, &services.public_url)
-                .with_credentials(services.fhir.credentials().clone())
-        });
+        // `initial_method: bulk_submit` sends the first load by `$bulk-submit`
+        // over the transformed resources, and every later one by `method`.
+        let initial_bulk = feed.delivery.initial_method == Some(DeliveryMethod::BulkSubmit);
+        let feed_bulk_transformed = feed.bulk_transformed() || initial_bulk;
+        let bulk =
+            (feed.delivery.method == DeliveryMethod::BulkSubmit || initial_bulk).then(|| {
+                BulkSubmitter::new(&services.fhir_base_url, &services.public_url)
+                    .with_credentials(services.fhir.credentials().clone())
+            });
         Self {
             feed,
             source,
@@ -325,7 +329,7 @@ impl FeedRunner {
                 Some(e)
             }
         };
-        if self.bulk.is_some() {
+        if self.bulk.is_some() && !self.initial_bulk_only() {
             if self.bulk_transformed {
                 self.transform_received(None).await?;
             } else {
@@ -335,6 +339,10 @@ impl FeedRunner {
             self.poll_submissions().await?;
         } else {
             self.transform_and_deliver().await?;
+            if self.initial_bulk_only() {
+                self.submit_pending().await?;
+                self.poll_submissions().await?;
+            }
         }
         self.finish()?;
         self.check_silence()?;

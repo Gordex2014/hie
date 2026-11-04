@@ -96,20 +96,23 @@ impl FeedRunner {
         {
             return Ok(());
         }
+        if self.bulk.is_none() || self.initial_bulk_only() {
+            self.deliver_due().await?;
+        }
         if self.bulk.is_some() {
             self.submit_pending().await?;
             self.poll_submissions().await?;
-        } else {
-            self.deliver_due().await?;
         }
         self.finish()
     }
 
     pub(super) async fn deliver_due(&self) -> Result<()> {
         loop {
-            let items = self
-                .db
-                .due_records(&self.feed.id, self.feed.delivery.batch_size)?;
+            // The first load of an `initial_method: bulk_submit` source goes by `$bulk-submit`.
+            let bulk_load = self.initial_bulk_load()?;
+            let items =
+                self.db
+                    .due_records(&self.feed.id, self.feed.delivery.batch_size, bulk_load)?;
             if items.is_empty() {
                 return Ok(());
             }
@@ -470,6 +473,9 @@ impl FeedRunner {
     }
 }
 
+/// A Bundle entry: its request url and its resource.
+type Entry = (String, Value);
+
 /// A record's resources.
 fn resources(item: &WorkItem) -> Vec<Value> {
     item.resources
@@ -481,7 +487,7 @@ fn resources(item: &WorkItem) -> Vec<Value> {
 
 /// The Bundle entries of `items` (request url, resource), and which item
 /// (by position) each entry belongs to.
-fn entries(items: &[WorkItem]) -> Result<(Vec<(String, Value)>, Vec<usize>)> {
+fn entries(items: &[WorkItem]) -> Result<(Vec<Entry>, Vec<usize>)> {
     let mut entries = Vec::new();
     let mut owner = Vec::new();
     for (i, item) in items.iter().enumerate() {

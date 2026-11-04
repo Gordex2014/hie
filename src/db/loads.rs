@@ -883,29 +883,42 @@ impl Db {
         )
     }
 
-    pub fn due_records(&self, feed: &str, limit: usize) -> Result<Vec<WorkItem>> {
+    /// Pending records due for delivery, but those of `except_load`.
+    pub fn due_records(
+        &self,
+        feed: &str,
+        limit: usize,
+        except_load: Option<i64>,
+    ) -> Result<Vec<WorkItem>> {
         self.work_items(
             &format!(
                 "SELECT {WORK_COLUMNS}
              FROM records r JOIN files f ON f.id = r.file_id
              WHERE r.feed_id = $1 AND r.status = 'pending' AND r.next_attempt_at <= $2
+               AND (CAST($4 AS BIGINT) IS NULL OR r.file_id <> CAST($4 AS BIGINT))
              ORDER BY r.id LIMIT $3"
             ),
-            &params![feed, now_ms(), limit],
+            &params![feed, now_ms(), limit, except_load],
         )
     }
 
-    /// Pending records of a feed that no submission holds yet and whose next
-    /// attempt is due, with their resources: what the engine writes out itself
-    /// on the transformed bulk path.
-    pub fn submittable_items(&self, feed: &str, limit: usize) -> Result<Vec<WorkItem>> {
+    /// Pending records of a feed (of `only_load`, when given) that no
+    /// submission holds yet and whose next attempt is due, with their
+    /// resources: what the engine writes out itself on the transformed bulk path.
+    pub fn submittable_items(
+        &self,
+        feed: &str,
+        limit: usize,
+        only_load: Option<i64>,
+    ) -> Result<Vec<WorkItem>> {
         self.work_items(
             &format!(
                 "SELECT {WORK_COLUMNS} FROM records r JOIN files f ON f.id = r.file_id
                  WHERE r.feed_id = $1 AND r.status = 'pending' AND r.submission IS NULL AND r.next_attempt_at <= $2
+                   AND (CAST($4 AS BIGINT) IS NULL OR r.file_id = CAST($4 AS BIGINT))
                  ORDER BY r.id LIMIT $3"
             ),
-            &params![feed, now_ms(), limit],
+            &params![feed, now_ms(), limit, only_load],
         )
     }
 

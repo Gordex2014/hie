@@ -56,7 +56,10 @@ impl FeedRunner {
             Outcome::Resources(mut resources) => {
                 // On the transformed bulk path a resource must carry an id:
                 // one is derived from the identifier when there is none.
-                let checked = if self.bulk_transformed {
+                let by_bulk = self.bulk_transformed
+                    && (!self.initial_bulk_only()
+                        || self.initial_bulk_load()? == Some(item.file_id));
+                let checked = if by_bulk {
                     resources
                         .iter_mut()
                         .map(transform::derive_id)

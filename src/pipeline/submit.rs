@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use crate::bulk::{self, BulkSubmitter, Poll};
+use crate::config::DeliveryMethod;
 use crate::db::now_ms;
 use crate::fhir::{self, SendError};
 use crate::transform;
@@ -19,6 +20,22 @@ use super::deliver::Checked;
 const SETTLE_PAGE: usize = 5_000;
 
 impl FeedRunner {
+    /// Whether `$bulk-submit` is only for the source's first load
+    /// (`delivery.initial_method: bulk_submit` with another `method`).
+    pub(super) fn initial_bulk_only(&self) -> bool {
+        self.feed.delivery.initial_method == Some(DeliveryMethod::BulkSubmit)
+            && self.feed.delivery.method != DeliveryMethod::BulkSubmit
+    }
+
+    /// The load that goes by `$bulk-submit` while the others go by `method`:
+    /// the source's first, when [`FeedRunner::initial_bulk_only`].
+    pub(super) fn initial_bulk_load(&self) -> Result<Option<i64>> {
+        if !self.initial_bulk_only() {
+            return Ok(None);
+        }
+        self.db.first_load_id(&self.feed.id)
+    }
+
     /// Opens one submission per drop: the files with pending records, up to the
     /// manifest cap, handed to HFS through a manifest the engine serves.
     pub(super) async fn submit_pending(&self) -> Result<()> {
@@ -238,9 +255,16 @@ impl FeedRunner {
     /// `bulk_dir` served by the engine, and opens one submission over them.
     pub(super) async fn submit_transformed(&self, bulk: &BulkSubmitter) -> Result<()> {
         loop {
-            let items = self
-                .db
-                .submittable_items(&self.feed.id, self.feed.delivery.bulk_records_max)?;
+            let only = match self.initial_bulk_load()? {
+                Some(load) => Some(load),
+                None if self.initial_bulk_only() => return Ok(()),
+                None => None,
+            };
+            let items = self.db.submittable_items(
+                &self.feed.id,
+                self.feed.delivery.bulk_records_max,
+                only,
+            )?;
             if items.is_empty() {
                 return Ok(());
             }

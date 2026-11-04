@@ -427,12 +427,11 @@ impl Db {
 
     /// The ids, lines and attempts of the group's failing rows, in line order.
     pub fn group_records(&self, group: &Group, limit: usize) -> Result<Vec<Value>> {
-        Ok(self
-            .query_json(
-                "SELECT id, line, run AS attempts FROM records
-                 WHERE file_id = $1 AND group_id = $2 AND status = 'rejected' ORDER BY line, id LIMIT $3",
-                params![group.load_id, group.id, limit],
-            )?)
+        self.query_json(
+            "SELECT id, line, run AS attempts FROM records
+             WHERE file_id = $1 AND group_id = $2 AND status = 'rejected' ORDER BY line, id LIMIT $3",
+            params![group.load_id, group.id, limit],
+        )
     }
 
     // ---- retries ---------------------------------------------------------------
@@ -745,7 +744,7 @@ impl Db {
                 },
             ));
         }
-        runs.sort_by(|a, b| b.0.cmp(&a.0));
+        runs.sort_by_key(|run| std::cmp::Reverse(run.0));
         Ok(runs.into_iter().take(limit).map(|(_, run)| run).collect())
     }
 
@@ -844,4 +843,115 @@ fn run_outcome(running: bool, written: i64, failed: i64, unknown: i64) -> String
         "partial"
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::versions::Environment;
+
+    fn version(n: i64) -> VersionRef {
+        VersionRef {
+            transform_id: "lab".into(),
+            version: n,
+            code_sha256: "a".repeat(64),
+            environment: Environment::local(),
+        }
+    }
+
+    /// Retries asked for at once never cover a row twice: one claims the
+    /// group's rows, the others see it in progress.
+    #[test]
+    fn concurrent_retries_of_a_group_claim_its_rows_once() {
+        let db = Arc::new(Db::in_memory().unwrap());
+        let load = db
+            .open_load("src", "a.csv", "sha", 3, None, Some(&version(1)))
+            .unwrap();
+        db.insert_records(
+            load,
+            "src",
+            &[(1, json!({"v": "x"}), None), (2, json!({"v": "y"}), None)],
+        )
+        .unwrap();
+        for item in db.received_records("src", 10).unwrap() {
+            db.mark_failed(
+                item.id,
+                "data",
+                "not a number",
+                None,
+                Some(&json!({"line": 3})),
+            )
+            .unwrap();
+        }
+        let failures = db.load_failures(load).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["count"], 2);
+        assert_eq!(failures[0]["location"], json!({"line": 3}));
+        let group = db
+            .failure_group(load, failures[0]["group"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let outcomes: Vec<Result<Value, RetryRefusal>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let (db, group) = (db.clone(), group.clone());
+                    s.spawn(move || db.create_retry(&group, &version(2)))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let accepted: Vec<&Value> = outcomes.iter().filter_map(|o| o.as_ref().ok()).collect();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0]["rows"], 2);
+        assert_eq!(accepted[0]["transform"], json!({"id": "lab", "version": 2}));
+        assert!(outcomes.iter().all(|o| match o {
+            Ok(_) => true,
+            Err(RetryRefusal::InProgress(id)) => *id == accepted[0]["id"],
+            Err(_) => false,
+        }));
+        // The claimed rows run the retry's version.
+        let items = db.received_records("src", 10).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| i.retry.as_ref()
+            == accepted[0]["id"].as_str().map(str::to_string).as_ref()
+            && i.version.as_ref().map(|v| v.version) == Some(2)));
+        let history = db.record_history(items[0].id).unwrap().unwrap();
+        let kinds: Vec<&str> = history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["admitted", "failed", "retried"]);
+        assert_eq!(history["events"][2]["transform"]["version"], 2);
+        assert_eq!(history["events"][1]["transform"]["version"], 1);
+    }
+
+    /// Content is sealed in the store's files and opened when read.
+    #[test]
+    fn row_content_is_sealed_at_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hie.db");
+        let db = Db::open(&path).unwrap();
+        let load = db.open_load("src", "a.csv", "sha", 3, None, None).unwrap();
+        db.insert_records(
+            load,
+            "src",
+            &[(1, json!({"patient": "zq-secret-marker"}), None)],
+        )
+        .unwrap();
+        let stored = db.query("SELECT raw FROM records", &[]).unwrap();
+        assert!(stored[0].string(0).starts_with("v1."));
+        assert_eq!(
+            db.query_json("SELECT raw FROM records", []).unwrap()[0]["raw"]["patient"],
+            "zq-secret-marker"
+        );
+        drop(db);
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            assert!(!bytes.windows(16).any(|w| w == b"zq-secret-marker"));
+        }
+    }
 }

@@ -598,3 +598,105 @@ async fn a_zipped_export_is_staged_and_submitted() {
         "staged entries removed: {staged:?}"
     );
 }
+
+/// `POST /` as a batch: every entry stored; counts the Bundles.
+async fn rest_batch(
+    State(c): State<Consumer>,
+    Json(bundle): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let entries: Vec<Value> = bundle["entry"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|_| json!({"response": {"status": "201 Created"}}))
+        .collect();
+    c.submissions
+        .lock()
+        .unwrap()
+        .entry("rest".into())
+        .or_default()
+        .polls += 1;
+    (
+        StatusCode::OK,
+        Json(json!({"resourceType": "Bundle", "type": "batch-response", "entry": entries})),
+    )
+}
+
+/// `delivery.initial_method: bulk_submit`: the source's first load goes by
+/// `$bulk-submit` over its transformed resources, the next one by REST.
+#[tokio::test]
+async fn the_first_load_goes_in_bulk_and_the_next_by_rest() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let consumer = Consumer {
+        base: Arc::default(),
+        submissions: Arc::default(),
+    };
+    let (hfs_listener, hfs_url) = bind().await;
+    *consumer.base.lock().unwrap() = hfs_url.clone();
+    let hfs = Router::new()
+        .route("/", post(rest_batch))
+        .route("/$bulk-submit", post(kickoff))
+        .route("/$bulk-submit-status", post(status_kickoff))
+        .route("/bulk-submit-status/{id}", get(poll))
+        .route("/bulk-submit-file/{id}/{part}", get(artifact))
+        .with_state(consumer.clone());
+    tokio::spawn(async move { axum::serve(hfs_listener, hfs).await.unwrap() });
+
+    let (hie_listener, hie_url) = bind().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::copy(
+        repo().join("transforms/lab_results.py"),
+        root.join("transforms/lab_results.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {hfs_url}\npublic_url: {hie_url}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sources/labs.yaml"),
+        "id: labs\nname: Labs\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 60\n  min_file_age_ms: 0\n\
+         transform: transforms/lab_results.py\ndelivery:\n  method: rest\n  initial_method: bulk_submit\n  initial_backoff_ms: 10\n",
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    manager.pause("labs", None).unwrap();
+    let runner = manager.runner("labs").unwrap();
+    let db = state.db.clone();
+    let router = hie::api::router(state);
+    tokio::spawn(async move { axum::serve(hie_listener, router).await.unwrap() });
+
+    let inbox = root.join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::copy(repo().join("examples/data/labs.csv"), inbox.join("a.csv")).unwrap();
+    runner.tick().await.unwrap();
+    assert_eq!(db.feed_counts("labs").unwrap()["submitted"], 3);
+    runner.tick().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    runner.tick().await.unwrap();
+    assert_eq!(db.feed_counts("labs").unwrap()["sent"], 3);
+    assert!(!consumer.submissions.lock().unwrap().contains_key("rest"));
+
+    std::fs::write(
+        inbox.join("b.csv"),
+        "patient,code,display,value,unit,date\nPatient/3,2345-7,Glucose,99,mg/dL,2026-10-16\n",
+    )
+    .unwrap();
+    runner.tick().await.unwrap();
+    assert_eq!(db.feed_counts("labs").unwrap()["sent"], 4);
+    assert_eq!(consumer.submissions.lock().unwrap()["rest"].polls, 1);
+    assert_eq!(
+        consumer.submissions.lock().unwrap().len(),
+        2,
+        "one submission, one batch"
+    );
+}
