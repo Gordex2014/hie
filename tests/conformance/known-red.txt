@@ -28,19 +28,10 @@ sequences/sources-namespaced-apart H-connectors            # also H-history: row
 sequences/validation-unavailable-delivers-nothing H-connectors # also H-history: rows and outcome on loads and records
 sources/check-now-pass H-connectors
 sources/destination-facts H-connectors
-transforms/try-validation-issues H-connectors              # also H-history: the Try answer
 
 # H-versions: transform ids and immutable versions, save conflicts, environments, pins, load-start snapshot.
 sequences/save-during-load-keeps-version H-versions        # also H-history: transform and rows on loads
 sequences/runtime-environment-pinned H-versions           # also H-history: waiting on loads and retries, retries
-sources/pin-and-follow H-versions
-transforms/create-idempotent H-versions
-transforms/delete H-versions
-transforms/legacy-put-creates-version H-versions
-transforms/rename-keeps-id H-versions
-transforms/save-conflict H-versions
-transforms/try-saved-version H-versions                    # also H-history: the Try answer
-transforms/versions-and-metadata H-versions
 
 # H-history: immutable failure and attempt history, retries, period counts, loads paging and rows,
 # outcome unknown, failed-content custody, usage history, Try answers with dispositions.
@@ -51,10 +42,5 @@ loads/legacy-retry-creates-retries H-history
 loads/outcome-unknown H-history
 loads/paging-cursor H-history
 loads/retry-lifecycle H-history                            # also H-versions: saving a version of a file transform
-sequences/lost-try-not-replayed H-history
 sequences/pinned-retry-runs-latest H-history               # also H-versions: pins and versions
-transforms/try-cancel H-history
-transforms/try-diagnostics-pass-through H-history
-transforms/try-inline H-history
-transforms/try-load-failure H-history
 transforms/usage-history H-history                         # also H-versions: pins and versions
