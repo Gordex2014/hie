@@ -501,12 +501,13 @@ Try runs code on a few records without storing anything or writing to the destin
 `GET /api/destination` → `200`:
 
 ```json
-{"base_url": "http://hfs:8080", "display_name": "Northgate FHIR", "fhir_version": "4.0.1",
+{"base_url": "http://hfs:8080", "display_name": "Northgate FHIR", "tenant": "northgate",
+ "tenant_header": "X-Tenant-ID", "fhir_version": "4.0.1",
  "software": {"name": "Helios FHIR Server", "version": "0.4.0"}, "reachable": true,
  "checked_at": "...", "resource_count": null, "validation": "required"}
 ```
 
-From the destination's `/metadata`, read at most once a minute. `display_name` is `destination.display_name` in `hie.yaml`, or `null`. `resource_count` is `null` when counting would be costly or is not supported.
+From the destination's `/metadata`, read at most once a minute. `display_name` is `destination.display_name` in `hie.yaml`, or `null`. `tenant` is the destination partition HIE delivers into (`destination.tenant`, or `HIE_FHIR_TENANT`), or `null` when none is set and no tenant header is sent; `tenant_header` is the header it is sent in (`destination.tenant_header`, `X-Tenant-ID` by default), reported either way ([The destination's partition](running.md#the-destinations-partition)). `resource_count` is `null` when counting would be costly or is not supported.
 
 `GET /api/sources/{id}/destination` → what this source has written, from HIE's history: `{"source": "labs", "resources_written": 8, "by_type": {"Observation": 8}, "last_written_at": "..."}`.
 

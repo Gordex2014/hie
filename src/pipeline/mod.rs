@@ -128,6 +128,7 @@ impl FeedRunner {
             (feed.delivery.method == DeliveryMethod::BulkSubmit || initial_bulk).then(|| {
                 BulkSubmitter::new(&services.fhir_base_url, &services.public_url)
                     .with_credentials(services.fhir.credentials().clone())
+                    .with_tenant(services.fhir.tenant().cloned())
             });
         Self {
             feed,

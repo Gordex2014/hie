@@ -504,6 +504,18 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 
 **Cost:** a source affected by the old decoding delivers its rows once more after the upgrade; with deterministic resource ids (as the bundled transforms derive, and decision 41's namespacing) that rewrites the same resources. A source whose `datetimeoffset` values were all at `+00:00`, or whose `datetime` database is at level 130 or above, lost nothing and reads again anyway, since its stored value cannot show it. A query read (`cursor_column`) on a `datetime` binds the cursor as a `datetime2` still, since the query is the operator's own: at level 120 and below rows sharing the cursor value can be skipped, as rows sharing a value at a `LIMIT` already can; a unique cursor column avoids both. Delivered `datetimeoffset` values now carry their own offset instead of `+00:00`; they are the same instants.
 
+## 44. The destination's tenant is a destination setting, sent on every request to the destination only
+
+**Chosen:** `destination.tenant` in `hie.yaml` (or `HIE_FHIR_TENANT`) names the destination partition HIE delivers into, and `destination.tenant_header` (default `X-Tenant-ID`, HFS's) the header it goes in. With a tenant set, every request to the destination carries it: the destination client sends it as a default header, so delivery, conditional updates, `$validate` and `/metadata` cannot miss it, and the `$bulk-submit` client adds it to its kick-off and status requests and to each status or receipt URL on the destination's own origin (scheme, host and port of `fhir_base_url`). Unset, no header is sent, as before. `GET /api/destination` reports both.
+
+**Why:**
+- A destination that partitions by a header stores what arrives without one in its default partition, where the tenant that should read it cannot: a delivery that lands in the wrong partition looks written to HIE and is invisible to its consumer.
+- One engine delivers to one destination partition, as it delivers to one `fhir_base_url`; a per-source tenant would let one deployment write across partitions, which is a decision for whoever owns the destination, not a source's author.
+- A header the request may or may not carry by call site is a header some call site forgets; a default header on the destination client cannot be forgotten.
+- A receipt URL on another origin (a pre-signed object store) is not the destination: it needs no partition, and the tenant is not sent where it is not the destination's business.
+
+**Cost:** one tenant per engine; delivering to several partitions takes several engines. The bearer token to status and receipt URLs is unchanged by this decision.
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.

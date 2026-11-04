@@ -76,6 +76,8 @@ impl SourceManager {
         let facts = json!({
             "base_url": self.config.fhir_base_url,
             "display_name": self.config.destination.display_name,
+            "tenant": self.config.destination.tenant_name(),
+            "tenant_header": self.config.destination.tenant_header,
             "fhir_version": metadata.as_ref().and_then(|m| m.fhir_version.clone()),
             "software": metadata.as_ref().and_then(|m| m.software.as_ref()).map(|s| json!({"name": s.name, "version": s.version})),
             "reachable": metadata.is_some(),

@@ -4,3 +4,6 @@ listen: 127.0.0.1:8090
 sources_dir: sources
 alerts:
   webhook_url:
+# destination:
+#   tenant: my-organization     # the destination partition (or HIE_FHIR_TENANT); unset: none
+#   tenant_header: X-Tenant-ID  # the header it is sent in on every request to the destination

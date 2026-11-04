@@ -21,10 +21,60 @@ pub enum EntryResult {
     Transient(u16, Value),
 }
 
+/// The destination partition a deployment delivers into: `<header>: <value>` on
+/// every request to the destination (`destination.tenant` in `hie.yaml`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tenant {
+    pub header: reqwest::header::HeaderName,
+    pub value: reqwest::header::HeaderValue,
+}
+
+impl Tenant {
+    /// The tenant header for `name` and `value`, refusing a name or a value
+    /// that is not a valid HTTP header.
+    pub fn new(header: &str, value: &str) -> anyhow::Result<Self> {
+        let header =
+            reqwest::header::HeaderName::from_bytes(header.trim().as_bytes()).map_err(|_| {
+                anyhow::anyhow!(
+                    "destination.tenant_header {header:?} is not a valid HTTP header name"
+                )
+            })?;
+        let value = reqwest::header::HeaderValue::from_str(value.trim()).map_err(|_| {
+            anyhow::anyhow!("destination.tenant {value:?} is not a valid HTTP header value")
+        })?;
+        Ok(Self { header, value })
+    }
+
+    /// The tenant's name, as sent.
+    pub fn name(&self) -> &str {
+        self.value.to_str().unwrap_or_default()
+    }
+
+    /// Adds the header to a request.
+    pub fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request.header(self.header.clone(), self.value.clone())
+    }
+}
+
+/// A client for the destination: every request it makes carries the tenant
+/// header, when there is one.
+fn destination_http(tenant: Option<&Tenant>) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(t) = tenant {
+        headers.insert(t.header.clone(), t.value.clone());
+    }
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .default_headers(headers)
+        .build()
+        .expect("HTTP client")
+}
+
 pub struct FhirClient {
     base: String,
     http: reqwest::Client,
     credentials: Credentials,
+    tenant: Option<Tenant>,
 }
 
 impl FhirClient {
@@ -34,19 +84,28 @@ impl FhirClient {
     }
 
     pub fn with_credentials(base: &str, credentials: Credentials) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .expect("HTTP client");
         Self {
             base: base.trim_end_matches('/').to_string(),
-            http,
+            http: destination_http(None),
             credentials,
+            tenant: None,
         }
+    }
+
+    /// The same client, sending the tenant header on every request (none when
+    /// `None`).
+    pub fn with_tenant(mut self, tenant: Option<Tenant>) -> Self {
+        self.http = destination_http(tenant.as_ref());
+        self.tenant = tenant;
+        self
     }
 
     pub fn credentials(&self) -> &Credentials {
         &self.credentials
+    }
+
+    pub fn tenant(&self) -> Option<&Tenant> {
+        self.tenant.as_ref()
     }
 
     pub async fn post_bundle(&self, bundle: &Value) -> Result<Value, SendError> {
