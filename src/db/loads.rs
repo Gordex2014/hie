@@ -1752,20 +1752,34 @@ mod tests {
             .unwrap();
         let item = &db.received_records("src", 1).unwrap()[0];
         let long = "x".repeat(2000);
-        db.mark_failed(
-            item.id,
-            item.run,
-            "server",
-            &long,
-            Some(&json!({"zq": "body"})),
-            None,
-        )
-        .unwrap();
+        // A marker long enough that random ciphertext never holds it by chance.
+        let marker = "plaintext-response-marker-0123456789abcdef";
+        let response = json!({ marker: marker });
+        db.mark_failed(item.id, item.run, "server", &long, Some(&response), None)
+            .unwrap();
         let row = &db
             .query("SELECT error, response FROM records", &[])
             .unwrap()[0];
         assert_eq!(row.string(0).chars().count(), REASON_MAX_CHARS + 1);
-        assert!(row.string(1).starts_with("c1.") && !row.string(1).contains("zq"));
+        // Sealed: neither the response, nor its marker, nor either in base64.
+        let stored = row.string(1);
+        let plain = response.to_string();
+        let b64 = |s: &str| {
+            use base64::Engine as _;
+            [
+                base64::engine::general_purpose::STANDARD.encode(s),
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s),
+            ]
+        };
+        assert!(stored.starts_with("c1."), "{stored}");
+        assert_ne!(stored, plain);
+        for needle in [plain.clone(), marker.to_string()]
+            .into_iter()
+            .chain(b64(&plain))
+            .chain(b64(marker))
+        {
+            assert!(!stored.contains(&needle), "{stored} holds {needle}");
+        }
         let reasons = db
             .query(
                 "SELECT reason FROM record_events WHERE kind = 'failed'",
