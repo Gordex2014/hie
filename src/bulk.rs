@@ -40,6 +40,7 @@ pub struct BulkSubmitter {
     fhir_base: String,
     public_url: String,
     credentials: Credentials,
+    tenant: Option<fhir::Tenant>,
 }
 
 /// The identifier system the engine submits under; the value is the source id.
@@ -56,7 +57,24 @@ impl BulkSubmitter {
             fhir_base: fhir_base.trim_end_matches('/').to_string(),
             public_url: public_url.trim_end_matches('/').to_string(),
             credentials: None,
+            tenant: None,
         }
+    }
+
+    /// The same submitter, sending the tenant header to the destination.
+    pub fn with_tenant(mut self, tenant: Option<fhir::Tenant>) -> Self {
+        self.tenant = tenant;
+        self
+    }
+
+    /// The tenant header goes to the destination's origin only: a status or
+    /// receipt URL elsewhere (a pre-signed object store, say) is not the
+    /// destination and is not told the partition.
+    fn tenant_for(&self, url: &str) -> Option<&fhir::Tenant> {
+        let origin = |u: &str| url::Url::parse(u).ok().map(|u| u.origin());
+        self.tenant
+            .as_ref()
+            .filter(|_| origin(url).is_some_and(|o| Some(o) == origin(&self.fhir_base)))
     }
 
     /// The same submitter, calling HFS with the engine's token.
@@ -100,12 +118,15 @@ impl BulkSubmitter {
     }
 
     async fn post(&self, path: &str, body: &Value) -> Result<reqwest::Response, SendError> {
-        let request = self
+        let mut request = self
             .http
             .post(format!("{}/{path}", self.fhir_base))
             .header("Content-Type", "application/fhir+json")
             .header("Accept", "application/fhir+json")
             .json(body);
+        if let Some(tenant) = &self.tenant {
+            request = tenant.apply(request);
+        }
         fhir::authorize(request, &self.credentials)
             .await?
             .send()
@@ -114,7 +135,10 @@ impl BulkSubmitter {
     }
 
     async fn get(&self, url: &str, accept: &str) -> Result<reqwest::Response, SendError> {
-        let request = self.http.get(url).header("Accept", accept);
+        let mut request = self.http.get(url).header("Accept", accept);
+        if let Some(tenant) = self.tenant_for(url) {
+            request = tenant.apply(request);
+        }
         fhir::authorize(request, &self.credentials)
             .await?
             .send()
@@ -366,5 +390,23 @@ mod tests {
         assert_eq!(m["output"][0]["count"], 3);
         assert_eq!(m["requiresAccessToken"], false);
         assert_eq!(s.manifest_url("t"), "http://hie/bulk/t/manifest.json");
+    }
+
+    #[test]
+    fn the_tenant_goes_to_the_destination_origin_only() {
+        let tenant = fhir::Tenant::new("X-Tenant-ID", "north").unwrap();
+        let s = BulkSubmitter::new("http://hfs:8080/fhir", "http://hie")
+            .with_tenant(Some(tenant.clone()));
+        assert_eq!(s.tenant_for("http://hfs:8080/status/1"), Some(&tenant));
+        assert_eq!(
+            s.tenant_for("http://hfs:8080/fhir/files/1?x=y"),
+            Some(&tenant)
+        );
+        assert_eq!(s.tenant_for("http://hfs:9000/files/1"), None);
+        assert_eq!(s.tenant_for("https://hfs:8080/files/1"), None);
+        assert_eq!(s.tenant_for("https://bucket.s3.example/out?sig=1"), None);
+        assert_eq!(s.tenant_for("not a url"), None);
+        let s = BulkSubmitter::new("http://hfs:8080/fhir", "http://hie");
+        assert_eq!(s.tenant_for("http://hfs:8080/status/1"), None);
     }
 }

@@ -59,10 +59,10 @@ pub fn build(
 ) -> Result<(Arc<manager::SourceManager>, api::AppState)> {
     let db = Arc::new(db::Db::connect(&config.database.to_string_lossy())?);
     purge::install(&db, config)?;
-    let fhir = Arc::new(fhir::FhirClient::with_credentials(
-        &config.fhir_base_url,
-        credentials,
-    ));
+    let fhir = Arc::new(
+        fhir::FhirClient::with_credentials(&config.fhir_base_url, credentials)
+            .with_tenant(config.destination.tenant()?),
+    );
     let alerts = Arc::new(alerts::Alerter::new(
         db.clone(),
         config.alerts.webhook_url.clone(),

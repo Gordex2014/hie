@@ -157,11 +157,63 @@ fn default_failed_content() -> Duration {
 }
 
 /// `destination` in `hie.yaml`.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DestinationConfig {
     /// What people call the destination; `null` in the API when unset.
     #[serde(default)]
     pub display_name: Option<String>,
+    /// The destination partition everything is delivered into, sent as
+    /// `tenant_header` on every request to the destination; `HIE_FHIR_TENANT`
+    /// overrides it. Unset (or blank): no header.
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// The header the tenant is sent in.
+    #[serde(default = "default_tenant_header")]
+    pub tenant_header: String,
+}
+
+impl Default for DestinationConfig {
+    fn default() -> Self {
+        Self {
+            display_name: None,
+            tenant: None,
+            tenant_header: default_tenant_header(),
+        }
+    }
+}
+
+fn default_tenant_header() -> String {
+    "X-Tenant-ID".into()
+}
+
+impl DestinationConfig {
+    /// The tenant, if one is set: blank is unset.
+    pub fn tenant_name(&self) -> Option<&str> {
+        self.tenant
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    }
+
+    /// The header sent on every request to the destination, if a tenant is set.
+    pub fn tenant(&self) -> Result<Option<crate::fhir::Tenant>> {
+        self.tenant_name()
+            .map(|t| crate::fhir::Tenant::new(&self.tenant_header, t))
+            .transpose()
+    }
+
+    /// Applies `HIE_FHIR_TENANT` (a blank value leaves the file's setting),
+    /// normalizes blank to unset and checks the header name and value.
+    fn resolve(&mut self, env: impl Fn(&str) -> Option<String>) -> Result<()> {
+        if let Some(tenant) = env("HIE_FHIR_TENANT").filter(|v| !v.trim().is_empty()) {
+            self.tenant = Some(tenant);
+        }
+        self.tenant = self.tenant_name().map(str::to_string);
+        self.tenant_header = self.tenant_header.trim().to_string();
+        crate::fhir::Tenant::new(&self.tenant_header, "x")?;
+        self.tenant()?;
+        Ok(())
+    }
 }
 
 /// `secrets` and `content` in `hie.yaml`: where a key lives.
@@ -343,6 +395,26 @@ pub struct FeedConfig {
     pub(crate) expect_every_text: Option<String>,
     #[serde(skip)]
     pub expect_every: Option<Duration>,
+    /// The file the definition was read from or written to; `None` for one
+    /// that is not a file (yet). Never part of the definition itself.
+    #[serde(skip)]
+    pub file: Option<PathBuf>,
+}
+
+/// The extensions a source definition file may have.
+const SOURCE_EXTENSIONS: [&str; 2] = ["yaml", "yml"];
+
+/// The file named for source `id` in `dir`: `<id>.yaml` or `<id>.yml`,
+/// whichever exists and is not `taken` (the file of another loaded source),
+/// or else `<id>.yaml`, where a new one is written. A loaded source knows
+/// its file ([`FeedConfig::file`]), whatever its name; this is for one that
+/// is not loaded.
+pub fn source_file(dir: &Path, id: &str, taken: &[PathBuf]) -> PathBuf {
+    SOURCE_EXTENSIONS
+        .iter()
+        .map(|ext| dir.join(format!("{id}.{ext}")))
+        .find(|path| path.exists() && !taken.contains(path))
+        .unwrap_or_else(|| dir.join(format!("{id}.{}", SOURCE_EXTENSIONS[0])))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -970,6 +1042,10 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     if config.try_runs.max_concurrent == 0 {
         bail!("try.max_concurrent must be at least 1");
     }
+    config
+        .destination
+        .resolve(|name| std::env::var(name).ok())
+        .with_context(|| format!("in {}", path.display()))?;
     std::fs::create_dir_all(&config.sources_dir)
         .with_context(|| format!("creating {}", config.sources_dir.display()))?;
 
@@ -977,7 +1053,11 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     let mut entries: Vec<_> = std::fs::read_dir(&config.sources_dir)
         .with_context(|| format!("reading {}", config.sources_dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("yaml" | "yml")))
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| SOURCE_EXTENSIONS.contains(&e))
+        })
         .collect();
     entries.sort();
     let mut ids = HashSet::new();
@@ -986,6 +1066,7 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
         let mut feed: FeedConfig = serde_yaml::from_str(&text)
             .with_context(|| format!("parsing {}", feed_path.display()))?;
         feed.resolve(&base)?;
+        feed.file = Some(feed_path);
         if !ids.insert(feed.id.clone()) {
             bail!("duplicate source id {}", feed.id);
         }
@@ -1136,6 +1217,69 @@ mod tests {
             ),
             _ => panic!("expected s3"),
         }
+    }
+
+    fn destination(yaml: &str) -> DestinationConfig {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn the_tenant_defaults_to_none_in_x_tenant_id() {
+        let mut d = destination("display_name: D\n");
+        d.resolve(|_| None).unwrap();
+        assert_eq!(d.tenant_name(), None);
+        assert_eq!(d.tenant_header, "X-Tenant-ID");
+        assert!(d.tenant().unwrap().is_none());
+        let mut d = destination("tenant: \"  \"\n");
+        d.resolve(|_| None).unwrap();
+        assert_eq!(d.tenant, None, "a blank tenant is unset");
+    }
+
+    #[test]
+    fn hie_fhir_tenant_overrides_the_file() {
+        let env =
+            |v: &'static str| move |name: &str| (name == "HIE_FHIR_TENANT").then(|| v.to_string());
+        let mut d = destination("tenant: north\ntenant_header: X-Partition\n");
+        d.resolve(env(" south ")).unwrap();
+        let t = d.tenant().unwrap().unwrap();
+        assert_eq!((t.header.as_str(), t.name()), ("x-partition", "south"));
+        let mut d = destination("tenant: north\n");
+        d.resolve(env("  ")).unwrap();
+        assert_eq!(
+            d.tenant_name(),
+            Some("north"),
+            "a blank override leaves the file's"
+        );
+        let mut d = destination("{}");
+        d.resolve(env("east")).unwrap();
+        assert_eq!(d.tenant().unwrap().unwrap().name(), "east");
+    }
+
+    #[test]
+    fn an_invalid_tenant_header_is_refused_at_load() {
+        for header in ["", "X Tenant", "X-Tenant:"] {
+            let mut d = DestinationConfig {
+                tenant_header: header.into(),
+                ..Default::default()
+            };
+            let err = d.resolve(|_| None).unwrap_err().to_string();
+            assert!(err.contains("tenant_header"), "{header:?}: {err}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("hie.yaml"),
+            "fhir_base_url: http://h\ndestination:\n  tenant: t\n  tenant_header: \"bad header\"\n",
+        )
+        .unwrap();
+        let err = format!("{:#}", load(&dir.path().join("hie.yaml")).unwrap_err());
+        assert!(err.contains("not a valid HTTP header name"), "{err}");
+        let mut d = destination("tenant: \"a\\nb\"\n");
+        assert!(
+            d.resolve(|_| None)
+                .unwrap_err()
+                .to_string()
+                .contains("destination.tenant")
+        );
     }
 
     #[test]

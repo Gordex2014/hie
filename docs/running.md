@@ -71,7 +71,20 @@ To build the image yourself: `docker build -t hie .`
 | `HIE_TERMINOLOGY_TOKEN` | | A bearer token for that HTS, when it requires one |
 | `HIE_RUNTIME_URL` | `runtime.url` in `hie.yaml` | The shared Python runtime transforms run at, instead of a local process (see [Transforms](transforms.md#transforms)) |
 | `HIE_RUNTIME_TOKEN` | | The consumer's bearer token for that runtime (`runtime.token_env` names another variable) |
+| `HIE_FHIR_TENANT` | `destination.tenant` in `hie.yaml` | The destination partition HIE delivers into (see [The destination's partition](#the-destinations-partition)); blank leaves the file's setting |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` | | Credentials for S3 sources, as for any AWS tool (profiles work too) |
+
+### The destination's partition
+
+A destination that keeps tenants apart by a request header (HFS reads `X-Tenant-ID`) stores what arrives without one in its default partition. To deliver into a tenant's partition, name it in `hie.yaml`:
+
+```yaml
+destination:
+  tenant: my-organization       # or HIE_FHIR_TENANT; unset or blank: no header
+  tenant_header: X-Tenant-ID    # the default
+```
+
+With a tenant set, every request HIE makes to the destination carries `<tenant_header>: <tenant>`: REST batches and transactions (with their conditional updates), `$validate`, the `$bulk-submit` kick-off and status requests, status polls and receipt files, and `/metadata` for `GET /api/destination`. A status or receipt URL on another origin than `fhir_base_url` (a pre-signed object store, say) does not get it; nor do source FHIR servers, the Python runtime, the terminology server or the token endpoint. Try's `$validate` uses the same destination client as delivery. The origin is decided on the URL HIE requests: redirects are followed as the HTTP client does, keeping the headers that request was sent with, so a destination that redirects a receipt to another host passes the tenant name along (it is not a secret), and a foreign URL that redirects back to the destination reaches it without one. A `tenant_header` that is not a valid HTTP header name, or a tenant that is not a valid header value, stops the engine at start (and `hie check`). `GET /api/destination` reports both.
 
 ### The store, and more than one instance
 

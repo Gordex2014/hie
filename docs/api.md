@@ -20,7 +20,7 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `POST /api/sources/{id}/resume` | Resumes and passes at once | Unchanged |
 | `POST /api/sources/{id}/check-now` | Passes now instead of at the next poll | Adds an optional `pass` ([Check now](#check-now-and-passes)) |
 | `GET /api/sources/{id}/loads` (also `/files`) | Every load: the file, its method, records read, sent, rejected, in progress, how long it took, where it is archived | Adds paging, `rows`, `progress`, the transform version ([Loads](#loads)) |
-| `GET /api/loads/{id}` | One load with its **failures grouped by reason**: kind, reason, count, first line, and up to three sample rows each | Groups gain a key, version, location, content state ([Failures](#failures)) |
+| `GET /api/loads/{id}` | One load with its **failures grouped by reason**: kind, reason, count, first line, and up to three sample rows each | Groups gain a key, version, location, content state, and their history: every group the load ever had stays listed, with `outstanding`, `resolved`, `first_failed_at`, `resolved_at` and `retries` ([Failures](#failures)) |
 | `POST /api/loads/{id}/retry` | Puts the load's rejected rows back at the start, all of them or those with one reason (`{"reason": "..."}`); the source passes at once | Kept; now a [retry](#retries) with `version: null` that keeps the history |
 | `GET /api/sources/{id}/stats?days=14` | What a source's page draws: today (files, records, sent, rejected, pending) and one row per day | Adds `tz` and historical counts ([Period counts](#period-counts)) |
 | `GET /api/transforms` | Every transform file: name, path, size, modified, and the sources that use it | Adds `id`, `display_name`, `current_version` ([Transforms](#transforms-and-versions)) |
@@ -405,7 +405,7 @@ Try runs code on a few records without storing anything or writing to the destin
   "id": 41, "source_id": "labs", "first": true, "method": "rest",
   "transform": {"id": "lab-results", "version": 2},
   "status": "done",
-  "rows": {"read": 10, "written": 8, "failed": 2, "outcome_unknown": 0, "in_progress": 0, "filtered": 0},
+  "rows": {"read": 10, "written": 8, "failed": 2, "failed_ever": 2, "outcome_unknown": 0, "in_progress": 0, "filtered": 0},
   "resources": {"written": 8},
   "progress": {"phase": "done", "rows_admitted": 10, "rows_processed": 10, "total_rows": 10},
   "waiting": null,
@@ -414,7 +414,7 @@ Try runs code on a few records without storing anything or writing to the destin
 ```
 
 - `status` adds `queued` (created at Start, not begun) to the 0.1 values.
-- `rows` counts the load's rows by their current outcome; `resources` counts resources, apart from rows.
+- `rows` counts the load's rows by their current outcome, except `rows.failed_ever`: the distinct rows of the load that ever failed (filtered rows aside), from the history, so a retry or reprocess that writes them later lowers `rows.failed` (and the 0.1 `rejected`) but never `rows.failed_ever`. The load list and `GET /api/loads/{id}` carry the same `rows`. `resources` counts resources, apart from rows.
 - `progress` is derived from the store: `rows_admitted` rows stored for the load, `rows_processed` of them with an outcome (written, failed, filtered or outcome unknown), `phase` one of `queued`, `reading`, `transforming`, `delivering`, `settling`, `done`. `total_rows` is the evidence's `read.rows` for a source's first load, `null` for other loads and once more rows were admitted than were counted.
 - **Outcome unknown** is explicit: a row whose write was sent and not confirmed counts in `rows.outcome_unknown`, and its record reads `outcome: outcome_unknown`. That is any write without a confirming answer: a transport error or timeout after the request was sent, a `429` or `5xx` for the Bundle or for the row's entry, and a bulk submission whose receipts have not settled. It is never counted as written or failed until a later attempt settles it.
 - `waiting`: `null`, or why the load's rows are held without failing: `validation_unavailable` (the destination cannot validate), `environment_unavailable` (the executor runs another environment than the load's version), `destination_unavailable` (writes are not confirmed and are retried). Retries carry the same member.
@@ -427,16 +427,27 @@ Try runs code on a few records without storing anything or writing to the destin
 ```json
 {"group": "g_5d1", "kind": "data", "reason": "value 'alto' is not a number", "count": 2, "first_line": 3,
  "transform": {"id": "lab-results", "version": 2}, "location": {"line": 14, "column": 9},
- "content": "kept", "complete": true, "samples": [...]}
+ "content": "kept", "complete": true,
+ "outstanding": 2, "resolved": 0, "first_failed_at": "2026-11-03T10:31:00.000Z", "resolved_at": null, "retries": [],
+ "samples": [...]}
 ```
 
-- A group is the load's rows that failed with the same kind, reason and transform version. `group` is stable for the load's life. `count` is how many of them still fail now. Rows a retry leaves failing with the same kind, reason and version stay in their group. `failures` lists the groups with failing rows; a group whose rows all recovered drops out of it but still answers at its own route, with `count: 0`.
+- A group is the load's rows that failed with the same kind, reason and transform version. `group` is stable for the load's life. Rows a retry leaves failing with the same kind, reason and version stay in their group; a retry that runs another version and fails them again puts them in that version's group, and they stay rows of the first group's history too.
+- `failures` lists **every group the load ever had**, those with rows failing now first (most first), then the others by when they were created. `first_line` is the first line failing in the group now, else the first line that ever failed in it. A group whose rows were all written or moved stays listed with `outstanding: 0`; nothing is dropped, so the original failure and how it was resolved can be read after a retry.
+- Current state: `count` is the group's rows failing in it now. A row a retry is running is not failing, so `count` reads `0` while it runs.
+- History, read from the immutable events (never counters). The group's rows are every row that ever failed in it. A row **leaves** the group with its first write or failure after its last failure in the group: it is then **resolved** (written, by a retry or a reprocess) or **moved** (failed into another group, such as the group of the version a retry ran, or filtered). Until it leaves, it is **outstanding**, whether it fails in the group now, a retry has it in flight, or its outcome is unknown.
+  - `outstanding`: the group's rows that have not left it. Always `outstanding ≥ count`, and `outstanding + resolved + moved` = the rows that ever failed in it.
+  - `resolved`: the group's rows that left it written.
+  - `first_failed_at`: when its first row failed.
+  - `resolved_at`: when `outstanding` reached `0`, that is when its last row was written or failed elsewhere; `null` while `outstanding > 0`.
+  - `retries`: the ids of the retries that targeted the group, oldest first (a reprocess of one record is not a retry and is not listed).
 - `kind` adds `validation` (the destination's `$validate` found errors), `reference` (a conditional reference matched no resource, or several) and `environment` to the 0.1 kinds.
 - `location` is the diagnostics' `location` of the first row, or `null`.
 - `content`: `kept`, `expired` (removed when its retention ran out), `purged` (removed earlier: its row was written by a retry or reprocess, or its source deleted), or `none` (the row was never kept). `complete` is false when some of the group's rows are no longer known (for example a source replaced in the middle of a load).
-- `samples` is kept for 0.1 clients while the content is kept, and `[]` after; the answer is `no-store`.
+- `content` of a group with rows failing now is that of those rows; of a group with none, that of the rows that ever failed in it: `kept` while any of them keeps its content. A row written by a retry or reprocess loses its content, so a group whose rows were all written reads `purged`.
+- `samples` is kept for 0.1 clients while the content is kept, and `[]` after; the answer is `no-store`. Samples are the rows that ever failed in the group (from the history) whose content is still kept, those failing in it now first, so a group with nothing failing keeps showing the rows that failed in it while their content is kept (for example rows a retry moved to its version's group).
 
-`GET /api/loads/{id}/failures/{group}` → the group with `records: [{"id", "line", "attempts"}]` and no content. `GET /api/loads/{id}/failures/{group}/samples?limit=3` (1 to 50) → `{"group", "samples": [{"record", "line", "raw"}], "content": "kept"}`, `no-store`; `410 content_expired` once the content is expired or purged.
+`GET /api/loads/{id}/failures/{group}` → the group, with the same members as in `failures` (history included), whether or not rows fail in it now, and `records: [{"id", "line", "attempts"}]` and no content. `records` are the rows failing in the group now, those a retry of it or a Try of its failures acts on, so a resolved group answers `records: []`; each row's own past is at `GET /api/records/{id}/history`. `GET /api/loads/{id}/failures/{group}/samples?limit=3` (1 to 50) → `{"group", "samples": [{"record", "line", "raw"}], "content": "kept"}` with the same rows as the group's `samples`, `no-store`; `410 content_expired` once the group's `content` is expired or purged, a resolved group included.
 
 **History.** Every attempt on a row is an immutable event: admitted, transformed, failed (kind, reason, version, location), validated, delivered, outcome unknown, settled, retried. A retry or a reprocess adds events; it never removes or rewrites one. `GET /api/records/{id}/history` → `{"record": 7, "events": [{"at", "kind", "attempt", "load", "retry", "transform": {"id", "version"}, "error": {"kind", "reason"}?}]}`, oldest first; `retry` is `null` for the load's own attempts. Events never hold row content or diagnostics output.
 
@@ -465,7 +476,7 @@ Try runs code on a few records without storing anything or writing to the destin
 - `409 retry_in_progress` with `retry` while an unfinished retry covers the same rows. `409 nothing_to_retry` when the group has no failing rows. `410 content_expired` when their content is gone. A replayed key answers `202` with the same retry.
 - `previous` is the latest earlier retry of the same group, or `null`, so retries of a group form a chain. Two retries never cover the same row at once, so the chain is linear.
 
-`GET /api/loads/{id}/retries` → `{"retries": [...]}`, newest first. `GET /api/loads/{id}/retries/latest` and `GET /api/loads/{id}/retries/{retry}` → `{"retry": {...}}`; `status` is `queued`, `running`, `done` or `failed`, `written` and `failed` count its rows.
+`GET /api/loads/{id}/retries` → `{"retries": [...]}`, newest first; the retries of one group are also in its `retries` ([Failures](#failures)), oldest first. `GET /api/loads/{id}/retries/latest` and `GET /api/loads/{id}/retries/{retry}` → `{"retry": {...}}`; `status` is `queued`, `running`, `done` or `failed`, `written` and `failed` count its rows.
 
 `POST /api/loads/{id}/retry` (0.1) stays: it creates one retry with `version: null` for each failure group that has rows with `reason` (all groups without one), skipping groups that already have an unfinished retry, and answers its 0.1 body `{"load", "retried", "reason"}` plus `retries`, the ids it created. It no longer erases the earlier failure.
 
@@ -501,12 +512,13 @@ Try runs code on a few records without storing anything or writing to the destin
 `GET /api/destination` → `200`:
 
 ```json
-{"base_url": "http://hfs:8080", "display_name": "Northgate FHIR", "fhir_version": "4.0.1",
+{"base_url": "http://hfs:8080", "display_name": "Clinic FHIR", "tenant": "clinic-a",
+ "tenant_header": "X-Tenant-ID", "fhir_version": "4.0.1",
  "software": {"name": "Helios FHIR Server", "version": "0.4.0"}, "reachable": true,
  "checked_at": "...", "resource_count": null, "validation": "required"}
 ```
 
-From the destination's `/metadata`, read at most once a minute. `display_name` is `destination.display_name` in `hie.yaml`, or `null`. `resource_count` is `null` when counting would be costly or is not supported.
+From the destination's `/metadata`, read at most once a minute. `display_name` is `destination.display_name` in `hie.yaml`, or `null`. `tenant` is the destination partition HIE delivers into (`destination.tenant`, or `HIE_FHIR_TENANT`), or `null` when none is set and no tenant header is sent; `tenant_header` is the header it is sent in (`destination.tenant_header`, `X-Tenant-ID` by default), reported either way ([The destination's partition](running.md#the-destinations-partition)). `resource_count` is `null` when counting would be costly or is not supported.
 
 `GET /api/sources/{id}/destination` → what this source has written, from HIE's history: `{"source": "labs", "resources_written": 8, "by_type": {"Observation": 8}, "last_written_at": "..."}`.
 

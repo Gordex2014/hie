@@ -781,6 +781,8 @@ impl Db {
             format!("CAST(COALESCE(SUM(CASE WHEN {cond} THEN 1 ELSE 0 END), 0) AS BIGINT)")
         };
         let flag = |cond: &str| format!("MAX(CASE WHEN {cond} THEN 1 ELSE 0 END)");
+        // The page of loads is chosen first, so their rows and history are
+        // counted for those loads only, not for every load the page skips.
         let sql = format!(
             "SELECT f.id, f.feed_id, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived,
                     COUNT(r.id),
@@ -790,12 +792,16 @@ impl Db {
                     f.transform_id, f.transform_version, f.environment,
                     {failed}, {filtered}, {unknown}, {received}, {pending},
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'sent' THEN r.resource_count ELSE 0 END), 0) AS BIGINT),
-                    {wait_validation}, {wait_environment}, {wait_destination}
-             FROM files f LEFT JOIN records r ON r.file_id = f.id
-             WHERE {condition}
+                    {wait_validation}, {wait_environment}, {wait_destination},
+                    (SELECT CAST(COUNT(DISTINCT e.record_id) AS BIGINT) FROM record_events e
+                      WHERE e.load_id = f.id AND e.kind = 'failed' AND COALESCE(e.error_kind, '') <> 'filtered')
+             FROM (SELECT f.id, f.feed_id, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key,
+                          f.archived, f.finished_at, f.received_at, f.transform_id, f.transform_version, f.environment
+                   FROM files f WHERE {condition} ORDER BY f.id {order} LIMIT ${n}) f
+             LEFT JOIN records r ON r.file_id = f.id
              GROUP BY f.id, f.feed_id, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived,
                       f.finished_at, f.received_at, f.transform_id, f.transform_version, f.environment
-             ORDER BY f.id {order} LIMIT ${n}",
+             ORDER BY f.id {order}",
             sent = count("r.status = 'sent'"),
             rejected = count("r.status = 'rejected'"),
             in_progress_01 = count("r.status IN ('received', 'pending', 'submitted')"),
@@ -875,7 +881,7 @@ impl Db {
                     "transform": transform,
                     "environment": r.json(18),
                     "rows": {
-                        "read": read, "written": written, "failed": failed,
+                        "read": read, "written": written, "failed": failed, "failed_ever": r.i64(28),
                         "outcome_unknown": unknown, "in_progress": received + pending, "filtered": filtered,
                     },
                     "resources": {"written": r.i64(24)},
@@ -1750,20 +1756,34 @@ mod tests {
             .unwrap();
         let item = &db.received_records("src", 1).unwrap()[0];
         let long = "x".repeat(2000);
-        db.mark_failed(
-            item.id,
-            item.run,
-            "server",
-            &long,
-            Some(&json!({"zq": "body"})),
-            None,
-        )
-        .unwrap();
+        // A marker long enough that random ciphertext never holds it by chance.
+        let marker = "plaintext-response-marker-0123456789abcdef";
+        let response = json!({ marker: marker });
+        db.mark_failed(item.id, item.run, "server", &long, Some(&response), None)
+            .unwrap();
         let row = &db
             .query("SELECT error, response FROM records", &[])
             .unwrap()[0];
         assert_eq!(row.string(0).chars().count(), REASON_MAX_CHARS + 1);
-        assert!(row.string(1).starts_with("c1.") && !row.string(1).contains("zq"));
+        // Sealed: neither the response, nor its marker, nor either in base64.
+        let stored = row.string(1);
+        let plain = response.to_string();
+        let b64 = |s: &str| {
+            use base64::Engine as _;
+            [
+                base64::engine::general_purpose::STANDARD.encode(s),
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s),
+            ]
+        };
+        assert!(stored.starts_with("c1."), "{stored}");
+        assert_ne!(stored, plain);
+        for needle in [plain.clone(), marker.to_string()]
+            .into_iter()
+            .chain(b64(&plain))
+            .chain(b64(marker))
+        {
+            assert!(!stored.contains(&needle), "{stored} holds {needle}");
+        }
         let reasons = db
             .query(
                 "SELECT reason FROM record_events WHERE kind = 'failed'",

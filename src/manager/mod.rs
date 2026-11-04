@@ -302,8 +302,21 @@ impl SourceManager {
             .map(|m| m.runner.clone())
     }
 
+    /// The file holding source `id`'s definition: the one it was loaded from
+    /// when it runs, else the one named for it (`.yaml` or `.yml`), else
+    /// where a new one is written. Every file operation on a source goes here.
     fn file_for(&self, id: &str) -> PathBuf {
-        self.sources_dir.join(format!("{id}.yaml"))
+        self.file_of(id, self.source(id).as_ref())
+    }
+
+    /// [`Self::file_for`] with the running definition given. A file named
+    /// for `id` that another source was loaded from is that source's.
+    fn file_of(&self, id: &str, running: Option<&FeedConfig>) -> PathBuf {
+        if let Some(file) = running.and_then(|feed| feed.file.clone()) {
+            return file;
+        }
+        let taken: Vec<PathBuf> = self.sources().into_iter().filter_map(|f| f.file).collect();
+        crate::config::source_file(&self.sources_dir, id, &taken)
     }
 
     /// The source's definition as its file holds it: paths as written, nothing resolved.
@@ -349,11 +362,13 @@ impl SourceManager {
         Ok((submitted, resolved))
     }
 
-    fn write(&self, submitted: &FeedConfig) -> Result<()> {
+    /// Writes a source's definition over its file; the file written.
+    fn write(&self, submitted: &FeedConfig) -> Result<PathBuf> {
         std::fs::create_dir_all(&self.sources_dir)?;
         let path = self.file_for(&submitted.id);
         std::fs::write(&path, submitted.to_yaml()?)
-            .with_context(|| format!("writing {}", path.display()))
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(path)
     }
 
     /// Writes a new source's file, only if none exists: of two attempts at
@@ -514,6 +529,7 @@ impl SourceManager {
         let mut feed: FeedConfig =
             serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         feed.resolve(&self.base_dir)?;
+        feed.file = Some(path);
         Ok(feed)
     }
 
@@ -608,7 +624,7 @@ impl SourceManager {
             Self::fill(&mut resolved, binding);
         }
         let before = self.source(id);
-        self.write(&submitted)?;
+        resolved.file = Some(self.write(&submitted)?);
         // The new definition holds its evidence and revision; what the old
         // one held is released.
         self.evidence.source_started(&Binding {
@@ -634,7 +650,7 @@ impl SourceManager {
             ));
         };
         Self::halt(&managed);
-        let path = self.file_for(id);
+        let path = self.file_of(id, Some(&managed.feed));
         if path.exists() {
             std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         }
