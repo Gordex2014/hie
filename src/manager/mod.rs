@@ -323,15 +323,22 @@ impl SourceManager {
         resolved
             .resolve(&self.base_dir)
             .map_err(|e| ManagerError::invalid("invalid_definition", format!("{e:#}")))?;
+        // Built once to check it, never run. A password reference without a
+        // revision is checked with the current one; a Start replaces it with
+        // its evidence's.
+        let mut checked = resolved.clone();
         if let SourceConfig::Database {
             connection: Some(connection),
             ..
-        } = &resolved.source
+        } = &mut checked.source
         {
             // A reference to a secret that does not exist, or without custody.
-            self.evidence.resolve_credential(connection)?;
+            let credential = self.evidence.resolve_credential(connection)?;
+            if let (Some(password), Some((_, revision))) = (&mut connection.password, credential) {
+                password.revision = Some(revision);
+            }
         }
-        Source::from_config_in(&resolved, &self.connect)
+        Source::from_config_in(&checked, &self.connect)
             .map_err(|e| ManagerError::invalid("invalid_definition", format!("{e:#}")))?;
         Ok((submitted, resolved))
     }
