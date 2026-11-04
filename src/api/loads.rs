@@ -165,8 +165,9 @@ fn load_or_404(s: &AppState, load_id: i64) -> Result<Value, ApiError> {
     Ok(load)
 }
 
-/// One load with its failure groups, each with up to three sample rows while
-/// their content is kept.
+/// One load with every failure group it ever had (resolved ones included,
+/// with their history), each with up to three sample rows while their content
+/// is kept.
 async fn get_load(
     State(s): State<AppState>,
     Path(file_id): Path<i64>,
@@ -190,8 +191,8 @@ struct GroupQuery {
     cursor: Option<String>,
 }
 
-/// One failure group with its failing records' ids, lines and attempts,
-/// paged by `limit` and `cursor` in line order.
+/// One failure group with its history and the ids, lines and attempts of
+/// the records failing in it now, paged by `limit` and `cursor` in line order.
 async fn get_group(
     State(s): State<AppState>,
     Path((file_id, group)): Path<(i64, String)>,
@@ -244,7 +245,8 @@ struct SamplesQuery {
     limit: Option<i64>,
 }
 
-/// A failure group's failed rows while their content is kept; `410` after.
+/// The rows that failed in a group (from the history, so a resolved group's
+/// too) while their content is kept; `410` after.
 async fn group_samples(
     State(s): State<AppState>,
     Path((file_id, group)): Path<(i64, String)>,

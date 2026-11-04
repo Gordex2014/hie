@@ -1,0 +1,441 @@
+{
+  "id": "loads/retry-resolves-group",
+  "title": "A retry that resolves a group keeps it listed: outstanding 0, resolved n, its retries and resolved_at, failed_ever beside the current failed, samples from the history while content is kept",
+  "fixtures": {
+    "files": {
+      "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+      "sources/lab.yaml": "id: lab\nname: Lab lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\ntransform: transforms/lab_csv.py\ndelivery:\n  initial_backoff_ms: 300\n  max_backoff_ms: 600\n",
+      "inbox/a.csv": "id,value\n1,alto\n2,5.4\n3,alto\n4,6.1\n"
+    }
+  },
+  "steps": [
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "wait for the load",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "id": "{{$load}}",
+              "status": "done",
+              "rows": {
+                "written": 2,
+                "failed": 2,
+                "failed_ever": 2
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "failures": [
+            {
+              "group": "{{$g1}}",
+              "count": 2,
+              "outstanding": 2,
+              "resolved": 0,
+              "first_failed_at": "{{$first}}",
+              "resolved_at": null,
+              "retries": [],
+              "transform": {
+                "version": 1
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "save a version that still fails the rows, for another reason",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/lab_csv/versions",
+        "headers": {
+          "Idempotency-Key": "v2"
+        },
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"cannot read {value!r}\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v2\"}],\n    }\n",
+          "base_version": 1
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "version": 2
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/loads/{{$load}}/retries",
+        "headers": {
+          "Idempotency-Key": "r1"
+        },
+        "body": {
+          "group": "{{$g1}}",
+          "version": null
+        }
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "retry": {
+            "id": "{{$rt1}}",
+            "transform": {
+              "version": 2
+            },
+            "rows": 2
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/retries/{{$rt1}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "retry": {
+            "status": "done",
+            "written": 0,
+            "failed": 2
+          }
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "name": "the rows left the first group for the version's own: both listed",
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "rejected": 2,
+          "rows": {
+            "failed": 2,
+            "failed_ever": 2,
+            "written": 2
+          },
+          "failures": [
+            "{{contains}}",
+            {
+              "group": "{{$g2}}",
+              "reason": "cannot read 'alto'",
+              "transform": {
+                "version": 2
+              },
+              "count": 2,
+              "outstanding": 2,
+              "resolved": 0,
+              "resolved_at": null,
+              "retries": []
+            },
+            {
+              "group": "{{$g1}}",
+              "reason": "value 'alto' is not a number",
+              "count": 0,
+              "outstanding": 0,
+              "resolved": 0,
+              "first_failed_at": "{{$first}}",
+              "resolved_at": "{{time}}",
+              "retries": [
+                "{{$rt1}}"
+              ],
+              "content": "kept",
+              "samples": [
+                {
+                  "line": "{{int}}",
+                  "raw": {
+                    "value": "alto"
+                  }
+                },
+                {
+                  "raw": {
+                    "value": "alto"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a group with nothing failing keeps its rows' samples while their content is kept",
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/failures/{{$g1}}/samples"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "group": "{{$g1}}",
+          "content": "kept",
+          "samples": [
+            {
+              "record": "{{int}}",
+              "raw": {
+                "value": "alto"
+              }
+            },
+            {
+              "raw": {
+                "value": "alto"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "the group's records are the rows failing in it now",
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/failures/{{$g1}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "group": "{{$g1}}",
+          "outstanding": 0,
+          "retries": [
+            "{{$rt1}}"
+          ],
+          "records": []
+        }
+      }
+    },
+    {
+      "name": "save a fix",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/lab_csv/versions",
+        "headers": {
+          "Idempotency-Key": "fix"
+        },
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        number = 0.0\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"fixed\"}],\n    }\n",
+          "base_version": 2
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "version": 3
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/loads/{{$load}}/retries",
+        "headers": {
+          "Idempotency-Key": "r2"
+        },
+        "body": {
+          "group": "{{$g2}}",
+          "version": null
+        }
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "retry": {
+            "id": "{{$rt2}}",
+            "transform": {
+              "version": 3
+            },
+            "rows": 2,
+            "previous": null
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/retries/{{$rt2}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "retry": {
+            "status": "done",
+            "written": 2,
+            "failed": 0
+          }
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "name": "resolved: rows.failed 0 and rows.failed_ever 2, every group kept with its history",
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "rejected": 0,
+          "rows": {
+            "failed": 0,
+            "failed_ever": 2,
+            "written": 4
+          },
+          "failures": [
+            "{{contains}}",
+            {
+              "group": "{{$g1}}",
+              "outstanding": 0,
+              "resolved": 2,
+              "first_failed_at": "{{$first}}",
+              "resolved_at": "{{time}}",
+              "retries": [
+                "{{$rt1}}"
+              ]
+            },
+            {
+              "group": "{{$g2}}",
+              "count": 0,
+              "outstanding": 0,
+              "resolved": 2,
+              "first_failed_at": "{{time}}",
+              "resolved_at": "{{time}}",
+              "retries": [
+                "{{$rt2}}"
+              ],
+              "content": "purged",
+              "samples": []
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "the load list keeps the historical count beside the current one",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "id": "{{$load}}",
+              "rows": {
+                "failed": 0,
+                "failed_ever": 2,
+                "written": 4
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/failures/{{$g2}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "group": "{{$g2}}",
+          "count": 0,
+          "outstanding": 0,
+          "resolved": 2,
+          "resolved_at": "{{time}}",
+          "retries": [
+            "{{$rt2}}"
+          ],
+          "content": "purged",
+          "records": []
+        }
+      }
+    },
+    {
+      "name": "rows written by a retry lose their content",
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/failures/{{$g2}}/samples"
+      },
+      "expect": {
+        "status": 410,
+        "body": {
+          "error": "{{string}}",
+          "code": "content_expired"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/stats?days=1&tz=UTC"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "today": {
+            "failed": 2,
+            "written": 4
+          }
+        }
+      }
+    },
+    {
+      "destination": {
+        "stored": [
+          {
+            "id": "obs-1",
+            "note": [
+              {
+                "text": "fixed"
+              }
+            ]
+          },
+          {
+            "id": "obs-3",
+            "note": [
+              {
+                "text": "fixed"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

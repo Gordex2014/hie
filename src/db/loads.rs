@@ -790,7 +790,9 @@ impl Db {
                     f.transform_id, f.transform_version, f.environment,
                     {failed}, {filtered}, {unknown}, {received}, {pending},
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'sent' THEN r.resource_count ELSE 0 END), 0) AS BIGINT),
-                    {wait_validation}, {wait_environment}, {wait_destination}
+                    {wait_validation}, {wait_environment}, {wait_destination},
+                    (SELECT CAST(COUNT(DISTINCT e.record_id) AS BIGINT) FROM record_events e
+                      WHERE e.load_id = f.id AND e.kind = 'failed' AND COALESCE(e.error_kind, '') <> 'filtered')
              FROM files f LEFT JOIN records r ON r.file_id = f.id
              WHERE {condition}
              GROUP BY f.id, f.feed_id, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived,
@@ -875,7 +877,7 @@ impl Db {
                     "transform": transform,
                     "environment": r.json(18),
                     "rows": {
-                        "read": read, "written": written, "failed": failed,
+                        "read": read, "written": written, "failed": failed, "failed_ever": r.i64(28),
                         "outcome_unknown": unknown, "in_progress": received + pending, "filtered": filtered,
                     },
                     "resources": {"written": r.i64(24)},

@@ -266,9 +266,35 @@
       "expect": {
         "status": 200,
         "body": {
-          "failures": []
+          "rows": {
+            "failed": 0,
+            "failed_ever": 2
+          },
+          "failures": [
+            "{{contains}}",
+            {
+              "group": "{{$ga}}",
+              "outstanding": 0,
+              "resolved": 1,
+              "resolved_at": "{{time}}",
+              "retries": [
+                "{{$a1}}",
+                "{{$a2}}"
+              ]
+            },
+            {
+              "group": "{{$gx}}",
+              "outstanding": 0,
+              "resolved": 1,
+              "resolved_at": "{{time}}",
+              "retries": [
+                "{{$x1}}"
+              ]
+            }
+          ]
         }
-      }
+      },
+      "name": "both groups resolved, still listed"
     }
   ]
 }

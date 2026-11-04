@@ -53,7 +53,12 @@
           "failures": [
             {
               "group": "{{$g}}",
-              "count": 2
+              "count": 2,
+              "outstanding": 2,
+              "resolved": 0,
+              "first_failed_at": "{{$first_failed_at}}",
+              "resolved_at": null,
+              "retries": []
             }
           ]
         }
@@ -247,6 +252,30 @@
       }
     },
     {
+      "name": "rows in flight: the group stays listed, not resolved yet",
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "failures": [
+            {
+              "group": "{{$g}}",
+              "count": 0,
+              "outstanding": 0,
+              "resolved": 0,
+              "resolved_at": null,
+              "retries": [
+                "{{$rt}}"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
       "name": "release the writes",
       "set_destination": {
         "writes": "ok"
@@ -281,9 +310,30 @@
       "expect": {
         "status": 200,
         "body": {
-          "failures": []
+          "rejected": 0,
+          "rows": {
+            "failed": 0,
+            "failed_ever": 2,
+            "written": 3
+          },
+          "failures": [
+            {
+              "group": "{{$g}}",
+              "count": 0,
+              "outstanding": 0,
+              "resolved": 2,
+              "first_failed_at": "{{$first_failed_at}}",
+              "resolved_at": "{{time}}",
+              "retries": [
+                "{{$rt}}"
+              ],
+              "content": "purged",
+              "samples": []
+            }
+          ]
         }
-      }
+      },
+      "name": "the resolved group stays listed with its history"
     },
     {
       "request": {
@@ -294,7 +344,14 @@
         "status": 200,
         "body": {
           "group": "{{$g}}",
-          "count": 0
+          "count": 0,
+          "outstanding": 0,
+          "resolved": 2,
+          "resolved_at": "{{time}}",
+          "retries": [
+            "{{$rt}}"
+          ],
+          "records": []
         }
       }
     },
