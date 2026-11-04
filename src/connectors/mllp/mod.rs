@@ -51,7 +51,7 @@ fn describe(source: &SourceConfig) -> String {
     }
 }
 
-fn build(feed: &FeedConfig) -> Result<Box<dyn Connector>> {
+fn build(feed: &FeedConfig, _ctx: &crate::connectors::Context) -> Result<Box<dyn Connector>> {
     let SourceConfig::Mllp { listen, spool, .. } = &feed.source else {
         bail!("source {} is not mllp", feed.id);
     };

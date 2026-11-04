@@ -22,6 +22,9 @@ pub(super) const PASSES: &str = "CREATE TABLE IF NOT EXISTS passes (
 CREATE INDEX IF NOT EXISTS passes_feed_status ON passes(feed_id, status);
 ";
 
+/// Why a pass ended without finishing.
+const INTERRUPTED: &str = "the pass was interrupted before it finished (the engine stopped)";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassStatus {
     Queued,
@@ -71,8 +74,20 @@ impl Db {
     }
 
     /// The passes of `feed` asked for and not begun: now `running`, served by
-    /// the pass that begins.
+    /// the pass that begins, owned by the source's lease holder. Passes still
+    /// running under another owner were abandoned and are ended as failed.
     pub fn start_passes(&self, feed: &str) -> Result<Vec<String>> {
+        let owner = self.lease(feed)?.map(|l| l.owner);
+        self.execute(
+            "UPDATE passes SET status = 'failed', error = $3, finished_at = $4
+             WHERE feed_id = $1 AND status = 'running' AND COALESCE(owner, '') <> $2",
+            &[
+                Param::Text(feed.into()),
+                Param::Text(owner.clone().unwrap_or_default()),
+                Param::Text(INTERRUPTED.into()),
+                Param::Int(now_ms()),
+            ],
+        )?;
         let ids: Vec<String> = self
             .query(
                 "SELECT id FROM passes WHERE feed_id = $1 AND status = 'queued' ORDER BY requested_at",
@@ -83,8 +98,12 @@ impl Db {
             .collect();
         for id in &ids {
             self.execute(
-                "UPDATE passes SET status = 'running', started_at = $2 WHERE id = $1 AND status = 'queued'",
-                &params![id, now_ms()],
+                "UPDATE passes SET status = 'running', started_at = $2, owner = $3 WHERE id = $1 AND status = 'queued'",
+                &[
+                    Param::Text(id.clone()),
+                    Param::Int(now_ms()),
+                    owner.clone().map_or(Param::Null, Param::Text),
+                ],
             )?;
         }
         Ok(ids)
@@ -104,7 +123,7 @@ impl Db {
         for id in ids {
             self.execute(
                 "UPDATE passes SET status = $2, skipped_reason = $3, error = $4, loads = $5, new_rows = $6, finished_at = $7
-                 WHERE id = $1",
+                 WHERE id = $1 AND status = 'running'",
                 &[
                     Param::Text(id.clone()),
                     Param::Text(status.as_str().into()),
@@ -117,6 +136,17 @@ impl Db {
             )?;
         }
         Ok(())
+    }
+
+    /// Ends as failed the passes of `feed` left running by `owner` (or by no
+    /// known owner): called when that instance starts, before it runs any.
+    pub fn recover_passes(&self, feed: &str, owner: &str) -> Result<()> {
+        self.execute(
+            "UPDATE passes SET status = 'failed', error = $3, finished_at = $4
+             WHERE feed_id = $1 AND status = 'running' AND (owner IS NULL OR owner = $2)",
+            &params![feed, owner, INTERRUPTED, now_ms()],
+        )
+        .map(drop)
     }
 
     /// One pass of `feed`.
@@ -141,5 +171,49 @@ impl Db {
                 requested_at: r.i64(7),
                 finished_at: r.opt_i64(8),
             }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pass_left_running_is_ended_when_another_owner_passes_or_its_own_restarts() {
+        let db = Db::in_memory().unwrap();
+        assert!(db.acquire_lease("src", "a", 60_000).unwrap());
+        let abandoned = db.request_pass("src").unwrap();
+        assert_eq!(
+            db.start_passes("src").unwrap(),
+            std::slice::from_ref(&abandoned)
+        );
+        // Instance a stops; b takes the lease and begins a pass.
+        db.release_lease("src", "a").unwrap();
+        assert!(db.acquire_lease("src", "b", 60_000).unwrap());
+        let next = db.request_pass("src").unwrap();
+        assert_eq!(db.start_passes("src").unwrap(), std::slice::from_ref(&next));
+        let pass = db.pass("src", &abandoned).unwrap().unwrap();
+        assert_eq!(pass.status, "failed");
+        assert!(pass.error.is_some() && pass.finished_at.is_some());
+        // An ended pass is not changed again; b's own pass is not touched.
+        db.finish_passes(
+            &[abandoned.clone(), next.clone()],
+            PassStatus::Done,
+            None,
+            None,
+            &[],
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            db.pass("src", &abandoned).unwrap().unwrap().status,
+            "failed"
+        );
+        assert_eq!(db.pass("src", &next).unwrap().unwrap().status, "done");
+        // b restarts with a pass still running: recovered as failed.
+        let left = db.request_pass("src").unwrap();
+        db.start_passes("src").unwrap();
+        db.recover_passes("src", "b").unwrap();
+        assert_eq!(db.pass("src", &left).unwrap().unwrap().status, "failed");
     }
 }

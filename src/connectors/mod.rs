@@ -36,6 +36,16 @@ use crate::db::Db;
 
 pub use source::Source;
 
+/// What a connector may need from the engine beyond its definition: the
+/// admission policy every connection is checked against before it is
+/// opened, and the kept secrets a connection's password names. The default
+/// (no policy, no secrets) is what a connector built outside an engine has.
+#[derive(Clone, Default)]
+pub struct Context {
+    pub admission: Arc<crate::admission::Admission>,
+    pub secrets: Option<Arc<crate::secrets::Secrets>>,
+}
+
 /// One object fetched from a source: a file, an S3 object, a pull.
 pub struct Incoming {
     /// The source's own handle: a file path, an object key.
@@ -257,7 +267,7 @@ pub struct Kind {
     pub describe: fn(&SourceConfig) -> String,
     /// The connector for a resolved definition. Checks only what building needs
     /// (environment variables, URLs); does not connect.
-    pub build: fn(&FeedConfig) -> Result<Box<dyn Connector>>,
+    pub build: fn(&FeedConfig, &Context) -> Result<Box<dyn Connector>>,
 }
 
 /// The registry: which module serves a source definition.

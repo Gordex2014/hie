@@ -5,24 +5,10 @@
 # Remove a line in the same change that makes its case pass; the runner fails on a listed case that passes.
 
 # H-secrets: write-only secrets, admission policy, secret-safe errors and the error code convention.
-admission/policy-read H-secrets
-admission/unenforced-without-policy H-secrets
-secrets/delete H-secrets
-secrets/unavailable-without-key H-secrets
-secrets/write-only-revisions H-secrets
-sequences/admission-refuses-before-connecting H-secrets   # also H-connectors: evidence for the allowed connection
-sequences/secret-never-echoed H-secrets                   # also H-connectors: database Test evidence, Start refusals
 
 # H-connectors: database connection shape, Test evidence, describe, sample, Start binding, first-load
 # progress, destination facts, passes, validation before delivery, namespacing, transaction delivery.
-database/describe H-connectors
 database/sqlserver-credential-binding H-connectors       # also H-secrets; runs only with HIE_TEST_MSSQL_URL
-database/first-load-progress H-connectors                 # also H-history: rows and progress on loads
-database/sample H-connectors
-database/start-binds-evidence H-connectors
-database/test-evidence H-connectors
-sources/check-now-pass H-connectors
-sources/destination-facts H-connectors
 
 # H-versions: transform ids and immutable versions, save conflicts, environments, pins, load-start snapshot.
 

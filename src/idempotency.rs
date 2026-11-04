@@ -104,6 +104,14 @@ impl Idempotent {
         &self.body
     }
 
+    /// Keys the request's hash with `key` (HMAC-SHA256 over the SHA-256), for
+    /// routes whose body carries a secret value: what is stored then cannot
+    /// be brute-forced back to the value without the key.
+    pub fn keyed(mut self, key: &[u8]) -> Result<Self, ApiError> {
+        self.request_sha256 = crate::secrets::keyed_hash(key, self.request_sha256.as_bytes())?;
+        Ok(self)
+    }
+
     /// Does `work` once per key. The work runs on a task of its own, so it
     /// finishes and its answer is stored even if the client goes away.
     ///

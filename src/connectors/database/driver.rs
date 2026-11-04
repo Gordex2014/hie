@@ -105,6 +105,11 @@ impl Driver {
         }
     }
 
+    /// The URL connected to.
+    pub(super) fn url(&self) -> &str {
+        &self.url
+    }
+
     async fn pool(&self) -> Result<&Pool> {
         self.pool
             .get_or_try_init(|| async {

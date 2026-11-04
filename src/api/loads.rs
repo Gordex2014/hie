@@ -48,13 +48,11 @@ fn no_store(body: Value) -> Response {
 }
 
 /// The row count of the evidence a source was started with (`read.rows` of
-/// its Test), the total of its first load's progress.
-///
-/// Cross-track: the evidence store belongs to the source side; until it is
-/// wired this answers `None`, so `total_rows` reads `null`.
+/// its Test), the total of its first load's progress; `None` without one.
 fn tested_total_rows(state: &AppState, source_id: &str) -> Option<i64> {
-    let _ = (state, source_id);
-    None
+    let evidence = state.manager.evidence();
+    let id = evidence.binding(source_id).ok()??.evidence?;
+    evidence.get(&id).ok()?.body["read"]["rows"].as_i64()
 }
 
 /// The members of a load its view in the store cannot know: its delivery

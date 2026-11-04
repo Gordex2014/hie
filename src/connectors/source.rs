@@ -8,7 +8,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::object::ObjectSource;
-use super::{Capability, Connector, Cursors, Incoming, Listed, Probe};
+use super::{Capability, Connector, Context, Cursors, Incoming, Listed, Probe};
 use crate::config::FeedConfig;
 use crate::db::Db;
 
@@ -24,8 +24,13 @@ impl Source {
     /// The connector the registry builds for a resolved definition. Cursors are
     /// not kept until `with_db`.
     pub fn from_config(feed: &FeedConfig) -> Result<Self> {
+        Self::from_config_in(feed, &Context::default())
+    }
+
+    /// The same, with the engine's admission policy and kept secrets.
+    pub fn from_config_in(feed: &FeedConfig, ctx: &Context) -> Result<Self> {
         Ok(Self {
-            connector: super::build::connector(feed)?,
+            connector: super::build::connector(feed, ctx)?,
             cursors: Cursors::new(&feed.id, None),
         })
     }

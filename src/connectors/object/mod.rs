@@ -83,7 +83,10 @@ fn check_s3(source: &SourceConfig) -> Result<()> {
     Ok(())
 }
 
-fn build_folder(feed: &FeedConfig) -> Result<Box<dyn Connector>> {
+fn build_folder(
+    feed: &FeedConfig,
+    _ctx: &crate::connectors::Context,
+) -> Result<Box<dyn Connector>> {
     let SourceConfig::Folder {
         path,
         pattern,
@@ -104,7 +107,7 @@ fn build_folder(feed: &FeedConfig) -> Result<Box<dyn Connector>> {
 
 /// An S3 bucket. Credentials come from the usual AWS environment
 /// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, profiles).
-fn build_s3(feed: &FeedConfig) -> Result<Box<dyn Connector>> {
+fn build_s3(feed: &FeedConfig, _ctx: &crate::connectors::Context) -> Result<Box<dyn Connector>> {
     let SourceConfig::S3 {
         bucket,
         prefix,
