@@ -15,7 +15,8 @@ name = "hie"
 path = "src/main.rs"
 
 [dependencies]
-aes-gcm = "0.10.3"
+aes = { version = "0.8.4", features = ["zeroize"] }
+aes-gcm = { version = "0.10.3", features = ["zeroize"] }
 anyhow = "1.0.103"
 async-trait = "0.1.92"
 axum = "0.8.4"
@@ -48,6 +49,7 @@ tokio-util = { version = "0.7", features = ["compat"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2"
+zeroize = "1.9.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]

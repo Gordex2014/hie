@@ -3,10 +3,17 @@
 //! `current_version`, `sources`, ...). Clients branch on `code`; `error` is
 //! for people. A route builds one with a constructor and adds members with
 //! [`ApiError::with`]; a manager error carries its own code and converts.
+//!
+//! [`conventions`] holds the rest of the API to it: what the framework answers
+//! by itself (a path or query value that does not parse, no such route, a
+//! method the route does not take, a body too large) becomes the same shape,
+//! with a fixed sentence that never repeats what the request sent.
 
-use axum::Json;
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::extract::Request;
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use axum::{Json, Router};
 use serde_json::{Map, Value};
 
 use crate::manager::{ErrorStatus, ManagerError};
@@ -132,5 +139,132 @@ impl From<ManagerError> for ApiError {
             error = error.with(name, value.clone());
         }
         error
+    }
+}
+
+/// Applies the error convention to everything `router` answers: unknown paths
+/// are `404 not_found`, and any error the framework answers in its own words
+/// is replaced by `{"error", "code"}` (its status and headers, such as
+/// `Allow`, are kept).
+pub fn conventions<S: Clone + Send + Sync + 'static>(router: Router<S>) -> Router<S> {
+    router
+        .fallback(|| async { ApiError::not_found("not_found", "nothing is at this path") })
+        .layer(axum::middleware::from_fn(normalize))
+}
+
+async fn normalize(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    let status = response.status();
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if !(status.is_client_error() || status.is_server_error()) || is_json {
+        return response;
+    }
+    let (code, sentence) = match status {
+        StatusCode::BAD_REQUEST
+        | StatusCode::UNPROCESSABLE_ENTITY
+        | StatusCode::UNSUPPORTED_MEDIA_TYPE => (
+            "invalid_body",
+            "the request's path, query or body is not one this route takes",
+        ),
+        StatusCode::UNAUTHORIZED => ("unauthorized", "a bearer token is required"),
+        StatusCode::FORBIDDEN => ("forbidden", "the token may not do this"),
+        StatusCode::NOT_FOUND => ("not_found", "nothing is at this path"),
+        StatusCode::METHOD_NOT_ALLOWED => {
+            ("method_not_allowed", "this path does not take this method")
+        }
+        StatusCode::PAYLOAD_TOO_LARGE => ("body_too_large", "the body is too large"),
+        s if s.is_client_error() => ("invalid_request", "the request is not one this route takes"),
+        _ => ("internal_error", "the engine failed to answer"),
+    };
+    let (mut parts, _) = response.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let mut normalized = ApiError::new(status, code, sentence).into_response();
+    for (name, value) in parts.headers {
+        if let Some(name) = name
+            && name != header::CONTENT_TYPE
+        {
+            normalized.headers_mut().insert(name, value);
+        }
+    }
+    normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::extract::{Path, Query};
+    use axum::routing::get;
+
+    use super::*;
+
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Limit {
+        limit: Option<i64>,
+    }
+
+    async fn serve(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn the_frameworks_own_answers_follow_the_convention() {
+        let app = conventions(
+            Router::new()
+                .route(
+                    "/records/{id}",
+                    get(|Path(id): Path<i64>| async move { id.to_string() }),
+                )
+                .route("/records", get(|Query(_): Query<Limit>| async { "ok" }))
+                .route(
+                    "/refused",
+                    get(|| async { ApiError::not_found("record_not_found", "record 1 not found") }),
+                ),
+        );
+        let base = serve(app).await;
+        let http = reqwest::Client::new();
+        for (method, path, status, code) in [
+            ("GET", "/records/Secret-Path-Value", 400, "invalid_body"),
+            (
+                "GET",
+                "/records?limit=Secret-Query-Value",
+                400,
+                "invalid_body",
+            ),
+            ("GET", "/nowhere/Secret-Path-Value", 404, "not_found"),
+            ("DELETE", "/records/1", 405, "method_not_allowed"),
+            ("GET", "/refused", 404, "record_not_found"),
+        ] {
+            let res = http
+                .request(method.parse().unwrap(), format!("{base}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status().as_u16(), status, "{method} {path}");
+            if status == 405 {
+                assert!(res.headers().contains_key(header::ALLOW));
+            }
+            let text = res.text().await.unwrap();
+            assert!(!text.contains("Secret"), "{text}");
+            let body: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["code"], code, "{method} {path}: {body}");
+            assert!(body["error"].is_string());
+        }
+        assert_eq!(
+            http.get(format!("{base}/records/7"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "7"
+        );
     }
 }
