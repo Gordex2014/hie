@@ -343,6 +343,29 @@ impl SourceManager {
             .with_context(|| format!("writing {}", path.display()))
     }
 
+    /// Writes a new source's file, only if none exists: of two attempts at
+    /// one Start (a stale idempotency owner and its successor, or two
+    /// clients), exactly one creates it. `false` when it exists.
+    fn write_new(&self, submitted: &FeedConfig) -> Result<bool> {
+        use std::io::Write;
+        std::fs::create_dir_all(&self.sources_dir)?;
+        let path = self.file_for(&submitted.id);
+        let yaml = submitted.to_yaml()?;
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+        };
+        file.write_all(yaml.as_bytes())
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(true)
+    }
+
     /// Checks a definition as a Start (or replace) does, after it is valid:
     /// admission, then its evidence. The binding it takes, if any.
     fn admit_and_bind(
@@ -400,7 +423,15 @@ impl SourceManager {
             Self::fill(&mut submitted, binding);
             Self::fill(&mut resolved, binding);
         }
-        self.write(&submitted)?;
+        if !self.write_new(&submitted)? {
+            if recovered && let Some(existing) = self.source(&submitted.id) {
+                return Ok(existing);
+            }
+            return Err(ManagerError::conflict(
+                "source_exists",
+                format!("source {} already exists", submitted.id),
+            ));
+        }
         self.ensure_default_rule(&submitted, by)?;
         if let Some(binding) = &binding {
             // The first load exists from the Start on, queued, so a client
