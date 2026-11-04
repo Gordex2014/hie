@@ -41,8 +41,9 @@ pub enum Claim {
 }
 
 impl Db {
-    /// Claims `key` for a request with this hash. A claim older than
-    /// `stale_after_ms` that never finished is taken over (same request only).
+    /// Claims `key` for a request with this hash. A claim whose owner has not
+    /// renewed it ([`Db::idempotency_renew`]) for `stale_after_ms` is taken over
+    /// (same request only), with a new owner token.
     pub fn idempotency_claim(
         &self,
         key: &str,
@@ -105,7 +106,20 @@ impl Db {
         })
     }
 
-    /// Stores the answer of the work done under a claim.
+    /// Renews the claim `token` owns, so it is not taken over while its work
+    /// runs; `false` when the token no longer owns it.
+    pub fn idempotency_renew(&self, key: &str, token: &str) -> Result<bool> {
+        Ok(self.execute(RENEW, &params![key, token, now_ms()])? == 1)
+    }
+
+    /// [`Db::idempotency_renew`] inside a transaction: also holds the claim's
+    /// row until the transaction ends.
+    pub fn idempotency_renew_in(tx: &mut Tx<'_>, key: &str, token: &str) -> Result<bool> {
+        Ok(tx.execute(RENEW, &params![key, token, now_ms()])? == 1)
+    }
+
+    /// Stores the answer of the work done under a claim; `false` (nothing
+    /// stored) when `token` no longer owns it.
     pub fn idempotency_complete(
         &self,
         key: &str,
@@ -137,6 +151,9 @@ impl Db {
         .map(drop)
     }
 }
+
+const RENEW: &str = "UPDATE idempotency_keys SET updated_at = $3
+     WHERE idem_key = $1 AND claim = $2 AND state = 'in_progress'";
 
 const COMPLETE: &str =
     "UPDATE idempotency_keys SET state = 'completed', status = $3, body = $4, updated_at = $5

@@ -90,13 +90,15 @@ pub fn router(state: AppState) -> Router {
             state.auth.clone(),
             crate::auth::require_bearer,
         ));
-    Router::new()
+    let app = Router::new()
         .merge(monitoring::open_router())
         // What HFS fetches during a $bulk-submit: the manifest, and the objects of
         // sources that cannot sign URLs. The token in the path is unguessable.
         .merge(bulk::open_router())
         .merge(api)
-        .with_state(state)
+        .with_state(state);
+    // Every answer, the framework's own included, is `{"error", "code"}`.
+    error::conventions(app)
 }
 
 const DAY_MS: i64 = 86_400_000;
