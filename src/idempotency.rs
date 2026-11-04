@@ -27,8 +27,9 @@
 //!   runs the work with [`Attempt::recovered`] set: the route then does the
 //!   work only if what it creates does not exist yet (and otherwise answers
 //!   what exists). Completing, renewing and giving up check the token, so an
-//!   owner whose claim was taken over can no longer store an answer; in
-//!   [`Idempotent::run_in_tx`] that rolls its work back.
+//!   owner whose claim was taken over can no longer store an answer and
+//!   answers `409 idempotency_conflict`: [`Idempotent::run`] stops its work at
+//!   the next renewal, [`Idempotent::run_in_tx`] rolls it back.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -64,6 +65,13 @@ pub struct Idempotent {
 }
 
 /// How the work is being done.
+///
+/// **Work with effects outside the store** ([`Idempotent::run`]) must create
+/// what it creates atomically and only if it does not exist yet (a file opened
+/// with `create_new`, an insert under a unique key): an owner whose claim
+/// lapsed (its engine hung) can already be in the middle of its work when the
+/// same request takes the key over, and only that atomic creation keeps the
+/// two from both doing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Attempt {
     /// The key was taken over from a claim that never finished: the earlier
@@ -106,6 +114,13 @@ impl Idempotent {
 
     /// Does `work` once per key. The work runs on a task of its own, so it
     /// finishes and its answer is stored even if the client goes away.
+    ///
+    /// The claim is renewed while the work runs. When a renewal finds the
+    /// claim taken over, the work is stopped there (its future is dropped, so
+    /// it does nothing more after its current step) and the answer is `409
+    /// idempotency_conflict`; so is it when the work finished but its answer
+    /// could not be stored for the same reason. See [`Attempt`] for what work
+    /// with effects outside the store must do.
     pub async fn run<F, Fut>(
         self,
         db: &std::sync::Arc<Db>,
@@ -132,18 +147,20 @@ impl Idempotent {
             tokio::pin!(work);
             let mut heartbeat = tokio::time::interval(HEARTBEAT);
             heartbeat.tick().await;
-            let result = loop {
+            loop {
                 tokio::select! {
-                    result = &mut work => break result,
+                    result = &mut work => break settle(&db, &key, &token, result),
                     _ = heartbeat.tick() => match db.idempotency_renew(&key, &token) {
                         Ok(true) => {}
-                        Ok(false) => tracing::error!("the claim on an idempotency key was taken over while its work ran"),
+                        Ok(false) => {
+                            tracing::error!("the claim on an idempotency key was taken over; its work is stopped");
+                            break Err(taken_over());
+                        }
+                        // The store did not answer: the claim may still be ours.
                         Err(e) => tracing::error!("renewing an idempotency key: {e:#}"),
                     },
                 }
-            };
-            settle(&db, &key, &token, &result);
-            result
+            }
         });
         match task.await {
             Ok(result) => result.map(respond),
@@ -258,7 +275,7 @@ impl Idempotent {
 fn taken_over() -> ApiError {
     ApiError::conflict(
         "idempotency_conflict",
-        "another request took this Idempotency-Key over; nothing was done",
+        "another request took this Idempotency-Key over and answers for it",
     )
 }
 
@@ -266,22 +283,35 @@ fn respond((status, body): Answer) -> Response {
     (status, Json(body)).into_response()
 }
 
-/// Stores a successful answer; gives the key up otherwise.
-fn settle(db: &Db, key: &str, token: &str, result: &Result<Answer, ApiError>) {
-    let stored = match result {
-        Ok((status, body)) if status.is_success() => db
-            .idempotency_complete(key, token, status.as_u16(), Some(body))
-            .map(|stored| {
-                if !stored {
-                    tracing::error!(
-                        "the claim on an idempotency key was taken over; this answer is not stored"
-                    );
-                }
-            }),
-        _ => db.idempotency_release(key, token),
+/// Stores a successful answer; gives the key up otherwise. An answer that
+/// cannot be stored because the claim was taken over becomes `409
+/// idempotency_conflict`: the request that holds the key now answers it.
+fn settle(
+    db: &Db,
+    key: &str,
+    token: &str,
+    result: Result<Answer, ApiError>,
+) -> Result<Answer, ApiError> {
+    let stored = match &result {
+        Ok((status, body)) if status.is_success() => {
+            db.idempotency_complete(key, token, status.as_u16(), Some(body))
+        }
+        _ => db.idempotency_release(key, token).map(|()| true),
     };
-    if let Err(e) = stored {
-        tracing::error!("recording the idempotency key's answer: {e:#}");
+    match stored {
+        Ok(true) => result,
+        Ok(false) => {
+            tracing::error!(
+                "the claim on an idempotency key was taken over; this answer is not stored"
+            );
+            Err(taken_over())
+        }
+        // The work was done; the store failed to record it. The claim lapses
+        // and the same request, sent again, finds what the work created.
+        Err(e) => {
+            tracing::error!("recording the idempotency key's answer: {e:#}");
+            result
+        }
     }
 }
 
@@ -645,6 +675,88 @@ mod tests {
         );
         finish.send(()).unwrap();
         assert_eq!(running.await.unwrap().unwrap(), StatusCode::CREATED);
+    }
+
+    /// Hands the claim on `key` to another owner, as a takeover would.
+    fn take_over(db: &Db, key: &str) {
+        db.transaction(|tx| {
+            tx.execute(
+                "UPDATE idempotency_keys SET claim = 'someone-else' WHERE idem_key = $1",
+                &params![key],
+            )
+        })
+        .unwrap();
+    }
+
+    /// Notes when the work's future is dropped.
+    struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_owner_is_stopped_and_answers_conflict() {
+        let db = Arc::new(Db::in_memory().unwrap());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let idem = Idempotent {
+            key: Some("k".into()),
+            request_sha256: "h".into(),
+            body: Bytes::new(),
+        };
+        let running = tokio::spawn({
+            let (db, dropped, finished) = (db.clone(), dropped.clone(), finished.clone());
+            async move {
+                idem.run(&db, true, move |_, _| async move {
+                    let _guard = Dropped(dropped);
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    Ok((StatusCode::CREATED, json!({})))
+                })
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        take_over(&db, "k");
+        let answer = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("stopped at the next renewal")
+            .unwrap();
+        assert_eq!(answer.unwrap_err().code(), "idempotency_conflict");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the work's future is dropped"
+        );
+        assert_eq!(finished.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn work_that_ends_after_a_takeover_answers_conflict() {
+        let db = Arc::new(Db::in_memory().unwrap());
+        let idem = Idempotent {
+            key: Some("k".into()),
+            request_sha256: "h".into(),
+            body: Bytes::new(),
+        };
+        let inner = db.clone();
+        let answer = idem
+            .run(&db, true, move |_, _| async move {
+                // Taken over before the first renewal, then the work ends.
+                take_over(&inner, "k");
+                Ok((StatusCode::CREATED, json!({"made": true})))
+            })
+            .await;
+        assert_eq!(answer.unwrap_err().code(), "idempotency_conflict");
+        assert!(
+            matches!(
+                db.idempotency_claim("k", "h", LAPSED_MS).unwrap(),
+                Claim::InProgress { .. }
+            ),
+            "the stale owner stored nothing"
+        );
     }
 
     #[tokio::test]
