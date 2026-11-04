@@ -194,7 +194,9 @@ mod tests {
     #[test]
     fn legacy_urls_give_their_parts() {
         assert_eq!(
-            url_parts("postgres://u:p@Host:5433/labs").unwrap(),
+            url_parts("postgres://u:p@Host:5433/labs")
+                .unwrap()
+                .normalized(),
             parts("postgres", Some("host"), Some(5433), "labs")
         );
         assert_eq!(

@@ -263,3 +263,78 @@ fn a_database_source_is_checked_on_resolve() {
     let err = Source::from_config(&ok).map(drop).unwrap_err();
     assert!(format!("{err:#}").contains("X"), "{err:#}");
 }
+
+/// A table read by parts follows the keyset (`new_rows_by`, `key`): rows that
+/// share a `new_rows_by` value across a run's boundary (1000 rows) are all
+/// read once, and rows added later with that same value are read next.
+#[tokio::test]
+async fn a_table_read_never_skips_rows_that_share_new_rows_by() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("labs.db").display().to_string();
+    let pool = SqlitePoolOptions::new()
+        .connect(&format!("sqlite:{path}?mode=rwc"))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE lab_results (id INTEGER NOT NULL PRIMARY KEY, batch INTEGER NOT NULL, value TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // 1500 rows in one batch value: a run of 1000 ends inside it.
+    let insert = |from: i64, to: i64, batch: i64| {
+        let pool = pool.clone();
+        async move {
+            for id in from..=to {
+                sqlx::query("INSERT INTO lab_results (id, batch, value) VALUES (?1, ?2, 'x')")
+                    .bind(id)
+                    .bind(batch)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+    };
+    insert(1, 1500, 7).await;
+
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut feed: hie::config::FeedConfig = serde_json::from_value(json!({
+        "id": "labs", "name": "Labs",
+        "source": {"type": "database",
+                   "connection": {"engine": "sqlite", "database": path},
+                   "read": {"mode": "table", "table": {"name": "lab_results"}, "key": ["id"], "new_rows_by": "batch"}},
+        "transform": "transforms/sql_lab_results.py",
+    }))
+    .unwrap();
+    feed.resolve(&repo).unwrap();
+    let db = Arc::new(Db::in_memory().unwrap());
+    let source = Source::from_config_in(&feed, &hie::connectors::Context::default())
+        .unwrap()
+        .with_db(db);
+
+    let ids = |bytes: Vec<u8>| -> Vec<i64> {
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["id"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect()
+    };
+    let key = source.list().await.unwrap().remove(0);
+    let first = ids(source.fetch(&key).await.unwrap().bytes);
+    assert_eq!(first, (1..=1500).collect::<Vec<_>>());
+    source.acknowledge(&key, "").await.unwrap();
+    assert!(source.list().await.unwrap().is_empty());
+
+    // Later rows in the same batch, and in a later one.
+    insert(1501, 1502, 7).await;
+    insert(1503, 1503, 8).await;
+    let key = source.list().await.unwrap().remove(0);
+    assert_eq!(
+        ids(source.fetch(&key).await.unwrap().bytes),
+        [1501, 1502, 1503]
+    );
+    source.acknowledge(&key, "").await.unwrap();
+    assert!(source.list().await.unwrap().is_empty());
+}

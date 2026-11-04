@@ -80,7 +80,7 @@ impl Db {
         let owner = self.lease(feed)?.map(|l| l.owner);
         self.execute(
             "UPDATE passes SET status = 'failed', error = $3, finished_at = $4
-             WHERE feed_id = $1 AND status = 'running' AND (owner IS NULL OR owner <> $2)",
+             WHERE feed_id = $1 AND status = 'running' AND COALESCE(owner, '') <> $2",
             &[
                 Param::Text(feed.into()),
                 Param::Text(owner.clone().unwrap_or_default()),
@@ -171,5 +171,49 @@ impl Db {
                 requested_at: r.i64(7),
                 finished_at: r.opt_i64(8),
             }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pass_left_running_is_ended_when_another_owner_passes_or_its_own_restarts() {
+        let db = Db::in_memory().unwrap();
+        assert!(db.acquire_lease("src", "a", 60_000).unwrap());
+        let abandoned = db.request_pass("src").unwrap();
+        assert_eq!(
+            db.start_passes("src").unwrap(),
+            std::slice::from_ref(&abandoned)
+        );
+        // Instance a stops; b takes the lease and begins a pass.
+        db.release_lease("src", "a").unwrap();
+        assert!(db.acquire_lease("src", "b", 60_000).unwrap());
+        let next = db.request_pass("src").unwrap();
+        assert_eq!(db.start_passes("src").unwrap(), std::slice::from_ref(&next));
+        let pass = db.pass("src", &abandoned).unwrap().unwrap();
+        assert_eq!(pass.status, "failed");
+        assert!(pass.error.is_some() && pass.finished_at.is_some());
+        // An ended pass is not changed again; b's own pass is not touched.
+        db.finish_passes(
+            &[abandoned.clone(), next.clone()],
+            PassStatus::Done,
+            None,
+            None,
+            &[],
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            db.pass("src", &abandoned).unwrap().unwrap().status,
+            "failed"
+        );
+        assert_eq!(db.pass("src", &next).unwrap().unwrap().status, "done");
+        // b restarts with a pass still running: recovered as failed.
+        let left = db.request_pass("src").unwrap();
+        db.start_passes("src").unwrap();
+        db.recover_passes("src", "b").unwrap();
+        assert_eq!(db.pass("src", &left).unwrap().unwrap().status, "failed");
     }
 }

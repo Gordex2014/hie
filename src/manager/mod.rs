@@ -200,7 +200,22 @@ impl SourceManager {
     }
 
     /// Builds and spawns the runner for a resolved definition, replacing a running one.
-    pub fn start(&self, feed: FeedConfig) -> Result<()> {
+    pub fn start(&self, mut feed: FeedConfig) -> Result<()> {
+        // A definition written by hand may leave its password's revision
+        // out: it runs with the current one, fixed now, never a later one.
+        if let SourceConfig::Database {
+            connection: Some(connection),
+            ..
+        } = &mut feed.source
+            && connection
+                .password
+                .as_ref()
+                .is_some_and(|p| p.revision.is_none())
+            && let Ok(Some((_, revision))) = self.evidence.resolve_credential(connection)
+            && let Some(password) = &mut connection.password
+        {
+            password.revision = Some(revision);
+        }
         self.admit_running(&feed)?;
         let source = Source::from_config_in(&feed, &self.connect)?.with_db(self.db.clone());
         let runner = Arc::new(FeedRunner::from_services(
@@ -540,5 +555,27 @@ impl SourceManager {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_definition_that_does_not_parse_names_no_value() {
+        let body = serde_json::json!({
+            "id": "labs", "name": "Labs", "transform": "t.py",
+            "source": {"type": "database", "connection": {"engine": "sqlite", "database": "x.db",
+                       "password": "Corpus-Secret-1!"}},
+        });
+        let e = read_definition::<FeedConfig>(&body).unwrap_err();
+        assert_eq!(e.code(), "invalid_definition");
+        assert!(!e.message().contains("Corpus-Secret-1!"), "{}", e.message());
+        assert!(
+            !e.members()
+                .values()
+                .any(|v| v.to_string().contains("Corpus-Secret-1!"))
+        );
     }
 }
