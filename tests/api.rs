@@ -890,8 +890,21 @@ async fn a_definition_is_its_file_whatever_the_file_is_named() {
         ["by-hand.yml", "late.yml", "long.yaml", "short.yml"]
     );
 
+    // A file named for an id but holding another source is that source's.
+    let created = http
+        .post(format!("{api}/api/sources"))
+        .json(&definition("by-hand", "Its own"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    let view = get(format!("{api}/api/sources/by-hand")).await;
+    assert_eq!(view["definition"]["name"], "Its own", "{view}");
+    let view = get(format!("{api}/api/sources/other")).await;
+    assert_eq!(view["definition"]["name"], "Replaced", "{view}");
+
     // A delete removes the file the source was read from.
-    for id in ["short", "long", "other"] {
+    for id in ["short", "long", "other", "by-hand"] {
         let deleted = http
             .delete(format!("{api}/api/sources/{id}"))
             .send()

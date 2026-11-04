@@ -353,14 +353,15 @@ pub struct FeedConfig {
 const SOURCE_EXTENSIONS: [&str; 2] = ["yaml", "yml"];
 
 /// The file named for source `id` in `dir`: `<id>.yaml` or `<id>.yml`,
-/// whichever exists, or `<id>.yaml` (where a new one is written) when
-/// neither does. A loaded source knows its file ([`FeedConfig::file`]),
-/// whatever its name; this is for one that is not loaded.
-pub fn source_file(dir: &Path, id: &str) -> PathBuf {
+/// whichever exists and is not `taken` (the file of another loaded source),
+/// or else `<id>.yaml`, where a new one is written. A loaded source knows
+/// its file ([`FeedConfig::file`]), whatever its name; this is for one that
+/// is not loaded.
+pub fn source_file(dir: &Path, id: &str, taken: &[PathBuf]) -> PathBuf {
     SOURCE_EXTENSIONS
         .iter()
         .map(|ext| dir.join(format!("{id}.{ext}")))
-        .find(|path| path.exists())
+        .find(|path| path.exists() && !taken.contains(path))
         .unwrap_or_else(|| dir.join(format!("{id}.{}", SOURCE_EXTENSIONS[0])))
 }
 

@@ -309,11 +309,14 @@ impl SourceManager {
         self.file_of(id, self.source(id).as_ref())
     }
 
-    /// [`Self::file_for`] with the running definition given.
+    /// [`Self::file_for`] with the running definition given. A file named
+    /// for `id` that another source was loaded from is that source's.
     fn file_of(&self, id: &str, running: Option<&FeedConfig>) -> PathBuf {
-        running
-            .and_then(|feed| feed.file.clone())
-            .unwrap_or_else(|| crate::config::source_file(&self.sources_dir, id))
+        if let Some(file) = running.and_then(|feed| feed.file.clone()) {
+            return file;
+        }
+        let taken: Vec<PathBuf> = self.sources().into_iter().filter_map(|f| f.file).collect();
+        crate::config::source_file(&self.sources_dir, id, &taken)
     }
 
     /// The source's definition as its file holds it: paths as written, nothing resolved.
