@@ -7,7 +7,6 @@
 # H-secrets: write-only secrets, admission policy, secret-safe errors and the error code convention.
 admission/policy-read H-secrets
 admission/unenforced-without-policy H-secrets
-conventions/error-codes H-secrets
 secrets/delete H-secrets
 secrets/unavailable-without-key H-secrets
 secrets/write-only-revisions H-secrets

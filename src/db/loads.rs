@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde_json::{Map, Value, json};
 
 use super::{Db, Param, now_ms, params};
+use crate::versions::{VersionKey, VersionRef};
 
 /// One row per object taken from a source: a load.
 pub(super) const FILES: &str = "CREATE TABLE IF NOT EXISTS files (
@@ -19,7 +20,10 @@ pub(super) const FILES: &str = "CREATE TABLE IF NOT EXISTS files (
   error TEXT,
   rejected_reported INTEGER NOT NULL DEFAULT 0,
   source_key TEXT,
-  archived INTEGER NOT NULL DEFAULT 0
+  archived INTEGER NOT NULL DEFAULT 0,
+  transform_id TEXT,
+  transform_version INTEGER,
+  environment TEXT
 );
 CREATE INDEX IF NOT EXISTS files_feed_sha ON files(feed_id, sha256);
 CREATE INDEX IF NOT EXISTS files_feed_received ON files(feed_id, received_at);
@@ -41,7 +45,10 @@ pub(super) const RECORDS: &str = "CREATE TABLE IF NOT EXISTS records (
   attempts INTEGER NOT NULL DEFAULT 0,
   next_attempt_at INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL,
-  submission TEXT
+  submission TEXT,
+  exec_retry TEXT,
+  exec_transform_id TEXT,
+  exec_version INTEGER
 );
 CREATE INDEX IF NOT EXISTS records_feed_status ON records(feed_id, status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS records_feed_status_id ON records(feed_id, status, id);
@@ -53,6 +60,15 @@ pub(super) const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("files", "source_key", "TEXT"),
     ("files", "archived", "INTEGER NOT NULL DEFAULT 0"),
     ("records", "submission", "TEXT"),
+    // The version a load runs, fixed when it is admitted (or leaves `queued`).
+    ("files", "transform_id", "TEXT"),
+    ("files", "transform_version", "INTEGER"),
+    ("files", "environment", "TEXT"),
+    // Who runs a record's current attempt: a retry and its version, or null
+    // for the load's own snapshot.
+    ("records", "exec_retry", "TEXT"),
+    ("records", "exec_transform_id", "TEXT"),
+    ("records", "exec_version", "INTEGER"),
 ];
 
 #[derive(Debug, Clone)]
@@ -64,6 +80,40 @@ pub struct WorkItem {
     pub raw: Value,
     pub resources: Option<Value>,
     pub attempts: u32,
+    /// The retry running this record's current attempt; `None` for the load's own.
+    pub retry: Option<String>,
+    /// The version this attempt runs: the retry's, else the load's snapshot;
+    /// `None` for a load admitted before loads recorded one.
+    pub version: Option<VersionKey>,
+}
+
+/// One failed row whose content is still kept, as Try's `failures` input and
+/// the failure samples read it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailedRow {
+    pub record_id: i64,
+    pub line: i64,
+    pub raw: Value,
+    /// The transform context the row ran with (`feed`, `file`, `line`).
+    pub context: Value,
+}
+
+/// Why [`Db::failed_rows`] has no rows to give.
+#[derive(Debug)]
+pub enum FailedRowsError {
+    LoadNotFound,
+    GroupNotFound,
+    /// A record named in the selection is not one of the group's failing rows.
+    RecordNotInGroup(i64),
+    /// The group's content was purged or expired (`410 content_expired`).
+    ContentExpired,
+    Store(anyhow::Error),
+}
+
+impl From<anyhow::Error> for FailedRowsError {
+    fn from(e: anyhow::Error) -> Self {
+        FailedRowsError::Store(e)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +126,13 @@ pub struct FinishedFile {
     pub newly_rejected: i64,
     pub first_rejection: Option<(i64, String)>,
 }
+
+/// What a work item is read from: the record, its load, and who runs it (the
+/// record's retry and version, else the load's snapshot).
+const WORK_COLUMNS: &str =
+    "r.id, r.file_id, r.line, f.name, r.raw, r.resources, r.attempts, r.exec_retry,
+    COALESCE(r.exec_transform_id, f.transform_id),
+    CASE WHEN r.exec_transform_id IS NULL THEN f.transform_version ELSE r.exec_version END";
 
 /// Rows per multi-row statement: well under both engines' parameter limits.
 const INSERT_ROWS_PER_STATEMENT: usize = 200;
@@ -127,6 +184,80 @@ impl Db {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             &params![feed, name, sha, size, status, duplicate_of, now, finished_at, source_key],
         )
+    }
+
+    /// A load created before its pass begins (a database source's first load,
+    /// at Start): `queued`, with no content yet. The source's next pass adopts
+    /// it ([`Db::open_load`]) instead of creating one.
+    pub fn create_queued_load(&self, feed: &str) -> Result<i64> {
+        self.insert_returning_id(
+            "INSERT INTO files (feed_id, name, sha256, size, status, received_at) VALUES ($1, '', '', 0, 'queued', $2)",
+            &params![feed, now_ms()],
+        )
+    }
+
+    /// Starts a load for an object a pass took: the source's oldest `queued`
+    /// load when there is one, else a new load; `processing`, with the version
+    /// it runs fixed from now on (`None` on the paths that run no transform).
+    pub fn open_load(
+        &self,
+        feed: &str,
+        name: &str,
+        sha: &str,
+        size: u64,
+        source_key: Option<&str>,
+        version: Option<&VersionRef>,
+    ) -> Result<i64> {
+        let (transform_id, transform_version, environment) = match version {
+            Some(v) => (
+                Some(v.transform_id.as_str()),
+                Some(v.version),
+                Some(serde_json::to_string(&v.environment)?),
+            ),
+            None => (None, None, None),
+        };
+        let now = now_ms();
+        if let Some(queued) = self.query_one(
+            "SELECT id FROM files WHERE feed_id = $1 AND status = 'queued' ORDER BY id LIMIT 1",
+            &params![feed],
+        )? {
+            let id = queued.i64(0);
+            let adopted = self.execute(
+                "UPDATE files SET name = $2, sha256 = $3, size = $4, status = 'processing', received_at = $5,
+                        source_key = $6, transform_id = $7, transform_version = $8, environment = $9
+                 WHERE id = $1 AND status = 'queued'",
+                &params![id, name, sha, size, now, source_key, transform_id, transform_version, environment],
+            )?;
+            if adopted == 1 {
+                return Ok(id);
+            }
+        }
+        self.insert_returning_id(
+            "INSERT INTO files (feed_id, name, sha256, size, status, received_at, source_key, transform_id, transform_version, environment)
+             VALUES ($1, $2, $3, $4, 'processing', $5, $6, $7, $8, $9)",
+            &params![feed, name, sha, size, now, source_key, transform_id, transform_version, environment],
+        )
+    }
+
+    /// The failed rows of one failure group of a load, all or those named, in
+    /// line order, at most 100, while their content is kept.
+    ///
+    /// Stub: failure groups do not exist until track H builds them, so every
+    /// existing load answers `GroupNotFound`.
+    pub fn failed_rows(
+        &self,
+        load_id: i64,
+        group: &str,
+        selection: Option<&[i64]>,
+    ) -> std::result::Result<Vec<FailedRow>, FailedRowsError> {
+        let _ = (group, selection);
+        if self
+            .query_one("SELECT 1 FROM files WHERE id = $1", &params![load_id])?
+            .is_none()
+        {
+            return Err(FailedRowsError::LoadNotFound);
+        }
+        Err(FailedRowsError::GroupNotFound)
     }
 
     /// The key and name of a file still waiting at its source (not archived yet).
@@ -306,25 +437,47 @@ impl Db {
                 raw: r.json(4).unwrap_or(Value::Null),
                 resources: r.json(5),
                 attempts: r.i64(6) as u32,
+                retry: r.opt_string(7),
+                version: match (r.opt_string(8), r.opt_i64(9)) {
+                    (Some(transform_id), Some(version)) => Some(VersionKey {
+                        transform_id,
+                        version,
+                    }),
+                    _ => None,
+                },
             })
             .collect())
     }
 
     pub fn received_records(&self, feed: &str, limit: usize) -> Result<Vec<WorkItem>> {
+        self.received_records_after(feed, 0, limit)
+    }
+
+    /// Received records with ids above `after`, in id order: a round of the
+    /// transform walks them chunk by chunk without meeting the ones it skipped.
+    pub fn received_records_after(
+        &self,
+        feed: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<WorkItem>> {
         self.work_items(
-            "SELECT r.id, r.file_id, r.line, f.name, r.raw, r.resources, r.attempts
-             FROM records r JOIN files f ON f.id = r.file_id
-             WHERE r.feed_id = $1 AND r.status = 'received' ORDER BY r.id LIMIT $2",
-            &params![feed, limit],
+            &format!(
+                "SELECT {WORK_COLUMNS} FROM records r JOIN files f ON f.id = r.file_id
+                 WHERE r.feed_id = $1 AND r.status = 'received' AND r.id > $2 ORDER BY r.id LIMIT $3"
+            ),
+            &params![feed, after, limit],
         )
     }
 
     pub fn due_records(&self, feed: &str, limit: usize) -> Result<Vec<WorkItem>> {
         self.work_items(
-            "SELECT r.id, r.file_id, r.line, f.name, r.raw, r.resources, r.attempts
+            &format!(
+                "SELECT {WORK_COLUMNS}
              FROM records r JOIN files f ON f.id = r.file_id
              WHERE r.feed_id = $1 AND r.status = 'pending' AND r.next_attempt_at <= $2
-             ORDER BY r.id LIMIT $3",
+             ORDER BY r.id LIMIT $3"
+            ),
             &params![feed, now_ms(), limit],
         )
     }

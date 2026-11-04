@@ -4,6 +4,7 @@
 //! (and restarting the sources that use one) and trying one on records;
 //! `probe` the connection test of a definition that is not a source yet.
 
+mod error;
 mod probe;
 mod transforms;
 
@@ -20,22 +21,11 @@ use crate::config::{Config, FeedConfig, RuntimeConfig};
 use crate::connectors::Source;
 use crate::db::{Db, Rule};
 use crate::fhir::FhirClient;
-use crate::pipeline::{FeedRunner, RunnerControl};
+use crate::pipeline::{FeedRunner, RunnerControl, Services};
 use crate::runtime::RuntimeSettings;
+use crate::versions::{ExecutorSettings, Versions};
 
-#[derive(Debug)]
-pub enum ManagerError {
-    Invalid(String),
-    NotFound(String),
-    Conflict(String),
-    Internal(anyhow::Error),
-}
-
-impl From<anyhow::Error> for ManagerError {
-    fn from(e: anyhow::Error) -> Self {
-        ManagerError::Internal(e)
-    }
-}
+pub use error::{ErrorStatus, ManagerError};
 
 struct Managed {
     feed: FeedConfig,
@@ -46,18 +36,17 @@ struct Managed {
 pub struct SourceManager {
     python: String,
     runtime_dir: PathBuf,
-    fhir_base_url: String,
-    public_url: String,
     sources_dir: PathBuf,
     transforms_dir: PathBuf,
     base_dir: PathBuf,
-    bulk_dir: PathBuf,
     terminology_url: Option<String>,
     /// The shared runtime transforms run at, when configured.
     runtime: Option<RuntimeSettings>,
     db: Arc<Db>,
-    fhir: Arc<FhirClient>,
-    alerts: Arc<Alerter>,
+    /// `hie.yaml` as loaded.
+    config: Arc<Config>,
+    /// What every runner shares (the store, HFS, versions, ...).
+    services: Services,
     sources: Mutex<BTreeMap<String, Managed>>,
 }
 
@@ -68,46 +57,66 @@ impl SourceManager {
         db: Arc<Db>,
         fhir: Arc<FhirClient>,
         alerts: Arc<Alerter>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            python: config.python.clone(),
-            runtime_dir: runtime_dir.to_path_buf(),
+    ) -> Result<Arc<Self>> {
+        let runtime = config
+            .runtime
+            .as_ref()
+            .filter(|r| !r.url.trim().is_empty())
+            .map(RuntimeConfig::settings);
+        let versions = Arc::new(Versions::new(
+            db.clone(),
+            ExecutorSettings {
+                python: config.python.clone(),
+                runtime_dir: runtime_dir.to_path_buf(),
+                terminology: config.terminology_url.clone(),
+                runtime: runtime.clone(),
+            },
+            &config.transforms_dir,
+        ));
+        let services = Services {
+            db: db.clone(),
+            fhir,
+            alerts,
+            versions,
             fhir_base_url: config.fhir_base_url.clone(),
             public_url: config.public_url.clone(),
+            bulk_dir: config.bulk_dir(),
+            validation: config.validation,
+            content_keys: Some(Arc::new(config.content_keys()?)),
+        };
+        Ok(Arc::new(Self {
+            python: config.python.clone(),
+            runtime_dir: runtime_dir.to_path_buf(),
             sources_dir: config.sources_dir.clone(),
             transforms_dir: config.transforms_dir.clone(),
             base_dir: config.base_dir.clone(),
-            bulk_dir: config.bulk_dir(),
             terminology_url: config.terminology_url.clone(),
-            runtime: config
-                .runtime
-                .as_ref()
-                .filter(|r| !r.url.trim().is_empty())
-                .map(RuntimeConfig::settings),
+            runtime,
             db,
-            fhir,
-            alerts,
+            config: Arc::new(config.clone()),
+            services,
             sources: Mutex::new(BTreeMap::new()),
-        })
+        }))
+    }
+
+    /// `hie.yaml` as loaded.
+    pub fn config(&self) -> &Arc<Config> {
+        &self.config
+    }
+
+    /// The transform versions loads and Try run.
+    pub fn versions(&self) -> &Arc<Versions> {
+        &self.services.versions
+    }
+
+    /// What every runner shares.
+    pub fn services(&self) -> &Services {
+        &self.services
     }
 
     /// Builds and spawns the runner for a resolved definition, replacing a running one.
     pub fn start(&self, feed: FeedConfig) -> Result<()> {
-        let runner = Arc::new(
-            FeedRunner::new(
-                feed.clone(),
-                self.db.clone(),
-                self.fhir.clone(),
-                self.alerts.clone(),
-                &self.python,
-                &self.runtime_dir,
-                &self.fhir_base_url,
-                &self.public_url,
-            )?
-            .with_bulk_dir(&self.bulk_dir)
-            .with_terminology(self.terminology_url.as_deref())
-            .with_runtime(self.runtime.as_ref()),
-        );
+        let runner = Arc::new(FeedRunner::new(feed.clone(), &self.services)?);
         let control = Arc::new(RunnerControl::default());
         tokio::spawn(runner.clone().run(control.clone()));
         let previous = self.sources.lock().expect("manager mutex").insert(
@@ -182,12 +191,13 @@ impl SourceManager {
     /// returns both the form to write (as submitted) and the resolved form to run.
     fn parse(&self, body: &Value) -> Result<(FeedConfig, FeedConfig), ManagerError> {
         let submitted: FeedConfig = serde_json::from_value(body.clone())
-            .map_err(|e| ManagerError::Invalid(e.to_string()))?;
+            .map_err(|e| ManagerError::invalid("invalid_definition", e.to_string()))?;
         let mut resolved = submitted.clone();
         resolved
             .resolve(&self.base_dir)
-            .map_err(|e| ManagerError::Invalid(format!("{e:#}")))?;
-        Source::from_config(&resolved).map_err(|e| ManagerError::Invalid(format!("{e:#}")))?;
+            .map_err(|e| ManagerError::invalid("invalid_definition", format!("{e:#}")))?;
+        Source::from_config(&resolved)
+            .map_err(|e| ManagerError::invalid("invalid_definition", format!("{e:#}")))?;
         Ok((submitted, resolved))
     }
 
@@ -201,15 +211,38 @@ impl SourceManager {
     pub fn create(&self, body: &Value, by: Option<&str>) -> Result<FeedConfig, ManagerError> {
         let (submitted, resolved) = self.parse(body)?;
         if self.source(&submitted.id).is_some() || self.file_for(&submitted.id).exists() {
-            return Err(ManagerError::Conflict(format!(
-                "source {} already exists",
-                submitted.id
-            )));
+            return Err(ManagerError::conflict(
+                "source_exists",
+                format!("source {} already exists", submitted.id),
+            ));
         }
         self.write(&submitted)?;
         self.ensure_default_rule(&submitted, by)?;
         self.start(resolved.clone())?;
+        self.on_source_created(&resolved)?;
         Ok(resolved)
+    }
+
+    // ---- lifecycle hooks: what other areas keep about a source -------------
+
+    /// A source was created: its pin period starts (versions).
+    fn on_source_created(&self, feed: &FeedConfig) -> Result<()> {
+        self.versions().source_created(feed)
+    }
+
+    /// A source's definition was replaced: its pin period moves (versions); the
+    /// evidence and secret revisions the old definition held are released (S).
+    fn on_source_replaced(&self, before: &FeedConfig, after: &FeedConfig) -> Result<()> {
+        self.versions().source_replaced(before, after)?;
+        crate::evidence::source_replaced(&self.db, before, after)
+    }
+
+    /// A source was deleted: its pin period ends (versions), its failed
+    /// content is purged (H), its evidence and secret revisions released (S).
+    fn on_source_deleted(&self, feed: &FeedConfig) -> Result<()> {
+        self.versions().source_deleted(&feed.id)?;
+        crate::purge::source_deleted(&self.db, &feed.id)?;
+        crate::evidence::source_deleted(&self.db, &feed.id)
     }
 
     /// Every source is born with one silence rule, so nobody has to remember to
@@ -236,17 +269,24 @@ impl SourceManager {
 
     pub fn replace(&self, id: &str, body: &Value) -> Result<FeedConfig, ManagerError> {
         if self.source(id).is_none() {
-            return Err(ManagerError::NotFound(format!("source {id} not found")));
+            return Err(ManagerError::not_found(
+                "source_not_found",
+                format!("source {id} not found"),
+            ));
         }
         let (submitted, resolved) = self.parse(body)?;
         if submitted.id != id {
-            return Err(ManagerError::Invalid(format!(
-                "the body's id {:?} does not match {id:?}",
-                submitted.id
-            )));
+            return Err(ManagerError::invalid(
+                "invalid_definition",
+                format!("the body's id {:?} does not match {id:?}", submitted.id),
+            ));
         }
+        let before = self.source(id);
         self.write(&submitted)?;
         self.start(resolved.clone())?;
+        if let Some(before) = before {
+            self.on_source_replaced(&before, &resolved)?;
+        }
         Ok(resolved)
     }
 
@@ -254,13 +294,17 @@ impl SourceManager {
     pub fn delete(&self, id: &str) -> Result<(), ManagerError> {
         let removed = self.sources.lock().expect("manager mutex").remove(id);
         let Some(managed) = removed else {
-            return Err(ManagerError::NotFound(format!("source {id} not found")));
+            return Err(ManagerError::not_found(
+                "source_not_found",
+                format!("source {id} not found"),
+            ));
         };
         Self::halt(&managed);
         let path = self.file_for(id);
         if path.exists() {
             std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         }
+        self.on_source_deleted(&managed.feed)?;
         Ok(())
     }
 
@@ -278,17 +322,26 @@ impl SourceManager {
 
     /// Makes the source pass now instead of at its next poll.
     pub fn check_now(&self, id: &str) -> Result<(), ManagerError> {
-        let sources = self.sources.lock().expect("manager mutex");
-        let managed = sources
-            .get(id)
-            .ok_or_else(|| ManagerError::NotFound(format!("source {id} not found")))?;
-        managed.control.poke.notify_one();
-        Ok(())
+        self.request_pass(id).map(drop)
+    }
+
+    /// Asks for a pass of the source now; the pass's `ps_` id, which the
+    /// runner marks running, then done, skipped or failed.
+    pub fn request_pass(&self, id: &str) -> Result<String, ManagerError> {
+        self.require(id)?;
+        let pass = self.db.request_pass(id)?;
+        if let Some(managed) = self.sources.lock().expect("manager mutex").get(id) {
+            managed.control.poke.notify_one();
+        }
+        Ok(pass)
     }
 
     fn require(&self, id: &str) -> Result<(), ManagerError> {
         if self.source(id).is_none() {
-            return Err(ManagerError::NotFound(format!("source {id} not found")));
+            return Err(ManagerError::not_found(
+                "source_not_found",
+                format!("source {id} not found"),
+            ));
         }
         Ok(())
     }

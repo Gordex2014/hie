@@ -8,6 +8,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::body::LooseJson;
 use super::{ApiError, ApiResult, AppState, not_found};
 use crate::db::params;
 
@@ -75,7 +76,7 @@ async fn get_load(State(s): State<AppState>, Path(file_id): Path<i64>) -> ApiRes
         )?
         .into_iter()
         .next()
-        .ok_or_else(|| not_found(&format!("load {file_id}")))?;
+        .ok_or_else(|| not_found("load_not_found", &format!("load {file_id}")))?;
     let source_id = load["source_id"].as_str().unwrap_or_default().to_string();
     load["method"] = s
         .manager
@@ -96,15 +97,15 @@ struct RetryBody {
 async fn retry_load(
     State(s): State<AppState>,
     Path(file_id): Path<i64>,
-    body: Option<Json<RetryBody>>,
+    body: Option<LooseJson<RetryBody>>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let reason = body.and_then(|Json(b)| b.reason);
+    let reason = body.and_then(|LooseJson(b)| b.reason);
     let source_id =
         s.db.query_json("SELECT feed_id FROM files WHERE id = $1", params![file_id])?
             .into_iter()
             .next()
             .and_then(|r| r["feed_id"].as_str().map(str::to_string))
-            .ok_or_else(|| not_found(&format!("load {file_id}")))?;
+            .ok_or_else(|| not_found("load_not_found", &format!("load {file_id}")))?;
     let retried = s.db.reprocess_rejected(file_id, reason.as_deref())?;
     if retried > 0 {
         let _ = s.manager.check_now(&source_id);

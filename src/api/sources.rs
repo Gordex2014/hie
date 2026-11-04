@@ -3,13 +3,14 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
+use super::body::LooseJson;
 use super::{ApiError, ApiResult, AppState, DAY_MS, count, iso_ms, not_found};
 use crate::config::FeedConfig;
 use crate::db::{now_ms, params};
@@ -26,7 +27,6 @@ pub(super) fn router() -> Router<AppState> {
         .route("/api/sources/{id}/pause", post(pause_source))
         .route("/api/sources/{id}/resume", post(resume_source))
         .route("/api/sources/{id}/check-now", post(check_now))
-        .route("/api/sources/{id}/stats", get(source_stats))
 }
 
 /// A source's definition and its state, as one object.
@@ -97,14 +97,14 @@ async fn get_source(State(s): State<AppState>, Path(id): Path<String>) -> ApiRes
     let feed = s
         .manager
         .source(&id)
-        .ok_or_else(|| not_found(&format!("source {id}")))?;
+        .ok_or_else(|| not_found("source_not_found", &format!("source {id}")))?;
     Ok(Json(source_status(&s, &feed)?))
 }
 
 async fn create_source(
     State(s): State<AppState>,
     principal: Option<axum::Extension<Arc<helios_auth::Principal>>>,
-    Json(body): Json<Value>,
+    LooseJson(body): LooseJson<Value>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let by = principal.map(|axum::Extension(p)| p.subject().to_string());
     let feed = s.manager.create(&body, by.as_deref())?;
@@ -114,7 +114,7 @@ async fn create_source(
 async fn replace_source(
     State(s): State<AppState>,
     Path(id): Path<String>,
-    Json(body): Json<Value>,
+    LooseJson(body): LooseJson<Value>,
 ) -> ApiResult {
     let feed = s.manager.replace(&id, &body)?;
     Ok(Json(source_status(&s, &feed)?))
@@ -137,11 +137,11 @@ async fn pause_source(
     State(s): State<AppState>,
     Path(id): Path<String>,
     principal: Option<axum::Extension<Arc<helios_auth::Principal>>>,
-    body: Option<Json<PauseBody>>,
+    body: Option<LooseJson<PauseBody>>,
 ) -> ApiResult {
     // Who paused it: the body's name, else the authenticated subject.
     let by = body
-        .and_then(|Json(b)| b.by)
+        .and_then(|LooseJson(b)| b.by)
         .or_else(|| principal.map(|axum::Extension(p)| p.subject().to_string()));
     s.manager.pause(&id, by.as_deref())?;
     get_source(State(s), Path(id)).await
@@ -163,87 +163,9 @@ async fn check_now(
     ))
 }
 
-async fn test_source(State(s): State<AppState>, Json(body): Json<Value>) -> ApiResult {
+async fn test_source(State(s): State<AppState>, LooseJson(body): LooseJson<Value>) -> ApiResult {
     let probe = s.manager.test(&body).await?;
     Ok(Json(
         serde_json::to_value(probe).map_err(anyhow::Error::from)?,
-    ))
-}
-
-#[derive(Deserialize)]
-struct StatsQuery {
-    days: Option<i64>,
-}
-
-/// What a source's page draws: today's numbers and one row per day for the last N days.
-async fn source_stats(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
-    Query(q): Query<StatsQuery>,
-) -> ApiResult {
-    s.manager
-        .source(&id)
-        .ok_or_else(|| not_found(&format!("source {id}")))?;
-    let days = q.days.unwrap_or(14).clamp(1, 366);
-    let today = chrono::Utc::now().date_naive();
-    let first = today - chrono::Days::new(days as u64 - 1);
-    let since = first
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
-        .timestamp_millis();
-
-    let mut by_day: Map<String, Value> = (0..days)
-        .map(|i| {
-            let day = (first + chrono::Days::new(i as u64)).to_string();
-            (day, json!({"files": 0, "sent": 0, "rejected": 0}))
-        })
-        .collect();
-    for row in s.db.query_json(
-        &format!(
-            "SELECT {} AS day, COUNT(*) AS n FROM files
-             WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2 GROUP BY 1",
-            s.db.day("received_at")
-        ),
-        params![id, since],
-    )? {
-        if let Some(entry) = row["day"].as_str().and_then(|d| by_day.get_mut(d)) {
-            entry["files"] = row["n"].clone();
-        }
-    }
-    for row in s.db.query_json(
-        &format!(
-            "SELECT {} AS day, status, COUNT(*) AS n FROM records
-             WHERE feed_id = $1 AND status IN ('sent', 'rejected') AND updated_at >= $2 GROUP BY 1, status",
-            s.db.day("updated_at")
-        ),
-        params![id, since],
-    )? {
-        if let (Some(entry), Some(status)) = (
-            row["day"].as_str().and_then(|d| by_day.get_mut(d)),
-            row["status"].as_str(),
-        ) {
-            entry[status] = row["n"].clone();
-        }
-    }
-    let rows: Vec<Value> = by_day
-        .into_iter()
-        .map(|(day, v)| json!({"day": day, "files": v["files"], "sent": v["sent"], "rejected": v["rejected"]}))
-        .collect();
-
-    let today_since = today
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
-        .timestamp_millis();
-    let today_json = json!({
-        "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2", params![id, today_since])?,
-        "records": count(&s.db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2", params![id, today_since])?,
-        "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status = 'sent' AND updated_at >= $2", params![id, today_since])?,
-        "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status = 'rejected' AND updated_at >= $2", params![id, today_since])?,
-        "pending": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status IN ('received', 'pending')", params![id])?,
-    });
-    Ok(Json(
-        json!({"source": id, "days": days, "today": today_json, "by_day": rows}),
     ))
 }

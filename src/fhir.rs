@@ -77,6 +77,194 @@ impl FhirClient {
     }
 }
 
+/// What the destination's `$validate` said of one resource.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Validated {
+    /// An `OperationOutcome`: its issues (none, or only warnings, when valid).
+    Outcome { issues: Vec<Issue> },
+    /// The destination could not validate: unreachable, a timeout, a `5xx`, or
+    /// an answer that is not an `OperationOutcome`. Never a verdict on the resource.
+    Unavailable,
+}
+
+impl Validated {
+    /// Whether the resource passed: an outcome without `error` or `fatal` issues.
+    pub fn is_valid(&self) -> bool {
+        matches!(self, Validated::Outcome { issues } if !issues.iter().any(Issue::is_error))
+    }
+}
+
+/// One issue of an `OperationOutcome`, as Try answers it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Issue {
+    /// `fatal`, `error`, `warning` or `information`.
+    pub severity: String,
+    pub code: String,
+    #[serde(default)]
+    pub diagnostics: Option<String>,
+    #[serde(default)]
+    pub expression: Vec<String>,
+}
+
+impl Issue {
+    /// An `error` or `fatal` issue: the resource fails.
+    pub fn is_error(&self) -> bool {
+        matches!(self.severity.as_str(), "error" | "fatal")
+    }
+}
+
+/// The destination's facts from its CapabilityStatement (`GET /metadata`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Metadata {
+    pub fhir_version: Option<String>,
+    pub software: Option<Software>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Software {
+    pub name: Option<String>,
+    pub version: Option<String>,
+}
+
+/// How long a `$validate` may take before the destination counts as unable.
+const VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
+const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+
+impl FhirClient {
+    /// Checks one resource with the destination's `POST {base}/{type}/$validate`.
+    pub async fn validate(&self, resource: &Value) -> Validated {
+        let Some(resource_type) = resource
+            .get("resourceType")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_alphanumeric()))
+        else {
+            return Validated::Outcome {
+                issues: vec![Issue {
+                    severity: "error".into(),
+                    code: "structure".into(),
+                    diagnostics: Some("the resource has no resourceType".into()),
+                    expression: vec![],
+                }],
+            };
+        };
+        let request = self
+            .http
+            .post(format!("{}/{resource_type}/$validate", self.base))
+            .timeout(VALIDATE_TIMEOUT)
+            .header("Content-Type", "application/fhir+json")
+            .header("Accept", "application/fhir+json")
+            .json(resource);
+        let Ok(request) = authorize(request, &self.credentials).await else {
+            return Validated::Unavailable;
+        };
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("$validate at {} unavailable: {e}", self.base);
+                return Validated::Unavailable;
+            }
+        };
+        let status = response.status().as_u16();
+        if matches!(status, 401 | 403) && self.credentials.is_some() {
+            refused_token(status, &self.credentials).await;
+            return Validated::Unavailable;
+        }
+        if status >= 500 {
+            tracing::warn!("$validate at {} answered HTTP {status}", self.base);
+            return Validated::Unavailable;
+        }
+        // A 4xx with an OperationOutcome is a verdict (HFS answers 400 for an
+        // invalid resource); anything that is not one is not.
+        match response.json::<Value>().await {
+            Ok(body)
+                if body.get("resourceType").and_then(Value::as_str) == Some("OperationOutcome") =>
+            {
+                Validated::Outcome {
+                    issues: issues(&body),
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    "$validate at {} did not answer an OperationOutcome (HTTP {status})",
+                    self.base
+                );
+                Validated::Unavailable
+            }
+        }
+    }
+
+    /// The destination's facts from `GET {base}/metadata`.
+    pub async fn metadata(&self) -> anyhow::Result<Metadata> {
+        let request = self
+            .http
+            .get(format!("{}/metadata", self.base))
+            .timeout(METADATA_TIMEOUT)
+            .header("Accept", "application/fhir+json");
+        let request = authorize(request, &self.credentials)
+            .await
+            .map_err(|e| anyhow::anyhow!("no token for {}: {e:?}", self.base))?;
+        let response = request.send().await?.error_for_status()?;
+        let body: Value = response.json().await?;
+        if body.get("resourceType").and_then(Value::as_str) != Some("CapabilityStatement") {
+            anyhow::bail!("{}/metadata is not a CapabilityStatement", self.base);
+        }
+        let text = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_string);
+        Ok(Metadata {
+            fhir_version: text(body.get("fhirVersion")),
+            software: body.get("software").map(|s| Software {
+                name: text(s.get("name")),
+                version: text(s.get("version")),
+            }),
+        })
+    }
+
+    /// The base URL calls go to.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+}
+
+/// The issues of an `OperationOutcome`.
+fn issues(outcome: &Value) -> Vec<Issue> {
+    outcome
+        .get("issue")
+        .and_then(Value::as_array)
+        .map(|issues| {
+            issues
+                .iter()
+                .map(|i| Issue {
+                    severity: i
+                        .get("severity")
+                        .and_then(Value::as_str)
+                        .unwrap_or("error")
+                        .to_string(),
+                    code: i
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    diagnostics: i
+                        .get("diagnostics")
+                        .or_else(|| i.pointer("/details/text"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    expression: i
+                        .get("expression")
+                        .or_else(|| i.get("location"))
+                        .and_then(Value::as_array)
+                        .map(|e| {
+                            e.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Adds the engine's bearer token to a request towards HFS, when it has one.
 pub async fn authorize(
     request: reqwest::RequestBuilder,

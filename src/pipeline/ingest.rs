@@ -71,13 +71,10 @@ impl FeedRunner {
 
         // On the bulk path the object stays at its source until HFS has read it.
         let keep = self.bulk.is_some() && !self.bulk_transformed;
-        let file_id = self.db.insert_file(
-            feed,
+        let file_id = self.open_load(
             &name,
             &sha,
             bytes.len() as u64,
-            "processing",
-            None,
             keep.then_some(key.as_str()),
         )?;
         let readable = self.admit(file_id, &name, &bytes)?;
@@ -91,6 +88,28 @@ impl FeedRunner {
         self.db.mark_file_archived(file_id, &archived)
     }
 
+    /// Starts the load of an object this pass took (adopting a `queued` one),
+    /// with the transform version it runs from now on: the source's pin, or
+    /// the current version it follows. The `source_objects` bulk path runs no
+    /// transform and records none.
+    fn open_load(&self, name: &str, sha: &str, size: u64, source_key: Option<&str>) -> Result<i64> {
+        let transforms = !(self.bulk.is_some() && !self.bulk_transformed);
+        let version = if transforms {
+            match self.versions.resolve_for_source(&self.feed) {
+                Ok(v) => Some(v),
+                // Taken anyway: its rows wait for a version that can run.
+                Err(e) => {
+                    tracing::error!(target: "hie::pipeline", feed = %self.feed.id, file = %name, "no transform version to record for the load: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.db
+            .open_load(&self.feed.id, name, sha, size, source_key, version.as_ref())
+    }
+
     /// Reads a file's records into the store; `false` when the file could not be read.
     pub(super) fn admit(&self, file_id: i64, name: &str, bytes: &[u8]) -> Result<bool> {
         let feed = &self.feed.id;
@@ -101,6 +120,7 @@ impl FeedRunner {
                     .map(|r| (r.line, r.raw, r.parse_error))
                     .collect();
                 self.db.insert_records(file_id, feed, &rows)?;
+                self.tally_load(file_id, rows.len());
                 tracing::info!(target: "hie::pipeline", feed, file = %name, records = rows.len(), "received");
                 Ok(true)
             }
@@ -190,13 +210,10 @@ impl FeedRunner {
             } else {
                 None
             };
-            let file_id = self.db.insert_file(
-                feed,
+            let file_id = self.open_load(
                 &entry_name,
                 &entry_sha,
                 data.len() as u64,
-                "processing",
-                None,
                 staged.as_deref(),
             )?;
             self.admit(file_id, &entry_name, &data)?;

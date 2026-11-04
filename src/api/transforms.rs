@@ -7,6 +7,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::body::LooseJson;
 use super::{ApiError, ApiResult, AppState, not_found};
 
 pub(super) fn router() -> Router<AppState> {
@@ -27,7 +28,7 @@ async fn get_transform(State(s): State<AppState>, Path(name): Path<String>) -> A
     let code = s
         .manager
         .transform_code(&name)?
-        .ok_or_else(|| not_found(&format!("transform {name}")))?;
+        .ok_or_else(|| not_found("transform_not_found", &format!("transform {name}")))?;
     Ok(Json(json!({"name": name, "code": code})))
 }
 
@@ -39,7 +40,7 @@ struct TransformBody {
 async fn put_transform(
     State(s): State<AppState>,
     Path(name): Path<String>,
-    Json(body): Json<TransformBody>,
+    LooseJson(body): LooseJson<TransformBody>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let existed = s.manager.save_transform(&name, &body.code)?;
     let status = if existed {
@@ -59,13 +60,10 @@ struct TryBody {
 async fn try_transform(
     State(s): State<AppState>,
     Path(name): Path<String>,
-    Json(body): Json<TryBody>,
+    LooseJson(body): LooseJson<TryBody>,
 ) -> ApiResult {
     if body.records.len() > 100 {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "try at most 100 records at a time".into(),
-        ));
+        return Err(ApiError::invalid_body("try at most 100 records at a time"));
     }
     let results = s.manager.try_transform(&name, &body.records).await?;
     Ok(Json(json!({"name": name, "results": results})))

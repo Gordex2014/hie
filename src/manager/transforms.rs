@@ -18,9 +18,10 @@ impl SourceManager {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
-            return Err(ManagerError::Invalid(format!(
-                "transform name {name:?} must be letters, digits, underscores and dashes"
-            )));
+            return Err(ManagerError::invalid(
+                "invalid_body",
+                format!("transform name {name:?} must be letters, digits, underscores and dashes"),
+            ));
         }
         Ok(self.transforms_dir.join(format!("{name}.py")))
     }
@@ -51,7 +52,13 @@ impl SourceManager {
             let canonical = path.canonicalize().unwrap_or(path.clone());
             let used_by: Vec<&str> = sources
                 .iter()
-                .filter(|f| f.transform.canonicalize().ok().as_ref() == Some(&canonical))
+                .filter(|f| {
+                    f.transform
+                        .file()
+                        .and_then(|p| p.canonicalize().ok())
+                        .as_ref()
+                        == Some(&canonical)
+                })
                 .map(|f| f.id.as_str())
                 .collect();
             let relative = path
@@ -90,7 +97,13 @@ impl SourceManager {
         std::fs::write(&path, code).with_context(|| format!("writing {}", path.display()))?;
         let canonical = path.canonicalize().unwrap_or(path);
         for feed in self.sources() {
-            if feed.transform.canonicalize().ok().as_ref() == Some(&canonical) {
+            if feed
+                .transform
+                .file()
+                .and_then(|p| p.canonicalize().ok())
+                .as_ref()
+                == Some(&canonical)
+            {
                 self.start(feed)?;
             }
         }
@@ -106,9 +119,10 @@ impl SourceManager {
     ) -> Result<Vec<Value>, ManagerError> {
         let path = self.transform_path(name)?;
         if !path.is_file() {
-            return Err(ManagerError::NotFound(format!(
-                "transform {name} not found"
-            )));
+            return Err(ManagerError::not_found(
+                "transform_not_found",
+                format!("transform {name} not found"),
+            ));
         }
         let mut transformer = Transformer::new(&self.python, &self.runtime_dir, &path);
         transformer.set_terminology(self.terminology_url.as_deref());
@@ -123,10 +137,12 @@ impl SourceManager {
                 )
             })
             .collect();
-        let outcomes = transformer
-            .try_many(&items)
-            .await
-            .map_err(|e| ManagerError::Invalid(format!("transform failed to run: {e:#}")))?;
+        let outcomes = transformer.try_many(&items).await.map_err(|e| {
+            ManagerError::invalid(
+                "transform_failed",
+                format!("transform failed to run: {e:#}"),
+            )
+        })?;
         let mut out = Vec::with_capacity(records.len());
         for (record, outcome) in records.iter().zip(outcomes) {
             out.push(match outcome {

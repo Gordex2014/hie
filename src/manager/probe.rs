@@ -17,20 +17,20 @@ impl SourceManager {
     pub async fn test(&self, body: &Value) -> Result<Probe, ManagerError> {
         let source_value = body.get("source").unwrap_or(body);
         let mut source: SourceConfig = serde_json::from_value(source_value.clone())
-            .map_err(|e| ManagerError::Invalid(e.to_string()))?;
+            .map_err(|e| ManagerError::invalid("invalid_definition", e.to_string()))?;
         source.resolve(&self.base_dir);
         let feed = FeedConfig {
             id: "test".into(),
             name: "test".into(),
             source,
             format: Default::default(),
-            transform: PathBuf::new(),
+            transform: PathBuf::new().into(),
             delivery: Default::default(),
             expect_every_text: None,
             expect_every: None,
         };
-        let source =
-            Source::from_config(&feed).map_err(|e| ManagerError::Invalid(format!("{e:#}")))?;
+        let source = Source::from_config(&feed)
+            .map_err(|e| ManagerError::invalid("invalid_definition", format!("{e:#}")))?;
         match source.probe().await {
             Ok(probe) => Ok(probe),
             Err(e) => Ok(Probe {

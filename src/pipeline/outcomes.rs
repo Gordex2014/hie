@@ -8,14 +8,24 @@ use serde_json::Value;
 use crate::db::WorkItem;
 use crate::fhir::DeliveryKey;
 use crate::transform::{self, Outcome};
+use crate::versions::{Exec, ItemOutcome};
 
 use super::{FeedRunner, TRANSFORM_CHUNK};
 
 impl FeedRunner {
-    /// Records what the transform made of one record. `false` when it could not
-    /// finish now: the record and the rest of its chunk wait for the next pass.
-    pub(super) fn record_outcome(&self, item: &WorkItem, outcome: Outcome) -> Result<bool> {
-        match outcome {
+    /// Records what the transform made of one record, run as `exec` says.
+    /// `false` when it could not finish now: the record and the rest of its
+    /// group wait for the next pass.
+    pub(super) fn record_outcome(
+        &self,
+        item: &WorkItem,
+        exec: &Exec,
+        outcome: ItemOutcome,
+    ) -> Result<bool> {
+        // Who ran it and what the executor said about it are recorded with the
+        // history (track H); diagnostics only through `diagnostics::for_storage`.
+        let _ = (exec, &outcome.diagnostics);
+        match outcome.outcome {
             Outcome::Transient(message) => {
                 // Not the row's fault: leave it and the rest for the next pass.
                 tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, line = item.line, "transform cannot finish now, will retry: {message}");

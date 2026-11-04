@@ -62,6 +62,8 @@ struct Pulled {
 fn check(source: &SourceConfig) -> Result<()> {
     let SourceConfig::Database {
         url_env,
+        connection,
+        read,
         query,
         cursor_column,
         max_runs,
@@ -70,6 +72,27 @@ fn check(source: &SourceConfig) -> Result<()> {
     else {
         return Ok(());
     };
+    if *max_runs == 0 {
+        bail!("database: max_runs must be at least 1");
+    }
+    if connection.is_some() || read.is_some() {
+        // The 0.2.0 shape: a connection by its parts and what to read.
+        if url_env.is_some() || query.is_some() || cursor_column.is_some() {
+            bail!("database: use either connection and read, or url_env, query and cursor_column");
+        }
+        let (Some(connection), Some(_)) = (connection, read) else {
+            bail!("database: connection and read go together");
+        };
+        if connection.engine.trim().is_empty() {
+            bail!("database: connection.engine is required");
+        }
+        return Ok(());
+    }
+    let (url_env, query, cursor_column) = (
+        url_env.as_deref().unwrap_or_default(),
+        query.as_deref().unwrap_or_default(),
+        cursor_column.as_deref().unwrap_or_default(),
+    );
     if url_env.trim().is_empty() {
         bail!("database: url_env names the environment variable holding the connection URL");
     }
@@ -85,19 +108,30 @@ fn check(source: &SourceConfig) -> Result<()> {
     {
         bail!("database: cursor_column must be a column name");
     }
-    if *max_runs == 0 {
-        bail!("database: max_runs must be at least 1");
-    }
     Ok(())
 }
 
 fn describe(source: &SourceConfig) -> String {
     match source {
         SourceConfig::Database {
-            url_env,
-            cursor_column,
+            url_env: Some(url_env),
+            cursor_column: Some(cursor_column),
             ..
         } => format!("database ${url_env} by {cursor_column}"),
+        SourceConfig::Database {
+            connection: Some(c),
+            ..
+        } => {
+            let parts = c.parts();
+            match (parts.host, parts.port) {
+                (Some(host), Some(port)) => format!(
+                    "{} {host}:{port}/{}",
+                    parts.engine,
+                    parts.database.unwrap_or_default()
+                ),
+                _ => format!("{} {}", parts.engine, parts.database.unwrap_or_default()),
+            }
+        }
         _ => String::new(),
     }
 }
@@ -113,6 +147,13 @@ fn build(feed: &FeedConfig) -> Result<Box<dyn Connector>> {
     } = &feed.source
     else {
         bail!("source {} is not a database", feed.id);
+    };
+    let (Some(url_env), Some(query), Some(cursor_column)) = (url_env, query, cursor_column) else {
+        // The 0.2.0 connection shape is built once secrets and admission exist.
+        bail!(
+            "source {}: database connections by parts are not supported yet",
+            feed.id
+        );
     };
     Ok(Box::new(DatabaseSource::new(
         &feed.id,

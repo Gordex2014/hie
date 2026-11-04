@@ -7,6 +7,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::body::LooseJson;
 use super::{ApiError, ApiResult, AppState, not_found};
 use crate::db::params;
 
@@ -56,7 +57,7 @@ async fn get_record(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult
         )?
         .into_iter()
         .next()
-        .ok_or_else(|| not_found(&format!("record {id}")))?;
+        .ok_or_else(|| not_found("record_not_found", &format!("record {id}")))?;
     Ok(Json(row))
 }
 
@@ -68,11 +69,11 @@ struct ReprocessBody {
 async fn reprocess(
     State(s): State<AppState>,
     Path(id): Path<i64>,
-    body: Option<Json<ReprocessBody>>,
+    body: Option<LooseJson<ReprocessBody>>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let raw = body.and_then(|Json(b)| b.raw);
+    let raw = body.and_then(|LooseJson(b)| b.raw);
     if !s.db.reprocess(id, raw.as_ref())? {
-        return Err(not_found(&format!("record {id}")));
+        return Err(not_found("record_not_found", &format!("record {id}")));
     }
     Ok((
         StatusCode::ACCEPTED,
