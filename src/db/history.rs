@@ -169,6 +169,15 @@ pub struct Group {
     pub first_line: Option<i64>,
     /// `kept`, `expired`, `purged` or `none`.
     pub content: String,
+    /// Rows of it written later by a retry or reprocess, from the history.
+    pub resolved: i64,
+    /// When its first row failed (epoch ms), from the history.
+    pub first_failed_at: Option<i64>,
+    /// When no row of it was left failing or in flight in it (epoch ms);
+    /// `None` while some is.
+    pub resolved_at: Option<i64>,
+    /// The retries that targeted it, oldest first.
+    pub retries: Vec<String>,
 }
 
 impl Group {
@@ -183,8 +192,37 @@ impl Group {
             "location": self.location,
             "content": self.content,
             "complete": true,
+            "outstanding": self.count,
+            "resolved": self.resolved,
+            "first_failed_at": at(self.first_failed_at),
+            "resolved_at": at(self.resolved_at),
+            "retries": self.retries,
         })
     }
+}
+
+/// The `failed` events of a failure group's rows: those of its load with its
+/// kind, reason and version. Needs the group as `g` and the events as `e`.
+const GROUP_EVENT_SQL: &str =
+    "e.load_id = g.load_id AND e.kind = 'failed' AND e.error_kind = g.kind
+       AND e.reason = g.reason
+       AND ((g.transform_id = '' AND (e.transform_id IS NULL OR e.transform_version IS NULL))
+            OR (e.transform_id = g.transform_id AND e.transform_version = g.transform_version))";
+
+/// What the history holds of a failure group: its rows (every row that ever
+/// failed in it), how many of them a retry or reprocess wrote later, when the
+/// first failed, when the last one left it, and their content now.
+#[derive(Default, Clone, Copy)]
+struct GroupHistory {
+    rows: i64,
+    resolved: i64,
+    first_failed_at: Option<i64>,
+    /// Rows still failing or in flight in the group (no outcome since).
+    open: i64,
+    left_at: Option<i64>,
+    kept: i64,
+    expired: i64,
+    purged: i64,
 }
 
 /// Unfinished retry statuses.
@@ -339,7 +377,7 @@ impl Db {
 
     fn groups(&self, load_id: i64, only: Option<&str>) -> Result<Vec<Group>> {
         let rows = self.query(
-            "SELECT g.id, g.kind, g.reason, g.transform_id, g.transform_version, g.location,
+            &format!("SELECT g.id, g.kind, g.reason, g.transform_id, g.transform_version, g.location,
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT),
                     MIN(CASE WHEN r.status = 'rejected' THEN r.line END),
                     MIN(r.line),
@@ -347,21 +385,36 @@ impl Db {
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' AND r.content = 'purged' THEN 1 ELSE 0 END), 0) AS BIGINT),
                     CAST(COALESCE(SUM(CASE WHEN r.content = 'expired' THEN 1 ELSE 0 END), 0) AS BIGINT),
                     CAST(COALESCE(SUM(CASE WHEN r.content = 'purged' THEN 1 ELSE 0 END), 0) AS BIGINT),
-                    MIN(g.created_at)
+                    MIN(g.created_at),
+                    (SELECT MIN(h.line) FROM records h WHERE h.file_id = g.load_id AND h.id IN
+                       (SELECT e.record_id FROM record_events e WHERE {GROUP_EVENT_SQL}))
              FROM failure_groups g LEFT JOIN records r ON r.group_id = g.id AND r.file_id = g.load_id
              WHERE g.load_id = $1 AND (CAST($2 AS TEXT) IS NULL OR g.id = CAST($2 AS TEXT))
              GROUP BY g.id, g.kind, g.reason, g.transform_id, g.transform_version, g.location
-             ORDER BY 7 DESC, 8, 14",
+             ORDER BY 7 DESC, 8, 14"),
             &params![load_id, only],
         )?;
+        let history = self.group_history(load_id, only)?;
+        let mut retries: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for r in self.query(
+            "SELECT group_id, id FROM retries WHERE load_id = $1 ORDER BY accepted_at, id",
+            &params![load_id],
+        )? {
+            retries.entry(r.string(0)).or_default().push(r.string(1));
+        }
         Ok(rows
             .iter()
             .map(|r| {
+                let id = r.string(0);
                 let count = r.i64(6);
-                let (expired, purged) = if count > 0 {
-                    (r.i64(9), r.i64(10))
-                } else {
-                    (r.i64(11), r.i64(12))
+                let h = history.get(&id).copied();
+                let (expired, purged) = match h {
+                    _ if count > 0 => (r.i64(9), r.i64(10)),
+                    // A group with nothing failing reads its content from the
+                    // rows that ever failed in it: kept while any of them is.
+                    Some(h) if h.rows > 0 && h.kept > 0 => (0, 0),
+                    Some(h) if h.rows > 0 => (h.expired, h.purged),
+                    _ => (r.i64(11), r.i64(12)),
                 };
                 let content = if expired > 0 {
                     "expired"
@@ -371,17 +424,77 @@ impl Db {
                     "kept"
                 };
                 let tid = r.string(3);
+                let h = h.unwrap_or_default();
                 Group {
-                    id: r.string(0),
                     load_id,
                     kind: r.string(1),
                     reason: r.string(2),
                     transform: (!tid.is_empty()).then(|| (tid, r.i64(4))),
                     location: r.json(5),
                     count,
-                    first_line: r.opt_i64(7).or_else(|| r.opt_i64(8)),
+                    first_line: r
+                        .opt_i64(7)
+                        .or_else(|| r.opt_i64(15))
+                        .or_else(|| r.opt_i64(8)),
                     content: content.to_string(),
+                    resolved: h.resolved,
+                    first_failed_at: h.first_failed_at.or_else(|| r.opt_i64(13)),
+                    resolved_at: (count == 0 && h.open == 0).then_some(h.left_at).flatten(),
+                    retries: retries.remove(&id).unwrap_or_default(),
+                    id,
                 }
+            })
+            .collect())
+    }
+
+    /// The history of a load's failure groups (one, with `only`), by group id.
+    fn group_history(
+        &self,
+        load_id: i64,
+        only: Option<&str>,
+    ) -> Result<BTreeMap<String, GroupHistory>> {
+        let rows = self.query(
+            &format!(
+                "WITH m AS (
+                   SELECT g.id AS gid, e.record_id AS rid, MIN(e.at) AS first_at,
+                          MIN(e.id) AS first_ev, MAX(e.id) AS last_ev
+                   FROM failure_groups g JOIN record_events e ON {GROUP_EVENT_SQL}
+                   WHERE g.load_id = $1 AND (CAST($2 AS TEXT) IS NULL OR g.id = CAST($2 AS TEXT))
+                   GROUP BY g.id, e.record_id),
+                 n AS (
+                   SELECT m.gid, m.first_at,
+                          CASE WHEN EXISTS (SELECT 1 FROM record_events d WHERE d.record_id = m.rid
+                                              AND d.kind = 'delivered' AND d.id > m.first_ev)
+                               THEN 1 ELSE 0 END AS resolved,
+                          (SELECT MIN(t.at) FROM record_events t WHERE t.record_id = m.rid
+                             AND t.kind IN ('delivered', 'failed') AND t.id > m.last_ev) AS left_at,
+                          r.content
+                   FROM m JOIN records r ON r.id = m.rid)
+                 SELECT gid, CAST(COUNT(*) AS BIGINT), CAST(SUM(resolved) AS BIGINT), MIN(first_at),
+                        CAST(SUM(CASE WHEN left_at IS NULL THEN 1 ELSE 0 END) AS BIGINT), MAX(left_at),
+                        CAST(SUM(CASE WHEN content IS NULL THEN 1 ELSE 0 END) AS BIGINT),
+                        CAST(SUM(CASE WHEN content = 'expired' THEN 1 ELSE 0 END) AS BIGINT),
+                        CAST(SUM(CASE WHEN content = 'purged' THEN 1 ELSE 0 END) AS BIGINT)
+                 FROM n GROUP BY gid"
+            ),
+            &params![load_id, only],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.string(0),
+                    GroupHistory {
+                        rows: r.i64(1),
+                        resolved: r.i64(2),
+                        first_failed_at: r.opt_i64(3),
+                        open: r.i64(4),
+                        left_at: r.opt_i64(5),
+                        kept: r.i64(6),
+                        expired: r.i64(7),
+                        purged: r.i64(8),
+                    },
+                )
             })
             .collect())
     }
@@ -391,14 +504,12 @@ impl Db {
         Ok(self.groups(load_id, Some(group))?.into_iter().next())
     }
 
-    /// The load's groups with failing rows, most rows first, each as `GET
+    /// Every failure group the load ever had, most rows failing now first
+    /// (those with none stay listed, by when they were created), each as `GET
     /// /api/loads/{id}` lists it, with up to three sample rows while kept.
     pub fn load_failures(&self, load_id: i64) -> Result<Vec<Value>> {
         let mut out = Vec::new();
         for group in self.groups(load_id, None)? {
-            if group.count == 0 {
-                continue;
-            }
             let samples: Vec<Value> = if group.content == "kept" {
                 self.group_rows(&group, 3)?
                     .into_iter()
@@ -414,13 +525,22 @@ impl Db {
         Ok(out)
     }
 
-    /// The group's failing rows whose content is kept: (record, line, raw).
+    /// The rows that failed in the group (from the history, so a resolved
+    /// group keeps them) whose content is kept, those failing in it now first:
+    /// (record, line, raw).
     pub fn group_rows(&self, group: &Group, limit: usize) -> Result<Vec<(i64, i64, Value)>> {
         Ok(self
             .query(
-                "SELECT id, line, raw FROM records
-                 WHERE file_id = $1 AND group_id = $2 AND status = 'rejected' AND content IS NULL
-                 ORDER BY line, id LIMIT $3",
+                &format!(
+                    "SELECT r.id, r.line, r.raw FROM records r
+                     WHERE r.file_id = $1 AND r.content IS NULL
+                       AND ((r.group_id = $2 AND r.status = 'rejected')
+                            OR r.id IN (SELECT e.record_id FROM failure_groups g JOIN record_events e
+                                        ON {GROUP_EVENT_SQL} WHERE g.id = $2))
+                     ORDER BY CASE WHEN r.group_id = $2 AND r.status = 'rejected' THEN 0 ELSE 1 END,
+                              r.line, r.id
+                     LIMIT $3"
+                ),
                 &params![group.load_id, group.id, limit],
             )?
             .iter()

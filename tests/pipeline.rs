@@ -573,7 +573,19 @@ async fn retries_chain_and_keep_the_failures_of_their_day() {
     let counts = db.period_counts(Some("lab"), day.0, day.1).unwrap();
     assert_eq!((counts.failed, counts.written, counts.rows_read), (1, 2, 2));
     assert_eq!(db.failure_group(load, &group.id).unwrap().unwrap().count, 0);
-    assert!(db.load_failures(load).unwrap().is_empty());
+    // The resolved group stays listed, with its history.
+    let failures = db.load_failures(load).unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["group"], group.id.as_str());
+    assert_eq!(
+        (&failures[0]["outstanding"], &failures[0]["resolved"]),
+        (&serde_json::json!(0), &serde_json::json!(1))
+    );
+    assert!(failures[0]["resolved_at"].is_string());
+    assert_eq!(
+        failures[0]["retries"],
+        serde_json::json!([first["id"], second["id"]])
+    );
     assert!(matches!(
         db.create_retry(&again, &fixed),
         Err(hie::db::RetryRefusal::NothingToRetry)
