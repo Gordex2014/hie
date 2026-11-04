@@ -34,6 +34,8 @@ mod execute;
 mod files;
 mod pins;
 mod programs;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -198,7 +200,7 @@ pub struct NewVersion<'a> {
 
 /// What a save found.
 pub enum Saved {
-    Version(VersionInfo),
+    Version(Box<VersionInfo>),
     /// `base_version` was not the current version.
     Conflict {
         current_version: i64,

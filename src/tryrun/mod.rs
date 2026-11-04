@@ -90,12 +90,19 @@ impl Drop for Permit {
 
 impl TryRuns {
     fn permit(&self, max: usize) -> Option<Permit> {
-        self.running
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < max).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| Permit(self.running.clone()))
+        let mut n = self.running.load(Ordering::Acquire);
+        loop {
+            if n >= max {
+                return None;
+            }
+            match self
+                .running
+                .compare_exchange(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(Permit(self.running.clone())),
+                Err(now) => n = now,
+            }
+        }
     }
 }
 

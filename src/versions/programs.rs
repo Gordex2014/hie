@@ -66,25 +66,16 @@ impl Versions {
             .filter(|(_, id, version)| !needed.contains(&(id.clone(), *version)))
             .map(|(name, ..)| name)
             .collect();
-        if reconcile {
-            // Names this engine stored before it knew of them (or before a
-            // store was replaced): the shape of ours, and not needed.
-            let needed_names: HashSet<String> = self
-                .db
-                .programs()?
-                .into_iter()
-                .filter(|(_, id, version)| needed.contains(&(id.clone(), *version)))
-                .map(|(name, ..)| name)
-                .collect();
-            if let Ok(held) = facade.list().await {
-                for (name, _) in held {
-                    if is_program_name(&name)
-                        && !needed_names.contains(&name)
-                        && !unused.contains(&name)
-                        && !self.held_for_needed(&name, &needed)
-                    {
-                        unused.push(name);
-                    }
+        if reconcile && let Ok(held) = facade.list().await {
+            // Names stored before this store knew of them (an earlier store,
+            // a crash between storing and recording): ours by their shape,
+            // and not a needed version's.
+            for (name, _) in held {
+                if is_program_name(&name)
+                    && !unused.contains(&name)
+                    && !self.held_for_needed(&name, &needed)
+                {
+                    unused.push(name);
                 }
             }
         }

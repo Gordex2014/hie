@@ -254,38 +254,40 @@ impl Tx<'_> {
     }
 
     /// Saves a new version on `base` (the current version when `None`): it is
-    /// numbered `base + 1` only if `base` is still the current version, which
-    /// is checked and moved in one conditional update, so of two saves on one
-    /// base exactly one wins, on either engine.
+    /// numbered `base + 1` only if `base` is still the current version. The
+    /// check and the move are one conditional update, the transaction's first
+    /// statement when `base` is given, so of two saves on one base exactly one
+    /// wins, on either engine and across processes.
     pub fn save_version(
         &mut self,
         id: &str,
         base: Option<i64>,
         v: &NewVersion<'_>,
     ) -> Result<Saved> {
-        let Some(t) = transform(self, id)?.filter(|t| !t.deleted) else {
-            return Ok(Saved::NotFound);
+        let base = match base {
+            Some(base) => base,
+            None => match transform(self, id)?.filter(|t| !t.deleted) {
+                Some(t) => t.current_version,
+                None => return Ok(Saved::NotFound),
+            },
         };
-        let base = base.unwrap_or(t.current_version);
-        if base != t.current_version {
-            return Ok(Saved::Conflict {
-                current_version: t.current_version,
-            });
-        }
         let now = now_ms();
         let moved = self.run(
             "UPDATE transforms SET current_version = $2, updated_at = $3
              WHERE id = $1 AND current_version = $4 AND deleted_at IS NULL",
             &params![id, base + 1, now, base],
         )?;
+        let t = transform(self, id)?.filter(|t| !t.deleted);
+        let Some(t) = t else {
+            return Ok(Saved::NotFound);
+        };
         if moved == 0 {
-            let current = transform(self, id)?.map_or(base, |t| t.current_version);
             return Ok(Saved::Conflict {
-                current_version: current,
+                current_version: t.current_version,
             });
         }
         self.insert_version(id, base + 1, Some(base), &t.display_name, v, now)
-            .map(Saved::Version)
+            .map(|v| Saved::Version(Box::new(v)))
     }
 
     /// Renames a live transform; `false` when the name is taken meanwhile.
