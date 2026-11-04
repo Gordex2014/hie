@@ -8,7 +8,6 @@
 
 # H-connectors: database connection shape, Test evidence, describe, sample, Start binding, first-load
 # progress, destination facts, passes, validation before delivery, namespacing, transaction delivery.
-database/sqlserver-credential-binding H-connectors       # also H-secrets; runs only with HIE_TEST_MSSQL_URL
 
 # H-versions: transform ids and immutable versions, save conflicts, environments, pins, load-start snapshot.
 
