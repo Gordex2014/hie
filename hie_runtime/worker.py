@@ -38,23 +38,61 @@ def load(path):
 
 
 # With HIE_WORKER_CAPTURE=1 (Try) each record's own stdout and stderr come back
-# in its reply's diagnostics, at most this many bytes each; otherwise they go to
-# the worker's stderr, which the engine discards.
+# in its reply's diagnostics, at most this many bytes of UTF-8 each; otherwise
+# they go to the worker's stderr, which the engine discards.
 STREAM_LIMIT = 4096
+
+
+class BoundedStream(io.TextIOBase):
+    """A text stream that keeps only the first `limit` bytes of UTF-8 written
+    to it, cut on a character boundary; the rest is dropped as it is written,
+    and `truncated` says so."""
+
+    def __init__(self, limit=STREAM_LIMIT):
+        super().__init__()
+        self.limit = limit
+        self.size = 0
+        self.parts = []
+        self.truncated = False
+
+    @property
+    def encoding(self):
+        return "utf-8"
+
+    def writable(self):
+        return True
+
+    def write(self, text):
+        if not isinstance(text, str):
+            raise TypeError(f"write() argument must be str, not {type(text).__name__}")
+        if self.truncated or not text:
+            if text:
+                self.truncated = True
+            return len(text)
+        data = text.encode("utf-8", "replace")
+        room = self.limit - self.size
+        if len(data) <= room:
+            self.parts.append(text)
+            self.size += len(data)
+        else:
+            # Whole characters only: a cut inside one drops that character.
+            kept = data[:room].decode("utf-8", "ignore")
+            self.parts.append(kept)
+            self.size += len(kept.encode("utf-8"))
+            self.truncated = True
+        return len(text)
+
+    def getvalue(self):
+        return "".join(self.parts)
 
 
 def captured(stdout, stderr):
     diagnostics = {}
-    truncated = False
-    for name, buffer in (("stdout", stdout), ("stderr", stderr)):
-        text = buffer.getvalue()
+    for name, stream in (("stdout", stdout), ("stderr", stderr)):
+        text = stream.getvalue()
         if text:
-            data = text.encode("utf-8")
-            if len(data) > STREAM_LIMIT:
-                text = data[:STREAM_LIMIT].decode("utf-8", "ignore")
-                truncated = True
             diagnostics[name] = text
-    if truncated:
+    if stdout.truncated or stderr.truncated:
         diagnostics["truncated"] = True
     return diagnostics
 
@@ -84,7 +122,7 @@ def main():
             continue
         request = json.loads(line)
         if capture:
-            sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+            sys.stdout, sys.stderr = BoundedStream(), BoundedStream()
         try:
             result = module.transform(request["record"], request["context"])
             if result is None:

@@ -244,6 +244,8 @@ pub struct Versions {
     materialized: PathBuf,
     /// Sources whose pin was reconciled with their definition in this process.
     seen: Mutex<HashSet<String>>,
+    /// One lock per source, held while its pin is first reconciled.
+    reconciling: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     tries: crate::tryrun::TryRuns,
     reclaimed: Mutex<Option<std::time::Instant>>,
     /// Whether the transform files found at start were imported.
@@ -267,6 +269,7 @@ impl Versions {
             executors: Mutex::new(HashMap::new()),
             materialized,
             seen: Mutex::new(HashSet::new()),
+            reconciling: Mutex::new(HashMap::new()),
             tries: crate::tryrun::TryRuns::default(),
             reclaimed: Mutex::new(None),
             imported: std::sync::atomic::AtomicBool::new(false),

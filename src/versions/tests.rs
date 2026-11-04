@@ -481,3 +481,88 @@ async fn a_try_stops_at_its_deadline_also_while_validating_or_loading() {
     assert_eq!(body["run"]["termination"], "confirmed");
     assert_eq!(body["items"][0]["disposition"], "not_started");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_save_never_writes_through_a_symlink_to_another_transforms_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    std::fs::create_dir_all(base.join("a")).unwrap();
+    std::fs::create_dir_all(base.join("transforms")).unwrap();
+    let original = "def transform(r, c):\n    return None  # script\n";
+    std::fs::write(base.join("a/script.py"), original).unwrap();
+    // transforms/foo.py is a link to a file another transform is.
+    std::os::unix::fs::symlink(base.join("a/script.py"), base.join("transforms/foo.py")).unwrap();
+    let db = Arc::new(Db::in_memory().unwrap());
+    let versions = versions(db.clone(), &base.join("transforms"), "python3");
+    let script = versions
+        .resolve_for_source(&feed(base, "src", "a/script.py"))
+        .unwrap();
+    assert_eq!(script.transform_id, "script");
+
+    versions.save_legacy("foo", "# foo\n").await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(base.join("a/script.py")).unwrap(),
+        original
+    );
+    let link = std::fs::symlink_metadata(base.join("transforms/foo.py")).unwrap();
+    assert!(link.file_type().is_symlink(), "the link is left as it was");
+    let foo = db
+        .transform_info(&versions.resolve_name("foo").unwrap().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(foo.file_path, None, "a link is never the transform's file");
+
+    // A regular destination is written whole, by a rename.
+    versions.save_legacy("bar", "# bar\n").await.unwrap();
+    let bar = base.join("transforms/bar.py");
+    assert!(
+        std::fs::symlink_metadata(&bar)
+            .unwrap()
+            .file_type()
+            .is_file()
+    );
+    assert_eq!(std::fs::read_to_string(&bar).unwrap(), "# bar\n");
+    let leftovers: Vec<_> = std::fs::read_dir(base.join("transforms"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty());
+}
+
+#[test]
+fn a_definition_whose_transform_cannot_be_read_yet_is_reconciled_once_it_can() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    std::fs::create_dir_all(base.join("t")).unwrap();
+    let b_code = "def transform(r, c):\n    return None  # b\n";
+    std::fs::write(
+        base.join("t/a.py"),
+        "def transform(r, c):\n    return None  # a\n",
+    )
+    .unwrap();
+    std::fs::write(base.join("t/b.py"), b_code).unwrap();
+    let db = Arc::new(Db::in_memory().unwrap());
+    // An earlier process ran the source on A.
+    let before = versions(db.clone(), &base.join("transforms"), "python3");
+    assert_eq!(
+        before
+            .resolve_for_source(&feed(base, "src", "t/a.py"))
+            .unwrap()
+            .transform_id,
+        "a"
+    );
+    drop(before);
+    // Its definition now names B, whose file cannot be read at first.
+    let on_b = feed(base, "src", "t/b.py");
+    std::fs::remove_file(base.join("t/b.py")).unwrap();
+    let versions = versions(db.clone(), &base.join("transforms"), "python3");
+    assert!(versions.resolve_for_source(&on_b).is_err());
+    std::fs::write(base.join("t/b.py"), b_code).unwrap();
+    assert_eq!(
+        versions.resolve_for_source(&on_b).unwrap().transform_id,
+        "b"
+    );
+    assert_eq!(db.pin_row("src").unwrap().unwrap().transform_id, "b");
+}

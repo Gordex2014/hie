@@ -475,6 +475,24 @@ impl Db {
         )? == 1)
     }
 
+    /// Reserves a file for a transform before HIE writes it: its path is
+    /// bound, and the SHA-256 recorded is what is there now (`on_disk`) unless
+    /// the path was already the transform's; `false` when another transform
+    /// owns that file.
+    pub fn reserve_transform_file(
+        &self,
+        id: &str,
+        path: &str,
+        on_disk: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self.execute(
+            "UPDATE transforms
+             SET file_sha256 = CASE WHEN file_path = $2 THEN file_sha256 ELSE $3 END, file_path = $2
+             WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM transforms o WHERE o.file_path = $2 AND o.id <> $1)",
+            &params![id, path, on_disk],
+        )? == 1)
+    }
+
     /// The transform a file is, deleted ones included.
     pub fn transform_by_file(&self, path: &str) -> Result<Option<TransformInfo>> {
         transform_where(&mut &*self, "file_path", path)

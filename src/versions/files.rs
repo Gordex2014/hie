@@ -102,8 +102,13 @@ impl Versions {
     }
 
     /// Writes the transform's current version to its own file under
-    /// `transforms/` (a transform whose file is elsewhere keeps that file; a
-    /// file another transform owns is left alone).
+    /// `transforms/` (a transform whose file is elsewhere keeps that file).
+    /// Never through a link: a destination that is a symlink, or anything
+    /// but a regular file, is left alone. The path is reserved for the
+    /// transform in the store before anything is written (refused when
+    /// another transform owns it), and the code is published by writing a
+    /// new file in the same directory and renaming it over the destination,
+    /// which replaces a directory entry and never follows one.
     pub(super) fn write_file(&self, id: &str) -> Result<()> {
         let Some(t) = self.transform(id)? else {
             return Ok(());
@@ -113,28 +118,35 @@ impl Versions {
         if t.file_path.as_deref().is_some_and(|p| p != own_key) {
             return Ok(());
         }
-        if self
-            .db
-            .transform_by_file(&own_key)?
-            .is_some_and(|other| other.id != t.id)
-        {
-            tracing::warn!(target: "hie::versions", transform = id, file = %own.display(),
-                "the transform's file belongs to another transform; not written");
-            return Ok(());
-        }
+        let on_disk = match std::fs::symlink_metadata(&own) {
+            Ok(meta) if !meta.file_type().is_file() => {
+                tracing::warn!(target: "hie::versions", transform = id, file = %own.display(),
+                    "the transform's file is a symlink or not a regular file; not written");
+                return Ok(());
+            }
+            Ok(_) => Some(crate::formats::sha256_hex(&std::fs::read(&own)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
         let code = self
             .db
             .version_code(id, t.current_version)?
             .context("the current version's code")?;
         let sha = sha256_hex(&code);
-        let same = std::fs::read_to_string(&own).is_ok_and(|on_disk| on_disk == code);
-        if !same {
-            std::fs::write(&own, &code).with_context(|| format!("writing {}", own.display()))?;
-        }
-        if !self.db.set_transform_file(id, &own_key, &sha)? {
+        // Reserved first, keeping the SHA-256 of what is there now: a write
+        // that fails leaves the file as the store knows it.
+        if !self
+            .db
+            .reserve_transform_file(id, &own_key, on_disk.as_deref())?
+        {
             tracing::warn!(target: "hie::versions", transform = id, file = %own.display(),
-                "the transform's file was taken by another transform meanwhile");
+                "the transform's file belongs to another transform; not written");
+            return Ok(());
         }
+        if on_disk.as_deref() != Some(sha.as_str()) {
+            publish(&own, &code)?;
+        }
+        self.db.set_transform_file(id, &own_key, &sha)?;
         Ok(())
     }
 
@@ -151,6 +163,28 @@ impl Versions {
             tracing::warn!(target: "hie::versions", file = %own.display(), "removing a deleted transform's file: {e}");
         }
     }
+}
+
+/// Writes `code` to a new file beside `dest` (created exclusively, so never
+/// through an existing entry) and renames it over `dest`.
+fn publish(dest: &Path, code: &str) -> Result<()> {
+    use std::io::Write;
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("a transform file name")?;
+    let temp = dest.with_file_name(format!(".{name}.{:016x}.tmp", rand::random::<u64>()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .and_then(|mut f| f.write_all(code.as_bytes()).and_then(|()| f.sync_all()))
+        .and_then(|()| std::fs::rename(&temp, dest));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(anyhow::Error::from(e).context(format!("writing {}", dest.display())));
+    }
+    Ok(())
 }
 
 /// One import attempt in one transaction: the file's transform found (by its

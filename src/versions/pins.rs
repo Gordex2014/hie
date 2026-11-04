@@ -6,6 +6,8 @@
 //! start afterwards without restarting a running one. Each change ends a pin
 //! period and starts another; the periods are the pin half of the usage.
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 
@@ -56,33 +58,56 @@ impl Versions {
     }
 
     /// The source's pin: the store's, taken from its definition the first time
-    /// this process sees the source when the definition changed meanwhile.
+    /// this process reconciles the source when the definition changed
+    /// meanwhile. A source counts as reconciled only once that succeeded (a
+    /// definition whose transform cannot be read yet is tried again at the
+    /// next call), and its first reconciliation runs under a lock of its own.
     fn effective_pin(&self, feed: &FeedConfig) -> Result<PinRow> {
-        let first = self
-            .seen
-            .lock()
-            .expect("seen sources")
-            .insert(feed.id.clone());
-        let stored = self.db.pin_row(&feed.id)?;
         if let TransformRef::File(path) = &feed.transform {
             // A 0.1 path follows its file: a changed file is a new version.
             self.import_file(path)?;
         }
-        match stored {
-            Some(row) if !first => Ok(row),
-            stored => {
-                let declared = self.declared_pin(feed)?;
-                match stored {
-                    Some(row) if row.declared == declared.declared => Ok(row),
-                    _ => {
-                        if !self.db.set_pin_row(&feed.id, &declared)? {
-                            anyhow::bail!("transform {} not found", declared.transform_id);
-                        }
-                        Ok(declared)
-                    }
-                }
-            }
+        if self.is_reconciled(&feed.id)
+            && let Some(row) = self.db.pin_row(&feed.id)?
+        {
+            return Ok(row);
         }
+        let lock = self.source_lock(&feed.id);
+        let _reconciling = lock.lock().expect("source reconciliation");
+        if self.is_reconciled(&feed.id)
+            && let Some(row) = self.db.pin_row(&feed.id)?
+        {
+            return Ok(row);
+        }
+        let stored = self.db.pin_row(&feed.id)?;
+        let declared = self.declared_pin(feed)?;
+        let row = match stored {
+            Some(row) if row.declared == declared.declared => row,
+            _ => {
+                if !self.db.set_pin_row(&feed.id, &declared)? {
+                    anyhow::bail!("transform {} not found", declared.transform_id);
+                }
+                declared
+            }
+        };
+        self.seen
+            .lock()
+            .expect("seen sources")
+            .insert(feed.id.clone());
+        Ok(row)
+    }
+
+    fn is_reconciled(&self, source: &str) -> bool {
+        self.seen.lock().expect("seen sources").contains(source)
+    }
+
+    fn source_lock(&self, source: &str) -> Arc<Mutex<()>> {
+        self.reconciling
+            .lock()
+            .expect("source locks")
+            .entry(source.to_string())
+            .or_default()
+            .clone()
     }
 
     /// The transform a source's pin names.
@@ -217,14 +242,19 @@ impl Versions {
     }
 
     fn adopt_definition(&self, feed: &FeedConfig) -> Result<()> {
-        self.seen
-            .lock()
-            .expect("seen sources")
-            .insert(feed.id.clone());
+        let lock = self.source_lock(&feed.id);
+        let _reconciling = lock.lock().expect("source reconciliation");
+        // Until the new definition's pin is in the store, the next load
+        // start reconciles it again rather than trusting the old one.
+        self.seen.lock().expect("seen sources").remove(&feed.id);
         let declared = self.declared_pin(feed)?;
         if !self.db.set_pin_row(&feed.id, &declared)? {
             anyhow::bail!("transform {} not found", declared.transform_id);
         }
+        self.seen
+            .lock()
+            .expect("seen sources")
+            .insert(feed.id.clone());
         Ok(())
     }
 
