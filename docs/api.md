@@ -501,7 +501,7 @@ Try runs code on a few records without storing anything or writing to the destin
 `GET /api/destination` → `200`:
 
 ```json
-{"base_url": "http://hfs:8080", "display_name": "Northgate FHIR", "tenant": "northgate",
+{"base_url": "http://hfs:8080", "display_name": "Clinic FHIR", "tenant": "clinic-a",
  "tenant_header": "X-Tenant-ID", "fhir_version": "4.0.1",
  "software": {"name": "Helios FHIR Server", "version": "0.4.0"}, "reachable": true,
  "checked_at": "...", "resource_count": null, "validation": "required"}
