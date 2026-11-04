@@ -599,7 +599,7 @@ mod tests {
                     type_name: (*t).into(),
                     nullable: *nullable,
                     class: Class::of(engine, t),
-                    numeric: Some((38, 30)).filter(|_| Class::of(engine, t) == Class::Decimal),
+                    numeric: (Class::of(engine, t) == Class::Decimal).then_some((38, 30)),
                 })
                 .collect(),
             primary_key: vec![],
@@ -649,7 +649,7 @@ mod tests {
         // not, whatever its length (30 fractional digits here).
         let exact = "1234567.123456789012345678901234567890";
         let mut row = serde_json::Map::new();
-        row.insert("amount".into(), serde_json::json!(1234567.1234567890));
+        row.insert("amount".into(), serde_json::json!(1234567.123456789));
         row.insert("id".into(), serde_json::json!(3));
         row.insert("hie_position_0".into(), serde_json::json!(exact));
         let (row, position) = plan.split(row);
