@@ -20,8 +20,9 @@ pub enum Cursor {
 
 /// How the values a cursor or a table read's position holds were decoded.
 /// Before 2 (no `version` in the store), SQL Server `datetimeoffset` values
-/// were read |offset| off their instant, so a position or cursor on one
-/// cannot be trusted: the read starts over (decision 43).
+/// were read |offset| off their instant, and a table read's `datetime`
+/// position was bound back inexactly, so a position or cursor on one cannot
+/// be trusted: the read starts over (decision 43).
 pub(super) const DECODING: u8 = 2;
 
 /// A cursor as kept in the store: `{"kind", "value", "version"}`.

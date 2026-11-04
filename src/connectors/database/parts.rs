@@ -381,13 +381,13 @@ impl PartsSource {
                     .and_then(|stored| serde_json::from_str::<Position>(&stored).ok())
                     .filter(|p| p.columns == plan.columns);
                 let mut after = match stored {
-                    // Written with the old datetimeoffset decoding: rows may
+                    // Written with the old time decoding and binds: rows may
                     // have been skipped anywhere before it.
-                    Some(p) if p.version < DECODING && plan.orders_by_datetimeoffset() => {
+                    Some(p) if p.version < DECODING && plan.distrusts_old_positions() => {
                         tracing::warn!(
                             target: "hie::database",
                             feed = %self.feed_id,
-                            "the stored position was read with the old datetimeoffset decoding; reading the table again from the start"
+                            "the stored position was written with the old datetimeoffset or datetime handling; reading the table again from the start"
                         );
                         None
                     }

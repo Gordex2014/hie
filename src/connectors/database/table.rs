@@ -412,6 +412,9 @@ pub struct Plan {
     /// Per order column: the placeholder's cast, so a bound position is
     /// compared exactly in the column's own type (`{}` is the placeholder).
     casts: Vec<Option<String>>,
+    /// Whether a position stored before [`super::cursor::DECODING`] may be
+    /// past rows never read (see [`Plan::distrusts_old_positions`]).
+    distrusts_old_positions: bool,
 }
 
 impl Plan {
@@ -433,6 +436,7 @@ impl Plan {
         let mut exact = Vec::new();
         let mut casts = Vec::new();
         let mut aliases: Vec<String> = Vec::new();
+        let mut distrusts_old_positions = false;
         for (i, c) in columns.iter().enumerate() {
             let column = info
                 .column(c)
@@ -441,6 +445,9 @@ impl Plan {
                 return Err(reason);
             }
             classes.push(column.class);
+            distrusts_old_positions |= engine == Engine::SqlServer
+                && (column.class == Class::TimestampTz
+                    || column.type_name.trim().eq_ignore_ascii_case("datetime"));
             // Decimals are read beside the row as exact text and bound back
             // as text cast to the column's type: never through a float or a
             // 28-digit decimal. SQLite stores them as floats already.
@@ -489,12 +496,18 @@ impl Plan {
             classes,
             exact,
             casts,
+            distrusts_old_positions,
         })
     }
 
-    /// Whether a SQL Server `datetimeoffset` column orders the read.
-    pub fn orders_by_datetimeoffset(&self) -> bool {
-        self.engine == Engine::SqlServer && self.classes.contains(&Class::TimestampTz)
+    /// Whether a position stored before the current decoding may be past
+    /// rows never read, so the read starts over: a SQL Server
+    /// `datetimeoffset` was decoded |offset| off, and a `datetime` was bound
+    /// back as a `datetime2(7)`, which at compatibility level 120 or below
+    /// compares a one-tick value (.0033333) as past the column's own (.003),
+    /// skipping the rows that share it.
+    pub fn distrusts_old_positions(&self) -> bool {
+        self.distrusts_old_positions
     }
 
     /// The statement reading up to `limit` rows past `after` (the order
@@ -767,7 +780,7 @@ mod tests {
             ],
         );
         let plan = Plan::new(&info, &["old".into(), "small".into(), "id".into()], "at").unwrap();
-        assert!(plan.orders_by_datetimeoffset());
+        assert!(plan.distrusts_old_positions());
         let after = [
             serde_json::json!("2026-10-01T00:20:00.1234567-04:00"),
             serde_json::json!("2026-10-01T00:20:00.006666666"),
@@ -795,7 +808,26 @@ mod tests {
             ],
         );
         let plan = Plan::new(&pg, &["id".into()], "at").unwrap();
-        assert!(!plan.orders_by_datetimeoffset());
+        assert!(!plan.distrusts_old_positions());
+        let plain = table(
+            Engine::SqlServer,
+            &[
+                ("at", "datetime2", false),
+                ("small", "smalldatetime", false),
+                ("id", "int", false),
+            ],
+        );
+        let plain = Plan::new(&plain, &["small".into(), "id".into()], "at").unwrap();
+        assert!(!plain.distrusts_old_positions());
+        let old = table(
+            Engine::SqlServer,
+            &[("at", "datetime", false), ("id", "int", false)],
+        );
+        assert!(
+            Plan::new(&old, &["id".into()], "at")
+                .unwrap()
+                .distrusts_old_positions()
+        );
         let (sql, binds) = plan.sql(
             Some(&[
                 serde_json::json!("2026-10-01T04:20:00+00:00"),

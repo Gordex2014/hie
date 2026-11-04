@@ -263,12 +263,13 @@ async fn server() -> Option<Server> {
     })
 }
 
-/// A table read by parts on `table` of `server`, keeping its position in `db`.
+/// A table read by parts on `table` of `database` on `server`, keeping its
+/// position in `db`.
 fn table_source(
     server: &Server,
     db: &std::sync::Arc<hie::db::Db>,
     id: &str,
-    table: &str,
+    (database, table): (&str, &str),
     key: &[&str],
     new_rows_by: &str,
     max_runs: usize,
@@ -291,7 +292,7 @@ fn table_source(
         "id": id, "name": id,
         "source": {"type": "database",
                    "connection": {"engine": "sqlserver", "host": server.host, "port": server.port,
-                                  "database": server.database, "user": server.user,
+                                  "database": database, "user": server.user,
                                   "password": {"secret": secret, "revision": 1},
                                   "encrypt": false, "trust_cert": true},
                    "read": {"mode": "table", "table": {"schema": "dbo", "name": table},
@@ -420,7 +421,15 @@ async fn sql_server_time_positions_read_every_row_exactly_once() {
 
         let db = Arc::new(hie::db::Db::in_memory().unwrap());
         let feed = format!("times-{}", case.name.replace('_', "-"));
-        let source = table_source(&server, &db, &feed, &table, &["id"], "at", 2);
+        let source = table_source(
+            &server,
+            &db,
+            &feed,
+            (&server.database, &table),
+            &["id"],
+            "at",
+            2,
+        );
         let expect = |row: &Value| -> Result<i64, String> {
             let id = row["id"].as_i64().unwrap();
             let text = row["at"].as_str().unwrap_or_default();
@@ -530,7 +539,11 @@ async fn sql_server_positions_from_the_old_datetimeoffset_decoding_read_again() 
         return;
     };
     let pid = std::process::id();
-    let (dto, dt2) = (format!("legacy_dto_{pid}"), format!("legacy_dt2_{pid}"));
+    let (dto, dt2, dt) = (
+        format!("legacy_dto_{pid}"),
+        format!("legacy_dt2_{pid}"),
+        format!("legacy_dt_{pid}"),
+    );
     server
         .client
         .execute(
@@ -539,7 +552,9 @@ async fn sql_server_positions_from_the_old_datetimeoffset_decoding_read_again() 
                  CREATE TABLE dbo.{dt2} (id INT NOT NULL PRIMARY KEY, at DATETIME2(0) NOT NULL);
                  WITH ns AS (SELECT TOP (30) CAST(ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS INT) AS n FROM sys.all_objects)
                  INSERT INTO dbo.{dto} (id, at) SELECT n, TODATETIMEOFFSET(DATEADD(minute, n, CAST('2026-10-01T00:00:00' AS DATETIME2(0))), '-04:00') FROM ns;
-                 INSERT INTO dbo.{dt2} (id, at) SELECT id, CAST(SWITCHOFFSET(at, '+00:00') AS DATETIME2(0)) FROM dbo.{dto}"
+                 INSERT INTO dbo.{dt2} (id, at) SELECT id, CAST(SWITCHOFFSET(at, '+00:00') AS DATETIME2(0)) FROM dbo.{dto};
+                 CREATE TABLE dbo.{dt} (id INT NOT NULL PRIMARY KEY, at DATETIME NOT NULL);
+                 INSERT INTO dbo.{dt} (id, at) SELECT id, at FROM dbo.{dt2}"
             ),
             &[],
         )
@@ -552,7 +567,15 @@ async fn sql_server_positions_from_the_old_datetimeoffset_decoding_read_again() 
     // Row 20 is 00:20-04:00; the old decoding recorded it 4 h late, in UTC.
     let old = r#"{"columns":["at","id"],"after":["2026-10-01T08:20:00+00:00",20]}"#;
     db.set_cursor("legacy-dto", "keyset", old).unwrap();
-    let source = table_source(&server, &db, "legacy-dto", &dto, &["id"], "at", 1);
+    let source = table_source(
+        &server,
+        &db,
+        "legacy-dto",
+        (&server.database, &dto),
+        &["id"],
+        "at",
+        1,
+    );
     let again = ids(pass(&source).await);
     let position: Value =
         serde_json::from_str(&db.cursor("legacy-dto", "keyset").unwrap().unwrap()).unwrap();
@@ -561,8 +584,30 @@ async fn sql_server_positions_from_the_old_datetimeoffset_decoding_read_again() 
     // A datetime2 never went through it: its position stands.
     let old = r#"{"columns":["at","id"],"after":["2026-10-01T04:20:00",20]}"#;
     db.set_cursor("legacy-dt2", "keyset", old).unwrap();
-    let source = table_source(&server, &db, "legacy-dt2", &dt2, &["id"], "at", 1);
+    let source = table_source(
+        &server,
+        &db,
+        "legacy-dt2",
+        (&server.database, &dt2),
+        &["id"],
+        "at",
+        1,
+    );
     let kept = ids(pass(&source).await);
+
+    // A datetime's old position was bound back inexactly: read again too.
+    let old = r#"{"columns":["at","id"],"after":["2026-10-01T04:20:00",20]}"#;
+    db.set_cursor("legacy-dt", "keyset", old).unwrap();
+    let source = table_source(
+        &server,
+        &db,
+        "legacy-dt",
+        (&server.database, &dt),
+        &["id"],
+        "at",
+        1,
+    );
+    let datetime_again = ids(pass(&source).await);
 
     // The 0.1 query: its cursor starts over from cursor_start.
     let url = std::env::var("HIE_TEST_MSSQL_URL").unwrap();
@@ -589,7 +634,10 @@ async fn sql_server_positions_from_the_old_datetimeoffset_decoding_read_again() 
 
     server
         .client
-        .execute(format!("DROP TABLE dbo.{dto}; DROP TABLE dbo.{dt2}"), &[])
+        .execute(
+            format!("DROP TABLE dbo.{dto}; DROP TABLE dbo.{dt2}; DROP TABLE dbo.{dt}"),
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(again, (1..=30).collect::<Vec<_>>());
@@ -599,9 +647,106 @@ async fn sql_server_positions_from_the_old_datetimeoffset_decoding_read_again() 
     );
     assert_eq!(after_again, 0);
     assert_eq!(kept, (21..=30).collect::<Vec<_>>());
+    assert_eq!(datetime_again, (1..=30).collect::<Vec<_>>());
     assert_eq!(query_again, (1..=30).collect::<Vec<_>>());
     assert_eq!(
         cursor,
         r#"{"kind":"timestamp","value":"2026-10-01T00:30:00-04:00","version":2}"#
     );
+}
+
+/// On SQL Server, in a database at compatibility level 120: a `datetime`
+/// value of one tick (.003) does not equal itself bound as the `datetime2`
+/// it decodes to (.0033333), so a position bound that way skipped the rows
+/// that share it; cast back to `datetime`, 1,500 rows sharing one such value
+/// across a page boundary, and the rows after it, are each read once.
+#[tokio::test]
+async fn sql_server_datetime_positions_are_exact_at_compatibility_level_120() {
+    use std::sync::Arc;
+    let Some(mut server) = server().await else {
+        return;
+    };
+    let pid = std::process::id();
+    let database = format!("hie_compat120_{pid}");
+    server
+        .client
+        .execute(
+            format!(
+                "CREATE DATABASE [{database}];
+                 ALTER DATABASE [{database}] SET COMPATIBILITY_LEVEL = 120;"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    server
+        .client
+        .execute(
+            format!(
+                "CREATE TABLE [{database}].dbo.ticks (id INT NOT NULL PRIMARY KEY, at DATETIME NOT NULL);
+                 WITH ns AS (SELECT TOP (2000) CAST(ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS INT) AS n
+                             FROM sys.all_objects a CROSS JOIN sys.all_objects b)
+                 INSERT INTO [{database}].dbo.ticks (id, at)
+                 SELECT n, CASE WHEN n <= 1500 THEN CAST('2026-10-01T00:00:00.003' AS DATETIME)
+                                ELSE DATEADD(minute, n, CAST('2026-10-01T00:00:00.003' AS DATETIME)) END FROM ns"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    // The cause, as the server sees it: the decoded value bound as a
+    // datetime2 does not match the rows it was read from.
+    let decoded = chrono::NaiveDateTime::parse_from_str(
+        "2026-10-01T00:00:00.003333333",
+        "%Y-%m-%dT%H:%M:%S%.f",
+    )
+    .unwrap();
+    let matching = server
+        .client
+        .query(
+            format!("SELECT COUNT_BIG(*) FROM [{database}].dbo.ticks WHERE at = @P1"),
+            &[&decoded],
+        )
+        .await
+        .unwrap()
+        .into_row()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64, _>(0);
+
+    let db = Arc::new(hie::db::Db::in_memory().unwrap());
+    let source = table_source(
+        &server,
+        &db,
+        "compat120",
+        (&database, "ticks"),
+        &["id"],
+        "at",
+        1,
+    );
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        ids.extend(
+            pass(&source)
+                .await
+                .iter()
+                .map(|r| r["id"].as_i64().unwrap()),
+        );
+    }
+    server
+        .client
+        .execute(
+            format!(
+                "ALTER DATABASE [{database}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{database}]"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(matching, Some(0));
+    let read = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!((read, ids), (2000, (1..=2000).collect::<Vec<_>>()));
 }
