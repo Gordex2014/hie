@@ -1,0 +1,221 @@
+{
+  "id": "compat/folder-source-lifecycle",
+  "title": "A folder source created, refused twice, checked now, paused, resumed, replaced and deleted, as in 0.1",
+  "fixtures": {
+    "files": {
+      "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+      "inbox/a.csv": "id,value\n1,5.4\n2,6.1\n"
+    }
+  },
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "body": {
+          "id": "lab",
+          "name": "Lab lab",
+          "source": {
+            "type": "folder",
+            "path": "inbox",
+            "pattern": "*.csv",
+            "poll_seconds": 3600,
+            "min_file_age_ms": 0
+          },
+          "transform": "transforms/lab_csv.py",
+          "expect_every": "24h"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": "lab",
+          "name": "Lab lab",
+          "state": "waiting",
+          "definition": {
+            "source": {
+              "path": "inbox"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "the same id again",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "body": {
+          "id": "lab",
+          "name": "Lab lab",
+          "source": {
+            "type": "folder",
+            "path": "inbox",
+            "pattern": "*.csv",
+            "poll_seconds": 3600,
+            "min_file_age_ms": 0
+          },
+          "transform": "transforms/lab_csv.py"
+        }
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "id": "lab",
+          "checking": true
+        }
+      }
+    },
+    {
+      "name": "both rows sent",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "records": {
+            "sent": 2
+          }
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/pause",
+        "body": {
+          "by": "sam"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "state": "paused",
+          "paused": {
+            "by": "sam",
+            "since": "{{time}}"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/resume"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "state": "{{string}}",
+          "paused": null
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/api/sources/lab",
+        "body": {
+          "id": "lab",
+          "name": "Lab renamed",
+          "source": {
+            "type": "folder",
+            "path": "inbox",
+            "pattern": "*.csv",
+            "poll_seconds": 3600,
+            "min_file_age_ms": 0
+          },
+          "transform": "transforms/lab_csv.py"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "id": "lab",
+          "name": "Lab renamed"
+        }
+      }
+    },
+    {
+      "name": "the id cannot change",
+      "request": {
+        "method": "PUT",
+        "path": "/api/sources/lab",
+        "body": {
+          "id": "other",
+          "name": "Lab other",
+          "source": {
+            "type": "folder",
+            "path": "inbox",
+            "pattern": "*.csv",
+            "poll_seconds": 3600,
+            "min_file_age_ms": 0
+          },
+          "transform": "transforms/lab_csv.py"
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "DELETE",
+        "path": "/api/sources/lab"
+      },
+      "expect": {
+        "status": 204
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}"
+        }
+      }
+    },
+    {
+      "name": "the history stays",
+      "request": {
+        "method": "GET",
+        "path": "/api/records?source=lab"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "records": [
+            {
+              "source_id": "lab"
+            },
+            {
+              "source_id": "lab"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

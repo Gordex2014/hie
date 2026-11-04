@@ -1,0 +1,146 @@
+{
+  "id": "transforms/try-load-failure",
+  "title": "The facade's load failure is not started and confirmed; an answer the facade did not sign is indeterminate and not resent",
+  "fixtures": {
+    "hie": {
+      "runtime": {
+        "url": "{{runtime}}",
+        "token_env": "HIE_CONFORMANCE_NO_TOKEN"
+      }
+    },
+    "runtime": {
+      "try": [
+        {
+          "status": 422,
+          "headers": {
+            "Python-Runtime-Error": "transform_load_failed",
+            "Python-Runtime-Environment-Id": "cpython-3.14@2-env-0123456789abcdef0123456789abcdef",
+            "Python-Runtime-Environment-Digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "Python-Runtime-Environment-Image-Digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "Python-Runtime-Environment-Binding": "hie-record@1",
+            "Python-Runtime-Environment-Profile": "hie-batch@1"
+          },
+          "body": {
+            "error": "transform_load_failed",
+            "load_error": {
+              "message": "SyntaxError: invalid syntax",
+              "trace": "  File \"<program>\", line 1\n"
+            }
+          }
+        },
+        {
+          "status": 502,
+          "headers": {},
+          "body": {
+            "error": "bad gateway"
+          }
+        },
+        {
+          "status": 200,
+          "body": {
+            "replies": []
+          }
+        }
+      ]
+    }
+  },
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "l-1",
+          "code": "def transform(record, context:\n",
+          "input": {
+            "records": [
+              {
+                "id": 1,
+                "value": "5.4"
+              },
+              {
+                "id": 2,
+                "value": "alto"
+              }
+            ]
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "run": {
+            "outcome": "not_started",
+            "reason": "load_failed",
+            "termination": "confirmed",
+            "load_error": {
+              "message": "{{contains:SyntaxError}}"
+            }
+          },
+          "items": [
+            {
+              "disposition": "not_started",
+              "result": "{{absent}}"
+            },
+            {
+              "disposition": "not_started"
+            }
+          ],
+          "coverage": {
+            "requested": 2,
+            "reported": 0,
+            "complete": false
+          }
+        }
+      }
+    },
+    {
+      "name": "a 502 without the facade's error header, as a proxy answers",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "l-2",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"rt\"}],\n    }\n",
+          "input": {
+            "records": [
+              {
+                "id": 1,
+                "value": "5.4"
+              },
+              {
+                "id": 2,
+                "value": "alto"
+              }
+            ]
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "run": {
+            "outcome": "indeterminate",
+            "termination": "unconfirmed",
+            "cleanup": "unconfirmed"
+          },
+          "items": [
+            {
+              "disposition": "not_reported"
+            },
+            {
+              "disposition": "not_reported"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "runtime": {
+        "calls": {
+          "try": 2
+        }
+      }
+    }
+  ]
+}

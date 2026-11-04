@@ -1,0 +1,251 @@
+{
+  "id": "database/test-evidence",
+  "title": "A Test answers bound evidence, replays by key, and fails a read that cannot run",
+  "fixtures": {
+    "sqlite": {
+      "labs": [
+        "CREATE TABLE lab_results (id INTEGER NOT NULL PRIMARY KEY, patient TEXT NOT NULL, value TEXT NOT NULL, status TEXT, updated_at TEXT)",
+        "INSERT INTO lab_results (id, patient, value) VALUES (1, 'p1', '5.1'), (2, 'p2', '5.2'), (3, 'p3', '5.3'), (4, 'p4', '5.4'), (5, 'p5', '5.5'), (6, 'p6', '5.6'), (7, 'p7', '5.7'), (8, 'p8', '5.8'), (9, 'p9', '5.9'), (10, 'p10', '6.0')"
+      ]
+    },
+    "hie": {
+      "admission": {
+        "synthetic_only": true,
+        "databases": [
+          {
+            "engine": "sqlite",
+            "database": "{{sqlite:labs}}"
+          }
+        ]
+      }
+    },
+    "files": {
+      "transforms/lab_db.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"db\"}],\n    }\n"
+    }
+  },
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/test",
+        "headers": {
+          "Idempotency-Key": "t1"
+        },
+        "body": {
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "reachable": true,
+          "evidence": {
+            "id": "{{$ev}}",
+            "kind": "database",
+            "verdict": "passed",
+            "tested_at": "{{time}}",
+            "definition_sha256": "{{hex:64}}",
+            "credential": null,
+            "checks": [
+              "{{contains}}",
+              {
+                "name": "admission",
+                "result": "passed"
+              },
+              {
+                "name": "connect",
+                "result": "passed"
+              },
+              {
+                "name": "read",
+                "result": "passed"
+              }
+            ],
+            "tables": [
+              "{{contains}}",
+              {
+                "schema": "main",
+                "name": "lab_results"
+              }
+            ],
+            "read": {
+              "rows": 10
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "the same key replays the evidence",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/test",
+        "headers": {
+          "Idempotency-Key": "t1"
+        },
+        "body": {
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "evidence": {
+            "id": "{{$ev}}"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/test",
+        "headers": {
+          "Idempotency-Key": "t1"
+        },
+        "body": {
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "missing"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          }
+        }
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}",
+          "code": "idempotency_conflict"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/evidence/{{$ev}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "id": "{{$ev}}",
+          "verdict": "passed",
+          "read": {
+            "rows": 10
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/evidence/ev_nope"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "evidence_not_found"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/test",
+        "headers": {
+          "Idempotency-Key": "t2"
+        },
+        "body": {
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "missing"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "evidence": {
+            "verdict": "failed",
+            "checks": [
+              "{{contains}}",
+              {
+                "name": "connect",
+                "result": "passed"
+              },
+              {
+                "name": "read",
+                "result": "failed"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

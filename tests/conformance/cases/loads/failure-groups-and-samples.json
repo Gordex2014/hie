@@ -1,0 +1,184 @@
+{
+  "id": "loads/failure-groups-and-samples",
+  "title": "Failures group by reason and version with their content state; record ids without content; samples no-store",
+  "fixtures": {
+    "files": {
+      "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+      "sources/lab.yaml": "id: lab\nname: Lab lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\ntransform: transforms/lab_csv.py\ndelivery:\n  initial_backoff_ms: 300\n  max_backoff_ms: 600\n",
+      "inbox/a.csv": "id,value,patient\n1,alto,zq-failed-marker-1\n2,5.4,p2\n3,alto,zq-failed-marker-3\n4,xyz,zq-failed-marker-4\n"
+    }
+  },
+  "forbid_at_rest": {
+    "values": [
+      "zq-failed-marker-1",
+      "zq-failed-marker-3",
+      "zq-failed-marker-4"
+    ],
+    "under": [
+      "data"
+    ]
+  },
+  "steps": [
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "wait for the load",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "id": "{{$load}}",
+              "status": "done",
+              "rows": {
+                "written": 1,
+                "failed": 3
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "headers": {
+          "cache-control": "{{contains:no-store}}"
+        },
+        "body": {
+          "failures": [
+            "{{contains}}",
+            {
+              "group": "{{$g}}",
+              "kind": "data",
+              "reason": "value 'alto' is not a number",
+              "count": 2,
+              "transform": {
+                "id": "lab_csv",
+                "version": 1
+              },
+              "location": "{{any}}",
+              "content": "kept",
+              "complete": true
+            },
+            {
+              "kind": "data",
+              "reason": "value 'xyz' is not a number",
+              "count": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/failures/{{$g}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "group": "{{$g}}",
+          "count": 2,
+          "content": "kept",
+          "records": [
+            {
+              "id": "{{$rec}}",
+              "line": "{{int}}",
+              "raw": "{{absent}}"
+            },
+            {
+              "id": "{{int}}",
+              "raw": "{{absent}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/failures/{{$g}}/samples?limit=1"
+      },
+      "expect": {
+        "status": 200,
+        "headers": {
+          "cache-control": "{{contains:no-store}}"
+        },
+        "body": {
+          "group": "{{$g}}",
+          "content": "kept",
+          "samples": [
+            {
+              "record": "{{int}}",
+              "raw": {
+                "value": "alto",
+                "patient": "{{contains:zq-failed-marker}}"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/failures/g_nope"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "group_not_found"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/records/{{$rec}}/history"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "record": "{{$rec}}",
+          "events": [
+            "{{contains}}",
+            {
+              "kind": "admitted",
+              "at": "{{time}}"
+            },
+            {
+              "kind": "failed",
+              "transform": {
+                "id": "lab_csv",
+                "version": 1
+              },
+              "error": {
+                "kind": "data"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

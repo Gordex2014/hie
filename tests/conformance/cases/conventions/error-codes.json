@@ -1,0 +1,93 @@
+{
+  "id": "conventions/error-codes",
+  "title": "Every error carries a stable code beside its sentence",
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/nope"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "source_not_found"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/999999"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "load_not_found"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/records/999999"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "record_not_found"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/transforms/nope"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "transform_not_found"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/alert-rules/999999"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "rule_not_found"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "body": {
+          "id": "Bad",
+          "name": "x",
+          "source": {
+            "type": "folder",
+            "path": "inbox"
+          },
+          "transform": "transforms/lab_csv.py"
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_definition"
+        }
+      }
+    }
+  ]
+}

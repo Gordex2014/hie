@@ -87,7 +87,7 @@ A complete .NET 10 port of the engine exists in the history (commit `c3272d4`), 
 - One bad row must not block the rest of a file. A batch gives a status per entry.
 - Lab results do not need all-or-nothing per file.
 
-**Cost:** No atomicity across a file. Feeds that need it (a resource and its dependents) would use `transaction`; very large feeds would use `$bulk-submit`.
+**Cost:** No atomicity across a file. Feeds that need it (a resource and its dependents) would use `transaction`; very large feeds would use `$bulk-submit`. (Amended by decision 41: a chunk with conditional references goes as a `transaction`.)
 
 ## 8. Two kinds of failure, handled differently
 
@@ -113,7 +113,7 @@ A complete .NET 10 port of the engine exists in the history (commit `c3272d4`), 
 - Building FHIR by text templating (the Camel exercise) let `alto` reach the server, and could let crafted values inject fields.
 - Building objects in code and failing early gives the precise reason ("value 'alto' is not a number").
 
-**Later:** Optional profile validation before sending, through HFS `$validate` or with HFS validation enabled.
+**Later:** Optional profile validation before sending, through HFS `$validate` or with HFS validation enabled. (Decision 40 adds structural validation through the destination's `$validate` before delivery.)
 
 ## 10. Every record is traceable, and corrections keep the original
 
@@ -221,7 +221,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 **Why:** The client UI's Transforms and Monitoring modules need these to render anything, and the assessment in discussion #1 lists them as the next additions after sources. "Try it" reuses the same Python worker as a real load, so the test is the real thing.
 
-**Not yet:** transform versions and "used by since"; failures grouped by reason with the transform line; alert rules with recipients.
+**Not yet:** transform versions and "used by since"; failures grouped by reason with the transform line; alert rules with recipients. (Versions are decision 35, the history decision 42; rules are decision 22.)
 
 ## 20. Bearer tokens on the API, validated as HFS validates them
 
@@ -285,7 +285,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 ## 25. A FHIR server as a source: pulled by `_lastUpdated`, one cursor per type
 
-**Chosen:** `source.type: fhir_server` names a server, the resource types to pull, and how to authenticate (a client-credentials grant or a fixed bearer token, the secret always read from an environment variable the file names). Each pass searches every type for `_lastUpdated=gt{cursor}`, sorted by `_lastUpdated`, page by page up to `max_pages`, and hands the resources on as one NDJSON load per type. The cursor is the newest `meta.lastUpdated` seen and moves only after the engine has stored the records. The load's format is forced to `ndjson`, resources are delivered by their id, and `$bulk-submit` is refused for this source. The connection test reads `/metadata` and counts what waits past each cursor.
+**Chosen:** `source.type: fhir_server` names a server, the resource types to pull, and how to authenticate (a client-credentials grant or a fixed bearer token, the secret always read from an environment variable the file names). Each pass searches every type for `_lastUpdated=gt{cursor}`, sorted by `_lastUpdated`, page by page up to `max_pages`, and hands the resources on as one NDJSON load per type. The cursor is the newest `meta.lastUpdated` seen and moves only after the engine has stored the records. The load's format is forced to `ndjson` and resources are delivered by their id. `$bulk-submit` works with `bulk_from: transformed` (the engine writes the NDJSON, decision 29); only `bulk_from: source_objects` is refused, since there is no file for HFS to fetch, and so is `auto` with the passthrough transform, which resolves to it. The connection test reads `/metadata` and counts what waits past each cursor.
 
 **Why:**
 - Migrating from or mirroring another FHIR server is a connector customers ask for first, and it needs nothing new on the wire: search and paging that every server has.
@@ -401,7 +401,97 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - Storing by sha avoids a `PUT` per pass, and comparing the runtime's digest catches a store that holds something else under the name.
 - Records never move on a runtime failure: the facade's non-200 answers mean nothing ran (its ADR 0003), so keeping the batch received and retrying is exact, not optimistic.
 
+(Extended by decision 39: the facade is the default executor, and Try reports dispositions.)
+
 **Cost / not yet:** no backoff on `503 Retry-After` beyond the poll interval, and no runtime outage alert yet (the facade's ADR 0006 items 2 and 4); terminology helpers answer `None` in the sandbox, so a transform that needs HTS runs locally; one oversize record (over 8 MiB) fails its whole batch and is retried every pass; authentication is the runtime's development token, JWT later.
+
+## 35. Transform versions are immutable, and each runs where it was saved
+
+**Chosen:** A transform has a stable id, a display name that can change, and numbered versions that never change once saved: code, its SHA-256, note, author, the display name of the moment, the base version and the execution environment. Versions live in the engine's store. A save names the version it was based on and is refused with `409 version_conflict` when another save got there first; creating a transform with its version 1 and saving a version are single atomic writes, replayed by `Idempotency-Key`. A source either pins a version or follows the current one, and each load and retry fixes its version when it starts. A retry's `version: null` means the latest saved version at the moment the retry is accepted; it is recorded on the retry and never moves the source's pin. The environment is the identity the executor reports (for python-runtime, its environment id and descriptor digest); a version runs only there, and a run that reports another environment is not applied. `PUT /api/transforms/{name}` keeps working by saving a new version; a file under `transforms/` becomes a transform whose id is its stem, and a changed file becomes a new version.
+
+**Why:**
+- A client UI versions transforms and shows which version each source ran and when; HIE overwriting one file per name (decision 19) cannot say what ran yesterday, and a save restarted every source that used the file in the middle of its load.
+- A save must never change what a pinned source runs: the person fixing a transform for the failed rows should not silently change the next ordinary load. Retrying with the latest saved version is the correction workflow; using the pin would rerun the broken program.
+- Pinning the environment makes a version mean the same thing tomorrow: a runtime whose default environment changed between two batches would otherwise run the same code against other libraries.
+- Ids stable across renames let other systems keep references to a transform while people rename it.
+
+**Cost / not yet:** the store holds every version's code forever unless the transform is deleted, which is refused while a source or an unfinished load or retry uses it. Until python-runtime selects an environment per call, HIE can only compare what ran with what the version names and refuse on a mismatch; a version whose environment is retired cannot run until it is saved again in a current one. Version files are no longer the record of truth, so decision 4's review-as-code applies to the store's export, not to `transforms/`.
+
+## 36. Secrets are write-only, and failed content is kept encrypted for a bounded time
+
+**Chosen:** A secret (a database password, a client secret) is posted once and never read back: `POST /api/secrets` answers an id and a revision, a new value is a new revision, and definitions refer to `{"secret", "revision"}`. Values are encrypted with AES-256-GCM under a key HIE holds outside the store (`secrets.key_file` or `HIE_SECRETS_KEY`), each ciphertext tagged with its key id so a key can be rotated by adding a new one and keeping the old for decryption; without a key the secret routes answer `503`. A Test records the revision it used, and a Start must use that same revision, so a source runs with the credential that was tested. A revision is destroyed once no evidence or source refers to it; a secret in use cannot be deleted. Errors from connections that used a secret are reduced to a kind and a fixed sentence, and nothing (answers, logs, history) carries a value. The content of failed rows, the only source data HIE keeps after a row is settled, is stored encrypted the same way under its own key, kept for `retention.failed_content` (30 days by default), and purged earlier once the row is written or its source deleted; a purge removes content only, never counts or history.
+
+**Why:**
+- Without authentication a client UI can only hand a password to the engine if the engine keeps it; environment variables named in YAML (decision 25, 26) need an operator on the host for every new connection.
+- Binding the revision to the Test stops a password changed after the Test from reaching a source nobody tested with it.
+- Failed rows are what a person needs to fix a transform, but they are source data; keeping them encrypted and for a bounded time limits what a copy of the store exposes, and keeping the counts when the content goes keeps the history honest.
+
+**Cost / not yet:** the key is a file or an environment variable, not a KMS; rotation needs a restart. Secret values exist in the engine's memory while a connection is opened. Rows still waiting for delivery stay in plaintext in the store, as in decision 5, until they settle.
+
+## 37. Admission: whole connections from an allowlist, checked before anything is used
+
+**Chosen:** `admission` in `hie.yaml` lists the connections the engine may open, each as a whole: for a database, engine, host, port and database name. A definition's connection is normalized (engine aliases, host case, default ports) and must match one entry in every part; otherwise it is refused with `403 admission_refused` naming the first part that does not match. The check runs inside HIE on Test, describe, sample, Start, replace and every pass, before a secret is decrypted, a name resolved or a socket opened. `synthetic_only: true` declares the installation holds synthetic data only. Without the block nothing is enforced, as in 0.1, and `GET /api/admission` says so.
+
+**Why:**
+- With authentication off, HIE's scopes protect nothing; the allowlist is the only server-side guard on where the engine connects, and it must hold whatever proxies sit in front.
+- Allowing hosts only would let a caller reach another database or another port on an allowed server; an allowlist of whole connections does not.
+- Checking before the credential is used means a refused definition cannot be used to send a password to an address of the caller's choosing.
+
+**Cost / not yet:** host names are compared as written, not resolved, so the policy lists the names definitions use. FHIR-server connections (base URL, token endpoint, client id, scopes) follow the same rule when that wizard moves here.
+
+## 38. One module per connector kind, behind a small interface
+
+**Chosen:** Each connector kind (folder, S3, FHIR server, database, MLLP) is one module that owns its definition and its checks, the parts of its connection that admission compares, its connection test and evidence, describe and sample where the kind has them, how it reads and what its cursor is, and how it acknowledges what it read. The pipeline sees only that interface and the loads it produces; formats (CSV, NDJSON, Bundle, HL7 v2) stay separate from connectors, and routes and schemas specific to one kind are registered by its module.
+
+**Why:**
+- Each new kind added so far touched the pipeline, the manager and the API; describe, sample, evidence and admission would multiply that by every kind.
+- A connector's quirks (SQL Server's `TOP n`, S3's read-only buckets, an MLLP spool) stay inside it, and a connector can be tested alone against a stand-in.
+
+**Cost:** an interface narrow enough for five kinds leaves some kinds with members they do not use (a folder has nothing to describe), answered as not supported.
+
+## 39. python-runtime's facade is the default executor, and Try never replays
+
+**Chosen:** Transforms run at python-runtime through its HIE facade (decision 34) in every deployment; the engine's own Python worker remains for development and tests. Try answers per run an outcome (`completed`, `stopped`, `indeterminate`, `not_started`), termination and cleanup as the executor confirms them, and per item a disposition (`reported`, `not_reported`, `not_started`); a run whose answer is uncertain is `indeterminate` and is never sent again by HIE, and a caller's run id cannot be reused. The executor's per-item `diagnostics` (warnings, events, the location in the transform's code, and, in Try only, bounded stdout and stderr) pass through unchanged; stdout and stderr are never stored or logged.
+
+**Why:**
+- The runtime is the sandbox for customer code; the local worker runs code with the engine's own rights.
+- A Try that ran is evidence a person acts on (a receipt for saving a version). A lost answer is not evidence that nothing ran, nor that everything did; replaying would run the code twice and could show a result the first run never produced.
+- Diagnostics are the runtime's to produce; HIE passing them through unchanged keeps one definition of them.
+
+**Cost / not yet:** per-item dispositions beyond all-or-nothing need python-runtime 0.1.3 to report them through the facade. Until then HIE reads the facade's own rule: a `200` means every item reported with termination and cleanup confirmed, and a `422 transform_load_failed` carrying the facade's `Python-Runtime-Error` header means nothing started, also confirmed. Every other non-`200` answer, including a `422` without that header, is unconfirmed. A version's environment is read from the consumer's `GET /v1/capabilities` when it is saved.
+
+## 40. Resources are validated by the destination before they are delivered
+
+**Chosen:** With `validation: required`, every resource a load or retry produces goes to the destination's `POST /{type}/$validate` before it is delivered, by REST or `$bulk-submit`. Error or fatal issues fail the row as `validation`, with the issue's text and path, and keep it with the other failures; nothing of it is delivered. A destination that cannot validate stops delivery of the batch: the rows wait, the load says validation is unavailable, and they are tried again with the delivery backoff. Try reports the same issues per resource.
+
+**Why:**
+- HFS accepts what it is given unless its own enforcement is on (decision 9); a client product that used to validate before every load must not lose that check by moving to HIE.
+- The destination's own validator is the one whose rules count, and it needs no second FHIR toolkit in the engine.
+- Delivering unvalidated during an outage would let through exactly the rows the check exists for, so an outage holds delivery rather than skipping the check.
+
+**Cost / not yet:** one more round trip per resource; the destination's terminology checks may be slow. `$validate` does not check that referenced resources exist. The setting is off when absent, so 0.1 installations behave as before.
+
+## 41. Source namespacing, and transactions where references need resolving
+
+**Chosen:** A source with `delivery.ids: namespaced` writes each resource that has an id under an id derived from the source, the type and the origin id (48 hex characters of SHA-256 over `{source}|{type}|{id}`), rewrites the relative references between its resources to the derived ids, and tags each resource with `urn:helios:hie:source` and the source id. With `delivery.bundle: auto`, a chunk holding a conditional reference (`Type?query`) goes as a `transaction`, which the destination resolves; anything else goes as a `batch`. A refused transaction is split, so one bad reference fails only its own row.
+
+**Why:**
+- Two sources that both send `Patient/1` otherwise overwrite each other; deriving the id from the source keeps them apart while the same record from the same source keeps updating the same resource, so a replay creates nothing.
+- A derived id is deterministic, so a reference can be rewritten without having seen the record it points at.
+- HFS resolves conditional references only inside a transaction; a batch stores them unresolved.
+
+**Cost / not yet:** derived ids are opaque, so a resource is found by its tag or identifier, not a readable id. Namespacing is opt-in per source (`as_sent` stays the default for 0.1 definitions). A transaction costs the per-entry independence of a batch until it is split.
+
+## 42. Failures and attempts are an immutable history; retries are records of their own
+
+**Chosen:** Every attempt on a row is an event appended to the store (admitted, transformed, failed with kind, reason, version and location, validated, delivered, outcome unknown, settled, retried) and is never rewritten. A retry is a durable record with its own id, the failure group it covers, the version it runs and the retry it follows; it survives a restart and is refused while another covers the same rows. Period counts come from the events, by when they happened, so a retry never lowers yesterday's failures. A row whose delivery was dispatched but not confirmed is `outcome_unknown`, never written or failed until it settles. Loads are paged by an opaque cursor, and a source's first load reports its progress as rows admitted against rows processed, with the row count from the Test as the total.
+
+**Why:**
+- The 0.1 retry wiped the error and the counts with it (decision 10's history kept the row, not what happened to it); a monitoring page that says what failed this week cannot be built on that.
+- A person retrying after a fix needs to see the retry's progress after leaving the page and after a restart.
+- Outcome unknown is a real state of REST and bulk delivery; inferring it in a UI from `pending` and an error kind is fragile.
+
+**Cost:** the event table grows with every attempt; it is kept, like the records, until a retention policy for history is decided.
 
 ## Not in the prototype
 

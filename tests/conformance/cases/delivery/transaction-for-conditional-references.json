@@ -1,0 +1,115 @@
+{
+  "id": "delivery/transaction-for-conditional-references",
+  "title": "A conditional reference goes in a transaction and is resolved; one that matches nothing fails only its row",
+  "fixtures": {
+    "destination": {
+      "seed": [
+        {
+          "resourceType": "Patient",
+          "id": "pt-1",
+          "identifier": [
+            {
+              "system": "urn:mrn",
+              "value": "123"
+            }
+          ]
+        }
+      ]
+    },
+    "files": {
+      "transforms/cond.py": "def transform(record, context):\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"subject\": {\"reference\": f\"Patient?identifier=urn:mrn|{record['mrn']}\"},\n        \"valueQuantity\": {\"value\": float(record[\"value\"])},\n    }\n",
+      "sources/lab.yaml": "id: lab\nname: Lab lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\ntransform: transforms/cond.py\n",
+      "inbox/a.csv": "id,mrn,value\n1,123,5.4\n2,999,6.1\n"
+    }
+  },
+  "steps": [
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "wait for the load",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "status": "done",
+              "rows": {
+                "written": 1,
+                "failed": 1
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "destination": {
+        "bundle_types": [
+          "{{contains}}",
+          "transaction"
+        ],
+        "writes": 1,
+        "stored": [
+          {
+            "id": "obs-1",
+            "subject": {
+              "reference": "Patient/pt-1"
+            }
+          }
+        ],
+        "not_stored": [
+          {
+            "id": "obs-2"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            {
+              "id": "{{$load}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "failures": [
+            {
+              "kind": "reference",
+              "count": 1
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,216 @@
+{
+  "id": "database/first-load-progress",
+  "title": "The first load reports rows admitted against processed with the tested total; a later load has no total",
+  "fixtures": {
+    "sqlite": {
+      "labs": [
+        "CREATE TABLE lab_results (id INTEGER NOT NULL PRIMARY KEY, patient TEXT NOT NULL, value TEXT NOT NULL, status TEXT, updated_at TEXT)",
+        "INSERT INTO lab_results (id, patient, value) VALUES (1, 'p1', '5.1'), (2, 'p2', '5.2'), (3, 'p3', '5.3'), (4, 'p4', '5.4'), (5, 'p5', '5.5'), (6, 'p6', '5.6'), (7, 'p7', '5.7'), (8, 'p8', '5.8'), (9, 'p9', '5.9'), (10, 'p10', '6.0')"
+      ]
+    },
+    "hie": {
+      "admission": {
+        "synthetic_only": true,
+        "databases": [
+          {
+            "engine": "sqlite",
+            "database": "{{sqlite:labs}}"
+          }
+        ]
+      }
+    },
+    "files": {
+      "transforms/lab_db.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"db\"}],\n    }\n"
+    }
+  },
+  "steps": [
+    {
+      "name": "test the connection",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/test",
+        "headers": {
+          "Idempotency-Key": "t1"
+        },
+        "body": {
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "evidence": {
+            "id": "{{$ev}}",
+            "verdict": "passed"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "headers": {
+          "Idempotency-Key": "s1"
+        },
+        "body": {
+          "id": "labs",
+          "name": "Lab results",
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          },
+          "format": "ndjson",
+          "transform": "transforms/lab_db.py",
+          "expect_every": "24h",
+          "evidence": "{{$ev}}"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "first_load": {
+            "id": "{{$first}}"
+          }
+        }
+      }
+    },
+    {
+      "name": "the first load finishes",
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$first}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "id": "{{$first}}",
+          "status": "done",
+          "first": true,
+          "rows": {
+            "read": 10,
+            "written": 10,
+            "failed": 0,
+            "outcome_unknown": 0,
+            "in_progress": 0
+          },
+          "progress": {
+            "phase": "done",
+            "rows_admitted": 10,
+            "rows_processed": 10,
+            "total_rows": 10
+          }
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/labs"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "first_load": {
+            "id": "{{$first}}",
+            "status": "done"
+          }
+        }
+      }
+    },
+    {
+      "destination": {
+        "resources": {
+          "Observation": 10
+        }
+      }
+    },
+    {
+      "sql": {
+        "db": "labs",
+        "statements": [
+          "INSERT INTO lab_results (id, patient, value) VALUES (11, 'p11', '6.1'), (12, 'p12', '6.2')"
+        ]
+      }
+    },
+    {
+      "name": "check labs now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/labs/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "new rows by id",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/labs/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "first": false,
+              "status": "done",
+              "rows": {
+                "read": 2,
+                "written": 2
+              },
+              "progress": {
+                "rows_admitted": 2,
+                "total_rows": null
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "destination": {
+        "resources": {
+          "Observation": 12
+        }
+      }
+    }
+  ]
+}

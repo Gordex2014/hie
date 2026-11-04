@@ -1,0 +1,144 @@
+{
+  "id": "sequences/lost-try-not-replayed",
+  "title": "An answer lost after dispatch is indeterminate and unconfirmed; HIE does not send it again, and the run id cannot be reused",
+  "fixtures": {
+    "hie": {
+      "runtime": {
+        "url": "{{runtime}}",
+        "token_env": "HIE_CONFORMANCE_NO_TOKEN"
+      }
+    },
+    "runtime": {
+      "try": [
+        {
+          "drop": true
+        },
+        {
+          "status": 200,
+          "body": {
+            "replies": []
+          }
+        }
+      ]
+    }
+  },
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "lost-1",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"rt\"}],\n    }\n",
+          "input": {
+            "records": [
+              {
+                "id": 1,
+                "value": "5.4"
+              },
+              {
+                "id": 2,
+                "value": "alto"
+              }
+            ]
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "run": {
+            "id": "lost-1",
+            "outcome": "indeterminate",
+            "reason": "response_lost",
+            "termination": "unconfirmed",
+            "cleanup": "unconfirmed"
+          },
+          "items": [
+            {
+              "index": 0,
+              "disposition": "not_reported",
+              "result": "{{absent}}"
+            },
+            {
+              "index": 1,
+              "disposition": "not_reported"
+            }
+          ],
+          "coverage": {
+            "requested": 2,
+            "reported": 0,
+            "complete": false
+          }
+        }
+      }
+    },
+    {
+      "runtime": {
+        "calls": {
+          "try": 1
+        }
+      }
+    },
+    {
+      "name": "the same run id is refused, not run",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "lost-1",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"rt\"}],\n    }\n",
+          "input": {
+            "records": [
+              {
+                "id": 1,
+                "value": "5.4"
+              },
+              {
+                "id": 2,
+                "value": "alto"
+              }
+            ]
+          }
+        }
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}",
+          "code": "run_id_in_use"
+        }
+      }
+    },
+    {
+      "sleep_ms": 1000
+    },
+    {
+      "name": "still one dispatch",
+      "runtime": {
+        "calls": {
+          "try": 1
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/transforms/try-runs/lost-1"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "run": {
+            "status": "finished",
+            "outcome": "indeterminate",
+            "termination": "unconfirmed"
+          },
+          "coverage": {
+            "complete": false
+          }
+        }
+      }
+    }
+  ]
+}

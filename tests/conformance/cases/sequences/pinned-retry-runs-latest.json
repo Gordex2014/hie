@@ -1,0 +1,337 @@
+{
+  "id": "sequences/pinned-retry-runs-latest",
+  "title": "Pinned to v2, save v3: the retry runs v3 and the next ordinary load still runs v2",
+  "fixtures": {
+    "files": {
+      "inbox/a.csv": "id,value\n1,5.4\n2,alto\n3,6.1\n"
+    }
+  },
+  "steps": [
+    {
+      "name": "create Lab results",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms",
+        "headers": {
+          "Idempotency-Key": "c1"
+        },
+        "body": {
+          "display_name": "Lab results",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "note": "First version",
+          "author": "Sam Whitaker"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": "{{$tid}}",
+          "current_version": 1
+        }
+      }
+    },
+    {
+      "name": "save version 2",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/versions",
+        "headers": {
+          "Idempotency-Key": "v-2"
+        },
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v2\"}],\n    }\n",
+          "base_version": 1
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "version": 2,
+          "base_version": 1
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "body": {
+          "id": "lab",
+          "name": "Lab lab",
+          "source": {
+            "type": "folder",
+            "path": "inbox",
+            "pattern": "*.csv",
+            "poll_seconds": 3600,
+            "min_file_age_ms": 0
+          },
+          "transform": {
+            "id": "{{$tid}}",
+            "version": 2
+          }
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "pin": {
+            "mode": "pinned",
+            "version": 2
+          }
+        }
+      }
+    },
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "wait for the load",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "id": "{{$load}}",
+              "name": "a.csv",
+              "status": "done",
+              "transform": {
+                "version": 2
+              },
+              "rows": {
+                "written": 2,
+                "failed": 1
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "destination": {
+        "stored": [
+          {
+            "id": "obs-1",
+            "note": [
+              {
+                "text": "v2"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "save version 3",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/versions",
+        "headers": {
+          "Idempotency-Key": "v-3"
+        },
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        number = 0.0\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v3\"}],\n    }\n",
+          "base_version": 2
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "version": 3,
+          "base_version": 2
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "failures": [
+            {
+              "group": "{{$g}}",
+              "transform": {
+                "version": 2
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/loads/{{$load}}/retries",
+        "headers": {
+          "Idempotency-Key": "r1"
+        },
+        "body": {
+          "group": "{{$g}}",
+          "version": null
+        }
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "retry": {
+            "id": "{{$rt}}",
+            "transform": {
+              "id": "{{$tid}}",
+              "version": 3
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/retries/{{$rt}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "retry": {
+            "status": "done",
+            "written": 1
+          }
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "destination": {
+        "stored": [
+          {
+            "id": "obs-2",
+            "note": [
+              {
+                "text": "v3"
+              }
+            ],
+            "valueQuantity": {
+              "value": 0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "the retry did not move the pin",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "pin": {
+            "mode": "pinned",
+            "version": 2,
+            "resolved_version": 2
+          }
+        }
+      }
+    },
+    {
+      "write_files": {
+        "inbox/b.csv": "id,value\n4,7.0\n5,alto\n"
+      }
+    },
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "the next ordinary load runs v2",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "name": "b.csv",
+              "status": "done",
+              "transform": {
+                "version": 2
+              },
+              "rows": {
+                "written": 1,
+                "failed": 1
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "destination": {
+        "stored": [
+          {
+            "id": "obs-4",
+            "note": [
+              {
+                "text": "v2"
+              }
+            ]
+          }
+        ],
+        "not_stored": [
+          {
+            "id": "obs-5"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/transforms/{{$tid}}/usage"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "versions": [
+            "{{contains}}",
+            {
+              "version": 3,
+              "runs": [
+                {
+                  "kind": "retry",
+                  "id": "{{$rt}}",
+                  "outcome": "written"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

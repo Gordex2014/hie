@@ -1,0 +1,118 @@
+{
+  "id": "compat/legacy-transform-put-and-try",
+  "title": "Saving and trying a transform by name, as in 0.1",
+  "steps": [
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/api/transforms/t1",
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "name": "t1",
+          "saved": true
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/transforms/t1"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "name": "t1",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/transforms"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "transforms": [
+            "{{contains}}",
+            {
+              "name": "t1",
+              "used_by": [],
+              "path": "{{string}}",
+              "size": "{{int}}",
+              "modified_at": "{{any}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/t1/try",
+        "body": {
+          "records": [
+            {
+              "id": 1,
+              "value": "5.4"
+            },
+            {
+              "id": 2,
+              "value": "alto"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "name": "t1",
+          "results": [
+            {
+              "resources": [
+                {
+                  "resourceType": "Observation",
+                  "valueQuantity": {
+                    "value": 5.4
+                  }
+                }
+              ]
+            },
+            {
+              "error": {
+                "kind": "data",
+                "message": "{{contains:not a number}}"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "path": "/api/transforms/bad%20name",
+        "body": {
+          "code": ""
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}"
+        }
+      }
+    },
+    {
+      "destination": {
+        "writes": 0
+      }
+    }
+  ]
+}

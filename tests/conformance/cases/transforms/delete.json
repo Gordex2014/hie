@@ -1,0 +1,73 @@
+{
+  "id": "transforms/delete",
+  "title": "An unused transform is deleted; one a source uses is refused",
+  "fixtures": {
+    "files": {
+      "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+      "sources/lab.yaml": "id: lab\nname: Lab lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\ntransform: transforms/lab_csv.py\n"
+    }
+  },
+  "steps": [
+    {
+      "name": "create Lab results",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms",
+        "headers": {
+          "Idempotency-Key": "c1"
+        },
+        "body": {
+          "display_name": "Lab results",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "note": "First version",
+          "author": "Sam Whitaker"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": "{{$tid}}",
+          "current_version": 1
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "DELETE",
+        "path": "/api/transforms/{{$tid}}"
+      },
+      "expect": {
+        "status": 204
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/transforms/{{$tid}}"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "transform_not_found"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "DELETE",
+        "path": "/api/transforms/lab_csv"
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}",
+          "code": "transform_in_use",
+          "sources": [
+            "lab"
+          ]
+        }
+      }
+    }
+  ]
+}

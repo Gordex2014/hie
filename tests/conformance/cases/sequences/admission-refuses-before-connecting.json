@@ -1,0 +1,360 @@
+{
+  "id": "sequences/admission-refuses-before-connecting",
+  "title": "On an allowed host, another port, database, host spelling or engine is refused before any connection; the allowed one is tried",
+  "fixtures": {
+    "secrets_key": true,
+    "tcp": [
+      "allowed",
+      "other"
+    ],
+    "hie": {
+      "admission": {
+        "synthetic_only": true,
+        "databases": [
+          {
+            "engine": "sqlserver",
+            "host": "127.0.0.1",
+            "port": "{{port:allowed}}",
+            "database": "labs"
+          }
+        ]
+      }
+    },
+    "files": {
+      "transforms/lab_db.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"db\"}],\n    }\n"
+    }
+  },
+  "forbid": [
+    "Corpus-Secret-Value-1!"
+  ],
+  "steps": [
+    {
+      "name": "keep the password",
+      "request": {
+        "method": "POST",
+        "path": "/api/secrets",
+        "headers": {
+          "Idempotency-Key": "s1"
+        },
+        "body": {
+          "name": "labs-reader",
+          "value": "Corpus-Secret-Value-1!"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": "{{$sec}}",
+          "revision": 1
+        }
+      }
+    },
+    {
+      "name": "another port",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/test",
+        "headers": {
+          "Idempotency-Key": "a1"
+        },
+        "body": {
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlserver",
+              "host": "127.0.0.1",
+              "port": "{{port:other}}",
+              "database": "labs",
+              "user": "hie_reader",
+              "password": {
+                "secret": "{{$sec}}",
+                "revision": 1
+              },
+              "encrypt": false,
+              "trust_cert": true
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "dbo",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 403,
+        "body": {
+          "error": "{{string}}",
+          "code": "admission_refused",
+          "field": "port"
+        }
+      }
+    },
+    {
+      "name": "another database",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/test",
+        "headers": {
+          "Idempotency-Key": "a2"
+        },
+        "body": {
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlserver",
+              "host": "127.0.0.1",
+              "port": "{{port:allowed}}",
+              "database": "payroll",
+              "user": "hie_reader",
+              "password": {
+                "secret": "{{$sec}}",
+                "revision": 1
+              },
+              "encrypt": false,
+              "trust_cert": true
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "dbo",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 403,
+        "body": {
+          "error": "{{string}}",
+          "code": "admission_refused",
+          "field": "database"
+        }
+      }
+    },
+    {
+      "name": "another host name",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/test",
+        "headers": {
+          "Idempotency-Key": "a3"
+        },
+        "body": {
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlserver",
+              "host": "localhost",
+              "port": "{{port:allowed}}",
+              "database": "labs",
+              "user": "hie_reader",
+              "password": {
+                "secret": "{{$sec}}",
+                "revision": 1
+              },
+              "encrypt": false,
+              "trust_cert": true
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "dbo",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 403,
+        "body": {
+          "error": "{{string}}",
+          "code": "admission_refused",
+          "field": "host"
+        }
+      }
+    },
+    {
+      "name": "another engine",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/test",
+        "headers": {
+          "Idempotency-Key": "a4"
+        },
+        "body": {
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "postgres",
+              "host": "127.0.0.1",
+              "port": "{{port:allowed}}",
+              "database": "labs",
+              "user": "hie_reader",
+              "password": {
+                "secret": "{{$sec}}",
+                "revision": 1
+              },
+              "encrypt": false,
+              "trust_cert": true
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "dbo",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 403,
+        "body": {
+          "error": "{{string}}",
+          "code": "admission_refused",
+          "field": "engine"
+        }
+      }
+    },
+    {
+      "name": "Start is refused the same way, first",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "headers": {
+          "Idempotency-Key": "a5"
+        },
+        "body": {
+          "id": "labs",
+          "name": "Labs",
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlserver",
+              "host": "127.0.0.1",
+              "port": "{{port:other}}",
+              "database": "labs",
+              "user": "hie_reader",
+              "password": {
+                "secret": "{{$sec}}",
+                "revision": 1
+              },
+              "encrypt": false,
+              "trust_cert": true
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "dbo",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            }
+          },
+          "format": "ndjson",
+          "transform": "transforms/lab_db.py",
+          "evidence": "ev_none"
+        }
+      },
+      "expect": {
+        "status": 403,
+        "body": {
+          "error": "{{string}}",
+          "code": "admission_refused",
+          "field": "port"
+        }
+      }
+    },
+    {
+      "name": "nothing was attempted",
+      "tcp": {
+        "allowed": 0,
+        "other": 0
+      }
+    },
+    {
+      "name": "the allowed connection is tried",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/test",
+        "headers": {
+          "Idempotency-Key": "a6"
+        },
+        "body": {
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlserver",
+              "host": "127.0.0.1",
+              "port": "{{port:allowed}}",
+              "database": "labs",
+              "user": "hie_reader",
+              "password": {
+                "secret": "{{$sec}}",
+                "revision": 1
+              },
+              "encrypt": false,
+              "trust_cert": true
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "dbo",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "evidence": {
+            "verdict": "failed",
+            "checks": [
+              "{{contains}}",
+              {
+                "name": "admission",
+                "result": "passed"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "tcp": {
+        "allowed": "{{gte:1}}",
+        "other": 0
+      }
+    }
+  ]
+}

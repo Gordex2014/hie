@@ -1,0 +1,399 @@
+{
+  "id": "database/start-binds-evidence",
+  "title": "Start needs passing evidence for exactly the tested read, replays by key, and refuses a second create",
+  "fixtures": {
+    "sqlite": {
+      "labs": [
+        "CREATE TABLE lab_results (id INTEGER NOT NULL PRIMARY KEY, patient TEXT NOT NULL, value TEXT NOT NULL, status TEXT, updated_at TEXT)",
+        "INSERT INTO lab_results (id, patient, value) VALUES (1, 'p1', '5.1'), (2, 'p2', '5.2'), (3, 'p3', '5.3'), (4, 'p4', '5.4'), (5, 'p5', '5.5'), (6, 'p6', '5.6'), (7, 'p7', '5.7'), (8, 'p8', '5.8'), (9, 'p9', '5.9'), (10, 'p10', '6.0')"
+      ]
+    },
+    "hie": {
+      "admission": {
+        "synthetic_only": true,
+        "databases": [
+          {
+            "engine": "sqlite",
+            "database": "{{sqlite:labs}}"
+          }
+        ]
+      }
+    },
+    "files": {
+      "transforms/lab_db.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"db\"}],\n    }\n"
+    }
+  },
+  "steps": [
+    {
+      "name": "test the connection",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/test",
+        "headers": {
+          "Idempotency-Key": "t1"
+        },
+        "body": {
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "evidence": {
+            "id": "{{$ev}}",
+            "verdict": "passed"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "headers": {
+          "Idempotency-Key": "s0"
+        },
+        "body": {
+          "id": "labs",
+          "name": "Lab results",
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          },
+          "format": "ndjson",
+          "transform": "transforms/lab_db.py",
+          "expect_every": "24h"
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "evidence_required"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "headers": {
+          "Idempotency-Key": "s1"
+        },
+        "body": {
+          "id": "labs",
+          "name": "Lab results",
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          },
+          "format": "ndjson",
+          "transform": "transforms/lab_db.py",
+          "expect_every": "24h",
+          "evidence": "ev_nope"
+        }
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "evidence_not_found"
+        }
+      }
+    },
+    {
+      "name": "another read than the tested one",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "headers": {
+          "Idempotency-Key": "s2"
+        },
+        "body": {
+          "id": "labs",
+          "name": "Lab results",
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "lab_results"
+              },
+              "key": [
+                "id",
+                "patient"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          },
+          "format": "ndjson",
+          "transform": "transforms/lab_db.py",
+          "expect_every": "24h",
+          "evidence": "{{$ev}}"
+        }
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}",
+          "code": "evidence_mismatch",
+          "field": "definition"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "headers": {
+          "Idempotency-Key": "s3"
+        },
+        "body": {
+          "id": "labs",
+          "name": "Lab results",
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          },
+          "format": "ndjson",
+          "transform": "transforms/lab_db.py",
+          "expect_every": "24h",
+          "evidence": "{{$ev}}"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": "labs",
+          "first_load": {
+            "id": "{{$first}}"
+          },
+          "evidence": "{{$ev}}",
+          "definition": {
+            "source": {
+              "connection": {
+                "engine": "sqlite"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "the same key replays the Start",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "headers": {
+          "Idempotency-Key": "s3"
+        },
+        "body": {
+          "id": "labs",
+          "name": "Lab results",
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          },
+          "format": "ndjson",
+          "transform": "transforms/lab_db.py",
+          "expect_every": "24h",
+          "evidence": "{{$ev}}"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "id": "labs",
+          "first_load": {
+            "id": "{{$first}}"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "headers": {
+          "Idempotency-Key": "s3"
+        },
+        "body": {
+          "id": "labs",
+          "name": "Other",
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          },
+          "format": "ndjson",
+          "transform": "transforms/lab_db.py",
+          "expect_every": "24h",
+          "evidence": "{{$ev}}"
+        }
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}",
+          "code": "idempotency_conflict"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "headers": {
+          "Idempotency-Key": "s4"
+        },
+        "body": {
+          "id": "labs",
+          "name": "Lab results",
+          "source": {
+            "type": "database",
+            "connection": {
+              "engine": "sqlite",
+              "database": "{{sqlite:labs}}"
+            },
+            "read": {
+              "mode": "table",
+              "table": {
+                "schema": "main",
+                "name": "lab_results"
+              },
+              "key": [
+                "id"
+              ],
+              "new_rows_by": "id"
+            },
+            "poll_seconds": 3600
+          },
+          "format": "ndjson",
+          "transform": "transforms/lab_db.py",
+          "expect_every": "24h",
+          "evidence": "{{$ev}}"
+        }
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}",
+          "code": "source_exists"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/labs"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "evidence": "{{$ev}}",
+          "first_load": {
+            "id": "{{$first}}"
+          }
+        }
+      }
+    }
+  ]
+}

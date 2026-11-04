@@ -1,0 +1,68 @@
+{
+  "id": "sources/destination-facts",
+  "title": "The destination's facts, and what one source has written to it",
+  "fixtures": {
+    "hie": {
+      "destination": {
+        "display_name": "Conformance FHIR"
+      },
+      "validation": "required"
+    },
+    "files": {
+      "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+      "sources/lab.yaml": "id: lab\nname: Lab lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 3600\n  min_file_age_ms: 0\ntransform: transforms/lab_csv.py\n",
+      "inbox/a.csv": "id,value\n1,5.4\n2,6.1\n"
+    }
+  },
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/destination"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "base_url": "{{destination}}",
+          "display_name": "Conformance FHIR",
+          "fhir_version": "4.0.1",
+          "software": {
+            "name": "Conformance stand-in"
+          },
+          "reachable": true,
+          "checked_at": "{{time}}",
+          "resource_count": "{{any}}",
+          "validation": "required"
+        }
+      }
+    },
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/destination"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "source": "lab",
+          "resources_written": 2,
+          "by_type": {
+            "Observation": 2
+          },
+          "last_written_at": "{{time}}"
+        }
+      },
+      "until_ms": 15000
+    }
+  ]
+}

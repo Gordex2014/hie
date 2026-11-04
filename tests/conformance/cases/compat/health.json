@@ -1,0 +1,23 @@
+{
+  "id": "compat/health",
+  "title": "The health answer is unchanged",
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/health"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "status": "ok",
+          "service": "hie",
+          "version": "{{string}}",
+          "uptime_seconds": "{{number}}",
+          "started_at": "{{time}}",
+          "timestamp": "{{time}}"
+        }
+      }
+    }
+  ]
+}

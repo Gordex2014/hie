@@ -1,0 +1,212 @@
+{
+  "id": "sequences/save-during-load-keeps-version",
+  "title": "A version saved while a load runs does not change that load; the next load takes it",
+  "fixtures": {
+    "destination": {
+      "writes": "hold"
+    },
+    "files": {
+      "inbox/a.csv": "id,value\n1,5.1\n2,5.2\n3,5.3\n4,5.4\n5,5.5\n6,5.6\n7,5.7\n8,5.8\n"
+    }
+  },
+  "steps": [
+    {
+      "name": "create Lab results",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms",
+        "headers": {
+          "Idempotency-Key": "c1"
+        },
+        "body": {
+          "display_name": "Lab results",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    time.sleep(0.2)\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "note": "First version",
+          "author": "Sam Whitaker"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": "{{$tid}}",
+          "current_version": 1
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "body": {
+          "id": "lab",
+          "name": "Lab lab",
+          "source": {
+            "type": "folder",
+            "path": "inbox",
+            "pattern": "*.csv",
+            "poll_seconds": 3600,
+            "min_file_age_ms": 0
+          },
+          "transform": {
+            "id": "{{$tid}}",
+            "follow": "current"
+          }
+        }
+      },
+      "expect": {
+        "status": 201
+      }
+    },
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "the load is running",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "name": "a.csv",
+              "status": "processing"
+            }
+          ]
+        }
+      },
+      "until_ms": 10000
+    },
+    {
+      "name": "save version 2",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/versions",
+        "headers": {
+          "Idempotency-Key": "v-2"
+        },
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v2\"}],\n    }\n",
+          "base_version": 1
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "version": 2,
+          "base_version": 1
+        }
+      }
+    },
+    {
+      "name": "release the writes",
+      "set_destination": {
+        "writes": "ok"
+      }
+    },
+    {
+      "name": "the load finished on v1",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "name": "a.csv",
+              "status": "done",
+              "transform": {
+                "version": 1
+              },
+              "rows": {
+                "written": 8
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 20000
+    },
+    {
+      "destination": {
+        "resources": {
+          "Observation": 8
+        },
+        "not_stored": [
+          {
+            "note": [
+              {
+                "text": "v2"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "write_files": {
+        "inbox/b.csv": "id,value\n9,7.0\n"
+      }
+    },
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "wait for the load",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "name": "b.csv",
+              "status": "done",
+              "transform": {
+                "version": 2
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "destination": {
+        "stored": [
+          {
+            "id": "obs-9",
+            "note": [
+              {
+                "text": "v2"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

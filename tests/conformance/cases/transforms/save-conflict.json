@@ -1,0 +1,131 @@
+{
+  "id": "transforms/save-conflict",
+  "title": "A save on a stale base is a conflict; a replayed save is the same version",
+  "steps": [
+    {
+      "name": "create Lab results",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms",
+        "headers": {
+          "Idempotency-Key": "c1"
+        },
+        "body": {
+          "display_name": "Lab results",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "note": "First version",
+          "author": "Sam Whitaker"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": "{{$tid}}",
+          "current_version": 1
+        }
+      }
+    },
+    {
+      "name": "save version 2",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/versions",
+        "headers": {
+          "Idempotency-Key": "v-a"
+        },
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v2\"}],\n    }\n",
+          "base_version": 1,
+          "note": "second"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "version": 2,
+          "base_version": 1
+        }
+      }
+    },
+    {
+      "name": "the same key replays",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/versions",
+        "headers": {
+          "Idempotency-Key": "v-a"
+        },
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v2\"}],\n    }\n",
+          "base_version": 1,
+          "note": "second"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "version": 2
+        }
+      }
+    },
+    {
+      "name": "a second save on base 1",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/versions",
+        "headers": {
+          "Idempotency-Key": "v-b"
+        },
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v2b\"}],\n    }\n",
+          "base_version": 1
+        }
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}",
+          "code": "version_conflict",
+          "current_version": 2
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/versions",
+        "body": {
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v3\"}],\n    }\n",
+          "base_version": 2
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "idempotency_key_required"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/nope/versions",
+        "headers": {
+          "Idempotency-Key": "v-c"
+        },
+        "body": {
+          "code": "x",
+          "base_version": 1
+        }
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "transform_not_found"
+        }
+      }
+    }
+  ]
+}

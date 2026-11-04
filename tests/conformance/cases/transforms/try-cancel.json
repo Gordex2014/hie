@@ -1,0 +1,143 @@
+{
+  "id": "transforms/try-cancel",
+  "title": "A running Try is cancelled: its answer reads stopped; a finished one cannot be cancelled",
+  "fixtures": {
+    "hie": {
+      "runtime": {
+        "url": "{{runtime}}",
+        "token_env": "HIE_CONFORMANCE_NO_TOKEN"
+      }
+    },
+    "runtime": {
+      "try": [
+        {
+          "hold": true
+        }
+      ]
+    }
+  },
+  "steps": [
+    {
+      "name": "start a slow run",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "c-1",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"rt\"}],\n    }\n",
+          "input": {
+            "records": [
+              {
+                "id": 1,
+                "value": "5.4"
+              },
+              {
+                "id": 2,
+                "value": "alto"
+              }
+            ]
+          }
+        }
+      },
+      "background": "slow"
+    },
+    {
+      "name": "the run is executing",
+      "request": {
+        "method": "GET",
+        "path": "/api/transforms/try-runs/c-1"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "run": {
+            "id": "c-1",
+            "status": "running",
+            "outcome": null,
+            "termination": null
+          },
+          "coverage": {
+            "requested": 2,
+            "reported": 0,
+            "complete": false
+          }
+        }
+      },
+      "until_ms": 5000
+    },
+    {
+      "runtime": {
+        "calls": {
+          "try": 1
+        }
+      },
+      "until_ms": 5000
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try-runs/c-1/cancel"
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "run": "c-1",
+          "cancelling": true
+        }
+      }
+    },
+    {
+      "await": "slow",
+      "expect": {
+        "status": 200,
+        "body": {
+          "run": {
+            "id": "c-1",
+            "status": "finished",
+            "outcome": "stopped",
+            "reason": "cancelled",
+            "termination": "{{string}}"
+          },
+          "items": [
+            {
+              "disposition": "{{string}}",
+              "result": "{{absent}}"
+            },
+            {
+              "result": "{{absent}}"
+            }
+          ],
+          "coverage": {
+            "complete": false
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try-runs/c-1/cancel"
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}",
+          "code": "run_finished"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try-runs/nope/cancel"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "run_not_found"
+        }
+      }
+    }
+  ]
+}
