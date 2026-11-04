@@ -145,7 +145,7 @@ fn unauthorized(reason: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, "Bearer")],
-        Json(json!({"error": reason})),
+        Json(json!({"error": reason, "code": "unauthorized"})),
     )
         .into_response()
 }
@@ -157,6 +157,7 @@ fn forbidden(required: &str, held: &[String]) -> Response {
         Json(json!({
             "error": format!("this needs the {required} scope; the token has {}",
                 if hie.is_empty() { "no hie/ scope".to_string() } else { format!("{hie:?}") }),
+            "code": "forbidden",
             "required": required,
         })),
     )

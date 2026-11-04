@@ -25,42 +25,51 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 const VERSION: &str = "v1";
 const NONCE_LEN: usize = 12;
+const KEY_LEN: usize = 32;
 
-/// One 256-bit key.
+/// One 256-bit key. Its bytes are wiped when it is dropped, as is every
+/// buffer that held it on the way in (file, variable, base64) or out.
 pub struct Key {
-    bytes: [u8; 32],
+    bytes: Zeroizing<[u8; KEY_LEN]>,
     id: String,
 }
 
 impl Key {
-    fn from_bytes(bytes: [u8; 32]) -> Self {
+    fn from_bytes(bytes: Zeroizing<[u8; KEY_LEN]>) -> Self {
         let mut hash = Sha256::new();
         hash.update(b"hie key id\0");
-        hash.update(bytes);
+        hash.update(bytes.as_slice());
         let id = hex::encode(&hash.finalize()[..4]);
         Key { bytes, id }
     }
 
     /// A new random key.
     pub fn generate() -> Self {
-        let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let mut bytes = Zeroizing::new([0u8; KEY_LEN]);
+        rand::rngs::OsRng.fill_bytes(&mut *bytes);
         Self::from_bytes(bytes)
     }
 
     /// A key written as base64 (standard or URL-safe, padding optional).
     pub fn from_base64(text: &str) -> Result<Self> {
         let text = text.trim();
-        let decoded = STANDARD
-            .decode(text)
-            .or_else(|_| URL_SAFE_NO_PAD.decode(text.trim_end_matches('=')))
-            .map_err(|_| anyhow::anyhow!("a key must be 32 bytes written in base64"))?;
-        let bytes: [u8; 32] = decoded
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("a key must be 32 bytes written in base64"))?;
+        let invalid = || anyhow::anyhow!("a key must be 32 bytes written in base64");
+        // Decoded into a wiped buffer of our own, never into an allocation
+        // the decoder would drop as it is.
+        let mut buffer = Zeroizing::new([0u8; 64]);
+        let len = STANDARD
+            .decode_slice(text, &mut buffer[..])
+            .or_else(|_| URL_SAFE_NO_PAD.decode_slice(text.trim_end_matches('='), &mut buffer[..]))
+            .map_err(|_| invalid())?;
+        if len != KEY_LEN {
+            return Err(invalid());
+        }
+        let mut bytes = Zeroizing::new([0u8; KEY_LEN]);
+        bytes.copy_from_slice(&buffer[..KEY_LEN]);
         Ok(Self::from_bytes(bytes))
     }
 
@@ -69,17 +78,17 @@ impl Key {
         &self.id
     }
 
-    fn cipher(&self) -> Aes256Gcm {
-        Aes256Gcm::new_from_slice(&self.bytes).expect("a 32-byte key")
+    /// The key in base64 and a newline, as a key file holds it.
+    fn to_line(&self) -> Zeroizing<String> {
+        // Sized up front, so the text never moves (and leaves a copy behind).
+        let mut line = Zeroizing::new(String::with_capacity(4 * KEY_LEN.div_ceil(3) + 1));
+        STANDARD.encode_string(self.bytes.as_slice(), &mut line);
+        line.push('\n');
+        line
     }
-}
 
-impl Drop for Key {
-    fn drop(&mut self) {
-        for b in self.bytes.iter_mut() {
-            // SAFETY: `b` is a valid, aligned reference into our own array.
-            unsafe { std::ptr::write_volatile(b, 0) };
-        }
+    fn cipher(&self) -> Aes256Gcm {
+        Aes256Gcm::new_from_slice(&*self.bytes).expect("a 32-byte key")
     }
 }
 
@@ -140,50 +149,68 @@ impl Keyring {
 
     /// The keys in a file (see [`Keyring::parse`]).
     pub fn from_file(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading the key file {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("the key file {}", path.display()))
+        let bytes = Zeroizing::new(
+            std::fs::read(path)
+                .with_context(|| format!("reading the key file {}", path.display()))?,
+        );
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| anyhow::anyhow!("the key file {} is not text", path.display()))?;
+        Self::parse(text).with_context(|| format!("the key file {}", path.display()))
     }
 
     /// The keys an environment variable holds; `None` when it is unset or empty.
     pub fn from_env(var: &str) -> Result<Option<Self>> {
-        match std::env::var(var) {
-            Ok(text) if !text.trim().is_empty() => Self::parse(&text)
-                .with_context(|| format!("the key in {var}"))
-                .map(Some),
-            _ => Ok(None),
+        let Some(value) = std::env::var_os(var) else {
+            return Ok(None);
+        };
+        let text = match value.into_string() {
+            Ok(text) => Zeroizing::new(text),
+            Err(other) => {
+                #[cfg(unix)]
+                drop(Zeroizing::new(std::os::unix::ffi::OsStringExt::into_vec(
+                    other,
+                )));
+                #[cfg(not(unix))]
+                drop(other);
+                bail!("the key in {var} is not text");
+            }
+        };
+        if text.trim().is_empty() {
+            return Ok(None);
         }
+        Self::parse(&text)
+            .with_context(|| format!("the key in {var}"))
+            .map(Some)
     }
 
-    /// The keys in `path`, or a new random key written there first (readable
-    /// by this user only) when the file does not exist yet.
+    /// The keys in `path`, or a new random key published there first (readable
+    /// by this user only) when the file does not exist yet. The new key is
+    /// written and synced to a private file beside it, then linked into place
+    /// only if nothing is there yet: two engines starting at once agree on
+    /// one key (the one that got there first), and a crash never leaves an
+    /// empty or partial key file.
     pub fn load_or_create(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)
-                    .with_context(|| format!("creating {}", dir.display()))?;
-            }
-            let key = Key::generate();
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            match options.open(path) {
-                Ok(mut file) => {
-                    file.write_all(format!("{}\n", STANDARD.encode(key.bytes)).as_bytes())
-                        .and_then(|_| file.sync_all())
-                        .with_context(|| format!("writing the key file {}", path.display()))?;
-                    return Self::new(vec![key]);
-                }
-                // Another process created it first: read theirs.
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("creating the key file {}", path.display()));
-                }
+        if path.exists() {
+            return Self::from_file(path);
+        }
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("key");
+        let mut tail = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut tail);
+        let temporary = dir.join(format!(".{name}.{}.tmp", hex::encode(tail)));
+        let written = write_private(&temporary, &Key::generate().to_line());
+        let published = written.and_then(|()| std::fs::hard_link(&temporary, path));
+        let _ = std::fs::remove_file(&temporary);
+        match published {
+            Ok(()) => sync_dir(dir).with_context(|| format!("syncing {}", dir.display()))?,
+            // Another engine published its key first: theirs is the key.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("creating the key file {}", path.display()));
             }
         }
         Self::from_file(path)
@@ -245,6 +272,34 @@ impl Keyring {
                 },
             )
             .map_err(|_| OpenError::Tampered)
+    }
+}
+
+/// Creates `path` (it must not exist) readable by this user only, with
+/// `contents`, synced to disk.
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()
+}
+
+/// Makes a new directory entry durable.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
     }
 }
 
@@ -325,5 +380,46 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn engines_starting_together_agree_on_one_complete_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("content.key");
+        let ids: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        Keyring::load_or_create(&path)
+                            .unwrap()
+                            .current_id()
+                            .to_string()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(ids.iter().all(|id| id == &ids[0]), "{ids:?}");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["content.key"], "no temporary file is left behind");
+    }
+
+    #[test]
+    fn keys_decode_from_either_base64_alphabet() {
+        let standard = Key::from_base64(KEY).unwrap();
+        let url_safe = URL_SAFE_NO_PAD.encode(STANDARD.decode(KEY).unwrap());
+        assert_eq!(Key::from_base64(&url_safe).unwrap().id(), standard.id());
+        assert_eq!(
+            Key::from_base64(&format!("{url_safe}=")).unwrap().id(),
+            standard.id()
+        );
+        assert!(Key::from_base64(&STANDARD.encode([7u8; 31])).is_err());
+        assert!(Key::from_base64(&STANDARD.encode([7u8; 33])).is_err());
+        assert!(Key::from_base64(&"A".repeat(400)).is_err());
+        let line = standard.to_line();
+        assert_eq!(Key::from_base64(&line).unwrap().id(), standard.id());
     }
 }
