@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
 use serde_json::{Map, Value};
 use sqlx::{ConnectOptions, Connection};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -119,7 +119,9 @@ pub enum Bind {
     Decimal(String),
     Text(String),
     Timestamp(NaiveDateTime),
-    TimestampTz(DateTime<Utc>),
+    /// An instant with its offset: `timestamptz` on PostgreSQL,
+    /// `datetimeoffset` on SQL Server.
+    TimestampTz(DateTime<FixedOffset>),
     Date(NaiveDate),
     Time(chrono::NaiveTime),
     Bool(bool),

@@ -16,7 +16,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::cursor::{Cursor, instant};
+use super::cursor::{Cursor, DECODING, instant};
 use super::endpoint::{Bind, DbError, Endpoint, Engine, Session, Stage};
 use super::table::{self, Plan, TableInfo};
 use crate::config::{DatabaseRead, TableName};
@@ -293,7 +293,7 @@ async fn run_query(
         (Cursor::Int(i), _) => Bind::Int(*i),
         (Cursor::Float(f), _) => Bind::Float(*f),
         (Cursor::Timestamp(t), Engine::Postgres) => instant(t)
-            .map(Bind::TimestampTz)
+            .map(|at| Bind::TimestampTz(at.fixed_offset()))
             .unwrap_or_else(|| Bind::Text(t.clone())),
         (Cursor::Timestamp(t), Engine::SqlServer) => instant(t)
             .map(|at| Bind::Timestamp(at.naive_utc()))
@@ -314,6 +314,9 @@ async fn run_query(
 struct Position {
     columns: Vec<String>,
     after: Vec<Value>,
+    /// How `after` was decoded ([`DECODING`]); 0 when written before it.
+    #[serde(default)]
+    version: u8,
 }
 
 /// A running source over a connection by parts.
@@ -373,11 +376,24 @@ impl PartsSource {
                     key.clone()
                 };
                 let plan = Plan::new(&info, &key, new_rows_by).map_err(|m| anyhow!(m))?;
-                let mut after = cursors
+                let stored = cursors
                     .get(KEYSET)?
                     .and_then(|stored| serde_json::from_str::<Position>(&stored).ok())
-                    .filter(|p| p.columns == plan.columns)
-                    .map(|p| p.after);
+                    .filter(|p| p.columns == plan.columns);
+                let mut after = match stored {
+                    // Written with the old time decoding and binds: rows may
+                    // have been skipped anywhere before it.
+                    Some(p) if p.version < DECODING && plan.distrusts_old_positions() => {
+                        tracing::warn!(
+                            target: "hie::database",
+                            feed = %self.feed_id,
+                            "the stored position was written with the old datetimeoffset or datetime handling; reading the table again from the start"
+                        );
+                        None
+                    }
+                    Some(p) => Some(p.after),
+                    None => None,
+                };
                 for _ in 0..self.max_runs {
                     let (sql, binds) = plan.sql(after.as_deref(), PAGE);
                     let rows = session.fetch(&sql, &binds, &clean).await?;
@@ -395,6 +411,7 @@ impl PartsSource {
                 let position = Position {
                     columns: plan.columns.clone(),
                     after: after.unwrap_or_default(),
+                    version: DECODING,
                 };
                 (KEYSET.to_string(), serde_json::to_string(&position)?)
             }
@@ -403,10 +420,23 @@ impl PartsSource {
                 cursor_column,
                 cursor_start,
             } => {
-                let mut cursor = match cursors.get(cursor_column)? {
-                    Some(stored) => Some(serde_json::from_str(&stored).context("stored cursor")?),
-                    None => cursor_start.as_deref().map(Cursor::parse),
+                let stored = match cursors.get(cursor_column)? {
+                    Some(stored) => {
+                        let sql_server = session.engine() == Engine::SqlServer;
+                        let cursor =
+                            Cursor::from_stored(&stored, sql_server).context("stored cursor")?;
+                        if cursor.is_none() {
+                            tracing::warn!(
+                                target: "hie::database",
+                                feed = %self.feed_id,
+                                "the stored cursor was read with the old datetimeoffset decoding; reading again from cursor_start"
+                            );
+                        }
+                        cursor
+                    }
+                    None => None,
                 };
+                let mut cursor = stored.or_else(|| cursor_start.as_deref().map(Cursor::parse));
                 for _ in 0..self.max_runs {
                     let rows = run_query(session, query, cursor.as_ref(), &clean).await?;
                     if rows.is_empty() {
@@ -431,7 +461,7 @@ impl PartsSource {
                 }
                 (
                     cursor_column.clone(),
-                    serde_json::to_string(&cursor.unwrap_or(Cursor::Int(i64::MIN)))?,
+                    cursor.unwrap_or(Cursor::Int(i64::MIN)).stored()?,
                 )
             }
         };

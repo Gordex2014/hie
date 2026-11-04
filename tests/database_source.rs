@@ -146,7 +146,7 @@ async fn a_table_is_read_past_a_cursor_and_nothing_twice() {
     );
     assert_eq!(
         db.cursor("lab-db", "id").unwrap().as_deref(),
-        Some(r#"{"kind":"int","value":4}"#)
+        Some(r#"{"kind":"int","value":4,"version":2}"#)
     );
     let record = db
         .query_json("SELECT raw, resources FROM records WHERE line = 1", [])
@@ -497,4 +497,126 @@ fn percent(text: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// On PostgreSQL (`HIE_TEST_DATABASE_URL`): a table read keyed on a
+/// `timestamptz` (values written at a non-UTC offset) and one keyed on a
+/// `timestamp`, both to the microsecond and three rows per value so values
+/// are shared across every page boundary, read every row exactly once over
+/// several pages and passes, and deliver each value as the instant (or
+/// date-time) it is, whatever the server's time zone.
+#[tokio::test]
+async fn a_postgres_table_keyed_on_a_time_reads_every_row_once() {
+    use chrono::{DateTime, Duration, NaiveDateTime};
+    let Ok(url) = std::env::var("HIE_TEST_DATABASE_URL") else {
+        eprintln!("skipping: HIE_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let parsed = url::Url::parse(&url).unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect(&url)
+        .await
+        .unwrap();
+    const ROWS: i64 = 2500;
+    let table = format!("times_{}", std::process::id());
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE public.{table} (id integer NOT NULL PRIMARY KEY, tz timestamptz NOT NULL, ts timestamp NOT NULL)"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO public.{table} (id, tz, ts)
+         SELECT i, ('2026-10-01 00:00:00.123456-04:00'::timestamptz + make_interval(mins => i / 3)),
+                ('2026-10-01 00:00:00.123456'::timestamp + make_interval(mins => i / 3))
+         FROM generate_series(1, {ROWS}) i"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let base = NaiveDateTime::parse_from_str("2026-10-01T00:00:00.123456", "%Y-%m-%dT%H:%M:%S%.f")
+        .unwrap();
+    let want = |id: i64| base + Duration::minutes(id / 3);
+
+    let db = Arc::new(Db::in_memory().unwrap());
+    let keys = hie::crypto::Keyring::parse("Y29uZm9ybWFuY2Utc2VjcmV0cy1rZXktMzItYnl0ZXM=").unwrap();
+    let secrets = Arc::new(hie::secrets::Secrets::new(db.clone(), Some(keys)));
+    let password = percent(parsed.password().unwrap_or_default());
+    let secret = db
+        .transaction(|tx| {
+            secrets
+                .create_in(tx, "pg", &password)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))
+        })
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut failures = Vec::new();
+    for column in ["tz", "ts"] {
+        let id = format!("pgtimes-{column}");
+        let mut feed: hie::config::FeedConfig = serde_json::from_value(json!({
+            "id": id, "name": "Times",
+            "source": {"type": "database",
+                       "connection": {"engine": "postgres", "host": parsed.host_str().unwrap(),
+                                      "port": parsed.port().unwrap_or(5432),
+                                      "database": parsed.path().trim_start_matches('/'),
+                                      "user": percent(parsed.username()),
+                                      "password": {"secret": secret, "revision": 1},
+                                      "encrypt": false},
+                       "read": {"mode": "table", "table": {"schema": "public", "name": table},
+                                "key": ["id"], "new_rows_by": column},
+                       "max_runs": 2},
+            "transform": "transforms/sql_lab_results.py",
+        }))
+        .unwrap();
+        feed.resolve(&repo).unwrap();
+        let ctx = hie::connectors::Context {
+            admission: Default::default(),
+            secrets: Some(secrets.clone()),
+        };
+        let source = Source::from_config_in(&feed, &ctx)
+            .unwrap()
+            .with_db(db.clone());
+        let mut ids = Vec::new();
+        let mut wrong = Vec::new();
+        for _ in 0..3 {
+            let Some(key) = source.list().await.unwrap().into_iter().next() else {
+                break;
+            };
+            let bytes = source.fetch(&key).await.unwrap().bytes;
+            source.acknowledge(&key, "").await.unwrap();
+            for line in String::from_utf8(bytes).unwrap().lines() {
+                let row: Value = serde_json::from_str(line).unwrap();
+                let id = row["id"].as_i64().unwrap();
+                ids.push(id);
+                let (tz, ts) = (row["tz"].as_str().unwrap(), row["ts"].as_str().unwrap());
+                let tz_ok = DateTime::parse_from_rfc3339(tz)
+                    .is_ok_and(|t| t.naive_utc() == want(id) + Duration::hours(4));
+                let ts_ok = NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f")
+                    .is_ok_and(|t| t == want(id));
+                if !(tz_ok && ts_ok) {
+                    wrong.push(format!("row {id}: tz {tz}, ts {ts}"));
+                }
+            }
+        }
+        let read = ids.len();
+        ids.sort();
+        ids.dedup();
+        if read != ROWS as usize || ids != (1..=ROWS).collect::<Vec<_>>() {
+            failures.push(format!("{column}: {read} rows, {} distinct", ids.len()));
+        }
+        if let Some(first) = wrong.first() {
+            failures.push(format!(
+                "{column}: {} values not exact, e.g. {first}",
+                wrong.len()
+            ));
+        }
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE public.{table}")))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

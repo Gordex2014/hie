@@ -4,7 +4,7 @@
 //! one read on that whole tuple, so rows that share a `new_rows_by` value are
 //! never skipped at a run's boundary.
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use serde_json::{Map, Value};
 
 use super::endpoint::{Bind, DbError, Engine, Session};
@@ -119,7 +119,7 @@ impl Class {
                 .map(Bind::Timestamp)
                 .unwrap_or_else(|| Bind::Text(s.clone())),
             (Class::TimestampTz, Value::String(s)) => DateTime::parse_from_rfc3339(s)
-                .map(|t| Bind::TimestampTz(t.with_timezone(&Utc)))
+                .map(Bind::TimestampTz)
                 .unwrap_or_else(|_| Bind::Text(s.clone())),
             (Class::Date, Value::String(s)) => NaiveDate::parse_from_str(s, "%Y-%m-%d")
                 .map(Bind::Date)
@@ -127,6 +127,17 @@ impl Class {
             (_, other) => by_json(other),
         }
     }
+}
+
+/// A SQL Server `datetime` keeps 1/300 s and a `smalldatetime` whole
+/// minutes; a date-time binds as a `datetime2(7)`, which a `datetime` value
+/// does not convert to exactly (2/300 s reads as .006666666 and converts as
+/// .0066667), so the position is cast back to the column's own type, where
+/// it is the value it was read from.
+fn time_cast(engine: Engine, column: &ColumnInfo) -> Option<String> {
+    let t = column.type_name.trim().to_ascii_lowercase();
+    (engine == Engine::SqlServer && matches!(t.as_str(), "datetime" | "smalldatetime"))
+        .then(|| format!("CAST({{}} AS {})", t.to_ascii_uppercase()))
 }
 
 fn by_json(value: &Value) -> Bind {
@@ -401,6 +412,9 @@ pub struct Plan {
     /// Per order column: the placeholder's cast, so a bound position is
     /// compared exactly in the column's own type (`{}` is the placeholder).
     casts: Vec<Option<String>>,
+    /// Whether a position stored before [`super::cursor::DECODING`] may be
+    /// past rows never read (see [`Plan::distrusts_old_positions`]).
+    distrusts_old_positions: bool,
 }
 
 impl Plan {
@@ -422,6 +436,7 @@ impl Plan {
         let mut exact = Vec::new();
         let mut casts = Vec::new();
         let mut aliases: Vec<String> = Vec::new();
+        let mut distrusts_old_positions = false;
         for (i, c) in columns.iter().enumerate() {
             let column = info
                 .column(c)
@@ -430,12 +445,15 @@ impl Plan {
                 return Err(reason);
             }
             classes.push(column.class);
+            distrusts_old_positions |= engine == Engine::SqlServer
+                && (column.class == Class::TimestampTz
+                    || column.type_name.trim().eq_ignore_ascii_case("datetime"));
             // Decimals are read beside the row as exact text and bound back
             // as text cast to the column's type: never through a float or a
             // 28-digit decimal. SQLite stores them as floats already.
             if column.class != Class::Decimal || engine == Engine::Sqlite {
                 exact.push(None);
-                casts.push(None);
+                casts.push(time_cast(engine, column));
                 continue;
             }
             let mut alias = format!("hie_position_{i}");
@@ -478,7 +496,18 @@ impl Plan {
             classes,
             exact,
             casts,
+            distrusts_old_positions,
         })
+    }
+
+    /// Whether a position stored before the current decoding may be past
+    /// rows never read, so the read starts over: a SQL Server
+    /// `datetimeoffset` was decoded |offset| off, and a `datetime` was bound
+    /// back as a `datetime2(7)`, which at compatibility level 120 or below
+    /// compares a one-tick value (.0033333) as past the column's own (.003),
+    /// skipping the rows that share it.
+    pub fn distrusts_old_positions(&self) -> bool {
+        self.distrusts_old_positions
     }
 
     /// The statement reading up to `limit` rows past `after` (the order
@@ -737,6 +766,77 @@ mod tests {
         assert_eq!(row["hie_position_0"], "the source's own value");
         assert!(!row.contains_key("hie_position_0_"));
         assert_eq!(position[0], "1.50");
+    }
+
+    #[test]
+    fn sql_server_times_bind_back_in_their_own_type() {
+        let info = table(
+            Engine::SqlServer,
+            &[
+                ("at", "datetimeoffset", false),
+                ("old", "datetime", false),
+                ("small", "smalldatetime", false),
+                ("id", "int", false),
+            ],
+        );
+        let plan = Plan::new(&info, &["old".into(), "small".into(), "id".into()], "at").unwrap();
+        assert!(plan.distrusts_old_positions());
+        let after = [
+            serde_json::json!("2026-10-01T00:20:00.1234567-04:00"),
+            serde_json::json!("2026-10-01T00:20:00.006666666"),
+            serde_json::json!("2026-10-01T00:20:00"),
+            serde_json::json!(1),
+        ];
+        let (sql, binds) = plan.sql(Some(&after), 5);
+        // The instant with its own offset: a `datetimeoffset`, not a UTC
+        // `datetime2`.
+        let Bind::TimestampTz(at) = &binds[0] else {
+            panic!("{binds:?}")
+        };
+        assert_eq!(at.to_rfc3339(), "2026-10-01T00:20:00.123456700-04:00");
+        assert!(sql.contains("[old] > CAST(@P3 AS DATETIME)"), "{sql}");
+        assert!(
+            sql.contains("[small] > CAST(@P6 AS SMALLDATETIME)"),
+            "{sql}"
+        );
+        assert!(sql.contains("[at] > @P1"), "{sql}");
+        let pg = table(
+            Engine::Postgres,
+            &[
+                ("at", "timestamp with time zone", false),
+                ("id", "integer", false),
+            ],
+        );
+        let plan = Plan::new(&pg, &["id".into()], "at").unwrap();
+        assert!(!plan.distrusts_old_positions());
+        let plain = table(
+            Engine::SqlServer,
+            &[
+                ("at", "datetime2", false),
+                ("small", "smalldatetime", false),
+                ("id", "int", false),
+            ],
+        );
+        let plain = Plan::new(&plain, &["small".into(), "id".into()], "at").unwrap();
+        assert!(!plain.distrusts_old_positions());
+        let old = table(
+            Engine::SqlServer,
+            &[("at", "datetime", false), ("id", "int", false)],
+        );
+        assert!(
+            Plan::new(&old, &["id".into()], "at")
+                .unwrap()
+                .distrusts_old_positions()
+        );
+        let (sql, binds) = plan.sql(
+            Some(&[
+                serde_json::json!("2026-10-01T04:20:00+00:00"),
+                serde_json::json!(1),
+            ]),
+            5,
+        );
+        assert!(sql.contains("(\"at\" > $1)"), "{sql}");
+        assert!(matches!(binds[0], Bind::TimestampTz(_)));
     }
 
     #[test]

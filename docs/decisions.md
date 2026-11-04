@@ -493,6 +493,17 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 
 **Cost:** the event table grows with every attempt; it is kept, like the records, until a retention policy for history is decided.
 
+## 43. Time positions bind back in their own type; positions read with the old datetimeoffset decoding start over
+
+**Chosen:** A SQL Server `datetimeoffset` is read as the instant it is, with its own offset (`2026-10-01T00:20:00-04:00`), and a table read's position on one binds back as a `datetimeoffset`; a `datetime` or `smalldatetime` position is cast back to the column's own type, and a PostgreSQL `timestamptz` binds as a `timestamptz`. Every position and query cursor HIE stores carries `version: 2`, the decoding it was written with. A stored value without it is not trusted when it may come from the old decoding or binds: a table read ordered by a SQL Server `datetimeoffset` or `datetime` (in `new_rows_by` or the key) reads the table again from its start, and a query read on SQL Server whose cursor is an instant with an offset starts again from `cursor_start`; a warning names the source. Every other stored position or cursor (integers, decimals, text, `datetime2`, `smalldatetime`, any PostgreSQL, MySQL or SQLite column) is kept as it is.
+
+**Why:**
+- Through 0.1.5 and the first 0.2.0 builds, HIE decoded a `datetimeoffset` through tiberius's `DateTime<Utc>`, which subtracts the offset from a value the server already sends in UTC: every value was read |offset| off. West of UTC each page and each pass then asked for rows past an instant up to 14 h too late, so rows were skipped, and skipped rows lie anywhere behind the stored position, not just before its last value; east of UTC each page started too early and read rows again. No rewind of the stored value recovers the first case, so only a read from the start is safe.
+- An old value cannot be told from a new one by its text: both decodings write `+00:00` for a value stored in UTC. Hence the explicit `version`.
+- A `datetime` value (1/300 s) was bound back as the `datetime2(7)` it decodes to, which is not the value it was read from: at compatibility level 130 and above two ticks (`.0066666`) compare below the column's `.0066667`, so the last row of a page was read again; at 120 and below one tick (`.0033333`) compares above the column's `.003`, so the rows sharing it after a page boundary were skipped, again anywhere behind the stored position. Cast back to `datetime`, it is the value it was read from at every level.
+
+**Cost:** a source affected by the old decoding delivers its rows once more after the upgrade; with deterministic resource ids (as the bundled transforms derive, and decision 41's namespacing) that rewrites the same resources. A source whose `datetimeoffset` values were all at `+00:00`, or whose `datetime` database is at level 130 or above, lost nothing and reads again anyway, since its stored value cannot show it. A query read (`cursor_column`) on a `datetime` binds the cursor as a `datetime2` still, since the query is the operator's own: at level 120 and below rows sharing the cursor value can be skipped, as rows sharing a value at a `LIMIT` already can; a unique cursor column avoids both. Delivered `datetimeoffset` values now carry their own offset instead of `+00:00`; they are the same instants.
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.

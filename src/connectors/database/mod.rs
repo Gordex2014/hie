@@ -292,9 +292,15 @@ impl DatabaseSource {
     /// Where the query starts: the stored cursor, else `cursor_start`.
     fn cursor(&self, cursors: &Cursors) -> Result<Option<Cursor>> {
         if let Some(stored) = cursors.get(&self.cursor_column)? {
-            return Ok(Some(
-                serde_json::from_str(&stored).context("stored cursor")?,
-            ));
+            let sql_server = matches!(self.driver.target(), driver::Target::MsSql(..));
+            match Cursor::from_stored(&stored, sql_server).context("stored cursor")? {
+                Some(cursor) => return Ok(Some(cursor)),
+                None => tracing::warn!(
+                    target: "hie::database",
+                    feed = %self.feed_id,
+                    "the stored cursor was read with the old datetimeoffset decoding; reading again from cursor_start"
+                ),
+            }
         }
         Ok(self.cursor_start.as_deref().map(Cursor::parse))
     }
@@ -406,7 +412,7 @@ impl Connector for DatabaseSource {
             .map(|p| p.newest)
             .with_context(|| format!("{key} was not pulled in this pass"))?;
         if cursors.kept() {
-            cursors.set(&self.cursor_column, &serde_json::to_string(&newest)?)?;
+            cursors.set(&self.cursor_column, &newest.stored()?)?;
         }
         Ok(format!("cursor {}", newest.text()))
     }
