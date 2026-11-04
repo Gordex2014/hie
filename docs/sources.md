@@ -51,7 +51,7 @@ source:
     mode: table
     table: {schema: dbo, name: lab_results}      # the schema defaults to dbo, public or main
     key: [id]                  # defaults to the table's primary key
-    new_rows_by: id            # an integer, decimal, date or time column, not nullable
+    new_rows_by: id            # not nullable; describe suggests integer, decimal, date or time columns
   poll_seconds: 900
 ```
 

@@ -458,7 +458,7 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - A Try that ran is evidence a person acts on (a receipt for saving a version). A lost answer is not evidence that nothing ran, nor that everything did; replaying would run the code twice and could show a result the first run never produced.
 - Diagnostics are the runtime's to produce; HIE passing them through unchanged keeps one definition of them.
 
-**Cost / not yet:** per-item dispositions beyond all-or-nothing need python-runtime 0.1.3 to report them through the facade. Until then HIE reads the facade's own rule: a `200` means every item reported with termination and cleanup confirmed, and a `422 transform_load_failed` carrying the facade's `Python-Runtime-Error` header means nothing started, also confirmed. Every other non-`200` answer, including a `422` without that header, is unconfirmed. A version's environment is read from the consumer's `GET /v1/capabilities` when it is saved.
+**Cost / not yet:** per-item dispositions come from python-runtime 0.1.3's `execution` evidence on a Try answer (an item it reports `unknown` is `not_reported`; one it reports without returning its reply, as on a failed run, is `not_reported` too). Without that evidence HIE reads the facade's own rule: a `200` means every item reported with termination and cleanup confirmed, and a `422 transform_load_failed` carrying the facade's `Python-Runtime-Error` header means nothing started, also confirmed. Every other non-`200` answer, including a `422` without that header, is unconfirmed. A version's environment is read from the consumer's `GET /v1/capabilities` when it is saved.
 
 ## 40. Resources are validated by the destination before they are delivered
 

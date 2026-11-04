@@ -46,7 +46,7 @@ Where a source's data comes from. Interface (`connectors/mod.rs`):
 | --- | --- | --- |
 | `folder`, `s3` | `object/mod.rs` (kinds, S3 builder), `object/folder.rs` (`FolderSource`), `object/store.rs` (`ObjectSource`, staging), `object/sqs.rs` (`SqsQueue`) | listing, age guard, archive rename, SQS-announced listing with periodic relist, signing |
 | `fhir_server` | `fhir_server/mod.rs` (pull per type, cursors), `fhir_server/client.rs` (remote auth, GET) | `_lastUpdated` paging, one cursor per resource type |
-| `database` | `database/mod.rs` (runs past the cursor), `database/connection.rs` (the URL `url_env` names), `database/driver.rs` (pools, binding per engine), `database/rows.rs` (row decoding), `database/cursor.rs` (`Cursor`) | PostgreSQL, MySQL, SQLite (sqlx), SQL Server (tiberius) |
+| `database` | `database/mod.rs` (runs past the cursor), `database/connection.rs` (the URL `url_env` names, parsed once into the driver's options), `database/endpoint.rs` (a `connection` with its secret revision: connect, describe, sample, secret-safe failures), `database/table.rs` (table reads by keyset on (`new_rows_by`, `key`), column classes and native binds), `database/parts.rs` (exact keyset positions), `database/driver.rs` (sessions, binding per engine), `database/rows.rs` (row decoding), `database/cursor.rs` (`Cursor`) | PostgreSQL, MySQL, SQLite (sqlx), SQL Server (tiberius); driver log events are always off |
 | `mllp` | `mllp/mod.rs` (connector over a spool `FolderSource`), `mllp/listener.rs` (MLLP framing, ACK, listener) | spool before ACK |
 
 `hie::source`, `hie::sqs` and `hie::hl7` re-export what was reached there before these modules existed. Log lines moved out of the old modules keep their old `tracing` targets (`hie::source`, `hie::database`, `hie::hl7`, `hie::pipeline`), so an `HIE_LOG` filter written for them still applies.
@@ -69,22 +69,26 @@ How a fetched object becomes records: `read(format, bytes) -> Vec<SourceRecord>`
 
 ### Store: `src/db/`
 
-`mod.rs` opens the store and creates or upgrades it; `engine.rs` holds the two drivers (SQLite, PostgreSQL), `Param`/`params!` and `Row`. One file per area owns its tables' DDL, the columns added to them since, its row types and its queries (`impl Db`): `loads.rs` (files, records; a load's version snapshot, a record's execution, queued loads, `failed_rows`), `submissions.rs`, `sources.rs` (pause state, cursors, leases), `alerts.rs` (alerts, rules), `idempotency.rs` (keys, claims, answers), `settings.rs` (engine keys), `passes.rs`, and the areas tracks fill: `versions.rs`, `secrets.rs`, `connectors.rs`, `history.rs` (`version_runs`). `Db::transaction` runs statements as one. `mod.rs` runs every table's DDL as one batch in `TABLES` order (the order stores have always been created in), then every area's `ADDED_COLUMNS` in order, each added when missing; that is how an existing store upgrades, on SQLite and on PostgreSQL alike.
+`mod.rs` opens the store and creates or upgrades it; `engine.rs` holds the two drivers (SQLite, PostgreSQL), `Param`/`params!` and `Row`. One file per area owns its tables' DDL, the columns added to them since, its row types and its queries (`impl Db`): `loads.rs` (files, records: a load's version snapshot, a record's execution and attempt, queued loads, failure groups, retries and their claims, dispatches, `failed_rows`; `loads/custody.rs` seals row content with associated data per row and column), `history.rs` (immutable events, `version_runs`), `submissions.rs`, `sources.rs` (pause state, cursors, leases), `alerts.rs` (alerts, rules), `idempotency.rs` (keys, claims with owner tokens, answers), `settings.rs` (engine keys), `passes.rs`, `versions.rs` (transforms, versions, pins and their periods, program names, Try runs), `secrets.rs` (sealed revisions, uses, holds), `connectors.rs` (evidence, source bindings, Start intents). `Db::transaction` runs statements as one. `mod.rs` runs every table's DDL as one batch in `TABLES` order, then every area's `ADDED_COLUMNS` in order, each added when missing; that is how an existing store upgrades, on SQLite and on PostgreSQL alike.
+
+### Capabilities
+
+| Capability | Module | Interface |
+| --- | --- | --- |
+| Transform versions, pins, executors | `versions/` (`catalog.rs` store and saves, `files.rs` transform files, `pins.rs`, `environment.rs` the runtime's environment, `execute.rs` executors per version, `programs.rs` runtime program names and reclaim) | `Versions`: `resolve_for_source` (the load-start snapshot), `latest`, `get`, `executor(&VersionRef)`, saves, pins, `usage`, `source_*` hooks |
+| Try | `tryrun/` (`dispatch.rs` one dispatch per run, `answer.rs`) | run ids, concurrency, deadline, cancel; never through the retrying transform path |
+| Secrets | `secrets/` | `Secrets`: create, revise, delete, holds; values opened only to connect |
+| Admission | `admission.rs` | `Admission::check(parts)`, `check_source`; before any secret is opened or socket is made |
+| Test evidence, describe, sample | `evidence/` | `Evidence`: `test`, `describe`, `sample`, `bind` (Start), bindings; `SampleRegistry` (in memory) |
+| Failed-content retention | `purge.rs` | `install` (hourly), `expired`, `source_deleted` |
+| Idempotency | `idempotency.rs` | `Idempotent::run`, `run_in_tx` |
+| Crypto, ids, diagnostics | `crypto.rs` (`Keyring`), `ids.rs`, `diagnostics.rs` (`for_storage`) | |
 
 ### Elsewhere
 
-`config.rs` (`hie.yaml` and definitions with their YAML: pins, database connections, delivery options; key loading), `versions/` (which version a load runs, `Execute` executors, `Exec`; phase 0: one version per file), `transform.rs` and `runtime.rs` (the local worker and the shared runtime), `diagnostics.rs` (`for_storage`), `fhir.rs` and `bulk.rs` (calls to HFS, `validate`, `metadata`), `credentials.rs` (the engine's identity towards HFS), `auth.rs` (bearer tokens on the API), `alerts.rs` (raising and clearing), `crypto.rs` (AES-256-GCM `Keyring`: seal, open, key files), `ids.rs` (opaque prefixed ids, `rfc3339_ms`), `idempotency.rs`, `secrets/` (`named(name)`: the value of a secret a source names, today an environment variable), and the modules tracks fill: `admission.rs`, `evidence/` (`SampleRegistry`), `tryrun/`, `purge.rs`.
+`config.rs` (`hie.yaml` and definitions with their YAML: pins, database connections, delivery options; key loading), `transform.rs` and `runtime.rs` (the local worker and the shared runtime's client), `fhir.rs` and `bulk.rs` (calls to HFS: delivery, `validate`, `metadata`, `$bulk-submit`, `check_delivery`), `credentials.rs` (the engine's identity towards HFS), `auth.rs` (bearer tokens on the API), `alerts.rs` (raising and clearing).
 
-### Who owns what next
-
-| Change | Owns | Adds |
-| --- | --- | --- |
-| H-versions: transform versions and their store and API | `src/transform.rs`, `src/runtime.rs`, `src/manager/transforms.rs`, `src/api/transforms.rs`, `src/pipeline/transforming.rs` (which version a load runs) | `src/db/versions.rs` |
-| H-connectors: describe, sample, test evidence, first-load progress | `src/connectors/**` except the three H-secrets files below; `src/manager/probe.rs`; `src/api/sources.rs` | describe/sample files per kind (for example `connectors/database/sample.rs`); `src/db/connectors.rs` if evidence is kept |
-| H-history: failures, attempts, retry, usage, validation, delivery | `src/db/loads.rs`, `src/api/loads.rs`, `src/api/records.rs`, `src/pipeline/outcomes.rs`, `src/pipeline/deliver.rs`, `src/pipeline/submit.rs`, `src/pipeline/ingest.rs`, `src/pipeline/alerting.rs` | `src/db/history.rs` |
-| H-secrets: secrets and admission | `src/secrets.rs` (may become `src/secrets/`), `src/connectors/build.rs` (admission, before any connector is built), `src/connectors/database/connection.rs`, `src/connectors/fhir_server/client.rs`, `src/manager/mod.rs` (`create`, `replace`) | `src/db/secrets.rs`, `src/api/secrets.rs` |
-
-Registration points, each a one-line append: `src/lib.rs` (`pub mod`), `src/api/mod.rs` (`mod` and `.merge(…::router())`), `src/db/mod.rs` (`mod`, `TABLES`, `ADDED_COLUMNS`; every area above already has its slot), `src/connectors/mod.rs` (`kind()`, only for a new kind of source). A new column on an existing table is appended to that area's `ADDED_COLUMNS` and, so a new store has it too, to its DDL.
+Registration points, each a one-line append: `src/lib.rs` (`pub mod`), `src/api/mod.rs` (`mod` and `.merge(…::router())`), `src/db/mod.rs` (`mod`, `TABLES`, `ADDED_COLUMNS`), `src/connectors/mod.rs` (`kind()`, only for a new kind of source). A new column on an existing table is appended to that area's `ADDED_COLUMNS` and, so a new store has it too, to its DDL.
 
 ## Release and deploy
 
