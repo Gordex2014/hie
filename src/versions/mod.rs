@@ -130,6 +130,25 @@ pub struct TransformInfo {
     pub file_path: Option<String>,
     /// The SHA-256 of what HIE last wrote to or read from that file.
     pub file_sha256: Option<String>,
+    /// Its 0.1 name, as given (`PUT /api/transforms/{name}`, a file's stem
+    /// under `transforms/`), when it has one; it names its file there.
+    pub legacy_name: Option<String>,
+}
+
+impl TransformInfo {
+    /// The name 0.1 clients see: its 0.1 name, else its id.
+    pub fn name(&self) -> &str {
+        self.legacy_name.as_deref().unwrap_or(&self.id)
+    }
+}
+
+/// What a delete found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Deleted {
+    Done,
+    NotFound,
+    /// Refused: the sources that refer to it (none when only unfinished work does).
+    InUse(Vec<String>),
 }
 
 /// One version's metadata (its code is read apart, [`Versions::code`]).
@@ -252,8 +271,12 @@ impl Versions {
             reclaimed: Mutex::new(None),
             imported: std::sync::atomic::AtomicBool::new(false),
         };
-        // Locally at once; at the runtime once its environment is known
-        // ([`Versions::ready`]).
+        if versions.facade.is_none() {
+            tracing::warn!(target: "hie::versions",
+                "no runtime configured: transforms run on the engine's own Python worker, with the engine's own rights (development and tests; configure `runtime:` to run them sandboxed at python-runtime)");
+        }
+        // Locally at once; at the runtime once its environment is known (read
+        // in the background from now, [`Versions::ready`]).
         versions.import_dir();
         versions
     }
@@ -339,7 +362,7 @@ impl Versions {
     pub fn transform_json(&self, t: &TransformInfo) -> Value {
         json!({
             "id": t.id,
-            "name": t.id,
+            "name": t.name(),
             "display_name": t.display_name,
             "current_version": t.current_version,
             "created_at": crate::ids::rfc3339_ms_at(t.created_at),

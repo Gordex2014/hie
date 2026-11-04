@@ -1,6 +1,7 @@
 //! What no longer needs to run is let go: the names stored at the runtime
 //! for versions that no pin names (pinned, or current and followed) and no
-//! unfinished load or retry still has rows waiting to run, and the executors
+//! unfinished load or retry may still run (rows waiting for their transform,
+//! or a load not finished, also one with no rows yet), and the executors
 //! (local workers) of those versions. Best effort, at most once a minute; a
 //! name reclaimed too early is stored again on its next run (`404
 //! transform_unknown`).
@@ -79,7 +80,24 @@ impl Versions {
                 }
             }
         }
+        let owners: std::collections::HashMap<String, (String, i64)> = self
+            .db
+            .programs()?
+            .into_iter()
+            .map(|(name, id, version)| (name, (id, version)))
+            .collect();
         for name in unused {
+            // Looked at again right before each delete: a pin set, a load
+            // admitted or a retry accepted meanwhile keeps the name. A
+            // remaining race costs a store again (`404 transform_unknown`).
+            let needed = self.needed()?;
+            let still = match owners.get(&name) {
+                Some(owner) => needed.contains(owner),
+                None => self.held_for_needed(&name, &needed),
+            };
+            if still {
+                continue;
+            }
             match facade.delete(&name).await {
                 Ok(true) => self.db.program_forgotten(&name)?,
                 Ok(false) => {}

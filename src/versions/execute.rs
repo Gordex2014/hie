@@ -160,11 +160,14 @@ impl Execute for RuntimeExecutor {
             if answer.status != StatusCode::OK {
                 bail!("the runtime did not run the batch: {}", describe(&answer));
             }
-            // Without the headers the run names no other environment.
-            let environment = answer
-                .environment
-                .clone()
-                .unwrap_or_else(|| self.version.environment.clone());
+            // Nothing is applied without complete evidence of where it ran.
+            let Some(environment) = answer.environment.clone() else {
+                return Err(EnvironmentUnavailable(format!(
+                    "the runtime's answer for version {} of {} names no complete environment",
+                    self.version.version, self.version.transform_id
+                ))
+                .into());
+            };
             if environment != self.version.environment {
                 // Nothing of this run is kept: the caller sees where it ran.
                 return Ok(Execution {

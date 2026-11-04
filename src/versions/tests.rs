@@ -132,7 +132,10 @@ fn of_two_saves_on_one_base_exactly_one_wins() {
         environment: &env,
     };
     first
-        .transaction(|tx| tx.insert_transform("t", "T", "t", &content("v1")).map(drop))
+        .transaction(|tx| {
+            tx.insert_transform("t", "T", "t", &content("v1"), None, None)
+                .map(drop)
+        })
         .unwrap();
     for round in 1..=5 {
         let barrier = Arc::new(Barrier::new(2));
@@ -194,4 +197,287 @@ fn a_try_run_whose_engine_stopped_reads_lost_and_keeps_its_id() {
         crate::tryrun::cancel(&versions, "r1").unwrap_err().code(),
         "run_finished"
     );
+}
+
+#[test]
+fn two_same_stem_files_imported_at_once_never_share_a_transform() {
+    for round in 0..5 {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        for sub in ["a", "b"] {
+            std::fs::create_dir_all(base.join(sub)).unwrap();
+            std::fs::write(
+                base.join(sub).join("script.py"),
+                format!("def transform(record, context):\n    return None  # {sub}\n"),
+            )
+            .unwrap();
+        }
+        let path = base.join("hie.db");
+        // Held for the whole round: on PostgreSQL the first handle on a
+        // store owns its test schema.
+        let db = Db::open(&path).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|sub| {
+                // Two engines on one store.
+                let db = Arc::new(Db::open(&path).unwrap());
+                let feed = feed(base, &format!("src-{sub}"), &format!("{sub}/script.py"));
+                let transforms = base.join("transforms");
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let versions = versions(db, &transforms, "python3");
+                    barrier.wait();
+                    versions.resolve_for_source(&feed).unwrap()
+                })
+            })
+            .collect();
+        let refs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_ne!(refs[0].transform_id, refs[1].transform_id, "round {round}");
+        assert_ne!(refs[0].code_sha256, refs[1].code_sha256, "round {round}");
+        for (r, sub) in refs.iter().zip(["a", "b"]) {
+            let file = db
+                .transform_info(&r.transform_id)
+                .unwrap()
+                .unwrap()
+                .file_path;
+            let own = base.join(sub).join("script.py").canonicalize().unwrap();
+            assert_eq!(file.as_deref(), Some(own.to_string_lossy().as_ref()));
+            assert_eq!(db.version_infos(&r.transform_id).unwrap().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn a_cold_runtime_fixes_no_version_so_no_load_is_admitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    std::fs::create_dir_all(base.join("transforms")).unwrap();
+    std::fs::write(
+        base.join("transforms/t.py"),
+        "def transform(r, c):\n    return None\n",
+    )
+    .unwrap();
+    let db = Arc::new(Db::in_memory().unwrap());
+    let versions = Versions::new(
+        db.clone(),
+        ExecutorSettings {
+            python: "python3".into(),
+            runtime_dir: base.to_path_buf(),
+            terminology: None,
+            // Nothing listens there: the runtime's environment is unknown.
+            runtime: Some(crate::runtime::RuntimeSettings {
+                url: "http://127.0.0.1:9".into(),
+                token: None,
+                batch_size: 10,
+            }),
+        },
+        &base.join("transforms"),
+    );
+    let feed = feed(base, "src", "transforms/t.py");
+    assert!(versions.resolve_for_source(&feed).is_err());
+    assert!(db.transform_infos().unwrap().is_empty());
+    assert!(db.pin_row("src").unwrap().is_none());
+}
+
+#[test]
+fn a_transform_referred_to_in_the_store_or_by_unfinished_work_is_not_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::in_memory().unwrap());
+    let versions = versions(db.clone(), dir.path(), "python3");
+    let env = Environment::local();
+    let content = NewVersion {
+        code: "x",
+        code_sha256: "0",
+        note: None,
+        author: None,
+        environment: &env,
+    };
+    db.transaction(|tx| {
+        tx.insert_transform("t", "T", "t", &content, None, None)
+            .map(drop)
+    })
+    .unwrap();
+    // A pin in the store (a source the manager does not hold right now).
+    let pin = super::PinRow {
+        transform_id: "t".into(),
+        version: None,
+        declared: "t@current".into(),
+    };
+    assert!(db.set_pin_row("gone-from-memory", &pin).unwrap());
+    let refused = versions.delete("t", &[]).unwrap_err();
+    assert_eq!(refused.code(), "transform_in_use");
+    assert_eq!(refused.members()["sources"], json!(["gone-from-memory"]));
+    db.remove_pin_row("gone-from-memory").unwrap();
+    // A load still being read with one of its versions.
+    let v = db.version_info("t", 1).unwrap().unwrap().reference();
+    let load = db
+        .open_load("src", "a.csv", "s", 1, None, Some(&v))
+        .unwrap();
+    assert_eq!(
+        versions.delete("t", &[]).unwrap_err().code(),
+        "transform_in_use"
+    );
+    db.fail_file(load, "x").unwrap();
+    versions.delete("t", &[]).unwrap();
+    // Gone: nothing can refer to it any more.
+    assert!(!db.set_pin_row("late", &pin).unwrap());
+    assert_eq!(
+        versions.delete("t", &[]).unwrap_err().code(),
+        "transform_not_found"
+    );
+}
+
+#[tokio::test]
+async fn zero_one_names_keep_their_case_and_get_ids_of_their_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let transforms = dir.path().join("transforms");
+    let db = Arc::new(Db::in_memory().unwrap());
+    let versions = versions(db.clone(), &transforms, "python3");
+    let code = "def transform(r, c):\n    return None\n";
+    assert_eq!(
+        versions.save_legacy("Lab_Results", code).await.unwrap(),
+        (true, 1)
+    );
+    assert_eq!(
+        versions.save_legacy("Lab_Results", code).await.unwrap(),
+        (false, 1)
+    );
+    let id = versions.resolve_name("Lab_Results").unwrap().unwrap();
+    assert!(id.starts_with("lab_results-"), "{id}");
+    assert!(
+        transforms.join("Lab_Results.py").is_file(),
+        "its file keeps the name"
+    );
+    // The 0.1 name that is the lower case of it is another transform, its own id.
+    assert_eq!(
+        versions.save_legacy("lab_results", "# b\n").await.unwrap(),
+        (true, 1)
+    );
+    assert_eq!(
+        versions.resolve_name("lab_results").unwrap().as_deref(),
+        Some("lab_results")
+    );
+    assert_eq!(
+        versions.resolve_name("Lab_Results").unwrap(),
+        Some(id.clone())
+    );
+    assert_eq!(db.version_infos(&id).unwrap().len(), 1);
+    assert!(versions.save_legacy("bad name", code).await.is_err());
+    assert!(versions.save_legacy("try", code).await.is_err());
+}
+
+#[tokio::test]
+async fn a_local_try_captures_each_records_output_and_loads_discard_it() {
+    let Some(python) = python() else {
+        eprintln!("skipping: set HIE_TEST_PYTHON");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("t.py");
+    std::fs::write(
+        &script,
+        "import sys\n\ndef transform(record, context):\n    print('zq-out', record['n'])\n    print('zq-err', file=sys.stderr)\n    return None\n",
+    )
+    .unwrap();
+    let command = |capture_streams| crate::transform::WorkerCommand {
+        python: python.clone(),
+        worker_script: Path::new(env!("CARGO_MANIFEST_DIR")).join("hie_runtime/worker.py"),
+        transform_script: script.clone(),
+        terminology: None,
+        capture_streams,
+    };
+    let mut tried = crate::transform::Worker::spawn(&command(true))
+        .await
+        .unwrap();
+    let reply = tried.call(&json!({"n": 1}), &json!({})).await.unwrap();
+    assert_eq!(
+        reply["diagnostics"],
+        json!({"stdout": "zq-out 1\n", "stderr": "zq-err\n"})
+    );
+    tried.kill().await.unwrap();
+    let mut loading = crate::transform::Worker::spawn(&command(false))
+        .await
+        .unwrap();
+    let reply = loading.call(&json!({"n": 2}), &json!({})).await.unwrap();
+    assert!(reply.get("diagnostics").is_none());
+    loading.kill().await.unwrap();
+}
+
+/// A destination whose `$validate` never answers.
+async fn silent_destination() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn try_input(
+    run_id: &str,
+    code: &str,
+    deadline_ms: u64,
+    validate: bool,
+) -> crate::tryrun::TryInput {
+    crate::tryrun::TryInput {
+        run_id: run_id.into(),
+        code: code.into(),
+        saved: None,
+        records: vec![json!({"n": 1})],
+        deadline: std::time::Duration::from_millis(deadline_ms),
+        validate,
+    }
+}
+
+#[tokio::test]
+async fn a_try_stops_at_its_deadline_also_while_validating_or_loading() {
+    let Some(python) = python() else {
+        eprintln!("skipping: set HIE_TEST_PYTHON");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::in_memory().unwrap());
+    let versions = Arc::new(versions(db, dir.path(), &python));
+    let fhir = Arc::new(crate::fhir::FhirClient::new(&silent_destination().await));
+
+    // Validation that never answers: stopped at the deadline, results kept.
+    let started = std::time::Instant::now();
+    let code = "def transform(r, c):\n    return {'resourceType': 'Basic', 'id': 'b'}\n";
+    let body = crate::tryrun::start(
+        versions.clone(),
+        fhir.clone(),
+        1,
+        try_input("v", code, 1000, true),
+    )
+    .await
+    .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1400),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(body["run"]["outcome"], "stopped");
+    assert_eq!(body["run"]["reason"], "deadline");
+    assert_eq!(body["run"]["validation"], "unavailable");
+    assert_eq!(body["items"][0]["validation"], Value::Null);
+    assert_eq!(body["items"][0]["result"]["resources"][0]["id"], "b");
+
+    // A program that never finishes loading: killed and reaped at the deadline.
+    let started = std::time::Instant::now();
+    let slow = "import time\ntime.sleep(30)\n\ndef transform(r, c):\n    return None\n";
+    let body = crate::tryrun::start(versions.clone(), fhir, 1, try_input("l", slow, 1000, false))
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1400),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(body["run"]["outcome"], "stopped");
+    assert_eq!(body["run"]["termination"], "confirmed");
+    assert_eq!(body["items"][0]["disposition"], "not_started");
 }

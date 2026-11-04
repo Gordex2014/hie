@@ -2,6 +2,10 @@
 //! contract's answer built from it.
 
 use serde_json::{Value, json};
+use tokio::sync::watch;
+use tokio::time::Instant;
+
+use super::dispatch::stopped;
 
 use super::TryInput;
 use crate::fhir::{FhirClient, Validated};
@@ -86,14 +90,19 @@ impl Dispatched {
 /// Validates every resource of every reported item with the destination's
 /// `$validate`: `completed`, or `unavailable` when the destination could not
 /// validate (then no item carries validation); `skipped` when nothing was
-/// reported.
-pub async fn validate(fhir: &FhirClient, d: &mut Dispatched) -> &'static str {
+/// reported. Validation is part of the run: a cancel or the run's deadline
+/// stops it at once (no further request), no item keeps validation, it reads
+/// `unavailable` and the run `stopped`.
+pub async fn validate(
+    fhir: &FhirClient,
+    d: &mut Dispatched,
+    cancelled: &mut watch::Receiver<bool>,
+    deadline: Instant,
+) -> &'static str {
     let mut any = false;
-    for item in &mut d.items {
-        let Item::Reported {
-            result, validation, ..
-        } = item
-        else {
+    let mut verdicts: Vec<Option<Value>> = vec![None; d.items.len()];
+    for (index, item) in d.items.iter().enumerate() {
+        let Item::Reported { result, .. } = item else {
             continue;
         };
         any = true;
@@ -102,24 +111,42 @@ pub async fn validate(fhir: &FhirClient, d: &mut Dispatched) -> &'static str {
         };
         let mut checked = Vec::with_capacity(resources.len());
         for (i, resource) in resources.iter().enumerate() {
-            match fhir.validate(resource).await {
+            let verdict = tokio::select! {
+                v = fhir.validate(resource) => v,
+                stop = stopped(cancelled, deadline) => {
+                    clear(d);
+                    d.outcome = "stopped";
+                    d.reason = Some(stop.reason().into());
+                    return "unavailable";
+                }
+            };
+            match verdict {
                 Validated::Outcome { issues } => {
                     let valid = !issues.iter().any(|i| i.is_error());
                     checked.push(json!({"resource": i, "valid": valid, "issues": issues}));
                 }
                 Validated::Unavailable => {
-                    for item in &mut d.items {
-                        if let Item::Reported { validation, .. } = item {
-                            *validation = None;
-                        }
-                    }
+                    clear(d);
                     return "unavailable";
                 }
             }
         }
-        *validation = Some(Value::Array(checked));
+        verdicts[index] = Some(Value::Array(checked));
+    }
+    for (item, verdict) in d.items.iter_mut().zip(verdicts) {
+        if let Item::Reported { validation, .. } = item {
+            *validation = verdict;
+        }
     }
     if any { "completed" } else { "skipped" }
+}
+
+fn clear(d: &mut Dispatched) {
+    for item in &mut d.items {
+        if let Item::Reported { validation, .. } = item {
+            *validation = None;
+        }
+    }
 }
 
 /// The run's metadata (what the registry keeps), its coverage, and the whole

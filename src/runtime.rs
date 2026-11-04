@@ -139,8 +139,13 @@ pub struct Facade {
 
 impl Facade {
     pub fn new(settings: RuntimeSettings) -> Self {
+        // A redirect is not the facade's answer, and nothing is sent twice:
+        // no redirects followed, no automatic retries (not even of a stream
+        // the server refused), so a Try is dispatched at most once.
         let client = reqwest::Client::builder()
             .user_agent(concat!("hie/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .expect("reqwest client");
         Self { settings, client }
@@ -329,12 +334,25 @@ fn header(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The environment an answer's headers name.
+/// The environment an answer's headers name: only complete evidence, an id
+/// (`[a-z0-9][a-z0-9.@-]`, at most 64 bytes) and a 64-hex descriptor digest;
+/// anything less names none.
 fn environment_of(headers: &HeaderMap) -> Option<Environment> {
-    Some(Environment {
+    let id = header(headers, "python-runtime-environment-id")?;
+    let digest = header(headers, "python-runtime-environment-digest")?;
+    let id_ok = (1..=64).contains(&id.len())
+        && id.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-.@".contains(&b));
+    let digest_ok = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (id_ok && digest_ok).then(|| Environment {
         executor: EXECUTOR.into(),
-        id: header(headers, "python-runtime-environment-id")?,
-        digest: header(headers, "python-runtime-environment-digest"),
+        id,
+        digest: Some(digest),
     })
 }
 
@@ -381,14 +399,14 @@ pub fn describe(answer: &Answer) -> String {
 }
 
 /// The name one version's code is stored under at the runtime:
-/// `{transform}-v{version}-{12 hex of its sha256}`, within the facade's
-/// `[A-Za-z0-9_-]{1,64}` (the transform id is shortened when needed) and never
-/// `try`. Two versions, or two contents, never share a name.
+/// `{transform}-v{version}-{12 hex}`, the hex a SHA-256 of the whole identity
+/// (transform id, version, code SHA-256), so a shortened transform id never
+/// makes two versions share a name; within the facade's `[A-Za-z0-9_-]{1,64}`
+/// and never `try`.
 pub fn program_name(transform_id: &str, version: i64, code_sha256: &str) -> String {
-    let suffix = format!(
-        "-v{version}-{}",
-        code_sha256.get(..12).unwrap_or(code_sha256)
-    );
+    let identity = format!("{transform_id}\n{version}\n{code_sha256}");
+    let hash = crate::formats::sha256_hex(identity.as_bytes());
+    let suffix = format!("-v{version}-{}", &hash[..12]);
     let room = 64usize.saturating_sub(suffix.len());
     let stem: String = transform_id
         .chars()
@@ -432,10 +450,11 @@ mod tests {
     #[test]
     fn names_follow_the_facade_rules_and_differ_per_version_and_content() {
         let sha = "0123456789abcdef".repeat(4);
-        assert_eq!(
-            program_name("lab_results", 3, &sha),
-            "lab_results-v3-0123456789ab"
-        );
+        assert!(program_name("lab_results", 3, &sha).starts_with("lab_results-v3-"));
+        // Two ids that only differ past the shortening keep two names.
+        let a = format!("{}a", "x".repeat(70));
+        let b = format!("{}b", "x".repeat(70));
+        assert_ne!(program_name(&a, 1, &sha), program_name(&b, 1, &sha));
         assert!(is_program_name(&program_name("lab_results", 3, &sha)));
         let long = program_name(&"x".repeat(80), 12, &sha);
         assert_eq!(long.len(), 64);

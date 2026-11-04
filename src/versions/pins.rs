@@ -75,7 +75,9 @@ impl Versions {
                 match stored {
                     Some(row) if row.declared == declared.declared => Ok(row),
                     _ => {
-                        self.db.set_pin_row(&feed.id, &declared)?;
+                        if !self.db.set_pin_row(&feed.id, &declared)? {
+                            anyhow::bail!("transform {} not found", declared.transform_id);
+                        }
                         Ok(declared)
                     }
                 }
@@ -90,7 +92,19 @@ impl Versions {
 
     /// The version a load of `feed` runs if it starts now: the version its
     /// pin names, or the current one it follows. Read afresh at every start.
+    /// An error means no version can be fixed now (the runtime's environment
+    /// is not known yet, so the transform files are not imported; the
+    /// transform or version does not exist): the caller does not admit the
+    /// load, and the next pass tries again.
     pub fn resolve_for_source(&self, feed: &FeedConfig) -> Result<VersionRef> {
+        if !self.imported.load(std::sync::atomic::Ordering::Acquire) {
+            self.import_dir();
+            if !self.imported.load(std::sync::atomic::Ordering::Acquire) {
+                anyhow::bail!(
+                    "the runtime's default environment is not known yet; no version can be fixed for a load"
+                );
+            }
+        }
         let pin = self.effective_pin(feed)?;
         let t = self
             .transform(&pin.transform_id)?
@@ -170,7 +184,12 @@ impl Versions {
             transform_id: id.clone(),
             version,
         };
-        self.db.set_pin_row(&feed.id, &row)?;
+        if !self.db.set_pin_row(&feed.id, &row)? {
+            return Err(ManagerError::not_found(
+                "transform_not_found",
+                format!("transform {id} not found"),
+            ));
+        }
         Ok(TransformRef::Pin(crate::config::TransformPin {
             id,
             version,
@@ -203,7 +222,10 @@ impl Versions {
             .expect("seen sources")
             .insert(feed.id.clone());
         let declared = self.declared_pin(feed)?;
-        self.db.set_pin_row(&feed.id, &declared)
+        if !self.db.set_pin_row(&feed.id, &declared)? {
+            anyhow::bail!("transform {} not found", declared.transform_id);
+        }
+        Ok(())
     }
 
     /// `GET /api/transforms/{id}/usage`: per version, every period a source

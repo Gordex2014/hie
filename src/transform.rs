@@ -34,9 +34,10 @@ pub struct WorkerCommand {
     pub transform_script: PathBuf,
     /// The HTS the worker may ask, handed over as `HIE_TERMINOLOGY_SERVER`.
     pub terminology: Option<String>,
-    /// Whether the transform's own output (its `print`s, which the worker sends
-    /// to stderr) reaches the engine's stderr; Try discards it.
-    pub inherit_stderr: bool,
+    /// Whether each record's own stdout and stderr come back in its reply's
+    /// `diagnostics` (Try only, bounded by the worker). Otherwise they are
+    /// discarded: a transform's output never reaches the engine's log.
+    pub capture_streams: bool,
 }
 
 /// Why a worker did not start: the script did not load (with the worker's
@@ -72,8 +73,22 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Starts the worker and waits for its first line.
+    /// Starts the worker and waits until it is ready.
     pub async fn spawn(command: &WorkerCommand) -> std::result::Result<Self, SpawnError> {
+        let mut worker = Self::launch(command)?;
+        match worker.ready(command).await {
+            Ok(()) => Ok(worker),
+            Err(e) => {
+                let _ = worker.kill().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Starts the worker's process; [`Worker::ready`] then waits for its
+    /// first line. The process is this value's, so a caller that gives up
+    /// while waiting can still [`Worker::kill`] it.
+    pub fn launch(command: &WorkerCommand) -> std::result::Result<Self, SpawnError> {
         let mut cmd = Command::new(&command.python);
         cmd.arg("-u")
             .arg(&command.worker_script)
@@ -84,14 +99,13 @@ impl Worker {
         if let Some(url) = &command.terminology {
             cmd.env("HIE_TERMINOLOGY_SERVER", url);
         }
+        if command.capture_streams {
+            cmd.env("HIE_WORKER_CAPTURE", "1");
+        }
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(if command.inherit_stderr {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
+            .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| {
@@ -105,33 +119,37 @@ impl Worker {
             .stdin
             .take()
             .ok_or_else(|| SpawnError::Process(anyhow!("no stdin")))?;
-        let mut stdout = BufReader::new(
+        let stdout = BufReader::new(
             child
                 .stdout
                 .take()
                 .ok_or_else(|| SpawnError::Process(anyhow!("no stdout")))?,
         );
-        let mut line = String::new();
-        stdout
-            .read_line(&mut line)
-            .await
-            .map_err(|e| SpawnError::Process(e.into()))?;
-        let first: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-        if first.get("ready") != Some(&json!(true)) {
-            let _ = child.kill().await;
-            return Err(match first.get("load_error") {
-                Some(e) => SpawnError::LoadFailed(e.clone()),
-                None => SpawnError::Process(anyhow!(
-                    "transform {} failed to load",
-                    command.transform_script.display()
-                )),
-            });
-        }
         Ok(Worker {
             child,
             stdin,
             stdout,
             next_id: 1,
+        })
+    }
+
+    /// Waits for the worker's first line: ready, or why the script did not load.
+    pub async fn ready(&mut self, command: &WorkerCommand) -> std::result::Result<(), SpawnError> {
+        let mut line = String::new();
+        self.stdout
+            .read_line(&mut line)
+            .await
+            .map_err(|e| SpawnError::Process(e.into()))?;
+        let first: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+        if first.get("ready") == Some(&json!(true)) {
+            return Ok(());
+        }
+        Err(match first.get("load_error") {
+            Some(e) => SpawnError::LoadFailed(e.clone()),
+            None => SpawnError::Process(anyhow!(
+                "transform {} failed to load",
+                command.transform_script.display()
+            )),
         })
     }
 
@@ -161,9 +179,13 @@ impl Worker {
         Ok(reply)
     }
 
-    /// Stops the process and waits until it is gone.
+    /// Stops the process and waits until it is reaped: `Ok` only then.
     pub async fn kill(mut self) -> Result<()> {
-        self.child.kill().await?;
+        if self.child.try_wait()?.is_none() {
+            self.child.kill().await?;
+        } else {
+            self.child.wait().await?;
+        }
         Ok(())
     }
 }
@@ -183,7 +205,7 @@ impl Transformer {
                 worker_script: runtime_dir.join("worker.py"),
                 transform_script: transform_script.to_path_buf(),
                 terminology: None,
-                inherit_stderr: true,
+                capture_streams: false,
             },
             worker: Mutex::new(None),
         }

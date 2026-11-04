@@ -1,8 +1,9 @@
 //! One dispatch of a Try run, never repeated: to python-runtime's `POST
-//! /transforms/try` with the code inline, or to a fresh worker of the engine's
-//! own over the code written to a scratch file. Cancel and the deadline stop
-//! it: at the runtime by dropping the request (the facade then cancels the
-//! partition), locally by killing the worker.
+//! /transforms/try` with the code inline (no redirect followed, no automatic
+//! retry), or to a fresh worker of the engine's own over the code written to a
+//! scratch file. Cancel and the run's deadline stop it: at the runtime by
+//! dropping the request (the facade then cancels the partition), locally by
+//! killing the worker and reaping it.
 //!
 //! How a facade answer is read (orchestrator decision a, contract "Try"):
 //! when it carries python-runtime 0.1.3's `execution` evidence and the
@@ -12,14 +13,19 @@
 //! `not_reported`; `reported` without a reply, as a failed try returns none, is
 //! `not_reported` too). Without it, only a `200` with every reply and a `422
 //! transform_load_failed` carrying the header confirm both; any other answer
-//! is `indeterminate`, both `unconfirmed`. A lost answer is the same, reason
-//! `response_lost`.
-
-use std::time::Duration;
+//! (a redirect included) is `indeterminate`, both `unconfirmed`. A lost answer
+//! is the same, reason `response_lost`.
+//!
+//! Environments: a saved version's results are kept only with complete
+//! evidence (the environment id and digest headers) that it ran in its own
+//! environment; otherwise the POST answers `409 environment_unavailable` and
+//! the run keeps its id, recorded without results. Inline code records what the
+//! headers say; a `200` without them is `indeterminate`.
 
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 use super::TryInput;
 use super::answer::{Dispatched, Item};
@@ -29,14 +35,14 @@ use crate::transform::{SpawnError, Worker, WorkerCommand};
 use crate::versions::{Environment, Versions};
 
 /// Why a run stopped before its answer.
-#[derive(Debug, Clone, Copy)]
-enum Stop {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
     Cancelled,
     Deadline,
 }
 
 impl Stop {
-    fn reason(self) -> &'static str {
+    pub fn reason(self) -> &'static str {
         match self {
             Stop::Cancelled => "cancelled",
             Stop::Deadline => "deadline",
@@ -44,7 +50,8 @@ impl Stop {
     }
 }
 
-async fn stopped(cancelled: &mut watch::Receiver<bool>, deadline: Duration) -> Stop {
+/// Resolves when the run is cancelled or its deadline passes.
+pub async fn stopped(cancelled: &mut watch::Receiver<bool>, deadline: Instant) -> Stop {
     let cancel = async {
         let asked = cancelled.wait_for(|c| *c).await.is_ok();
         if !asked {
@@ -54,7 +61,22 @@ async fn stopped(cancelled: &mut watch::Receiver<bool>, deadline: Duration) -> S
     };
     tokio::select! {
         _ = cancel => Stop::Cancelled,
-        _ = tokio::time::sleep(deadline) => Stop::Deadline,
+        _ = tokio::time::sleep_until(deadline) => Stop::Deadline,
+    }
+}
+
+/// A run the route answers with an error. `ran: None` means nothing was
+/// dispatched (the run id is given back); otherwise the run was dispatched,
+/// keeps its id for 24 hours, and is recorded as `ran` says (no results).
+#[derive(Debug)]
+pub struct Refusal {
+    pub error: ManagerError,
+    pub ran: Option<Box<Dispatched>>,
+}
+
+impl From<ManagerError> for Refusal {
+    fn from(error: ManagerError) -> Self {
+        Self { error, ran: None }
     }
 }
 
@@ -86,30 +108,30 @@ fn requests(records: &[Value]) -> Vec<(Value, Value)> {
         .collect()
 }
 
-/// Dispatches the run once. A refusal (nothing ran, or what ran in another
-/// environment is not kept) is an error; everything else is a [`Dispatched`].
+/// Dispatches the run once.
 pub async fn dispatch(
     versions: &Versions,
     input: &TryInput,
-    mut cancelled: watch::Receiver<bool>,
-) -> Result<Dispatched, ManagerError> {
+    cancelled: &mut watch::Receiver<bool>,
+    deadline: Instant,
+) -> Result<Dispatched, Refusal> {
     let wanted = input.saved.as_ref().map(|s| &s.environment);
     match versions.facade() {
         Some(facade) => {
             if let Some(env) = wanted
                 && env.executor != crate::runtime::EXECUTOR
             {
-                return Err(environment_unavailable(&env.id));
+                return Err(environment_unavailable(&env.id).into());
             }
-            remote(facade, input, wanted, &mut cancelled).await
+            remote(facade, input, wanted, cancelled, deadline).await
         }
         None => {
             if let Some(env) = wanted
                 && env.executor != "local"
             {
-                return Err(environment_unavailable(&env.id));
+                return Err(environment_unavailable(&env.id).into());
             }
-            local(versions, input, &mut cancelled).await
+            local(versions, input, cancelled, deadline).await
         }
     }
 }
@@ -121,19 +143,20 @@ async fn remote(
     input: &TryInput,
     wanted: Option<&Environment>,
     cancelled: &mut watch::Receiver<bool>,
-) -> Result<Dispatched, ManagerError> {
+    deadline: Instant,
+) -> Result<Dispatched, Refusal> {
     let n = input.records.len();
     let requests = requests(&input.records);
     let call = facade.try_code(&input.code, wanted.map(|e| e.id.as_str()), &requests);
     let answer = tokio::select! {
         answer = call => answer,
-        stop = stopped(cancelled, input.deadline) => {
+        stop = stopped(cancelled, deadline) => {
             return Ok(Dispatched::all(n, "stopped", stop.reason(), false, Item::NotReported));
         }
     };
     let answer = match answer {
         Ok(a) => a,
-        Err(TryCallError::NotSent(e)) => return Err(executor_unavailable(e)),
+        Err(TryCallError::NotSent(e)) => return Err(executor_unavailable(e).into()),
         Err(TryCallError::Lost(_)) => {
             return Ok(Dispatched::all(
                 n,
@@ -144,22 +167,53 @@ async fn remote(
             ));
         }
     };
+    let wanted_id = wanted.map_or("(default)", |e| e.id.as_str());
     if answer.status == StatusCode::FORBIDDEN
         && answer.facade_error.is_some()
         && answer.error_code() == "environment_unavailable"
     {
-        return Err(environment_unavailable(
-            wanted.map_or("(default)", |e| e.id.as_str()),
-        ));
-    }
-    if let (Some(wanted), Some(ran)) = (wanted, &answer.environment)
-        && ran != wanted
-    {
-        // A version only runs where it was saved: nothing of this run is kept.
-        return Err(environment_unavailable(&wanted.id));
+        // The facade refused before running anything, but it was sent: the
+        // run keeps its id.
+        return Err(Refusal {
+            error: environment_unavailable(wanted_id),
+            ran: Some(Box::new(Dispatched::all(
+                n,
+                "not_started",
+                "environment_unavailable",
+                false,
+                Item::NotStarted,
+            ))),
+        });
     }
     let mut d = read_answer(&answer, n);
-    d.environment = answer.environment.clone().or_else(|| wanted.cloned());
+    match (wanted, &answer.environment) {
+        // A saved version's results need evidence that it ran where it was saved.
+        (Some(wanted), ran)
+            if ran.as_ref() != Some(wanted)
+                && (ran.is_some() || answer.status == StatusCode::OK) =>
+        {
+            let reason = if ran.is_some() {
+                "environment_mismatch"
+            } else {
+                "environment_unreported"
+            };
+            let mut kept = Dispatched::all(n, "indeterminate", reason, false, Item::NotReported);
+            kept.termination = d.termination;
+            kept.cleanup = d.cleanup;
+            kept.environment = answer.environment.clone();
+            return Err(Refusal {
+                error: environment_unavailable(&wanted.id),
+                ran: Some(Box::new(kept)),
+            });
+        }
+        (None, None) if answer.status == StatusCode::OK => {
+            // Inline code whose answer does not say where it ran.
+            d.outcome = "indeterminate";
+            d.reason = Some("environment_unreported".into());
+        }
+        _ => {}
+    }
+    d.environment = answer.environment.clone();
     Ok(d)
 }
 
@@ -293,55 +347,67 @@ async fn local(
     versions: &Versions,
     input: &TryInput,
     cancelled: &mut watch::Receiver<bool>,
-) -> Result<Dispatched, ManagerError> {
+    deadline: Instant,
+) -> Result<Dispatched, Refusal> {
     let n = input.records.len();
-    let scratch = versions.scratch_file("try")?;
-    std::fs::write(&scratch, &input.code).map_err(anyhow::Error::from)?;
+    let scratch = versions.scratch_file("try").map_err(ManagerError::from)?;
+    std::fs::write(&scratch, &input.code)
+        .map_err(|e| ManagerError::from(anyhow::Error::from(e)))?;
     let settings = versions.settings();
     let command = WorkerCommand {
         python: settings.python.clone(),
         worker_script: settings.runtime_dir.join("worker.py"),
         transform_script: scratch.clone(),
         terminology: settings.terminology.clone(),
-        // A Try's output is never logged.
-        inherit_stderr: false,
+        // Each record's own output comes back in its diagnostics, bounded.
+        capture_streams: true,
     };
-    let remove = |d: &mut Dispatched| {
-        if std::fs::remove_file(&scratch).is_err() && scratch.exists() {
+    let finish = |mut d: Dispatched, reaped: bool| {
+        if !reaped {
+            d.termination = "unconfirmed";
+        }
+        if std::fs::remove_file(&scratch).is_err() && scratch.exists() || !reaped {
             d.cleanup = "unconfirmed";
         }
+        d.environment = Some(Environment::local());
+        d
     };
-    let deadline = tokio::time::Instant::now() + input.deadline;
-    let spawned = tokio::select! {
-        w = Worker::spawn(&command) => w,
-        stop = stopped(cancelled, input.deadline) => {
-            let mut d = Dispatched::all(n, "stopped", stop.reason(), true, Item::NotStarted);
-            d.environment = Some(Environment::local());
-            remove(&mut d);
-            return Ok(d);
-        }
-    };
-    let mut worker = match spawned {
+    let mut worker = match Worker::launch(&command) {
         Ok(w) => w,
-        Err(SpawnError::LoadFailed(load_error)) => {
-            let mut d = Dispatched::all(n, "not_started", "load_failed", true, Item::NotStarted);
-            d.environment = Some(Environment::local());
-            d.load_error = Some(load_error);
-            remove(&mut d);
-            return Ok(d);
-        }
-        Err(SpawnError::Process(e)) => {
+        Err(e) => {
             let _ = std::fs::remove_file(&scratch);
-            return Err(executor_unavailable(format!("{e:#}")));
+            return Err(executor_unavailable(e).into());
         }
     };
+    let ready = tokio::select! {
+        r = worker.ready(&command) => Ok(r),
+        stop = stopped(cancelled, deadline) => Err(stop),
+    };
+    match ready {
+        Ok(Ok(())) => {}
+        Ok(Err(SpawnError::LoadFailed(load_error))) => {
+            let reaped = worker.kill().await.is_ok();
+            let mut d = Dispatched::all(n, "not_started", "load_failed", true, Item::NotStarted);
+            d.load_error = Some(load_error);
+            return Ok(finish(d, reaped));
+        }
+        Ok(Err(SpawnError::Process(_))) => {
+            let reaped = worker.kill().await.is_ok();
+            let d = Dispatched::all(n, "indeterminate", "worker_exited", true, Item::NotStarted);
+            return Ok(finish(d, reaped));
+        }
+        Err(stop) => {
+            let reaped = worker.kill().await.is_ok();
+            let d = Dispatched::all(n, "stopped", stop.reason(), true, Item::NotStarted);
+            return Ok(finish(d, reaped));
+        }
+    }
     let mut items = Vec::with_capacity(n);
     let mut ended: Option<&'static str> = None;
     for (record, context) in requests(&input.records) {
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         let step = tokio::select! {
             reply = worker.call(&record, &context) => Ok(reply),
-            stop = stopped(cancelled, left) => Err(stop),
+            stop = stopped(cancelled, deadline) => Err(stop),
         };
         match step {
             Ok(Ok(reply)) => items.push(Item::of_reply(&reply)),
@@ -357,22 +423,21 @@ async fn local(
             }
         }
     }
-    let killed = worker.kill().await.is_ok();
+    let reaped = worker.kill().await.is_ok();
     items.resize(n, Item::NotStarted);
     let (outcome, reason) = match ended {
         None => ("completed", None),
         Some(r @ ("cancelled" | "deadline")) => ("stopped", Some(r.to_string())),
         Some(r) => ("indeterminate", Some(r.to_string())),
     };
-    let mut d = Dispatched {
+    let d = Dispatched {
         outcome,
         reason,
-        termination: if killed { "confirmed" } else { "unconfirmed" },
+        termination: "confirmed",
         cleanup: "confirmed",
-        environment: Some(Environment::local()),
+        environment: None,
         load_error: None,
         items,
     };
-    remove(&mut d);
-    Ok(d)
+    Ok(finish(d, reaped))
 }
