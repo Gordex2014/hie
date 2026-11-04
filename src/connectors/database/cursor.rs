@@ -18,7 +18,41 @@ pub enum Cursor {
     Text(String),
 }
 
+/// How the values a cursor or a table read's position holds were decoded.
+/// Before 2 (no `version` in the store), SQL Server `datetimeoffset` values
+/// were read |offset| off their instant, so a position or cursor on one
+/// cannot be trusted: the read starts over (decision 43).
+pub(super) const DECODING: u8 = 2;
+
+/// A cursor as kept in the store: `{"kind", "value", "version"}`.
+#[derive(Serialize, Deserialize)]
+struct Stored {
+    #[serde(flatten)]
+    cursor: Cursor,
+    #[serde(default)]
+    version: u8,
+}
+
 impl Cursor {
+    /// The cursor as kept in the store.
+    pub(super) fn stored(&self) -> serde_json::Result<String> {
+        serde_json::to_string(&Stored {
+            cursor: self.clone(),
+            version: DECODING,
+        })
+    }
+
+    /// A cursor kept in the store; `None` when it is an instant that SQL
+    /// Server's old decoding wrote (it may be past rows never read), so the
+    /// read starts over from `cursor_start`.
+    pub(super) fn from_stored(text: &str, sql_server: bool) -> serde_json::Result<Option<Self>> {
+        let Stored { cursor, version } = serde_json::from_str(text)?;
+        let stale = version < DECODING
+            && sql_server
+            && matches!(&cursor, Cursor::Timestamp(t) if DateTime::parse_from_rfc3339(t).is_ok());
+        Ok((!stale).then_some(cursor))
+    }
+
     /// What a person typed as `cursor_start`: a number, an instant, a date, or text.
     pub(super) fn parse(text: &str) -> Self {
         let t = text.trim();
@@ -107,6 +141,30 @@ mod tests {
             Cursor::Date("2026-10-01".into())
         );
         assert_eq!(Cursor::parse("abc"), Cursor::Text("abc".into()));
+    }
+
+    #[test]
+    fn stored_cursors_written_by_the_old_decoding_start_over_on_sql_server() {
+        let at = Cursor::Timestamp("2026-10-01T14:00:00-04:00".into());
+        let stored = at.stored().unwrap();
+        assert_eq!(
+            stored,
+            r#"{"kind":"timestamp","value":"2026-10-01T14:00:00-04:00","version":2}"#
+        );
+        assert_eq!(Cursor::from_stored(&stored, true).unwrap(), Some(at));
+        // Before `version`, an instant read from SQL Server is not trusted;
+        // a date-time without an offset (`datetime2`), another kind, or
+        // another engine is.
+        let old = r#"{"kind":"timestamp","value":"2026-10-01T18:00:00+00:00"}"#;
+        assert_eq!(Cursor::from_stored(old, true).unwrap(), None);
+        assert!(Cursor::from_stored(old, false).unwrap().is_some());
+        let naive = r#"{"kind":"timestamp","value":"2026-10-01T18:00:00"}"#;
+        assert!(Cursor::from_stored(naive, true).unwrap().is_some());
+        let int = r#"{"kind":"int","value":7}"#;
+        assert_eq!(
+            Cursor::from_stored(int, true).unwrap(),
+            Some(Cursor::Int(7))
+        );
     }
 
     #[test]

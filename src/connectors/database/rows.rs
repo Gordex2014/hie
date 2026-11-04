@@ -1,7 +1,7 @@
 //! A row of each driver as a JSON object keyed by column name, with each
 //! column's type decoded to the JSON value a transform expects.
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
 use serde_json::{Map, Value};
 use sqlx::mysql::MySqlRow;
 use sqlx::postgres::PgRow;
@@ -190,8 +190,11 @@ pub(super) fn mssql_row(row: &tiberius::Row) -> Map<String, Value> {
                     })
                 })
             }
+            // The instant with the value's own offset. TDS sends the UTC
+            // date-time and the offset; tiberius's `DateTime<Utc>` subtracts
+            // the offset once more, so a value is read |offset| off.
             T::DatetimeOffsetn => row
-                .try_get::<DateTime<Utc>, _>(i)
+                .try_get::<DateTime<FixedOffset>, _>(i)
                 .ok()
                 .map(|v| v.map_or(Value::Null, |t| Value::String(t.to_rfc3339()))),
             T::BigVarBin | T::BigBinary | T::Image => row
