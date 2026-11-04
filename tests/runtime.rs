@@ -30,6 +30,20 @@ struct Facade {
     environment: String,
     /// The environments named in run bodies.
     named: Vec<String>,
+    /// Answers without the environment headers, as a proxy that strips them.
+    no_headers: bool,
+    /// `POST /transforms/try` answers `307` to itself.
+    redirect_try: bool,
+}
+
+impl Facade {
+    fn headers(&self) -> HeaderMap {
+        if self.no_headers {
+            HeaderMap::new()
+        } else {
+            env_headers(&self.environment)
+        }
+    }
 }
 
 const ENV: &str = "cpython-3.14@2-env-0123456789abcdef0123456789abcdef";
@@ -122,7 +136,7 @@ async fn run_transform(
     let replies: Vec<Value> = requests.iter().map(reply).collect();
     (
         StatusCode::OK,
-        env_headers(&s.environment),
+        s.headers(),
         Json(json!({"replies": replies})),
     )
 }
@@ -130,10 +144,15 @@ async fn run_transform(
 async fn try_transform(
     State(s): State<Shared>,
     Json(body): Json<Value>,
-) -> (HeaderMap, Json<Value>) {
+) -> (StatusCode, HeaderMap, Json<Value>) {
     let mut s = s.lock().unwrap();
     s.tries += 1;
     assert!(body["code"].is_string());
+    if s.redirect_try {
+        let mut h = HeaderMap::new();
+        h.insert("location", "/transforms/try".parse().unwrap());
+        return (StatusCode::TEMPORARY_REDIRECT, h, Json(json!({})));
+    }
     let replies: Vec<Value> = body["requests"]
         .as_array()
         .unwrap()
@@ -141,7 +160,8 @@ async fn try_transform(
         .map(reply)
         .collect();
     (
-        env_headers(&s.environment),
+        StatusCode::OK,
+        s.headers(),
         Json(json!({"replies": replies})),
     )
 }
@@ -218,6 +238,9 @@ async fn transforms_run_at_the_shared_runtime() {
         hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
     let runner: Arc<FeedRunner> = manager.runner("export").unwrap();
     manager.pause("export", None).unwrap();
+    // The runtime's environment is read (and the files found at start saved
+    // in it) before the first pass; until then no load would be admitted.
+    state.versions.ready().await;
 
     // 400 records: more than one call at batch_size 150, two of them rejected by the transform.
     let mut lines = Vec::new();
@@ -339,7 +362,75 @@ async fn transforms_run_at_the_shared_runtime() {
     assert_eq!(out["results"][1]["error"]["kind"], "data");
     assert_eq!(out["run"]["environment"]["id"], ENV);
     assert_eq!(out["run"]["transform"]["version"], 2);
+    assert_eq!(facade.lock().unwrap().tries, 1);
+
+    let try_saved = |run_id: &'static str| {
+        let api = api.clone();
+        async move {
+            let response = reqwest::Client::new()
+                .post(format!("{api}/api/transforms/fhir_passthrough/try"))
+                .json(&json!({"run_id": run_id, "input": {"records": [{"resourceType": "Patient", "id": "t2"}]}}))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            (status, response.json::<Value>().await.unwrap())
+        }
+    };
+    // Ran in another environment: refused, nothing shown, and the run id
+    // stays used (it was dispatched).
+    facade.lock().unwrap().environment =
+        "cpython-3.14@2-env-fedcba9876543210fedcba9876543210".into();
+    let (status, body) = try_saved("e-1").await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("environment_unavailable"))
+    );
+    assert_eq!(try_saved("e-1").await.1["code"], "run_id_in_use");
+    assert_eq!(facade.lock().unwrap().tries, 2, "never sent again");
+    let run: Value = reqwest::get(format!("{api}/api/transforms/try-runs/e-1"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(run["run"]["status"], "finished");
+    assert_eq!(run["coverage"]["reported"], 0);
+    facade.lock().unwrap().environment = ENV.into();
+
+    // An answer without complete environment evidence applies nothing: the
+    // load waits; a saved version's Try is refused.
+    facade.lock().unwrap().no_headers = true;
+    std::fs::write(
+        root.join("inbox/unproven.ndjson"),
+        "{\"resourceType\":\"Patient\",\"id\":\"w1\"}\n",
+    )
+    .unwrap();
+    runner.tick().await.unwrap();
+    assert_eq!((count(&state, "received"), count(&state, "sent")), (1, 402));
+    let load = state
+        .db
+        .query_json("SELECT MAX(id) AS id FROM files", [])
+        .unwrap()[0]["id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        state.db.version_waiting(load, None).unwrap().as_deref(),
+        Some("environment_unavailable")
+    );
+    assert_eq!(try_saved("h-1").await.1["code"], "environment_unavailable");
+    facade.lock().unwrap().no_headers = false;
+    runner.tick().await.unwrap();
+    assert_eq!((count(&state, "received"), count(&state, "sent")), (0, 403));
+
+    // A redirect is not the facade's answer and is not followed.
+    facade.lock().unwrap().redirect_try = true;
+    let (status, body) = try_saved("r-1").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["run"]["outcome"], "indeterminate");
+    assert_eq!(body["run"]["termination"], "unconfirmed");
     let f = facade.lock().unwrap();
-    assert_eq!((f.tries, f.puts), (1, 3));
+    assert_eq!((f.tries, f.puts), (4, 3), "the redirect was not followed");
+    drop(f);
     drop(manager);
 }

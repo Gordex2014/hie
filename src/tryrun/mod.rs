@@ -139,6 +139,8 @@ pub async fn start(
             format!("run id {} was used in the last 24 hours", input.run_id),
         ));
     }
+    // One absolute deadline for the whole run: dispatch and validation.
+    let deadline = tokio::time::Instant::now() + input.deadline;
     let (cancel, cancelled) = tokio::sync::watch::channel(false);
     let control = Arc::new(Control {
         cancel,
@@ -154,7 +156,15 @@ pub async fn start(
         let versions = task_versions;
         // The slot travels with the work, which outlives the request.
         let _permit = permit;
-        let result = execute(&versions, &fhir, &input, &started_at, cancelled, &control).await;
+        let result = execute(
+            &versions,
+            &fhir,
+            &input,
+            &started_at,
+            (cancelled, deadline),
+            &control,
+        )
+        .await;
         versions
             .tries()
             .active
@@ -176,24 +186,35 @@ async fn execute(
     fhir: &FhirClient,
     input: &TryInput,
     started_at: &str,
-    cancelled: tokio::sync::watch::Receiver<bool>,
+    (mut cancelled, deadline): (tokio::sync::watch::Receiver<bool>, tokio::time::Instant),
     control: &Control,
 ) -> Result<Value, ManagerError> {
     let db = versions.db();
-    let dispatched = match dispatch::dispatch(versions, input, cancelled).await {
+    let mut dispatched = match dispatch::dispatch(versions, input, &mut cancelled, deadline).await {
         Ok(d) => d,
         Err(refusal) => {
-            // Nothing was kept: the run id is given back.
             control.state.lock().expect("try state").finished = true;
-            if let Err(e) = db.try_release(&input.run_id) {
-                tracing::error!(target: "hie::tryrun", "releasing a Try run id: {e:#}");
+            match refusal.ran {
+                // Nothing was dispatched: the run id is given back.
+                None => {
+                    if let Err(e) = db.try_release(&input.run_id) {
+                        tracing::error!(target: "hie::tryrun", "releasing a Try run id: {e:#}");
+                    }
+                }
+                // Dispatched: the id stays reserved, the run recorded
+                // without results, and the route answers the refusal.
+                Some(ran) => {
+                    let built = answer::build(input, &ran, "skipped", started_at);
+                    if let Err(e) = db.try_finish(&input.run_id, &built.run, &built.coverage) {
+                        tracing::error!(target: "hie::tryrun", "recording a Try run's outcome: {e:#}");
+                    }
+                }
             }
-            return Err(refusal);
+            return Err(refusal.error);
         }
     };
-    let mut dispatched = dispatched;
     let validation = if input.validate {
-        answer::validate(fhir, &mut dispatched).await
+        answer::validate(fhir, &mut dispatched, &mut cancelled, deadline).await
     } else {
         "skipped"
     };

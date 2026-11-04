@@ -16,7 +16,9 @@ resources or None. It raises `hie.DataError` for bad source data.
 """
 
 import importlib.util
+import io
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -33,6 +35,28 @@ def load(path):
     if not callable(getattr(module, "transform", None)):
         raise SystemExit(f"{path} does not define transform(record, context)")
     return module
+
+
+# With HIE_WORKER_CAPTURE=1 (Try) each record's own stdout and stderr come back
+# in its reply's diagnostics, at most this many bytes each; otherwise they go to
+# the worker's stderr, which the engine discards.
+STREAM_LIMIT = 4096
+
+
+def captured(stdout, stderr):
+    diagnostics = {}
+    truncated = False
+    for name, buffer in (("stdout", stdout), ("stderr", stderr)):
+        text = buffer.getvalue()
+        if text:
+            data = text.encode("utf-8")
+            if len(data) > STREAM_LIMIT:
+                text = data[:STREAM_LIMIT].decode("utf-8", "ignore")
+                truncated = True
+            diagnostics[name] = text
+    if truncated:
+        diagnostics["truncated"] = True
+    return diagnostics
 
 
 def main():
@@ -53,10 +77,14 @@ def main():
         sys.exit(1)
     protocol.write(json.dumps({"ready": True}) + "\n")
     protocol.flush()
+    capture = os.environ.get("HIE_WORKER_CAPTURE") == "1"
+    streams = (sys.stdout, sys.stderr)
     for line in sys.stdin:
         if not line.strip():
             continue
         request = json.loads(line)
+        if capture:
+            sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
         try:
             result = module.transform(request["record"], request["context"])
             if result is None:
@@ -77,6 +105,11 @@ def main():
                     "trace": traceback.format_exc(limit=5),
                 },
             }
+        if capture:
+            diagnostics = captured(sys.stdout, sys.stderr)
+            sys.stdout, sys.stderr = streams
+            if diagnostics:
+                reply["diagnostics"] = diagnostics
         protocol.write(json.dumps(reply) + "\n")
         protocol.flush()
 

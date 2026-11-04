@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use super::engine::Row;
 use super::{Db, Param, Tx, now_ms, params};
-use crate::versions::{NewVersion, PinPeriod, PinRow, Saved, TransformInfo, VersionInfo};
+use crate::versions::{Deleted, NewVersion, PinPeriod, PinRow, Saved, TransformInfo, VersionInfo};
 
 /// The DDL of this area's tables (`CREATE TABLE IF NOT EXISTS ...`).
 pub(super) const TABLES: &str = "CREATE TABLE IF NOT EXISTS transforms (
@@ -22,9 +22,12 @@ pub(super) const TABLES: &str = "CREATE TABLE IF NOT EXISTS transforms (
   updated_at INTEGER NOT NULL,
   deleted_at INTEGER,
   file_path TEXT,
-  file_sha256 TEXT
+  file_sha256 TEXT,
+  legacy_name TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS transforms_display_key ON transforms(display_key);
+CREATE UNIQUE INDEX IF NOT EXISTS transforms_file_path ON transforms(file_path);
+CREATE UNIQUE INDEX IF NOT EXISTS transforms_legacy_name ON transforms(legacy_name);
 CREATE TABLE IF NOT EXISTS transform_versions (
   transform_id TEXT NOT NULL,
   version INTEGER NOT NULL,
@@ -111,8 +114,7 @@ impl Sql for Tx<'_> {
     }
 }
 
-const TRANSFORM_COLUMNS: &str =
-    "id, display_name, current_version, created_at, updated_at, deleted_at, file_path, file_sha256";
+const TRANSFORM_COLUMNS: &str = "id, display_name, current_version, created_at, updated_at, deleted_at, file_path, file_sha256, legacy_name";
 
 fn transform_of(r: &Row) -> TransformInfo {
     TransformInfo {
@@ -124,6 +126,7 @@ fn transform_of(r: &Row) -> TransformInfo {
         deleted: r.opt_i64(5).is_some(),
         file_path: r.opt_string(6),
         file_sha256: r.opt_string(7),
+        legacy_name: r.opt_string(8),
     }
 }
 
@@ -148,6 +151,16 @@ fn transform(sql: &mut impl Sql, id: &str) -> Result<Option<TransformInfo>> {
         .row(
             &format!("SELECT {TRANSFORM_COLUMNS} FROM transforms WHERE id = $1"),
             &params![id],
+        )?
+        .as_ref()
+        .map(transform_of))
+}
+
+fn transform_where(sql: &mut impl Sql, column: &str, value: &str) -> Result<Option<TransformInfo>> {
+    Ok(sql
+        .row(
+            &format!("SELECT {TRANSFORM_COLUMNS} FROM transforms WHERE {column} = $1"),
+            &params![value],
         )?
         .as_ref()
         .map(transform_of))
@@ -180,20 +193,73 @@ impl Tx<'_> {
             .is_some())
     }
 
-    /// Creates a transform with its version 1. `false` when the id or the
-    /// display name was taken meanwhile (nothing written).
+    /// The transform a file (its canonical path) is, deleted ones included.
+    pub fn transform_by_file(&mut self, path: &str) -> Result<Option<TransformInfo>> {
+        transform_where(self, "file_path", path)
+    }
+
+    /// The transform a 0.1 name (`PUT /api/transforms/{name}`, a file's stem
+    /// under `transforms/`) is, deleted ones included.
+    pub fn transform_by_legacy_name(&mut self, name: &str) -> Result<Option<TransformInfo>> {
+        transform_where(self, "legacy_name", name)
+    }
+
+    /// Binds a transform to its file (and the SHA-256 HIE last read or wrote
+    /// there); `false` when another transform owns that file.
+    pub fn bind_transform_file(&mut self, id: &str, path: &str, sha: &str) -> Result<bool> {
+        Ok(self.run(
+            "UPDATE transforms SET file_path = $2, file_sha256 = $3
+             WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM transforms o WHERE o.file_path = $2 AND o.id <> $1)",
+            &params![id, path, sha],
+        )? == 1)
+    }
+
+    /// The SHA-256 of one version's code.
+    pub fn version_sha(&mut self, id: &str, number: i64) -> Result<Option<String>> {
+        Ok(version(self, id, number)?.map(|v| v.code_sha256))
+    }
+
+    /// Makes the transaction a writer before it reads: on SQLite a
+    /// transaction that read first cannot write once another connection has
+    /// written (it fails instead of waiting); one that writes first waits its
+    /// turn. Harmless on PostgreSQL.
+    pub fn begin_write(&mut self) -> Result<()> {
+        self.run(
+            "UPDATE transforms SET updated_at = updated_at WHERE 1 = 0",
+            &[],
+        )
+        .map(drop)
+    }
+
+    /// Locks a live transform's row for the rest of the transaction; `false`
+    /// when it is deleted or never existed. Deleting a transform takes the same
+    /// lock, so whatever starts to refer to a transform (a pin, a source, a
+    /// retry) and holds this lock cannot interleave with its deletion.
+    pub fn lock_live_transform(&mut self, id: &str) -> Result<bool> {
+        Ok(self.run(
+            "UPDATE transforms SET updated_at = updated_at WHERE id = $1 AND deleted_at IS NULL",
+            &params![id],
+        )? == 1)
+    }
+
+    /// Creates a transform with its version 1, bound to its file and 0.1 name
+    /// when it has them. `None` when the id, the display name, the file or
+    /// the name was taken meanwhile (nothing written).
     pub fn insert_transform(
         &mut self,
         id: &str,
         display_name: &str,
         display_key: &str,
         first: &NewVersion<'_>,
+        file: Option<(&str, &str)>,
+        legacy_name: Option<&str>,
     ) -> Result<Option<(TransformInfo, VersionInfo)>> {
         let now = now_ms();
+        let (path, sha) = file.map_or((None, None), |(p, s)| (Some(p), Some(s)));
         let inserted = self.run(
-            "INSERT INTO transforms (id, display_name, display_key, current_version, created_at, updated_at)
-             VALUES ($1, $2, $3, 1, $4, $4) ON CONFLICT DO NOTHING",
-            &params![id, display_name, display_key, now],
+            "INSERT INTO transforms (id, display_name, display_key, current_version, created_at, updated_at, file_path, file_sha256, legacy_name)
+             VALUES ($1, $2, $3, 1, $4, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+            &params![id, display_name, display_key, now, path, sha, legacy_name],
         )?;
         if inserted == 0 {
             return Ok(None);
@@ -302,20 +368,56 @@ impl Tx<'_> {
         Ok(true)
     }
 
-    /// Deletes a transform: its id stays taken and its versions' metadata stays
-    /// for the usage history; its code goes.
-    pub fn delete_transform(&mut self, id: &str) -> Result<()> {
+    /// Deletes a transform unless something refers to it, in one
+    /// transaction under its row lock ([`Tx::lock_live_transform`]): a pin
+    /// in the store, one of `sources` (the definitions the manager holds), or
+    /// an unfinished load or retry running one of its versions. Its id stays
+    /// taken and its versions stay (a load that snapshotted one just before
+    /// still runs it), for the usage history.
+    pub fn delete_transform_unused(&mut self, id: &str, sources: &[String]) -> Result<Deleted> {
+        if !self.lock_live_transform(id)? {
+            return Ok(Deleted::NotFound);
+        }
+        let mut users: Vec<String> = self
+            .rows(
+                "SELECT source_id FROM source_pins WHERE transform_id = $1 ORDER BY source_id",
+                &params![id],
+            )?
+            .iter()
+            .map(|r| r.string(0))
+            .collect();
+        for source in sources {
+            if !users.contains(source) {
+                users.push(source.clone());
+            }
+        }
+        users.sort();
+        if !users.is_empty() || running(self, id)? {
+            return Ok(Deleted::InUse(users));
+        }
         let now = now_ms();
         self.run(
             "UPDATE transforms SET deleted_at = $2, display_key = NULL, updated_at = $2, file_sha256 = NULL WHERE id = $1",
             &params![id, now],
         )?;
-        self.run(
-            "UPDATE transform_versions SET code = NULL WHERE transform_id = $1",
-            &params![id],
-        )?;
-        Ok(())
+        Ok(Deleted::Done)
     }
+}
+
+/// Whether an unfinished load or retry runs one of the transform's versions:
+/// rows of it not settled yet, or a load still being read with it.
+fn running(sql: &mut impl Sql, id: &str) -> Result<bool> {
+    Ok(sql
+        .row(
+            "SELECT 1 FROM records r JOIN files f ON f.id = r.file_id
+             WHERE r.status IN ('received', 'pending', 'submitted')
+               AND COALESCE(r.exec_transform_id, f.transform_id) = $1
+             UNION ALL
+             SELECT 1 FROM files WHERE transform_id = $1 AND status IN ('queued', 'processing', 'unpacked')
+             LIMIT 1",
+            &params![id],
+        )?
+        .is_some())
 }
 
 impl Db {
@@ -363,52 +465,39 @@ impl Db {
     }
 
     /// Records a transform's file (its canonical path) and the SHA-256 of
-    /// what HIE last wrote to it or read from it.
-    pub fn set_transform_file(&self, id: &str, path: &str, sha: &str) -> Result<()> {
-        self.execute(
-            "UPDATE transforms SET file_path = $2, file_sha256 = $3 WHERE id = $1",
+    /// what HIE last wrote to it or read from it; `false` when another
+    /// transform owns that file.
+    pub fn set_transform_file(&self, id: &str, path: &str, sha: &str) -> Result<bool> {
+        Ok(self.execute(
+            "UPDATE transforms SET file_path = $2, file_sha256 = $3
+             WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM transforms o WHERE o.file_path = $2 AND o.id <> $1)",
             &params![id, path, sha],
-        )
-        .map(drop)
+        )? == 1)
     }
 
-    /// The transform a file (its canonical path) is, deleted ones included.
+    /// The transform a file is, deleted ones included.
     pub fn transform_by_file(&self, path: &str) -> Result<Option<TransformInfo>> {
-        Ok(self
-            .query_one(
-                &format!("SELECT {TRANSFORM_COLUMNS} FROM transforms WHERE file_path = $1 ORDER BY id LIMIT 1"),
-                &params![path],
-            )?
-            .as_ref()
-            .map(transform_of))
+        transform_where(&mut &*self, "file_path", path)
     }
 
-    /// Whether an unfinished load or retry runs one of the transform's
-    /// versions: rows of it waiting for the transform, or a load still being
-    /// read with it.
-    pub fn transform_running(&self, id: &str) -> Result<bool> {
-        Ok(self
-            .query_one(
-                "SELECT 1 FROM records r JOIN files f ON f.id = r.file_id
-                 WHERE r.status IN ('received', 'pending', 'submitted')
-                   AND COALESCE(r.exec_transform_id, f.transform_id) = $1
-                 UNION ALL
-                 SELECT 1 FROM files WHERE transform_id = $1 AND status IN ('processing', 'unpacked')
-                 LIMIT 1",
-                &params![id],
-            )?
-            .is_some())
+    /// The transform a 0.1 name is, deleted ones included.
+    pub fn transform_by_legacy_name(&self, name: &str) -> Result<Option<TransformInfo>> {
+        transform_where(&mut &*self, "legacy_name", name)
     }
 
-    /// The versions rows still waiting for their transform run: what the
-    /// runtime must keep holding.
+    /// The versions an unfinished load or retry may still run: rows waiting
+    /// for their transform, and loads not finished (also those with no rows
+    /// yet). What the runtime must keep holding.
     pub fn versions_waiting_to_run(&self) -> Result<Vec<(String, i64)>> {
         Ok(self
             .query(
                 "SELECT DISTINCT COALESCE(r.exec_transform_id, f.transform_id),
                         CASE WHEN r.exec_transform_id IS NULL THEN f.transform_version ELSE r.exec_version END
                  FROM records r JOIN files f ON f.id = r.file_id
-                 WHERE r.status = 'received'",
+                 WHERE r.status = 'received'
+                 UNION
+                 SELECT transform_id, transform_version FROM files
+                 WHERE status IN ('queued', 'processing', 'unpacked') AND transform_id IS NOT NULL",
                 &[],
             )?
             .iter()
@@ -432,10 +521,14 @@ impl Db {
             }))
     }
 
-    /// Sets a source's pin. When what it runs changes, the open pin period
-    /// ends and another starts, in the same transaction.
-    pub fn set_pin_row(&self, source: &str, pin: &PinRow) -> Result<()> {
+    /// Sets a source's pin, under its transform's row lock: `false` (nothing
+    /// written) when the transform is deleted. When what it runs changes, the
+    /// open pin period ends and another starts, in the same transaction.
+    pub fn set_pin_row(&self, source: &str, pin: &PinRow) -> Result<bool> {
         self.transaction(|tx| {
+            if !tx.lock_live_transform(&pin.transform_id)? {
+                return Ok(false);
+            }
             let now = now_ms();
             let before = tx.row(
                 "SELECT transform_id, version FROM source_pins WHERE source_id = $1",
@@ -461,7 +554,7 @@ impl Db {
                     &params![source, pin.transform_id, pin.version, now],
                 )?;
             }
-            Ok(())
+            Ok(true)
         })
     }
 

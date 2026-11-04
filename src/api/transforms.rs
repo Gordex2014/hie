@@ -62,12 +62,17 @@ struct VersionQuery {
 }
 
 /// One transform with its code and version: the current one, or `?version=`.
+/// A 0.1 name reaches its transform too.
 async fn get_transform(
     State(s): State<AppState>,
-    Path(id): Path<String>,
+    Path(name): Path<String>,
     Query(q): Query<VersionQuery>,
 ) -> ApiResult {
     s.versions.ready().await;
+    let id = s
+        .versions
+        .resolve_name(&name)?
+        .ok_or_else(|| transform_missing(&name))?;
     let t = s
         .versions
         .transform(&id)?
@@ -534,6 +539,11 @@ async fn try_saved(
     };
     let deadline = deadline(deadline_ms)?;
     s.versions.ready().await;
+    let name = id;
+    let id = s
+        .versions
+        .resolve_name(&name)?
+        .ok_or_else(|| transform_missing(&name))?;
     let t = s
         .versions
         .transform(&id)?
@@ -565,7 +575,7 @@ async fn try_saved(
         deadline,
         validate: validate.unwrap_or(true),
     };
-    run_try(&s, input, legacy.then_some(id.as_str())).await
+    run_try(&s, input, legacy.then_some(name.as_str())).await
 }
 
 async fn get_try_run(State(s): State<AppState>, Path(run): Path<String>) -> ApiResult {

@@ -37,6 +37,16 @@ impl FeedRunner {
     pub(super) async fn ingest(&self, incoming: Incoming) -> Result<()> {
         let feed = &self.feed.id;
         let Incoming { key, name, bytes } = incoming;
+        // A load that runs a transform is admitted only with its version fixed:
+        // when none can be fixed now, nothing is written and the object stays
+        // at its source for the next pass.
+        if !(self.bulk.is_some() && !self.bulk_transformed) {
+            self.versions.resolve_for_source(&self.feed).map_err(|e| {
+                e.context(format!(
+                    "{name}: no transform version can be fixed for a load yet"
+                ))
+            })?;
+        }
         let sha = formats::sha256_hex(&bytes);
 
         if let Some(original) = self.db.find_file_by_hash(feed, &sha)? {
@@ -95,14 +105,13 @@ impl FeedRunner {
     fn open_load(&self, name: &str, sha: &str, size: u64, source_key: Option<&str>) -> Result<i64> {
         let transforms = !(self.bulk.is_some() && !self.bulk_transformed);
         let version = if transforms {
-            match self.versions.resolve_for_source(&self.feed) {
-                Ok(v) => Some(v),
-                // Taken anyway: its rows wait for a version that can run.
-                Err(e) => {
-                    tracing::error!(target: "hie::pipeline", feed = %self.feed.id, file = %name, "no transform version to record for the load: {e:#}");
-                    None
-                }
-            }
+            // Never admitted without its version: the object stays at its
+            // source and the next pass takes it again.
+            Some(self.versions.resolve_for_source(&self.feed).map_err(|e| {
+                e.context(format!(
+                    "{name}: no transform version can be fixed for the load yet"
+                ))
+            })?)
         } else {
             None
         };
