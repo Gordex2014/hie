@@ -33,7 +33,10 @@ use engine::{Conn, PgHandle};
 pub use engine::{IntoParam, Param, Row};
 pub use history::{Group, PeriodCounts, RetryRefusal, VersionRun};
 pub use idempotency::Claim;
-pub use loads::{Deferral, FailedRow, FailedRowsError, FinishedFile, Waiting, WorkItem};
+pub use loads::{
+    Deferral, FailedRow, FailedRowsError, FinishedFile, REASON_MAX_CHARS, Reprocess, Waiting,
+    WorkItem,
+};
 pub use passes::{Pass, PassStatus};
 pub use sources::Lease;
 pub use submissions::{Submission, SubmittableFile};

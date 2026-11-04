@@ -547,10 +547,20 @@ pub fn entry_results(response: &Value, expected: usize) -> Vec<EntryResult> {
         .collect()
 }
 
-/// A short, human-readable reason from an OperationOutcome (or anything else).
+/// A short, human-readable reason from an OperationOutcome: its issues'
+/// texts. An answer that holds none is never echoed (it may carry rows).
 pub fn outcome_text(v: &Value) -> String {
+    let texts = issue_texts(v);
+    if texts.is_empty() {
+        "the answer holds no OperationOutcome text".to_string()
+    } else {
+        texts.join("; ")
+    }
+}
+
+fn issue_texts(v: &Value) -> Vec<String> {
     let outcome = v.get("outcome").unwrap_or(v);
-    let texts: Vec<String> = outcome
+    outcome
         .get("issue")
         .and_then(Value::as_array)
         .map(|issues| {
@@ -564,12 +574,25 @@ pub fn outcome_text(v: &Value) -> String {
                 })
                 .collect()
         })
-        .unwrap_or_default();
-    if texts.is_empty() {
-        v.to_string()
-    } else {
-        texts.join("; ")
+        .unwrap_or_default()
+}
+
+/// The reason HIE keeps for an answer: `HTTP <status>` and the text of its
+/// first issue; the rest of the answer stays only in the row's sealed
+/// response.
+pub fn refusal_reason(status: u16, body: &Value) -> String {
+    match issue_texts(body).into_iter().next() {
+        Some(text) => format!("HTTP {status}: {text}"),
+        None => format!("HTTP {status}"),
     }
+}
+
+/// Whether an answer is a definitive refusal: `400`, `404`, `409`, `412` or
+/// `422` with an `OperationOutcome`, so the destination committed nothing.
+/// Any other answer that is not a success leaves the outcome unknown.
+pub fn is_definitive_refusal(status: u16, body: &Value) -> bool {
+    matches!(status, 400 | 404 | 409 | 412 | 422)
+        && body.get("resourceType").and_then(Value::as_str) == Some("OperationOutcome")
 }
 
 #[cfg(test)]

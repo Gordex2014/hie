@@ -19,6 +19,10 @@ use super::deliver::Checked;
 /// Records settled per page when a submission's receipts come back.
 const SETTLE_PAGE: usize = 5_000;
 
+/// How long after a poll still in progress the receipts are polled again
+/// (the first poll after a kick-off waits the delivery's initial backoff).
+const RECEIPT_POLL_MS: i64 = 2_000;
+
 impl FeedRunner {
     /// Whether `$bulk-submit` is only for the source's first load
     /// (`delivery.initial_method: bulk_submit` with another `method`).
@@ -45,6 +49,14 @@ impl FeedRunner {
         if self.bulk_transformed {
             return self.submit_transformed(bulk).await;
         }
+        // HFS reads the source objects themselves: nothing the engine must see
+        // first (validation, namespacing) can happen on this path.
+        if let Err(e) = bulk::check_delivery(&self.feed, self.validation) {
+            tracing::error!(target: "hie::pipeline", feed = %self.feed.id, "nothing submitted: {e:#}");
+            return Ok(());
+        }
+        // Rows a retry runs were transformed by its version: they go by REST.
+        self.deliver_due_where(true).await?;
         loop {
             let files = self
                 .db
@@ -123,7 +135,14 @@ impl FeedRunner {
                     None => Ok(Some(("kickoff", None))),
                     Some(url) => match bulk.poll(url).await {
                         Ok(Poll::InProgress) => Ok(None),
-                        Ok(Poll::Done { references, errors }) => {
+                        Ok(Poll::Done {
+                            references,
+                            errors,
+                            malformed,
+                        }) => {
+                            if malformed > 0 {
+                                tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, submission = %sub.submission_id, malformed, "receipt lines that could not be read; their rows stay unknown");
+                            }
                             self.settle(&sub.token, &references, &errors).await?;
                             Ok(Some(("done", None)))
                         }
@@ -138,23 +157,35 @@ impl FeedRunner {
                         &sub.status,
                         None,
                         sub.attempts,
-                        now_ms() + 2000,
+                        now_ms() + RECEIPT_POLL_MS,
                         None,
                     )?;
                 }
                 Ok(Some((status, url))) => {
+                    // A running submission is polled for its receipts when due.
+                    let next = if status == "running" {
+                        now_ms() + self.backoff_ms(1)
+                    } else {
+                        0
+                    };
                     self.db
-                        .update_submission(&sub.token, status, url.as_deref(), 0, 0, None)?;
+                        .update_submission(&sub.token, status, url.as_deref(), 0, next, None)?;
                     if status == "done" {
                         self.recovered()?;
                     }
                 }
                 Err(SendError::Refused(status, body)) => {
-                    let reason = format!("HTTP {status}: {}", fhir::outcome_text(&body));
+                    let reason = fhir::refusal_reason(status, &body);
                     tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
-                    for (record_id, _, _) in self.db.submitted_records(&sub.token)? {
-                        self.db
-                            .mark_rejected(record_id, "server", &reason, Some(&body))?;
+                    for (record_id, run, _, _) in self.db.submitted_records(&sub.token)? {
+                        self.db.mark_failed(
+                            record_id,
+                            run,
+                            "server",
+                            &reason,
+                            Some(&body),
+                            None,
+                        )?;
                     }
                     self.db.update_submission(
                         &sub.token,
@@ -165,6 +196,7 @@ impl FeedRunner {
                         Some(&reason),
                     )?;
                     self.archive_submission(&sub.token).await?;
+                    self.remove_submission_files(&sub.token).await;
                 }
                 Err(SendError::Transient(reason)) => {
                     let attempts = sub.attempts + 1;
@@ -188,21 +220,21 @@ impl FeedRunner {
         Ok(())
     }
 
-    /// Gives every submitted record its disposition from the receipts, then archives
-    /// the objects HFS has read.
+    /// Gives every submitted record its disposition from the receipts, then
+    /// archives the objects HFS has read. A row is written when every one of
+    /// its resources has a receipt; failed when HFS reports an error naming
+    /// one of them; otherwise its outcome stays unknown and it is submitted
+    /// again (missing or unreadable receipts are no verdict).
     pub(super) async fn settle(
         &self,
         token: &str,
         references: &std::collections::HashSet<String>,
         errors: &[String],
     ) -> Result<()> {
-        let hint = match errors.len() {
-            0 => String::new(),
-            n => format!(" HFS reported {n} error(s); the first: {}", errors[0]),
-        };
         // Page through the submission: a large one holds a million records, and
         // each page's receipts are applied in sets.
         let mut after_id = 0;
+        let again = now_ms() + self.backoff_ms(2);
         loop {
             let page = self
                 .db
@@ -211,25 +243,55 @@ impl FeedRunner {
                 break;
             }
             let mut sent = Vec::with_capacity(page.len());
-            for (record_id, _, resources) in &page {
-                let reference = resources
-                    .get(0)
-                    .and_then(|r| transform::check_resource(r).ok())
-                    .map(|key| fhir::request_url(&key));
-                match reference {
-                    Some(r) if references.contains(&r) => {
-                        sent.push((*record_id, json!([{"reference": r, "via": "$bulk-submit"}])))
-                    }
-                    _ => self.db.mark_rejected(
+            let mut unknown = Vec::new();
+            for (record_id, run, _, resources) in &page {
+                after_id = *record_id;
+                let wanted: Option<Vec<String>> = resources
+                    .as_array()
+                    .filter(|r| !r.is_empty())
+                    .and_then(|r| {
+                        r.iter()
+                            .map(|r| {
+                                transform::check_resource(r)
+                                    .ok()
+                                    .map(|key| fhir::request_url(&key))
+                            })
+                            .collect()
+                    });
+                let Some(wanted) = wanted else {
+                    unknown.push((*record_id, *run));
+                    continue;
+                };
+                if wanted.iter().all(|r| references.contains(r)) {
+                    let receipts: Vec<serde_json::Value> = wanted
+                        .iter()
+                        .map(|r| json!({"reference": r, "via": "$bulk-submit"}))
+                        .collect();
+                    sent.push((*record_id, *run, serde_json::Value::Array(receipts)));
+                    continue;
+                }
+                let refused = wanted
+                    .iter()
+                    .filter(|r| !references.contains(*r))
+                    .find_map(|r| errors.iter().find(|e| e.contains(r.as_str())));
+                match refused {
+                    Some(error) => self.db.mark_failed(
                         *record_id,
+                        *run,
                         "server",
-                        &format!("no receipt from HFS for this resource.{hint}"),
+                        &format!("HFS refused it: {error}"),
+                        None,
                         None,
                     )?,
+                    None => unknown.push((*record_id, *run)),
                 }
-                after_id = *record_id;
             }
             self.db.mark_sent_many(&sent)?;
+            self.db.resubmit(
+                &unknown,
+                again,
+                "no receipt from HFS confirms this row yet; it is submitted again",
+            )?;
         }
         self.archive_submission(token).await?;
         self.remove_submission_files(token).await;
@@ -314,8 +376,7 @@ impl FeedRunner {
                         let dir = self.bulk_dir.join(&token);
                         std::fs::create_dir_all(&dir)
                             .with_context(|| format!("creating {}", dir.display()))?;
-                        std::fs::write(dir.join(&name), &bytes)
-                            .with_context(|| format!("writing {}", dir.join(&name).display()))?;
+                        bulk::write_served(&self.db, &dir.join(&name), &bytes)?;
                         bulk.file_url(&token, n)
                     }
                 };

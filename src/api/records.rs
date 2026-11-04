@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use super::body::LooseJson;
 use super::{ApiError, ApiResult, AppState, not_found};
+use crate::db::Reprocess;
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -73,8 +74,17 @@ async fn reprocess(
     body: Option<LooseJson<ReprocessBody>>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let raw = body.and_then(|LooseJson(b)| b.raw);
-    if !s.db.reprocess(id, raw.as_ref())? {
-        return Err(not_found("record_not_found", &format!("record {id}")));
+    match s.db.reprocess(id, raw.as_ref())? {
+        Reprocess::Done => {}
+        Reprocess::NotFound => {
+            return Err(not_found("record_not_found", &format!("record {id}")));
+        }
+        Reprocess::InFlight => {
+            return Err(ApiError::conflict(
+                "record_in_flight",
+                "a write of this record is not settled yet, or a retry runs it; reprocess it once it settles",
+            ));
+        }
     }
     Ok((
         StatusCode::ACCEPTED,

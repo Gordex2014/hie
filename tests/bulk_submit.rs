@@ -24,6 +24,8 @@ struct Submission {
 struct Consumer {
     base: Arc<Mutex<String>>,
     submissions: Arc<Mutex<HashMap<String, Submission>>>,
+    /// Leaves the first resource of the next submission without a receipt.
+    drop_first_receipt: Arc<Mutex<bool>>,
 }
 
 fn param<'a>(body: &'a Value, name: &str) -> Option<&'a Value> {
@@ -70,6 +72,9 @@ async fn kickoff(State(c): State<Consumer>, Json(body): Json<Value>) -> impl Int
                 Err(e) => sub.errors.push(format!("invalid JSON: {e}")),
             }
         }
+    }
+    if std::mem::take(&mut *c.drop_first_receipt.lock().unwrap()) && !sub.references.is_empty() {
+        sub.references.remove(0);
     }
     c.submissions.lock().unwrap().insert(id.clone(), sub);
     (
@@ -177,6 +182,7 @@ async fn an_ndjson_drop_goes_through_bulk_submit_and_its_receipts_come_back() {
     let consumer = Consumer {
         base: Arc::default(),
         submissions: Arc::default(),
+        drop_first_receipt: Arc::default(),
     };
     let (hfs_listener, hfs_url) = bind().await;
     *consumer.base.lock().unwrap() = hfs_url.clone();
@@ -262,6 +268,8 @@ async fn an_ndjson_drop_goes_through_bulk_submit_and_its_receipts_come_back() {
     );
 
     // Pass 2: HFS is still working.
+    // The first receipt poll waits the delivery's initial backoff.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     runner.tick().await.unwrap();
     assert_eq!(db.feed_counts("exports").unwrap()["submitted"], 2);
 
@@ -328,6 +336,7 @@ async fn a_csv_is_transformed_and_submitted_in_bulk() {
     let consumer = Consumer {
         base: Arc::default(),
         submissions: Arc::default(),
+        drop_first_receipt: Arc::default(),
     };
     let (hfs_listener, hfs_url) = bind().await;
     *consumer.base.lock().unwrap() = hfs_url.clone();
@@ -423,6 +432,8 @@ async fn a_csv_is_transformed_and_submitted_in_bulk() {
     }
 
     // Passes 2 and 3: the receipts arrive, the record is sent, the engine's file goes.
+    // The first receipt poll waits the delivery's initial backoff.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     runner.tick().await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
     runner.tick().await.unwrap();
@@ -477,6 +488,7 @@ async fn a_zipped_export_is_staged_and_submitted() {
     let consumer = Consumer {
         base: Arc::default(),
         submissions: Arc::default(),
+        drop_first_receipt: Arc::default(),
     };
     let (hfs_listener, hfs_url) = bind().await;
     *consumer.base.lock().unwrap() = hfs_url.clone();
@@ -584,6 +596,8 @@ async fn a_zipped_export_is_staged_and_submitted() {
     }
 
     // Passes 2 and 3: receipts in, records settled, staged entries removed.
+    // The first receipt poll waits the delivery's initial backoff.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     runner.tick().await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
     runner.tick().await.unwrap();
@@ -633,6 +647,7 @@ async fn the_first_load_goes_in_bulk_and_the_next_by_rest() {
     let consumer = Consumer {
         base: Arc::default(),
         submissions: Arc::default(),
+        drop_first_receipt: Arc::default(),
     };
     let (hfs_listener, hfs_url) = bind().await;
     *consumer.base.lock().unwrap() = hfs_url.clone();
@@ -680,6 +695,8 @@ async fn the_first_load_goes_in_bulk_and_the_next_by_rest() {
     std::fs::copy(repo().join("examples/data/labs.csv"), inbox.join("a.csv")).unwrap();
     runner.tick().await.unwrap();
     assert_eq!(db.feed_counts("labs").unwrap()["submitted"], 3);
+    // The first receipt poll waits the delivery's initial backoff.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     runner.tick().await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
     runner.tick().await.unwrap();
@@ -699,4 +716,105 @@ async fn the_first_load_goes_in_bulk_and_the_next_by_rest() {
         2,
         "one submission, one batch"
     );
+}
+
+/// A row without a receipt is no failure: its outcome stays unknown and it is
+/// submitted again; the NDJSON the engine serves is sealed on disk, and the
+/// first receipt poll is scheduled after the kick-off.
+#[tokio::test]
+async fn a_row_without_its_receipt_stays_unknown_and_goes_again() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let consumer = Consumer {
+        base: Arc::default(),
+        submissions: Arc::default(),
+        drop_first_receipt: Arc::new(Mutex::new(true)),
+    };
+    let (hfs_listener, hfs_url) = bind().await;
+    *consumer.base.lock().unwrap() = hfs_url.clone();
+    let hfs = Router::new()
+        .route("/$bulk-submit", post(kickoff))
+        .route("/$bulk-submit-status", post(status_kickoff))
+        .route("/bulk-submit-status/{id}", get(poll))
+        .route("/bulk-submit-file/{id}/{part}", get(artifact))
+        .with_state(consumer.clone());
+    tokio::spawn(async move { axum::serve(hfs_listener, hfs).await.unwrap() });
+    let (hie_listener, hie_url) = bind().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::copy(
+        repo().join("transforms/lab_results.py"),
+        root.join("transforms/lab_results.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {hfs_url}\npublic_url: {hie_url}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sources/labs.yaml"),
+        "id: labs\nname: Labs\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 60\n  min_file_age_ms: 0\n\
+         transform: transforms/lab_results.py\ndelivery:\n  method: bulk_submit\n  initial_backoff_ms: 10\n  max_backoff_ms: 20\n",
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    manager.pause("labs", None).unwrap();
+    let runner = manager.runner("labs").unwrap();
+    let db = state.db.clone();
+    let bulk_dir = state.bulk_dir.clone();
+    let router = hie::api::router(state);
+    tokio::spawn(async move { axum::serve(hie_listener, router).await.unwrap() });
+    let inbox = root.join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::copy(repo().join("examples/data/labs.csv"), inbox.join("a.csv")).unwrap();
+
+    runner.tick().await.unwrap();
+    assert_eq!(db.feed_counts("labs").unwrap()["submitted"], 3);
+    // The file HFS fetched is sealed where the engine keeps it.
+    let token = db.query_json("SELECT token FROM submissions", []).unwrap()[0]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let on_disk = std::fs::read_to_string(bulk_dir.join(&token).join("1.ndjson")).unwrap();
+    assert!(
+        !on_disk.contains("resourceType") && !on_disk.contains("Patient/"),
+        "{on_disk}"
+    );
+    assert!(
+        db.next_attempt_at("labs").unwrap().is_some(),
+        "the first poll is scheduled"
+    );
+
+    for _ in 0..2 {
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        runner.tick().await.unwrap();
+    }
+    let counts = db.feed_counts("labs").unwrap();
+    assert_eq!(
+        (counts["sent"].as_i64(), counts["rejected"].as_i64()),
+        (Some(2), Some(0)),
+        "{counts}"
+    );
+    let load = db.load_views("labs", None, None, false, 1).unwrap()[0].clone();
+    assert_eq!(load["rows"]["outcome_unknown"], 1, "{load}");
+    assert!(
+        !bulk_dir.join(&token).exists(),
+        "served file removed after the receipts"
+    );
+
+    // Submitted again, this time with its receipt.
+    for _ in 0..3 {
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        runner.tick().await.unwrap();
+    }
+    let counts = db.feed_counts("labs").unwrap();
+    assert_eq!(counts["sent"], 3, "{counts}");
+    assert_eq!(consumer.submissions.lock().unwrap().len(), 2);
 }

@@ -36,8 +36,13 @@ async fn bulk_file(
         s.db.submission_file(&token, file_id)?
             .ok_or_else(|| not_found("not_found", "file"))?
     };
-    let bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|_| not_found("not_found", "file"))?;
+    // What the engine wrote under `bulk_dir` is sealed: opened as it is served.
+    let (db, dir) = (s.db.clone(), s.bulk_dir.clone());
+    let bytes = tokio::task::spawn_blocking(move || {
+        crate::bulk::read_served(&db, &dir, std::path::Path::new(&path))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?
+    .map_err(|_| not_found("not_found", "file"))?;
     Ok(([(header::CONTENT_TYPE, "application/fhir+ndjson")], bytes).into_response())
 }

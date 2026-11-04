@@ -13,7 +13,8 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::engine::Conn;
-use super::{Db, Param, now_ms, params};
+use super::loads::Column;
+use super::{Db, Param, Tx, now_ms, params};
 use crate::ids::{self, Kind};
 use crate::versions::VersionRef;
 
@@ -70,6 +71,10 @@ CREATE TABLE IF NOT EXISTS retries (
 CREATE INDEX IF NOT EXISTS retries_load ON retries(load_id, accepted_at);
 CREATE INDEX IF NOT EXISTS retries_feed_status ON retries(feed_id, status);
 CREATE INDEX IF NOT EXISTS retries_version ON retries(transform_id, transform_version);
+CREATE TABLE IF NOT EXISTS retry_claims (
+  record_id INTEGER NOT NULL PRIMARY KEY,
+  retry_id TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS retry_rows (
   retry_id TEXT NOT NULL,
   record_id INTEGER NOT NULL,
@@ -130,6 +135,10 @@ pub struct PeriodCounts {
 /// What a retry asked for is refused for, in the order the contract checks.
 #[derive(Debug)]
 pub enum RetryRefusal {
+    /// The load or the group is gone (`404`).
+    GroupNotFound,
+    /// The version's transform was deleted (`409 transform_deleted`).
+    TransformDeleted,
     /// The group's failing rows lost their content (`410 content_expired`).
     ContentExpired,
     /// An unfinished retry covers the group's rows (`409 retry_in_progress`).
@@ -419,114 +428,206 @@ impl Db {
                 (
                     r.i64(0),
                     r.i64(1),
-                    self.unseal(r.get(2)).unwrap_or(Value::Null),
+                    self.open_record(Some(r.i64(0)), Column::Raw, r.get(2))
+                        .unwrap_or(Value::Null),
                 )
             })
             .collect())
     }
 
-    /// The ids, lines and attempts of the group's failing rows, in line order.
-    pub fn group_records(&self, group: &Group, limit: usize) -> Result<Vec<Value>> {
-        self.query_json(
-            "SELECT id, line, run AS attempts FROM records
-             WHERE file_id = $1 AND group_id = $2 AND status = 'rejected' ORDER BY line, id LIMIT $3",
-            params![group.load_id, group.id, limit],
-        )
+    /// The ids, lines and attempts of the group's failing rows in (line, id)
+    /// order: those after `after` (forwards), or the last ones before
+    /// `before` (backwards, answered in order), at most `limit`.
+    pub fn group_records(
+        &self,
+        group: &Group,
+        after: Option<(i64, i64)>,
+        before: Option<(i64, i64)>,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
+        let (cond, order, key) = match (after, before) {
+            (_, Some(k)) => ("AND (line < $3 OR (line = $3 AND id < $4))", "DESC", k),
+            (Some(k), None) => ("AND (line > $3 OR (line = $3 AND id > $4))", "ASC", k),
+            (None, None) => (
+                "AND CAST($3 AS BIGINT) IS NOT NULL AND CAST($4 AS BIGINT) IS NOT NULL",
+                "ASC",
+                (0, 0),
+            ),
+        };
+        let mut rows = self.query_json(
+            &format!(
+                "SELECT id, line, run AS attempts FROM records
+                 WHERE file_id = $1 AND group_id = $2 AND status = 'rejected' {cond}
+                 ORDER BY line {order}, id {order} LIMIT $5"
+            ),
+            params![group.load_id, group.id, key.0, key.1, limit],
+        )?;
+        if before.is_some() {
+            rows.reverse();
+        }
+        Ok(rows)
     }
 
     // ---- retries ---------------------------------------------------------------
 
-    /// Accepts a retry of a group's failing rows with `version`, claiming them
-    /// in the same transaction so two retries never cover one row. The rows go
-    /// back to the start, run by the retry's version.
+    /// Accepts a retry of a group's failing rows with `version`, in a
+    /// transaction of its own (see [`Db::create_retry_in`]).
     pub fn create_retry(&self, group: &Group, version: &VersionRef) -> Result<Value, RetryRefusal> {
+        self.transaction(|tx: &mut Tx<'_>| -> Result<Result<Value, RetryRefusal>> {
+            Self::create_retry_in(tx, group.load_id, &group.id, version)
+        })?
+    }
+
+    /// Accepts a retry inside the caller's transaction (so an idempotency
+    /// answer commits with it): the load is locked first, so acceptances of
+    /// one load are serialized across connections, and every refusal is
+    /// checked again under that lock. The group's failing rows are claimed
+    /// (`retry_claims`: a record is in at most one active retry, the store
+    /// enforces it) and go back to the start, run by the retry's version,
+    /// which is fixed now while its transform is held live.
+    pub fn create_retry_in(
+        tx: &mut Tx<'_>,
+        load_id: i64,
+        group_id: &str,
+        version: &VersionRef,
+    ) -> Result<Result<Value, RetryRefusal>> {
+        // The load's row lock (a writer from here on, on SQLite).
+        let feed = tx
+            .conn
+            .query(
+                "UPDATE files SET status = status WHERE id = $1 RETURNING feed_id",
+                &params![load_id],
+            )?
+            .first()
+            .map(|r| r.string(0));
+        let Some(feed) = feed else {
+            return Ok(Err(RetryRefusal::GroupNotFound));
+        };
+        if tx
+            .conn
+            .query(
+                "SELECT 1 FROM failure_groups WHERE id = $1 AND load_id = $2",
+                &params![group_id, load_id],
+            )?
+            .is_empty()
+        {
+            return Ok(Err(RetryRefusal::GroupNotFound));
+        }
+        if !super::loads::live_transform(tx, &version.transform_id)? {
+            return Ok(Err(RetryRefusal::TransformDeleted));
+        }
+        let c = &mut *tx.conn;
+        let rows = c.query(
+            "SELECT id, content FROM records WHERE file_id = $1 AND group_id = $2 AND status = 'rejected' ORDER BY id",
+            &params![load_id, group_id],
+        )?;
+        if rows.iter().any(|r| r.opt_string(1).is_some()) {
+            return Ok(Err(RetryRefusal::ContentExpired));
+        }
+        let unfinished = c.query(
+            &format!(
+                "SELECT t.id FROM retries t WHERE t.load_id = $1 AND t.status IN {UNFINISHED} AND t.group_id = $2
+                 UNION SELECT k.retry_id FROM retry_claims k JOIN records r ON r.id = k.record_id
+                 WHERE r.file_id = $1 AND r.group_id = $2"
+            ),
+            &params![load_id, group_id],
+        )?;
+        if let Some(other) = unfinished.first() {
+            return Ok(Err(RetryRefusal::InProgress(other.string(0))));
+        }
+        if rows.is_empty() {
+            return Ok(Err(RetryRefusal::NothingToRetry));
+        }
         let id = ids::new(Kind::Retry);
-        let created = self.atomically(|c| {
-            let unfinished = c.query(
+        let previous = c
+            .query(
+                "SELECT id FROM retries WHERE load_id = $1 AND group_id = $2 ORDER BY accepted_at DESC, id DESC LIMIT 1",
+                &params![load_id, group_id],
+            )?
+            .first()
+            .map(|r| r.string(0));
+        let now = now_ms();
+        c.execute(
+            "INSERT INTO retries (id, load_id, feed_id, group_id, transform_id, transform_version, status, rows, previous, accepted_at)
+             VALUES ($1, $2, $3, $4, $5, $6, 'queued', $7, $8, $9)",
+            &params![
+                id,
+                load_id,
+                feed,
+                group_id,
+                version.transform_id,
+                version.version,
+                rows.len(),
+                previous,
+                now
+            ],
+        )?;
+        let ids: Vec<i64> = rows.iter().map(|r| r.i64(0)).collect();
+        for chunk in ids.chunks(IDS_PER_STATEMENT) {
+            // The claim: a primary key per record, so no second active retry
+            // can take a row even if acceptance were not serialized.
+            let claims: Vec<String> = (0..chunk.len())
+                .map(|i| format!("(${}, $1)", i + 2))
+                .collect();
+            let mut values: Vec<Param> = vec![Param::Text(id.clone())];
+            values.extend(chunk.iter().map(|i| Param::Int(*i)));
+            c.execute(
                 &format!(
-                    "SELECT DISTINCT t.id FROM retries t JOIN retry_rows rr ON rr.retry_id = t.id
-                     JOIN records r ON r.id = rr.record_id
-                     WHERE t.load_id = $1 AND t.status IN {UNFINISHED}
-                       AND (t.group_id = $2 OR r.group_id = $2)"
+                    "INSERT INTO retry_claims (record_id, retry_id) VALUES {}",
+                    claims.join(", ")
                 ),
-                &params![group.load_id, group.id],
+                &values,
             )?;
-            let rows = c.query(
-                "SELECT id, content FROM records WHERE file_id = $1 AND group_id = $2 AND status = 'rejected' ORDER BY id",
-                &params![group.load_id, group.id],
-            )?;
-            if !rows.is_empty() && rows.iter().any(|r| r.opt_string(1).is_some()) {
-                return Ok(Err(RetryRefusal::ContentExpired));
-            }
-            if let Some(other) = unfinished.first() {
-                return Ok(Err(RetryRefusal::InProgress(other.string(0))));
-            }
-            if rows.is_empty() {
-                return Ok(Err(RetryRefusal::NothingToRetry));
-            }
-            let feed = c
-                .query("SELECT feed_id FROM files WHERE id = $1", &params![group.load_id])?
-                .first()
-                .map(|r| r.string(0))
-                .unwrap_or_default();
-            let previous = c
-                .query(
-                    "SELECT id FROM retries WHERE load_id = $1 AND group_id = $2 ORDER BY accepted_at DESC, id DESC LIMIT 1",
-                    &params![group.load_id, group.id],
-                )?
-                .first()
-                .map(|r| r.string(0));
-            let now = now_ms();
+            let rows_sql: Vec<String> = (0..chunk.len())
+                .map(|i| format!("($1, ${})", i + 2))
+                .collect();
             c.execute(
-                "INSERT INTO retries (id, load_id, feed_id, group_id, transform_id, transform_version, status, rows, previous, accepted_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, 'queued', $7, $8, $9)",
-                &params![
-                    id,
-                    group.load_id,
-                    feed,
-                    group.id,
-                    version.transform_id,
-                    version.version,
-                    rows.len(),
-                    previous,
-                    now
-                ],
+                &format!(
+                    "INSERT INTO retry_rows (retry_id, record_id) VALUES {}",
+                    rows_sql.join(", ")
+                ),
+                &values,
             )?;
-            let ids: Vec<i64> = rows.iter().map(|r| r.i64(0)).collect();
-            for chunk in ids.chunks(IDS_PER_STATEMENT) {
-                let marks: Vec<String> = (0..chunk.len()).map(|i| format!("${}", i + 5)).collect();
-                let mut values: Vec<Param> = params![id, version.transform_id, version.version, now].to_vec();
-                values.extend(chunk.iter().map(|i| Param::Int(*i)));
-                c.execute(
-                    &format!(
-                        "UPDATE records SET status = 'received', exec_retry = $1, exec_transform_id = $2, exec_version = $3,
-                                run = run + 1, resources = NULL, resource_count = NULL, resource_types = NULL, response = NULL,
-                                error_kind = NULL, error = NULL, attempts = 0, next_attempt_at = 0, submission = NULL,
-                                uncertain = 0, waiting = NULL, dispatch = NULL, validated = 0, updated_at = $4
-                         WHERE id IN ({})",
-                        marks.join(", ")
-                    ),
-                    &values,
-                )?;
-                let rows_sql: Vec<String> = (0..chunk.len()).map(|i| format!("($1, ${})", i + 2)).collect();
-                let mut values: Vec<Param> = vec![Param::Text(id.clone())];
-                values.extend(chunk.iter().map(|i| Param::Int(*i)));
-                c.execute(
-                    &format!("INSERT INTO retry_rows (retry_id, record_id) VALUES {}", rows_sql.join(", ")),
-                    &values,
-                )?;
-            }
-            append_events(c, &ids, "retried", None)?;
-            c.execute(
-                "UPDATE files SET status = 'processing', finished_at = NULL WHERE id = $1",
-                &params![group.load_id],
+            let marks: Vec<String> = (0..chunk.len()).map(|i| format!("${}", i + 6)).collect();
+            let mut values: Vec<Param> =
+                params![id, version.transform_id, version.version, now, group_id].to_vec();
+            values.extend(chunk.iter().map(|i| Param::Int(*i)));
+            let claimed = c.execute(
+                &format!(
+                    "UPDATE records SET status = 'received', exec_retry = $1, exec_transform_id = $2, exec_version = $3,
+                            run = run + 1, resources = NULL, resource_count = NULL, resource_types = NULL, response = NULL,
+                            error_kind = NULL, error = NULL, attempts = 0, next_attempt_at = 0, submission = NULL,
+                            uncertain = 0, waiting = NULL, dispatch = NULL, validated = 0, updated_at = $4
+                     WHERE id IN ({}) AND status = 'rejected' AND group_id = $5",
+                    marks.join(", ")
+                ),
+                &values,
             )?;
-            Ok(Ok(()))
-        })?;
-        created?;
-        Ok(self
-            .retry(group.load_id, &id)?
-            .ok_or_else(|| anyhow::anyhow!("retry {id} not stored"))?)
+            anyhow::ensure!(
+                claimed == chunk.len() as u64,
+                "the group's rows changed while the retry was accepted"
+            );
+        }
+        append_events(c, &ids, "retried", None)?;
+        c.execute(
+            "UPDATE files SET status = 'processing', finished_at = NULL WHERE id = $1",
+            &params![load_id],
+        )?;
+        Ok(Ok(json!({
+            "id": id,
+            "load": load_id,
+            "group": group_id,
+            "transform": {"id": version.transform_id, "version": version.version},
+            "status": "queued",
+            "rows": rows.len(),
+            "written": 0,
+            "failed": 0,
+            "outcome_unknown": 0,
+            "waiting": null,
+            "previous": previous,
+            "accepted_at": at(Some(now)),
+            "finished_at": null,
+        })))
     }
 
     fn retries_where(&self, condition: &str, p: &[Param]) -> Result<Vec<Value>> {
@@ -613,9 +714,8 @@ impl Db {
         let busy: Vec<String> = self
             .query(
                 &format!(
-                    "SELECT DISTINCT r.group_id FROM retries t JOIN retry_rows rr ON rr.retry_id = t.id
-                     JOIN records r ON r.id = rr.record_id
-                     WHERE t.load_id = $1 AND t.status IN {UNFINISHED} AND r.group_id IS NOT NULL
+                    "SELECT DISTINCT r.group_id FROM retry_claims k JOIN records r ON r.id = k.record_id
+                     WHERE r.file_id = $1 AND r.group_id IS NOT NULL
                      UNION SELECT group_id FROM retries WHERE load_id = $1 AND status IN {UNFINISHED}"
                 ),
                 &params![load_id],
@@ -666,6 +766,7 @@ impl Db {
                 ),
                 &params![id, r.i64(1), r.i64(2), now_ms()],
             )?;
+            self.execute("DELETE FROM retry_claims WHERE retry_id = $1", &params![id])?;
             done.push(id);
         }
         Ok(done)
@@ -867,49 +968,58 @@ mod tests {
         }
     }
 
-    /// Retries asked for at once never cover a row twice: one claims the
-    /// group's rows, the others see it in progress.
+    /// Retries asked for at once, through separate handles on one store (two
+    /// connections, as two engines on one store), never cover a row twice:
+    /// one claims the group's rows, the others see it in progress. On
+    /// PostgreSQL with `HIE_TEST_DATABASE_URL`, both handles share a schema.
     #[test]
     fn concurrent_retries_of_a_group_claim_its_rows_once() {
-        let db = Arc::new(Db::in_memory().unwrap());
-        let load = db
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hie.db");
+        let a = Arc::new(Db::open(&path).unwrap());
+        let b = Arc::new(Db::open(&path).unwrap());
+        let load = a
             .open_load("src", "a.csv", "sha", 3, None, Some(&version(1)))
             .unwrap();
-        db.insert_records(
+        a.insert_records(
             load,
             "src",
             &[(1, json!({"v": "x"}), None), (2, json!({"v": "y"}), None)],
         )
         .unwrap();
-        for item in db.received_records("src", 10).unwrap() {
-            db.mark_failed(
+        for item in a.received_records("src", 10).unwrap() {
+            a.mark_failed(
                 item.id,
+                item.run,
                 "data",
                 "not a number",
                 None,
-                Some(&json!({"line": 3})),
+                Some(&json!({"line": 3, "stdout": "never kept"})),
             )
             .unwrap();
         }
-        let failures = db.load_failures(load).unwrap();
+        let failures = a.load_failures(load).unwrap();
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0]["count"], 2);
         assert_eq!(failures[0]["location"], json!({"line": 3}));
-        let group = db
+        let group = a
             .failure_group(load, failures[0]["group"].as_str().unwrap())
             .unwrap()
             .unwrap();
         let outcomes: Vec<Result<Value, RetryRefusal>> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..8)
-                .map(|_| {
-                    let (db, group) = (db.clone(), group.clone());
+                .map(|n| {
+                    let (db, group) = (
+                        if n % 2 == 0 { a.clone() } else { b.clone() },
+                        group.clone(),
+                    );
                     s.spawn(move || db.create_retry(&group, &version(2)))
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         let accepted: Vec<&Value> = outcomes.iter().filter_map(|o| o.as_ref().ok()).collect();
-        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted.len(), 1, "{outcomes:?}");
         assert_eq!(accepted[0]["rows"], 2);
         assert_eq!(accepted[0]["transform"], json!({"id": "lab", "version": 2}));
         assert!(outcomes.iter().all(|o| match o {
@@ -917,13 +1027,29 @@ mod tests {
             Err(RetryRefusal::InProgress(id)) => *id == accepted[0]["id"],
             Err(_) => false,
         }));
+        // The store holds one claim per row, for that retry.
+        let claims = b
+            .query(
+                "SELECT record_id, retry_id FROM retry_claims ORDER BY record_id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(claims.len(), 2);
+        assert!(
+            claims
+                .iter()
+                .all(|c| Some(c.string(1).as_str()) == accepted[0]["id"].as_str())
+        );
         // The claimed rows run the retry's version.
-        let items = db.received_records("src", 10).unwrap();
+        let items = b.received_records("src", 10).unwrap();
         assert_eq!(items.len(), 2);
-        assert!(items.iter().all(|i| i.retry.as_ref()
-            == accepted[0]["id"].as_str().map(str::to_string).as_ref()
-            && i.version.as_ref().map(|v| v.version) == Some(2)));
-        let history = db.record_history(items[0].id).unwrap().unwrap();
+        assert!(
+            items
+                .iter()
+                .all(|i| i.retry.as_deref() == accepted[0]["id"].as_str()
+                    && i.version.as_ref().map(|v| v.version) == Some(2))
+        );
+        let history = b.record_history(items[0].id).unwrap().unwrap();
         let kinds: Vec<&str> = history["events"]
             .as_array()
             .unwrap()
@@ -933,6 +1059,14 @@ mod tests {
         assert_eq!(kinds, ["admitted", "failed", "retried"]);
         assert_eq!(history["events"][2]["transform"]["version"], 2);
         assert_eq!(history["events"][1]["transform"]["version"], 1);
+        // A stale result of the attempt the retry replaced is dropped.
+        a.mark_transformed(
+            items[0].id,
+            items[0].run - 1,
+            &json!([{"resourceType": "Patient"}]),
+        )
+        .unwrap();
+        assert_eq!(b.received_records("src", 10).unwrap().len(), 2);
     }
 
     /// Content is sealed in the store's files and opened when read.
@@ -949,7 +1083,7 @@ mod tests {
         )
         .unwrap();
         let stored = db.query("SELECT raw FROM records", &[]).unwrap();
-        assert!(stored[0].string(0).starts_with("v1."));
+        assert!(stored[0].string(0).starts_with("c1."));
         assert_eq!(
             db.query_json("SELECT raw FROM records", []).unwrap()[0]["raw"]["patient"],
             "zq-secret-marker"
