@@ -160,10 +160,17 @@ pub(super) fn mssql_row(row: &tiberius::Row) -> Map<String, Value> {
                         .ok()
                         .map(|v| v.map_or(Value::Null, |n| Value::from(n as f64)))
                 }),
+            // `Numeric` holds any scale up to 38 (a 28-digit decimal cannot,
+            // and panics past it); money arrives as a float.
             T::Decimaln | T::Numericn | T::Money | T::Money4 => row
-                .try_get::<tiberius::numeric::Decimal, _>(i)
+                .try_get::<tiberius::numeric::Numeric, _>(i)
                 .ok()
-                .map(|v| v.map_or(Value::Null, |d| number(&d.to_string()))),
+                .map(|v| v.map_or(Value::Null, |n| number(&numeric_text(n.value(), n.scale()))))
+                .or_else(|| {
+                    row.try_get::<f64, _>(i)
+                        .ok()
+                        .map(|v| v.map_or(Value::Null, Value::from))
+                }),
             T::Guid => row
                 .try_get::<tiberius::Uuid, _>(i)
                 .ok()
@@ -222,10 +229,39 @@ pub(super) fn sqlite_row(row: &SqliteRow) -> Map<String, Value> {
     out
 }
 
+/// A fixed-point value (`value` × 10^-`scale`) as decimal text, exactly.
+fn numeric_text(value: i128, scale: u8) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let scale = scale as usize;
+    let sign = if value < 0 { "-" } else { "" };
+    if scale == 0 {
+        return format!("{sign}{digits}");
+    }
+    let digits = format!("{digits:0>width$}", width = scale + 1);
+    let (int, frac) = digits.split_at(digits.len() - scale);
+    format!("{sign}{int}.{frac}")
+}
+
 /// A decimal as a JSON number when it fits one, as text otherwise.
 fn number(text: &str) -> Value {
     serde_json::from_str::<Value>(text)
         .ok()
         .filter(Value::is_number)
         .unwrap_or_else(|| Value::String(text.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::numeric_text;
+
+    #[test]
+    fn fixed_point_values_are_written_exactly() {
+        assert_eq!(
+            numeric_text(1_000_000_000_000_000_000_000_000_000_001, 30),
+            "1.000000000000000000000000000001"
+        );
+        assert_eq!(numeric_text(-12345, 4), "-1.2345");
+        assert_eq!(numeric_text(5, 3), "0.005");
+        assert_eq!(numeric_text(42, 0), "42");
+    }
 }
