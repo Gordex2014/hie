@@ -517,8 +517,14 @@ impl Db {
             return Ok(Err(RetryRefusal::TransformDeleted));
         }
         let c = &mut *tx.conn;
+        // The group's rows are locked as a reprocess and a stored transaction
+        // lock theirs, so none of them changes while it is claimed.
+        let lock = super::loads::for_update(c);
         let rows = c.query(
-            "SELECT id, content FROM records WHERE file_id = $1 AND group_id = $2 AND status = 'rejected' ORDER BY id",
+            &format!(
+                "SELECT id, content FROM records WHERE file_id = $1 AND group_id = $2 AND status = 'rejected'
+                 ORDER BY id{lock}"
+            ),
             &params![load_id, group_id],
         )?;
         if rows.iter().any(|r| r.opt_string(1).is_some()) {

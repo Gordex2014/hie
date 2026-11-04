@@ -26,8 +26,10 @@ pub enum Poll {
     Done {
         /// `Type/id` of every resource HFS stored.
         references: HashSet<String>,
-        /// What HFS said about the lines it could not store.
-        errors: Vec<String>,
+        /// What HFS said about the lines it could not store: its
+        /// `OperationOutcome`s, whole (each is kept sealed with the row it is
+        /// about; only its first issue becomes the plaintext reason).
+        errors: Vec<Value>,
         /// Receipt lines that could not be read: the receipts are incomplete.
         malformed: usize,
     },
@@ -221,9 +223,7 @@ impl BulkSubmitter {
                 if let Some(file_url) = entry["url"].as_str() {
                     let (lines, bad) = self.lines(file_url).await?;
                     malformed += bad;
-                    for line in lines {
-                        errors.push(fhir::outcome_text(&line));
-                    }
+                    errors.extend(lines);
                 }
             }
             next = manifest["link"]

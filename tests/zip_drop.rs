@@ -329,6 +329,26 @@ async fn a_zip_unpacked_half_way_is_resumed_not_skipped() {
     )
     .unwrap();
 
+    // And the second entry's load opened, its rows never in (their insert
+    // rolled back): not admitted, so neither finished nor skipped.
+    let observations = b"{\"resourceType\":\"Observation\",\"id\":\"o1\",\"subject\":{\"reference\":\"Patient/p1\"}}\n";
+    let unadmitted = db
+        .open_load(
+            "drops",
+            "drop.zip!/out/Observation.ndjson",
+            &hie::formats::sha256_hex(observations),
+            observations.len() as u64,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(
+        db.finish_files("drops")
+            .unwrap()
+            .iter()
+            .all(|f| f.id != unadmitted),
+        "a load whose rows never went in is not finished"
+    );
     let runner = FeedRunner::with_source(
         feed,
         source,
@@ -341,6 +361,16 @@ async fn a_zip_unpacked_half_way_is_resumed_not_skipped() {
         "http://127.0.0.1:0",
     );
     runner.tick().await.unwrap();
+    let admitted = db
+        .query_json(
+            "SELECT COUNT(*) AS n FROM records WHERE file_id = $1",
+            hie::db::params![unadmitted],
+        )
+        .unwrap();
+    assert_eq!(
+        admitted[0]["n"], 1,
+        "the unadmitted entry is admitted into its load"
+    );
 
     let files = db
         .query_json("SELECT id, name, status FROM files ORDER BY id", [])

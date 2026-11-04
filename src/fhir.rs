@@ -577,6 +577,11 @@ fn issue_texts(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The text of an answer's first issue, if it has one.
+pub fn first_issue_text(body: &Value) -> Option<String> {
+    issue_texts(body).into_iter().next()
+}
+
 /// The reason HIE keeps for an answer: `HTTP <status>` and the text of its
 /// first issue; the rest of the answer stays only in the row's sealed
 /// response.

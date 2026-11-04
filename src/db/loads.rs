@@ -57,7 +57,8 @@ pub(super) const FILES: &str = "CREATE TABLE IF NOT EXISTS files (
   archived INTEGER NOT NULL DEFAULT 0,
   transform_id TEXT,
   transform_version INTEGER,
-  environment TEXT
+  environment TEXT,
+  admitted INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS files_feed_sha ON files(feed_id, sha256);
 CREATE INDEX IF NOT EXISTS files_feed_received ON files(feed_id, received_at);
@@ -131,6 +132,10 @@ pub(super) const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("records", "resource_count", "INTEGER"),
     ("records", "resource_types", "TEXT"),
     ("records", "validated", "INTEGER NOT NULL DEFAULT 0"),
+    // Whether a load's rows are all in: set with the rows, in their
+    // transaction. A load opened whose rows never went in is neither finished
+    // nor taken as admitted (loads from before the marker count as admitted).
+    ("files", "admitted", "INTEGER NOT NULL DEFAULT 1"),
 ];
 
 #[derive(Debug, Clone)]
@@ -284,6 +289,22 @@ fn resource_types(resources: &Value) -> (i64, String) {
     let types: Map<String, Value> = types.into_iter().map(|(k, v)| (k, json!(v))).collect();
     (n, Value::Object(types).to_string())
 }
+
+/// ` FOR UPDATE` on PostgreSQL, where a transaction locks the rows it reads
+/// only when asked; nothing on SQLite, whose `BEGIN IMMEDIATE` (see
+/// [`Db::atomically`]) already makes the whole transaction exclusive.
+pub(super) fn for_update(c: &Conn) -> &'static str {
+    match c {
+        Conn::Postgres(_) => " FOR UPDATE",
+        Conn::Sqlite(_) => "",
+    }
+}
+
+/// A record's eligibility for a new attempt, as a predicate on `records`: no
+/// write of it unresolved and no retry running it.
+pub(super) const NOT_IN_FLIGHT: &str =
+    "status <> 'submitted' AND dispatch IS NULL AND uncertain = 0
+     AND NOT EXISTS (SELECT 1 FROM retry_claims k WHERE k.record_id = records.id)";
 
 /// Holds a transform live for the rest of the transaction (the version
 /// store's lock, which its deletion takes too); `false` when it was deleted.
@@ -475,7 +496,7 @@ impl Db {
             {
                 let adopted = tx.execute(
                     "UPDATE files SET name = $2, sha256 = $3, size = $4, status = 'processing', received_at = $5,
-                            source_key = $6, transform_id = $7, transform_version = $8, environment = $9
+                            source_key = $6, transform_id = $7, transform_version = $8, environment = $9, admitted = 0
                      WHERE id = $1 AND status = 'queued'",
                     &params![queued, name, sha, size, now, source_key, transform_id, transform_version, environment],
                 )?;
@@ -484,8 +505,8 @@ impl Db {
                 }
             }
             tx.insert_returning_id(
-                "INSERT INTO files (feed_id, name, sha256, size, status, received_at, source_key, transform_id, transform_version, environment)
-                 VALUES ($1, $2, $3, $4, 'processing', $5, $6, $7, $8, $9)",
+                "INSERT INTO files (feed_id, name, sha256, size, status, received_at, source_key, transform_id, transform_version, environment, admitted)
+                 VALUES ($1, $2, $3, $4, 'processing', $5, $6, $7, $8, $9, 0)",
                 &params![feed, name, sha, size, now, source_key, transform_id, transform_version, environment],
             )
         })
@@ -512,7 +533,8 @@ impl Db {
     }
 
     /// The load an entry of `container` already has (made after it, by an
-    /// expansion that stopped half-way), and whether its rows are in.
+    /// expansion that stopped half-way), and whether its admission completed
+    /// (its rows went in, or it was found unreadable).
     pub fn entry_load(
         &self,
         container: i64,
@@ -522,13 +544,13 @@ impl Db {
     ) -> Result<Option<(i64, bool)>> {
         Ok(self
             .query_one(
-                "SELECT f.id, f.status, (SELECT COUNT(*) FROM records r WHERE r.file_id = f.id)
+                "SELECT f.id, f.admitted
                  FROM files f WHERE f.feed_id = $1 AND f.name = $2 AND f.sha256 = $3 AND f.id > $4
                    AND f.status NOT IN ('duplicate', 'unpacking')
                  ORDER BY f.id LIMIT 1",
                 &params![feed, name, sha, container],
             )?
-            .map(|r| (r.i64(0), r.i64(2) > 0 || r.string(1) != "processing")))
+            .map(|r| (r.i64(0), r.i64(1) == 1)))
     }
 
     /// Every entry of a zip was admitted: it is `unpacked`, read once.
@@ -652,7 +674,7 @@ impl Db {
 
     pub fn fail_file(&self, file_id: i64, error: &str) -> Result<()> {
         self.execute(
-            "UPDATE files SET status = 'unreadable', error = $2, finished_at = $3 WHERE id = $1",
+            "UPDATE files SET status = 'unreadable', error = $2, finished_at = $3, admitted = 1 WHERE id = $1",
             &params![file_id, error, now_ms()],
         )
         .map(drop)
@@ -667,7 +689,7 @@ impl Db {
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT),
                     f.rejected_reported
              FROM files f LEFT JOIN records r ON r.file_id = f.id
-             WHERE f.feed_id = $1 AND f.status IN ('processing', 'unpacked')
+             WHERE f.feed_id = $1 AND f.status IN ('processing', 'unpacked') AND f.admitted = 1
              GROUP BY f.id, f.name, f.rejected_reported
              HAVING COALESCE(SUM(CASE WHEN r.status IN ('received', 'pending', 'submitted') THEN 1 ELSE 0 END), 0) = 0",
             &params![feed],
@@ -873,7 +895,12 @@ impl Db {
         rows: &[(i64, Value, Option<String>)],
     ) -> Result<()> {
         if rows.is_empty() {
-            return Ok(());
+            return self
+                .execute(
+                    "UPDATE files SET admitted = 1 WHERE id = $1",
+                    &params![file_id],
+                )
+                .map(drop);
         }
         self.atomically(|c| {
             let now = now_ms();
@@ -949,6 +976,9 @@ impl Db {
                 };
                 fail_in(c, r.i64(0), None, &failure, None)?;
             }
+            // With the rows, never before: an admission that rolled back
+            // leaves the load unadmitted, to be admitted again.
+            c.execute("UPDATE files SET admitted = 1 WHERE id = $1", &params![file_id])?;
             Ok(())
         })
     }
@@ -1356,11 +1386,13 @@ impl Db {
     /// transaction, a submission, an unknown outcome) or a retry runs it.
     pub fn reprocess(&self, id: i64, raw: Option<&Value>) -> Result<Reprocess> {
         self.atomically(|c| {
+            // The record is locked before its eligibility is read, and the
+            // update checks it again: a stored transaction or a retry that
+            // takes it meanwhile cannot be erased.
+            let lock = for_update(c);
             let Some(row) = c
                 .query(
-                    "SELECT r.raw, r.original_raw, r.status, r.dispatch, r.uncertain, r.submission,
-                            EXISTS (SELECT 1 FROM retry_claims k WHERE k.record_id = r.id)
-                     FROM records r WHERE r.id = $1",
+                    &format!("SELECT raw, original_raw FROM records WHERE id = $1{lock}"),
                     &params![id],
                 )?
                 .into_iter()
@@ -1368,19 +1400,16 @@ impl Db {
             else {
                 return Ok(Reprocess::NotFound);
             };
-            let claimed = match row.get(6) {
-                Value::Bool(b) => *b,
-                other => other.as_i64().unwrap_or(0) != 0,
-            };
-            let in_flight = row.string(2) == "submitted"
-                || row.opt_string(3).is_some()
-                || row.i64(4) == 1
-                || claimed;
-            if in_flight {
+            if c.query(
+                &format!("SELECT 1 FROM records WHERE id = $1 AND {NOT_IN_FLIGHT}"),
+                &params![id],
+            )?
+            .is_empty()
+            {
                 return Ok(Reprocess::InFlight);
             }
             let now = now_ms();
-            match raw {
+            let updated = match raw {
                 Some(raw) => {
                     // The row as received is kept once, sealed for its own column.
                     let original = match row.opt_string(1) {
@@ -1390,26 +1419,29 @@ impl Db {
                             .map(|v| self.seal_record(id, Column::OriginalRaw, &v)),
                     };
                     c.execute(
-                        "UPDATE records SET status = 'received', original_raw = $2, raw = $3,
+                        &format!("UPDATE records SET status = 'received', original_raw = $2, raw = $3,
                                 content = NULL, resources = NULL, resource_count = NULL, resource_types = NULL,
                                 error_kind = NULL, error = NULL, response = NULL, attempts = 0, next_attempt_at = 0,
                                 run = run + 1, exec_retry = NULL, exec_transform_id = NULL, exec_version = NULL,
                                 uncertain = 0, waiting = NULL, dispatch = NULL, validated = 0, submission = NULL,
                                 updated_at = $4
-                         WHERE id = $1",
+                         WHERE id = $1 AND {NOT_IN_FLIGHT}"),
                         &params![id, original, self.seal_record(id, Column::Raw, raw), now],
                     )?
                 }
                 None => c.execute(
-                    "UPDATE records SET status = 'received', resources = NULL, resource_count = NULL, resource_types = NULL,
+                    &format!("UPDATE records SET status = 'received', resources = NULL, resource_count = NULL, resource_types = NULL,
                             error_kind = NULL, error = NULL, response = NULL, attempts = 0, next_attempt_at = 0,
                             run = run + 1, exec_retry = NULL, exec_transform_id = NULL, exec_version = NULL,
                             uncertain = 0, waiting = NULL, dispatch = NULL, validated = 0, submission = NULL,
                             updated_at = $2
-                     WHERE id = $1",
+                     WHERE id = $1 AND {NOT_IN_FLIGHT}"),
                     &params![id, now],
                 )?,
             };
+            if updated == 0 {
+                return Ok(Reprocess::InFlight);
+            }
             append_events(c, &[id], "retried", None)?;
             c.execute(
                 "UPDATE files SET status = 'processing', finished_at = NULL WHERE id = (SELECT file_id FROM records WHERE id = $1)",
@@ -1730,5 +1762,140 @@ mod tests {
         assert_eq!(reasons[0].string(0).chars().count(), REASON_MAX_CHARS + 1);
         let groups = db.query("SELECT reason FROM failure_groups", &[]).unwrap();
         assert_eq!(groups[0].string(0).chars().count(), REASON_MAX_CHARS + 1);
+    }
+
+    /// A transaction kept and a reprocess of the same row at once, through two
+    /// connections (on PostgreSQL with `HIE_TEST_DATABASE_URL`, two
+    /// connections to one schema): one of them wins, never both, so no stored
+    /// transaction keeps a row a reprocess replaced. The same holds for a retry
+    /// accepted while its row is reprocessed.
+    #[test]
+    fn a_reprocess_never_erases_a_transaction_or_a_retry_that_took_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hie.db");
+        let a = std::sync::Arc::new(Db::open(&path).unwrap());
+        let b = std::sync::Arc::new(Db::open(&path).unwrap());
+        let load = a.open_load("src", "a.csv", "sha", 3, None, None).unwrap();
+        for n in 0..25 {
+            a.insert_records(load, "src", &[(n, json!({"n": n}), None)])
+                .unwrap();
+            let item = a.received_records("src", 1).unwrap()[0].clone();
+            a.mark_transformed(
+                item.id,
+                item.run,
+                &json!([{"resourceType": "Patient", "id": "p"}]),
+            )
+            .unwrap();
+            let (kept, reprocessed) = std::thread::scope(|s| {
+                let keep = s.spawn(|| {
+                    a.create_dispatch("src", &json!({"bundle": {}}), &[(item.id, item.run)])
+                        .unwrap()
+                });
+                let redo = s.spawn(|| b.reprocess(item.id, None).unwrap());
+                (keep.join().unwrap(), redo.join().unwrap())
+            });
+            let row = &a
+                .query(
+                    "SELECT dispatch, run, status FROM records WHERE id = $1",
+                    &params![item.id],
+                )
+                .unwrap()[0];
+            match (&kept, reprocessed) {
+                (Some(d), Reprocess::InFlight) => {
+                    assert_eq!(
+                        (row.opt_string(0).as_deref(), row.i64(1)),
+                        (Some(d.as_str()), item.run)
+                    );
+                }
+                (None, Reprocess::Done) => {
+                    assert_eq!((row.opt_string(0), row.i64(1)), (None, item.run + 1));
+                }
+                other => panic!("both or neither took the row: {other:?}"),
+            }
+            // Settle the row either way for the next round.
+            a.execute(
+                "UPDATE records SET status = 'sent', dispatch = NULL WHERE id = $1",
+                &params![item.id],
+            )
+            .unwrap();
+        }
+        // A retry accepted while its row is reprocessed.
+        for n in 100..115 {
+            a.insert_records(load, "src", &[(n, json!({"n": n}), None)])
+                .unwrap();
+            let item = a.received_records("src", 1).unwrap()[0].clone();
+            a.mark_failed(item.id, item.run, "data", &format!("bad {n}"), None, None)
+                .unwrap();
+            let group = a
+                .load_failures(load)
+                .unwrap()
+                .into_iter()
+                .find(|g| g["reason"] == format!("bad {n}"))
+                .unwrap();
+            let group = a
+                .failure_group(load, group["group"].as_str().unwrap())
+                .unwrap()
+                .unwrap();
+            let version = crate::versions::VersionRef {
+                transform_id: "lab".into(),
+                version: 1,
+                code_sha256: "a".repeat(64),
+                environment: crate::versions::Environment::local(),
+            };
+            let (retried, reprocessed) = std::thread::scope(|s| {
+                let retry = s.spawn(|| a.create_retry(&group, &version));
+                let redo = s.spawn(|| b.reprocess(item.id, None).unwrap());
+                (retry.join().unwrap(), redo.join().unwrap())
+            });
+            match (&retried, reprocessed) {
+                (Ok(_), Reprocess::InFlight)
+                | (Err(super::super::RetryRefusal::NothingToRetry), Reprocess::Done) => {}
+                other => panic!("both or neither took the row: {other:?}"),
+            }
+            a.execute(
+                "UPDATE records SET status = 'sent' WHERE id = $1",
+                &params![item.id],
+            )
+            .unwrap();
+            a.execute("DELETE FROM retry_claims", &[]).unwrap();
+            a.execute("UPDATE retries SET status = 'done'", &[])
+                .unwrap();
+        }
+    }
+
+    /// A transaction is kept only when every row joins it as it was read: a
+    /// row a reprocess replaced since keeps the whole of it from being stored.
+    #[test]
+    fn a_transaction_is_kept_whole_or_not_at_all() {
+        let db = Db::in_memory().unwrap();
+        let load = db.open_load("src", "a.csv", "sha", 3, None, None).unwrap();
+        db.insert_records(load, "src", &[(1, json!({}), None), (2, json!({}), None)])
+            .unwrap();
+        let items = db.received_records("src", 10).unwrap();
+        for i in &items {
+            db.mark_transformed(
+                i.id,
+                i.run,
+                &json!([{"resourceType": "Patient", "id": "p"}]),
+            )
+            .unwrap();
+        }
+        assert_eq!(db.reprocess(items[1].id, None).unwrap(), Reprocess::Done);
+        let members: Vec<(i64, i64)> = items.iter().map(|i| (i.id, i.run)).collect();
+        assert_eq!(
+            db.create_dispatch("src", &json!({"bundle": {}}), &members)
+                .unwrap(),
+            None
+        );
+        assert!(
+            db.query("SELECT id FROM dispatches", &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.query("SELECT id FROM records WHERE dispatch IS NOT NULL", &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 }

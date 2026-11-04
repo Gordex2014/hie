@@ -70,6 +70,7 @@ impl FeedRunner {
             let mut file_ids = Vec::new();
             let mut records = 0usize;
             let mut hashes = Vec::new();
+            let mut generation = 0;
             for file in &files {
                 let url = match &file.source_key {
                     // An entry the engine keeps itself is served, never signed.
@@ -85,6 +86,12 @@ impl FeedRunner {
                 file_ids.push(file.file_id);
                 records += file.count;
                 hashes.push(file.name.clone());
+                generation = generation.max(file.attempts);
+            }
+            // Rows sent again after unconfirmed receipts are a new submission
+            // for the destination, not a repeat it would refuse as known.
+            if generation > 0 {
+                hashes.push(format!("attempt {generation}"));
             }
             let hash_refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
             let submission_id = bulk::submission_id(&self.feed.id, &hash_refs);
@@ -107,6 +114,7 @@ impl FeedRunner {
             return Ok(());
         };
         for sub in self.db.submissions_due(&self.feed.id)? {
+            let mut unresolved: Option<(usize, u32)> = None;
             let step = match sub.status.as_str() {
                 "kickoff" => {
                     match bulk
@@ -143,7 +151,7 @@ impl FeedRunner {
                             if malformed > 0 {
                                 tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, submission = %sub.submission_id, malformed, "receipt lines that could not be read; their rows stay unknown");
                             }
-                            self.settle(&sub.token, &references, &errors).await?;
+                            unresolved = self.settle(&sub.token, &references, &errors).await?;
                             Ok(Some(("done", None)))
                         }
                         Err(e) => Err(e),
@@ -171,7 +179,15 @@ impl FeedRunner {
                     self.db
                         .update_submission(&sub.token, status, url.as_deref(), 0, next, None)?;
                     if status == "done" {
-                        self.recovered()?;
+                        match unresolved.take() {
+                            // Rows the receipts left unconfirmed go again: their
+                            // attempts carry on, and so does the outage count.
+                            Some((rows, attempts)) => self.outage(
+                                attempts,
+                                &format!("the receipts confirmed neither the writing nor the refusal of {rows} row(s)"),
+                            )?,
+                            None => self.recovered()?,
+                        }
                     }
                 }
                 Err(SendError::Refused(status, body)) => {
@@ -224,17 +240,19 @@ impl FeedRunner {
     /// archives the objects HFS has read. A row is written when every one of
     /// its resources has a receipt; failed when HFS reports an error naming
     /// one of them; otherwise its outcome stays unknown and it is submitted
-    /// again (missing or unreadable receipts are no verdict).
+    /// again (missing or unreadable receipts are no verdict). Answers how many
+    /// rows went back that way and the most attempts one of them has had.
     pub(super) async fn settle(
         &self,
         token: &str,
         references: &std::collections::HashSet<String>,
-        errors: &[String],
-    ) -> Result<()> {
+        errors: &[serde_json::Value],
+    ) -> Result<Option<(usize, u32)>> {
         // Page through the submission: a large one holds a million records, and
         // each page's receipts are applied in sets.
         let mut after_id = 0;
         let again = now_ms() + self.backoff_ms(2);
+        let mut unresolved: Option<(usize, u32)> = None;
         loop {
             let page = self
                 .db
@@ -270,32 +288,40 @@ impl FeedRunner {
                     sent.push((*record_id, *run, serde_json::Value::Array(receipts)));
                     continue;
                 }
+                // An outcome that names one of its missing resources refuses it.
                 let refused = wanted
                     .iter()
                     .filter(|r| !references.contains(*r))
-                    .find_map(|r| errors.iter().find(|e| e.contains(r.as_str())));
+                    .find_map(|r| errors.iter().find(|e| e.to_string().contains(r.as_str())));
                 match refused {
-                    Some(error) => self.db.mark_failed(
+                    Some(outcome) => self.db.mark_failed(
                         *record_id,
                         *run,
                         "server",
-                        &format!("HFS refused it: {error}"),
-                        None,
+                        &match fhir::first_issue_text(outcome) {
+                            Some(text) => format!("HFS refused it: {text}"),
+                            None => "HFS refused it".to_string(),
+                        },
+                        Some(outcome),
                         None,
                     )?,
                     None => unknown.push((*record_id, *run)),
                 }
             }
             self.db.mark_sent_many(&sent)?;
-            self.db.resubmit(
-                &unknown,
-                again,
-                "no receipt from HFS confirms this row yet; it is submitted again",
-            )?;
+            if !unknown.is_empty() {
+                let worst = self.db.resubmit(
+                    &unknown,
+                    again,
+                    "no receipt from HFS confirms this row yet; it is submitted again",
+                )?;
+                let (rows, attempts) = unresolved.unwrap_or((0, 0));
+                unresolved = Some((rows + unknown.len(), attempts.max(worst)));
+            }
         }
         self.archive_submission(token).await?;
         self.remove_submission_files(token).await;
-        Ok(())
+        Ok(unresolved)
     }
 
     /// Drops what the engine wrote for a transformed submission, now that HFS has
@@ -332,6 +358,7 @@ impl FeedRunner {
             }
             // With validation required, nothing of the batch goes while the
             // destination cannot validate, and invalid rows never go.
+            let generation = items.iter().map(|i| i.attempts).max().unwrap_or(0);
             let records: Vec<(i64, serde_json::Value)> = match self.validate(&items).await? {
                 Checked::Held => return Ok(()),
                 Checked::Deliver(items) => items
@@ -388,7 +415,15 @@ impl FeedRunner {
                 record_ids[0],
                 record_ids[record_ids.len() - 1]
             );
-            let submission_id = bulk::submission_id(&self.feed.id, &[span.as_str()]);
+            // Rows sent again after unconfirmed receipts are a new submission
+            // for the destination, not a repeat it would refuse as known.
+            let generation = format!("attempt {generation}");
+            let parts: Vec<&str> = if generation == "attempt 0" {
+                vec![span.as_str()]
+            } else {
+                vec![span.as_str(), generation.as_str()]
+            };
+            let submission_id = bulk::submission_id(&self.feed.id, &parts);
             let manifest = bulk.manifest(&entries);
             self.db.create_submission(
                 &token,
@@ -401,10 +436,15 @@ impl FeedRunner {
         }
     }
 
+    /// Archives (or, staged by the engine, removes) the input objects of a
+    /// submission whose rows have all settled; one with rows still to be
+    /// submitted again stays where HFS can read it.
     pub(super) async fn archive_submission(&self, token: &str) -> Result<()> {
         let file_ids: Vec<i64> = {
             let rows = self.db.query_json(
-                "SELECT DISTINCT file_id FROM records WHERE submission = $1",
+                "SELECT DISTINCT r.file_id FROM records r WHERE r.submission = $1
+                   AND NOT EXISTS (SELECT 1 FROM records o WHERE o.file_id = r.file_id
+                                     AND o.status NOT IN ('sent', 'rejected'))",
                 crate::db::params![token],
             )?;
             rows.iter().filter_map(|r| r["file_id"].as_i64()).collect()

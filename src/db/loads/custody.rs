@@ -203,69 +203,90 @@ impl Db {
     }
 
     /// Brings rows written before custody under it: failed rows without a
-    /// failure group get one (by kind, reason and their load's version) and a
-    /// failure time; plaintext content is sealed in place. Idempotent; answers
-    /// how many rows were grouped and how many sealed.
+    /// failure group get one (by kind, reason and their load's version), a
+    /// failure time and one `failed` event at that time; plaintext content is
+    /// sealed in place. One pass in id order, a bounded page per transaction,
+    /// each page read again under lock and adopted whole before the next.
+    /// Idempotent; answers how many rows were grouped and how many sealed.
     pub fn adopt_legacy_rows(&self) -> Result<(usize, usize)> {
         const PAGE: i64 = 500;
-        let mut grouped = 0;
+        let (mut grouped, mut sealed, mut after) = (0, 0, 0);
         loop {
-            let rows = self.query(
-                "SELECT r.id, r.file_id, r.error_kind, r.error, r.updated_at, f.transform_id, f.transform_version
-                 FROM records r JOIN files f ON f.id = r.file_id
-                 WHERE r.status = 'rejected' AND r.group_id IS NULL
-                   AND COALESCE(r.error_kind, '') <> 'filtered'
-                 ORDER BY r.id LIMIT $1",
-                &params![PAGE],
-            )?;
-            if rows.is_empty() {
-                break;
-            }
-            self.atomically(|c| {
-                for r in &rows {
-                    let kind = r.opt_string(2).unwrap_or_else(|| "unknown".into());
-                    let reason = bounded(&r.string(3));
-                    let failure = Failure {
-                        kind: &kind,
-                        reason: &reason,
-                        location: None,
-                    };
-                    let transform = r.opt_string(5).zip(r.opt_i64(6));
-                    let group = group_for(
-                        c,
-                        r.i64(1),
-                        &failure,
-                        transform.as_ref().map(|(t, v)| (t.as_str(), *v)),
-                    )?;
-                    c.execute(
-                        "UPDATE records SET group_id = $2, error = $3, failed_at = COALESCE(failed_at, $4)
-                         WHERE id = $1 AND group_id IS NULL",
-                        &params![r.i64(0), group, reason, r.opt_i64(4).unwrap_or_else(now_ms)],
-                    )?;
-                }
-                Ok(())
-            })?;
-            grouped += rows.len();
-        }
-        let mut sealed = 0;
-        let mut after = 0;
-        loop {
-            let rows = self.query(
-                "SELECT id, raw, original_raw, resources, response FROM records
-                 WHERE id > $1 AND ((raw NOT LIKE 'c1.%' AND raw <> 'null')
-                    OR (original_raw IS NOT NULL AND original_raw NOT LIKE 'c1.%')
-                    OR (resources IS NOT NULL AND resources NOT LIKE 'c1.%')
-                    OR (response IS NOT NULL AND response NOT LIKE 'c1.%'))
-                 ORDER BY id LIMIT $2",
-                &params![after, PAGE],
-            )?;
-            let Some(last) = rows.last() else { break };
-            after = last.i64(0);
-            self.atomically(|c| {
+            let page = self.atomically(|c| {
+                let lock = match c {
+                    super::super::engine::Conn::Postgres(_) => " FOR UPDATE OF r",
+                    super::super::engine::Conn::Sqlite(_) => "",
+                };
+                let rows = c.query(
+                    &format!(
+                        "SELECT r.id, r.file_id, r.error_kind, r.error, r.updated_at, r.run, r.exec_retry,
+                                COALESCE(r.exec_transform_id, f.transform_id),
+                                CASE WHEN r.exec_transform_id IS NULL THEN f.transform_version ELSE r.exec_version END,
+                                (r.status = 'rejected' AND r.group_id IS NULL AND COALESCE(r.error_kind, '') <> 'filtered'),
+                                r.raw, r.original_raw, r.resources, r.response
+                         FROM records r JOIN files f ON f.id = r.file_id
+                         WHERE r.id > $1 AND (
+                               (r.status = 'rejected' AND r.group_id IS NULL AND COALESCE(r.error_kind, '') <> 'filtered')
+                            OR (r.raw NOT LIKE 'c1.%' AND r.raw <> 'null')
+                            OR (r.original_raw IS NOT NULL AND r.original_raw NOT LIKE 'c1.%')
+                            OR (r.resources IS NOT NULL AND r.resources NOT LIKE 'c1.%')
+                            OR (r.response IS NOT NULL AND r.response NOT LIKE 'c1.%'))
+                         ORDER BY r.id LIMIT $2{lock}"
+                    ),
+                    &params![after, PAGE],
+                )?;
+                let (mut g, mut z) = (0, 0);
                 for r in &rows {
                     let id = r.i64(0);
+                    let ungrouped = match r.get(9) {
+                        Value::Bool(b) => *b,
+                        other => other.as_i64().unwrap_or(0) != 0,
+                    };
+                    if ungrouped {
+                        let kind = r.opt_string(2).unwrap_or_else(|| "unknown".into());
+                        let reason = bounded(&r.string(3));
+                        let failed_at = r.opt_i64(4).unwrap_or_else(now_ms);
+                        let failure = Failure {
+                            kind: &kind,
+                            reason: &reason,
+                            location: None,
+                        };
+                        let transform = r.opt_string(7).zip(r.opt_i64(8));
+                        let group = group_for(
+                            c,
+                            r.i64(1),
+                            &failure,
+                            transform.as_ref().map(|(t, v)| (t.as_str(), *v)),
+                        )?;
+                        if c.execute(
+                            "UPDATE records SET group_id = $2, error = $3, failed_at = COALESCE(failed_at, $4)
+                             WHERE id = $1 AND group_id IS NULL AND status = 'rejected'",
+                            &params![id, group, reason, failed_at],
+                        )? == 1
+                        {
+                            // The failure it had, in the history, when it happened.
+                            c.execute(
+                                "INSERT INTO record_events (record_id, load_id, feed_id, kind, attempt, retry_id,
+                                        transform_id, transform_version, error_kind, reason, at)
+                                 SELECT r.id, r.file_id, r.feed_id, 'failed', r.run, r.exec_retry, $2, $3, $4, $5, $6
+                                 FROM records r WHERE r.id = $1
+                                   AND NOT EXISTS (SELECT 1 FROM record_events e
+                                                   WHERE e.record_id = r.id AND e.kind = 'failed')",
+                                &params![
+                                    id,
+                                    transform.as_ref().map(|(t, _)| t.clone()),
+                                    transform.as_ref().map(|(_, v)| *v),
+                                    kind,
+                                    reason,
+                                    failed_at
+                                ],
+                            )?;
+                            g += 1;
+                        }
+                    }
+                    let mut touched = false;
                     for (i, column) in Column::ALL.into_iter().enumerate() {
-                        let Some(old) = r.opt_string(i + 1) else {
+                        let Some(old) = r.opt_string(i + 10) else {
                             continue;
                         };
                         if is_sealed(&old) || (column == Column::Raw && old == "null") {
@@ -273,8 +294,7 @@ impl Db {
                         }
                         let value =
                             serde_json::from_str(&old).unwrap_or(Value::String(old.clone()));
-                        // Only if it is still that plaintext: a write since
-                        // sealed it already.
+                        // Only if it is still that plaintext: a write since sealed it.
                         c.execute(
                             &format!(
                                 "UPDATE records SET {name} = $2 WHERE id = $1 AND {name} = $3",
@@ -283,11 +303,19 @@ impl Db {
                             &params![id, self.seal_record(id, column, &value), old],
                         )
                         .with_context(|| format!("sealing record {id}"))?;
+                        touched = true;
                     }
+                    z += usize::from(touched);
                 }
-                Ok(())
+                Ok((rows.last().map(|r| r.i64(0)), g, z))
             })?;
-            sealed += rows.len();
+            let (last, g, z) = page;
+            grouped += g;
+            sealed += z;
+            match last {
+                Some(last) => after = last,
+                None => break,
+            }
         }
         Ok((grouped, sealed))
     }
@@ -387,7 +415,42 @@ mod tests {
             .query_json("SELECT id, raw FROM records ORDER BY id", [])
             .unwrap();
         assert_eq!(rows[0]["raw"]["patient"], "zq-legacy");
+        // Their failures count when they happened, once.
+        let then = db.period_counts(Some("src"), 0, 2000).unwrap();
+        assert_eq!(then.failed, 2);
+        let failed_events = db
+            .query("SELECT at FROM record_events WHERE kind = 'failed'", &[])
+            .unwrap();
+        assert_eq!(failed_events.len(), 2);
+        assert!(failed_events.iter().all(|e| e.i64(0) == 1000));
         // Old rows now expire with their retention like any other.
         assert_eq!(db.expire_failed_content(2000).unwrap(), 2);
+    }
+
+    /// More rows than a page: one pass adopts every one of them.
+    #[test]
+    fn adoption_walks_every_page_once() {
+        let db = Db::in_memory().unwrap();
+        let load = db
+            .insert_file("src", "a.csv", "sha", 3, "done", None, None)
+            .unwrap();
+        for line in 1..=1203 {
+            db.execute(
+                "INSERT INTO records (file_id, feed_id, line, raw, status, error_kind, error, updated_at)
+                 VALUES ($1, 'src', $2, $3, 'rejected', 'data', 'bad', 1000)",
+                &params![load, line, json!({"line": line}).to_string()],
+            )
+            .unwrap();
+        }
+        assert_eq!(db.adopt_legacy_rows().unwrap(), (1203, 1203));
+        assert_eq!(db.adopt_legacy_rows().unwrap(), (0, 0));
+        let left = db
+            .query(
+                "SELECT COUNT(*) FROM records WHERE group_id IS NULL OR raw NOT LIKE 'c1.%'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(left[0].i64(0), 0);
+        assert_eq!(db.period_counts(Some("src"), 0, 2000).unwrap().failed, 1203);
     }
 }
