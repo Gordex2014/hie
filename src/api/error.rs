@@ -180,17 +180,25 @@ async fn normalize(request: Request, next: Next) -> Response {
         s if s.is_client_error() => ("invalid_request", "the request is not one this route takes"),
         _ => ("internal_error", "the engine failed to answer"),
     };
+    // The original answer keeps its status and headers (every value of a
+    // repeated one); only the body and the headers describing it change.
     let (mut parts, _) = response.into_parts();
-    parts.headers.remove(header::CONTENT_LENGTH);
-    let mut normalized = ApiError::new(status, code, sentence).into_response();
-    for (name, value) in parts.headers {
-        if let Some(name) = name
-            && name != header::CONTENT_TYPE
-        {
-            normalized.headers_mut().insert(name, value);
-        }
+    let (normalized, body) = ApiError::new(status, code, sentence)
+        .into_response()
+        .into_parts();
+    for name in [
+        header::CONTENT_LENGTH,
+        header::CONTENT_ENCODING,
+        header::CONTENT_TYPE,
+    ] {
+        parts.headers.remove(&name);
     }
-    normalized
+    if let Some(content_type) = normalized.headers.get(header::CONTENT_TYPE) {
+        parts
+            .headers
+            .insert(header::CONTENT_TYPE, content_type.clone());
+    }
+    Response::from_parts(parts, body)
 }
 
 #[cfg(test)]
@@ -222,6 +230,18 @@ mod tests {
                     get(|Path(id): Path<i64>| async move { id.to_string() }),
                 )
                 .route("/records", get(|Query(_): Query<Limit>| async { "ok" }))
+                .route(
+                    "/cached",
+                    get(|| async {
+                        let mut response = (StatusCode::BAD_REQUEST, "plain text").into_response();
+                        let headers = response.headers_mut();
+                        headers.append(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                        headers.append(header::CACHE_CONTROL, HeaderValue::from_static("private"));
+                        headers.append(header::SET_COOKIE, HeaderValue::from_static("a=1"));
+                        headers.append(header::SET_COOKIE, HeaderValue::from_static("b=2"));
+                        response
+                    }),
+                )
                 .route(
                     "/refused",
                     get(|| async { ApiError::not_found("record_not_found", "record 1 not found") }),
@@ -256,6 +276,18 @@ mod tests {
             assert_eq!(body["code"], code, "{method} {path}: {body}");
             assert!(body["error"].is_string());
         }
+        let res = http.get(format!("{base}/cached")).send().await.unwrap();
+        let values = |name| -> Vec<String> {
+            res.headers()
+                .get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(values(header::CACHE_CONTROL), ["no-store", "private"]);
+        assert_eq!(values(header::SET_COOKIE), ["a=1", "b=2"]);
+        assert_eq!(values(header::CONTENT_TYPE), ["application/json"]);
+        assert_eq!(res.json::<Value>().await.unwrap()["code"], "invalid_body");
         assert_eq!(
             http.get(format!("{base}/records/7"))
                 .send()

@@ -13,23 +13,26 @@
 //!
 //! A key file or variable holds one key per line (or per comma), each 32 bytes
 //! in base64; the first is the current one. Keys never appear in `Debug`
-//! output, errors or logs; a key's id is a truncated hash of it.
+//! output, errors or logs; a key's id is a key check value (a fixed block
+//! encrypted under it), safe to show.
 
 use std::io::Write;
 use std::path::Path;
 
+use aes::cipher::BlockEncrypt;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use rand::RngCore;
-use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 const VERSION: &str = "v1";
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
+/// A key in base64 (44 characters with padding) and a newline.
+const LINE_LEN: usize = 45;
 
 /// One 256-bit key. Its bytes are wiped when it is dropped, as is every
 /// buffer that held it on the way in (file, variable, base64) or out.
@@ -40,10 +43,14 @@ pub struct Key {
 
 impl Key {
     fn from_bytes(bytes: Zeroizing<[u8; KEY_LEN]>) -> Self {
-        let mut hash = Sha256::new();
-        hash.update(b"hie key id\0");
-        hash.update(bytes.as_slice());
-        let id = hex::encode(&hash.finalize()[..4]);
+        // The id is a key check value: a fixed block encrypted under the key.
+        // AES keeps nothing of the key after it is dropped (its round keys are
+        // wiped), which a SHA-256 over the key could not promise: sha2 0.10
+        // leaves the last block it hashed in its buffer.
+        let cipher = aes::Aes256::new_from_slice(bytes.as_slice()).expect("a 32-byte key");
+        let mut block = aes::Block::from(*b"hie key id\0\0\0\0\0\0");
+        cipher.encrypt_block(&mut block);
+        let id = hex::encode(&block[..4]);
         Key { bytes, id }
     }
 
@@ -73,17 +80,21 @@ impl Key {
         Ok(Self::from_bytes(bytes))
     }
 
-    /// The key's id: 8 hex characters of a hash of it, safe to show.
+    /// The key's id: 8 hex characters of its key check value, safe to show.
     pub fn id(&self) -> &str {
         &self.id
     }
 
-    /// The key in base64 and a newline, as a key file holds it.
-    fn to_line(&self) -> Zeroizing<String> {
-        // Sized up front, so the text never moves (and leaves a copy behind).
-        let mut line = Zeroizing::new(String::with_capacity(4 * KEY_LEN.div_ceil(3) + 1));
-        STANDARD.encode_string(self.bytes.as_slice(), &mut line);
-        line.push('\n');
+    /// The key in base64 and a newline, as a key file holds it. Encoded
+    /// straight into a wiped buffer: base64's `encode_string` would stage it
+    /// in a scratch buffer of its own.
+    fn to_line(&self) -> Zeroizing<[u8; LINE_LEN]> {
+        let mut line = Zeroizing::new([0u8; LINE_LEN]);
+        let written = STANDARD
+            .encode_slice(self.bytes.as_slice(), &mut line[..LINE_LEN - 1])
+            .expect("32 bytes are 44 base64 characters");
+        debug_assert_eq!(written, LINE_LEN - 1);
+        line[LINE_LEN - 1] = b'\n';
         line
     }
 
@@ -202,7 +213,7 @@ impl Keyring {
         let mut tail = [0u8; 8];
         rand::rngs::OsRng.fill_bytes(&mut tail);
         let temporary = dir.join(format!(".{name}.{}.tmp", hex::encode(tail)));
-        let written = write_private(&temporary, &Key::generate().to_line());
+        let written = write_private(&temporary, Key::generate().to_line().as_slice());
         let published = written.and_then(|()| std::fs::hard_link(&temporary, path));
         let _ = std::fs::remove_file(&temporary);
         match published {
@@ -277,7 +288,7 @@ impl Keyring {
 
 /// Creates `path` (it must not exist) readable by this user only, with
 /// `contents`, synced to disk.
-fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -286,7 +297,7 @@ fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    file.write_all(contents.as_bytes())?;
+    file.write_all(contents)?;
     file.sync_all()
 }
 
@@ -363,6 +374,9 @@ mod tests {
     fn keys_are_checked_and_never_printed() {
         assert!(Key::from_base64("c2hvcnQ=").is_err());
         let ring = Keyring::parse(KEY).unwrap();
+        let id = ring.current_id();
+        assert!(id.len() == 8 && id.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(Key::generate().id(), Key::generate().id());
         let printed = format!("{ring:?}");
         assert!(!printed.contains(KEY) && printed.contains(ring.current_id()));
     }
@@ -420,6 +434,11 @@ mod tests {
         assert!(Key::from_base64(&STANDARD.encode([7u8; 33])).is_err());
         assert!(Key::from_base64(&"A".repeat(400)).is_err());
         let line = standard.to_line();
-        assert_eq!(Key::from_base64(&line).unwrap().id(), standard.id());
+        assert_eq!(
+            &line[..],
+            format!("{}\n", STANDARD.encode(STANDARD.decode(KEY).unwrap())).as_bytes()
+        );
+        let line = std::str::from_utf8(line.as_slice()).unwrap();
+        assert_eq!(Key::from_base64(line).unwrap().id(), standard.id());
     }
 }
