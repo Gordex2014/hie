@@ -27,6 +27,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -41,6 +42,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1095,6 +1097,7 @@ dependencies = [
 name = "helios-hie"
 version = "0.1.5"
 dependencies = [
+ "aes",
  "aes-gcm",
  "anyhow",
  "async-trait",
@@ -1129,6 +1132,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "zeroize",
  "zip",
 ]
 
