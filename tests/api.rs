@@ -788,3 +788,126 @@ async fn a_start_stopped_after_its_file_is_finished_when_the_engine_starts() {
     assert!(db.start_intents(None).unwrap().is_empty());
     assert!(db.evidence(&evidence).unwrap().is_some());
 }
+
+#[tokio::test]
+async fn a_definition_is_its_file_whatever_the_file_is_named() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::create_dir_all(root.join("inbox")).unwrap();
+    std::fs::copy(
+        repo().join("transforms/lab_results.py"),
+        root.join("transforms/lab_results.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: http://127.0.0.1:9\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    let definition = |id: &str, name: &str| {
+        json!({"id": id, "name": name,
+               "source": {"type": "folder", "path": "inbox", "poll_seconds": 3600},
+               "transform": "transforms/lab_results.py"})
+    };
+    let yaml = |id: &str| serde_yaml::to_string(&definition(id, "As written")).unwrap();
+    // `.yml`, `.yaml`, and a file not named for its source: the loader reads all three.
+    std::fs::write(root.join("sources/short.yml"), yaml("short")).unwrap();
+    std::fs::write(root.join("sources/long.yaml"), yaml("long")).unwrap();
+    std::fs::write(root.join("sources/by-hand.yml"), yaml("other")).unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    assert_eq!(feeds.len(), 3);
+    let (_manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let api = serve(hie::api::router(state)).await;
+    let http = reqwest::Client::new();
+    let get = |path: String| {
+        let http = http.clone();
+        async move {
+            let response = http.get(path).send().await.unwrap();
+            assert_eq!(response.status(), 200);
+            response.json::<Value>().await.unwrap()
+        }
+    };
+
+    // Every answer that carries a source carries its definition.
+    let listed = get(format!("{api}/api/sources")).await;
+    let monitoring = get(format!("{api}/api/monitoring/status")).await;
+    for sources in [&listed["sources"], &monitoring["sources"]] {
+        let sources = sources.as_array().unwrap();
+        assert_eq!(sources.len(), 3, "{sources:?}");
+        for source in sources {
+            assert_eq!(source["definition"]["id"], source["id"], "{source}");
+        }
+    }
+    for id in ["short", "long", "other"] {
+        let view = get(format!("{api}/api/sources/{id}")).await;
+        assert_eq!(view["definition"]["name"], "As written", "{view}");
+    }
+    let files = || {
+        let mut names: Vec<String> = std::fs::read_dir(root.join("sources"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+
+    // A replace writes over the file it was read from, whatever its extension.
+    for id in ["short", "other"] {
+        let replaced = http
+            .put(format!("{api}/api/sources/{id}"))
+            .json(&definition(id, "Replaced"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replaced.status(), 200, "{}", replaced.text().await.unwrap());
+        let view = get(format!("{api}/api/sources/{id}")).await;
+        assert_eq!(view["definition"]["name"], "Replaced", "{view}");
+    }
+    assert_eq!(files(), ["by-hand.yml", "long.yaml", "short.yml"]);
+    let file = std::fs::read_to_string(root.join("sources/short.yml")).unwrap();
+    assert!(file.contains("name: Replaced"), "{file}");
+
+    // A source exists while a file named for it does, `.yml` or `.yaml`.
+    std::fs::write(root.join("sources/late.yml"), yaml("late")).unwrap();
+    for id in ["short", "late"] {
+        let again = http
+            .post(format!("{api}/api/sources"))
+            .json(&definition(id, "Again"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), 409, "{}", again.text().await.unwrap());
+    }
+    assert_eq!(
+        files(),
+        ["by-hand.yml", "late.yml", "long.yaml", "short.yml"]
+    );
+
+    // A delete removes the file the source was read from.
+    for id in ["short", "long", "other"] {
+        let deleted = http
+            .delete(format!("{api}/api/sources/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert!(deleted.status().is_success(), "{}", deleted.status());
+    }
+    assert_eq!(files(), ["late.yml"]);
+
+    // A new source is written as `<id>.yaml`.
+    let created = http
+        .post(format!("{api}/api/sources"))
+        .json(&definition("short", "New"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    assert_eq!(files(), ["late.yml", "short.yaml"]);
+}

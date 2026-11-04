@@ -42,6 +42,7 @@ impl SourceManager {
             delivery: Default::default(),
             expect_every_text: None,
             expect_every: None,
+            file: None,
         };
         let source = Source::from_config_in(&feed, &self.connect)
             .map_err(|e| ManagerError::invalid("invalid_definition", format!("{e:#}")))?;

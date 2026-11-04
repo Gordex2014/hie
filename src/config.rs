@@ -343,6 +343,25 @@ pub struct FeedConfig {
     pub(crate) expect_every_text: Option<String>,
     #[serde(skip)]
     pub expect_every: Option<Duration>,
+    /// The file the definition was read from or written to; `None` for one
+    /// that is not a file (yet). Never part of the definition itself.
+    #[serde(skip)]
+    pub file: Option<PathBuf>,
+}
+
+/// The extensions a source definition file may have.
+const SOURCE_EXTENSIONS: [&str; 2] = ["yaml", "yml"];
+
+/// The file named for source `id` in `dir`: `<id>.yaml` or `<id>.yml`,
+/// whichever exists, or `<id>.yaml` (where a new one is written) when
+/// neither does. A loaded source knows its file ([`FeedConfig::file`]),
+/// whatever its name; this is for one that is not loaded.
+pub fn source_file(dir: &Path, id: &str) -> PathBuf {
+    SOURCE_EXTENSIONS
+        .iter()
+        .map(|ext| dir.join(format!("{id}.{ext}")))
+        .find(|path| path.exists())
+        .unwrap_or_else(|| dir.join(format!("{id}.{}", SOURCE_EXTENSIONS[0])))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -977,7 +996,11 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     let mut entries: Vec<_> = std::fs::read_dir(&config.sources_dir)
         .with_context(|| format!("reading {}", config.sources_dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("yaml" | "yml")))
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| SOURCE_EXTENSIONS.contains(&e))
+        })
         .collect();
     entries.sort();
     let mut ids = HashSet::new();
@@ -986,6 +1009,7 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
         let mut feed: FeedConfig = serde_yaml::from_str(&text)
             .with_context(|| format!("parsing {}", feed_path.display()))?;
         feed.resolve(&base)?;
+        feed.file = Some(feed_path);
         if !ids.insert(feed.id.clone()) {
             bail!("duplicate source id {}", feed.id);
         }
