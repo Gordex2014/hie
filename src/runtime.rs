@@ -1,205 +1,367 @@
-//! The shared Python runtime as a transform backend (`runtime: <url>` in
-//! `hie.yaml`): python-runtime's HIE facade stores a transform's code under a
-//! name (`PUT /transforms/{name}`), runs it over a batch of requests
-//! (`POST /transforms/{name}/run`) and runs inline code once
-//! (`POST /transforms/try`). Replies are the worker's own lines, one per
-//! request in order, so what comes back is parsed exactly as the local
-//! worker's output.
+//! python-runtime's HIE facade as a transform executor (`runtime:` in
+//! `hie.yaml`; decisions 34 and 39): the consumer's capabilities (its default
+//! environment), a version's code stored under a name (`PUT
+//! /transforms/{name}`), batches run against it (`POST
+//! /transforms/{name}/run`), inline code tried once (`POST /transforms/try`),
+//! and names listed and deleted (`GET /transforms`, `DELETE
+//! /transforms/{name}`). Every body that runs or stores code names the
+//! version's environment; every answer after a partition started names the
+//! environment that ran it in `Python-Runtime-Environment-*` headers.
+//!
+//! This is only the HTTP client: what an answer means for a load is
+//! `versions::execute`'s, for a Try `tryrun`'s.
 
-use std::path::Path;
-use std::sync::Mutex;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use reqwest::StatusCode;
+use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+
+use crate::versions::Environment;
 
 /// The facade's own ceiling on requests per call.
 pub const MAX_REQUESTS_PER_CALL: usize = 1000;
-/// The facade's ceiling on requests per try.
-pub const MAX_TRY_REQUESTS: usize = 100;
 /// Longer than the facade's run budget (120 s by default), so a slow batch is
 /// answered rather than cut on this side.
 const CALL_TIMEOUT: Duration = Duration::from_secs(180);
+/// Capabilities, listing and deleting answer at once or not at all.
+const SHORT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The executor name versions saved for the runtime carry.
+pub const EXECUTOR: &str = "python-runtime";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeSettings {
     pub url: String,
     pub token: Option<String>,
-    /// Requests per run call; the facade partitions them further itself.
+    /// Requests per run call; the runtime partitions them further itself.
     pub batch_size: usize,
 }
 
-/// One transform as the runtime knows it.
-pub struct RemoteRuntime {
-    settings: RuntimeSettings,
-    client: reqwest::Client,
-    name: String,
-    /// The sha256 of the code the runtime holds under `name`, once stored.
-    stored: Mutex<Option<String>>,
+/// One answer of the facade: its status, body, the environment its headers
+/// name (when a partition started) and its `Python-Runtime-Error` header (the
+/// mark that the facade itself answered).
+#[derive(Debug, Clone)]
+pub struct Answer {
+    pub status: StatusCode,
+    pub body: Value,
+    pub environment: Option<Environment>,
+    pub facade_error: Option<String>,
 }
 
-impl RemoteRuntime {
-    pub fn new(settings: RuntimeSettings, transform_script: &Path) -> Self {
+impl Answer {
+    /// The `error` code of an error body.
+    pub fn error_code(&self) -> &str {
+        self.body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    }
+}
+
+/// What the consumer may run in: the default environment and those offered.
+#[derive(Debug, Clone, Default)]
+pub struct Capabilities {
+    pub default_environment: Option<String>,
+    /// Content id to descriptor digest.
+    pub environments: BTreeMap<String, String>,
+    pub aliases: BTreeMap<String, String>,
+}
+
+impl Capabilities {
+    fn read(body: &Value) -> Self {
+        let environments = body
+            .get("environments")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|e| {
+                        Some((
+                            e.get("id")?.as_str()?.to_string(),
+                            e.get("digest")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let aliases = body
+            .get("aliases")
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            default_environment: body
+                .get("default_environment")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            environments,
+            aliases,
+        }
+    }
+
+    /// The environment `id` (a content id or an alias) names, when offered.
+    pub fn environment(&self, id: &str) -> Option<Environment> {
+        let id = self.aliases.get(id).map(String::as_str).unwrap_or(id);
+        self.environments.get(id).map(|digest| Environment {
+            executor: EXECUTOR.into(),
+            id: id.to_string(),
+            digest: Some(digest.clone()),
+        })
+    }
+
+    /// The default environment, when the runtime names one it offers.
+    pub fn default(&self) -> Option<Environment> {
+        self.environment(self.default_environment.as_deref()?)
+    }
+}
+
+/// Why a Try's call has no answer.
+#[derive(Debug)]
+pub enum TryCallError {
+    /// The request never reached the runtime: nothing ran.
+    NotSent(anyhow::Error),
+    /// It was sent and no answer came: anything may have run.
+    Lost(anyhow::Error),
+}
+
+/// The facade client.
+#[derive(Clone)]
+pub struct Facade {
+    settings: RuntimeSettings,
+    client: reqwest::Client,
+}
+
+impl Facade {
+    pub fn new(settings: RuntimeSettings) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(CALL_TIMEOUT)
             .user_agent(concat!("hie/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("reqwest client");
-        Self {
-            name: transform_name(transform_script),
-            settings,
-            client,
-            stored: Mutex::new(None),
-        }
+        Self { settings, client }
     }
 
-    /// The name the transform is stored under at the runtime.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Runs the stored transform over `requests` (record, context pairs), storing
-    /// its code first when the runtime does not hold this version. One reply per
-    /// request, in order.
-    pub async fn run(&self, script: &Path, requests: &[(Value, Value)]) -> Result<Vec<Value>> {
-        let code = std::fs::read_to_string(script)
-            .with_context(|| format!("reading {}", script.display()))?;
-        self.ensure_stored(&code).await?;
-        let mut replies = Vec::with_capacity(requests.len());
-        let per_call = self.settings.batch_size.clamp(1, MAX_REQUESTS_PER_CALL);
-        for chunk in requests.chunks(per_call) {
-            let body = envelope(chunk, None);
-            let url = format!("{}/transforms/{}/run", self.base(), self.name);
-            let mut answer = self.post(&url, &body).await?;
-            if answer.0 == StatusCode::NOT_FOUND && error_code(&answer.1) == "transform_unknown" {
-                // The runtime lost or never had it (a restart without its store):
-                // stored again, run again.
-                *self.stored.lock().expect("stored") = None;
-                self.ensure_stored(&code).await?;
-                answer = self.post(&url, &body).await?;
-            }
-            replies.extend(Self::replies(answer, chunk.len())?);
-        }
-        Ok(replies)
-    }
-
-    /// Runs `code` inline over at most [`MAX_TRY_REQUESTS`] requests; nothing is stored.
-    pub async fn try_code(&self, code: &str, requests: &[(Value, Value)]) -> Result<Vec<Value>> {
-        if requests.len() > MAX_TRY_REQUESTS {
-            bail!("a try takes at most {MAX_TRY_REQUESTS} records");
-        }
-        let url = format!("{}/transforms/try", self.base());
-        let answer = self.post(&url, &envelope(requests, Some(code))).await?;
-        Self::replies(answer, requests.len())
+    pub fn settings(&self) -> &RuntimeSettings {
+        &self.settings
     }
 
     fn base(&self) -> &str {
         self.settings.url.trim_end_matches('/')
     }
 
-    async fn ensure_stored(&self, code: &str) -> Result<()> {
-        let sha = hex::encode(Sha256::digest(code.as_bytes()));
-        if self.stored.lock().expect("stored").as_deref() == Some(sha.as_str()) {
-            return Ok(());
+    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.settings.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
         }
-        let url = format!("{}/transforms/{}", self.base(), self.name);
-        let (status, body) = self
-            .send(self.client.put(&url), &json!({"code": code}))
-            .await?;
-        if !(status == StatusCode::OK || status == StatusCode::CREATED) {
-            bail!(
-                "the runtime did not store transform {}: {}",
-                self.name,
-                describe(status, &body)
-            );
-        }
-        let theirs = body
-            .get("sha256")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if theirs != sha {
-            bail!(
-                "the runtime stored transform {} with sha256 {theirs}, expected {sha}",
-                self.name
-            );
-        }
-        *self.stored.lock().expect("stored") = Some(sha);
-        Ok(())
     }
 
-    async fn post(&self, url: &str, body: &Value) -> Result<(StatusCode, Value)> {
-        self.send(self.client.post(url), body).await
+    /// The consumer's `GET /v1/capabilities`.
+    pub async fn capabilities(&self) -> Result<Capabilities> {
+        let response = self
+            .authorized(self.client.get(format!("{}/v1/capabilities", self.base())))
+            .timeout(SHORT_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "the runtime at {} cannot be reached: {e}",
+                    self.settings.url
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("the runtime's capabilities answered HTTP {status}");
+        }
+        let body: Value = response
+            .json()
+            .await
+            .context("reading the runtime's capabilities")?;
+        Ok(Capabilities::read(&body))
     }
 
-    async fn send(
+    /// Stores `code` under `name`, for `environment`.
+    pub async fn put(&self, name: &str, code: &str, environment: Option<&str>) -> Result<Answer> {
+        let mut body = json!({"code": code});
+        if let Some(env) = environment {
+            body["environment"] = json!(env);
+        }
+        let request = self
+            .client
+            .put(format!("{}/transforms/{name}", self.base()))
+            .timeout(CALL_TIMEOUT);
+        self.send(request, &body).await
+    }
+
+    /// Runs the code stored under `name` over `requests`, in `environment`.
+    pub async fn run(
         &self,
-        request: reqwest::RequestBuilder,
-        body: &Value,
-    ) -> Result<(StatusCode, Value)> {
-        let mut request = request.json(body);
-        if let Some(token) = &self.settings.token {
-            request = request.bearer_auth(token);
-        }
+        name: &str,
+        environment: Option<&str>,
+        requests: &[(Value, Value)],
+    ) -> Result<Answer> {
+        let request = self
+            .client
+            .post(format!("{}/transforms/{name}/run", self.base()))
+            .timeout(CALL_TIMEOUT);
+        self.send(request, &envelope(requests, None, environment))
+            .await
+    }
+
+    /// Runs `code` once over `requests`; nothing is stored, nothing retried.
+    /// No timeout here: the caller stops it at its deadline by dropping it,
+    /// which cancels the running partition.
+    pub async fn try_code(
+        &self,
+        code: &str,
+        environment: Option<&str>,
+        requests: &[(Value, Value)],
+    ) -> std::result::Result<Answer, TryCallError> {
+        let request = self
+            .authorized(self.client.post(format!("{}/transforms/try", self.base())))
+            .json(&envelope(requests, Some(code), environment));
         let response = request.send().await.map_err(|e| {
+            if e.is_connect() {
+                TryCallError::NotSent(anyhow!("the runtime cannot be reached: {e}"))
+            } else {
+                TryCallError::Lost(anyhow!("the runtime's answer was lost: {e}"))
+            }
+        })?;
+        read(response).await.map_err(TryCallError::Lost)
+    }
+
+    /// The names the consumer holds, with the digest of their code.
+    pub async fn list(&self) -> Result<Vec<(String, String)>> {
+        let answer = self
+            .send_empty(
+                self.client
+                    .get(format!("{}/transforms", self.base()))
+                    .timeout(SHORT_TIMEOUT),
+            )
+            .await?;
+        if answer.status != StatusCode::OK {
+            anyhow::bail!(
+                "listing the runtime's transforms answered HTTP {}",
+                answer.status
+            );
+        }
+        Ok(answer
+            .body
+            .get("transforms")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|t| {
+                        Some((
+                            t.get("name")?.as_str()?.to_string(),
+                            t.get("sha256")?.as_str().unwrap_or_default().to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Frees a name: `true` once the runtime no longer holds it (deleted now,
+    /// or `404 transform_unknown`).
+    pub async fn delete(&self, name: &str) -> Result<bool> {
+        let answer = self
+            .send_empty(
+                self.client
+                    .delete(format!("{}/transforms/{name}", self.base()))
+                    .timeout(SHORT_TIMEOUT),
+            )
+            .await?;
+        Ok(answer.status == StatusCode::OK
+            || (answer.status == StatusCode::NOT_FOUND
+                && answer.error_code() == "transform_unknown"))
+    }
+
+    async fn send(&self, request: reqwest::RequestBuilder, body: &Value) -> Result<Answer> {
+        let response = self
+            .authorized(request.json(body))
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "the runtime at {} cannot be reached: {e}",
+                    self.settings.url
+                )
+            })?;
+        read(response).await
+    }
+
+    async fn send_empty(&self, request: reqwest::RequestBuilder) -> Result<Answer> {
+        let response = self.authorized(request).send().await.map_err(|e| {
             anyhow!(
                 "the runtime at {} cannot be reached: {e}",
                 self.settings.url
             )
         })?;
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        let body = serde_json::from_str(&text).unwrap_or(Value::Null);
-        Ok((status, body))
-    }
-
-    fn replies((status, body): (StatusCode, Value), expected: usize) -> Result<Vec<Value>> {
-        if status != StatusCode::OK {
-            bail!(
-                "the runtime did not run the batch: {}",
-                describe(status, &body)
-            );
-        }
-        let replies = body
-            .get("replies")
-            .and_then(Value::as_array)
-            .cloned()
-            .ok_or_else(|| anyhow!("the runtime answered without replies"))?;
-        if replies.len() != expected {
-            bail!(
-                "the runtime answered {} replies for {expected} requests",
-                replies.len()
-            );
-        }
-        Ok(replies)
+        read(response).await
     }
 }
 
-fn envelope(requests: &[(Value, Value)], code: Option<&str>) -> Value {
+async fn read(response: reqwest::Response) -> Result<Answer> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| anyhow!("reading the runtime's answer: {e}"))?;
+    Ok(Answer {
+        status,
+        body: serde_json::from_str(&text).unwrap_or(Value::Null),
+        environment: environment_of(&headers),
+        facade_error: header(&headers, "python-runtime-error"),
+    })
+}
+
+fn header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// The environment an answer's headers name.
+fn environment_of(headers: &HeaderMap) -> Option<Environment> {
+    Some(Environment {
+        executor: EXECUTOR.into(),
+        id: header(headers, "python-runtime-environment-id")?,
+        digest: header(headers, "python-runtime-environment-digest"),
+    })
+}
+
+fn envelope(requests: &[(Value, Value)], code: Option<&str>, environment: Option<&str>) -> Value {
     let requests: Vec<Value> = requests
         .iter()
         .enumerate()
         .map(|(i, (record, context))| json!({"id": i, "record": record, "context": context}))
         .collect();
-    match code {
-        Some(code) => json!({"code": code, "requests": requests}),
-        None => json!({"requests": requests}),
+    let mut body = json!({"requests": requests});
+    if let Some(code) = code {
+        body["code"] = json!(code);
     }
-}
-
-fn error_code(body: &Value) -> &str {
-    body.get("error")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
+    if let Some(env) = environment {
+        body["environment"] = json!(env);
+    }
+    body
 }
 
 /// What a refusal means for the operator, by the facade's status mapping.
-fn describe(status: StatusCode, body: &Value) -> String {
-    let code = error_code(body);
+pub fn describe(answer: &Answer) -> String {
+    let code = answer.error_code();
+    let status = answer.status;
     match status.as_u16() {
         422 => {
-            let detail = body
+            let detail = answer
+                .body
                 .get("load_error")
                 .and_then(|e| e.get("message"))
                 .and_then(Value::as_str)
@@ -218,14 +380,17 @@ fn describe(status: StatusCode, body: &Value) -> String {
     }
 }
 
-/// The name a transform file is stored under: its stem, with anything outside
-/// `[A-Za-z0-9_-]` replaced, at most 64 characters, never the reserved `try`.
-pub fn transform_name(script: &Path) -> String {
-    let stem = script
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("transform");
-    let mut name: String = stem
+/// The name one version's code is stored under at the runtime:
+/// `{transform}-v{version}-{12 hex of its sha256}`, within the facade's
+/// `[A-Za-z0-9_-]{1,64}` (the transform id is shortened when needed) and never
+/// `try`. Two versions, or two contents, never share a name.
+pub fn program_name(transform_id: &str, version: i64, code_sha256: &str) -> String {
+    let suffix = format!(
+        "-v{version}-{}",
+        code_sha256.get(..12).unwrap_or(code_sha256)
+    );
+    let room = 64usize.saturating_sub(suffix.len());
+    let stem: String = transform_id
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
@@ -234,15 +399,30 @@ pub fn transform_name(script: &Path) -> String {
                 '_'
             }
         })
-        .take(64)
+        .take(room)
         .collect();
-    if name.is_empty() {
-        name = "transform".into();
-    }
-    if name == "try" {
-        name = "try_".into();
-    }
-    name
+    let stem = if stem.is_empty() {
+        "t".to_string()
+    } else {
+        stem
+    };
+    format!("{stem}{suffix}")
+}
+
+/// Whether a name at the runtime has the shape [`program_name`] gives.
+pub fn is_program_name(name: &str) -> bool {
+    let Some((head, sha)) = name.rsplit_once('-') else {
+        return false;
+    };
+    let Some((_, version)) = head.rsplit_once("-v") else {
+        return false;
+    };
+    sha.len() == 12
+        && sha
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && !version.is_empty()
+        && version.bytes().all(|b| b.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -250,13 +430,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn names_follow_the_facade_rules() {
+    fn names_follow_the_facade_rules_and_differ_per_version_and_content() {
+        let sha = "0123456789abcdef".repeat(4);
         assert_eq!(
-            transform_name(Path::new("transforms/lab_results.py")),
-            "lab_results"
+            program_name("lab_results", 3, &sha),
+            "lab_results-v3-0123456789ab"
         );
-        assert_eq!(transform_name(Path::new("a b.c.py")), "a_b_c");
-        assert_eq!(transform_name(Path::new("try.py")), "try_");
-        assert_eq!(transform_name(Path::new(&"x".repeat(80))).len(), 64);
+        assert!(is_program_name(&program_name("lab_results", 3, &sha)));
+        let long = program_name(&"x".repeat(80), 12, &sha);
+        assert_eq!(long.len(), 64);
+        assert!(
+            long.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        );
+        assert_ne!(program_name("t", 1, &sha), program_name("t", 2, &sha));
+        assert_ne!(
+            program_name("t", 1, &sha),
+            program_name("t", 1, &"f".repeat(64))
+        );
+        assert_ne!(program_name("try", 1, &sha), "try");
+        assert!(!is_program_name("orders"));
     }
 }

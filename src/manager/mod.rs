@@ -198,6 +198,7 @@ impl SourceManager {
             .map_err(|e| ManagerError::invalid("invalid_definition", format!("{e:#}")))?;
         Source::from_config(&resolved)
             .map_err(|e| ManagerError::invalid("invalid_definition", format!("{e:#}")))?;
+        self.check_transform(&resolved)?;
         Ok((submitted, resolved))
     }
 

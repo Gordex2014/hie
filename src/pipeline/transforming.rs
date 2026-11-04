@@ -7,7 +7,10 @@
 //! through that version's executor. A group that cannot run this round (its
 //! version is unknown, its executor failed, it ran in another environment, or
 //! something it depends on is down) is left where it is and the round goes on
-//! with the other groups.
+//! with the other groups. A group held because the executor runs another
+//! environment than its version's marks its loads and retries waiting
+//! (`environment_unavailable`, read through `Db::version_waiting`) until a
+//! later round runs them.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -17,12 +20,15 @@ use tokio::sync::Notify;
 
 use super::{FeedRunner, TRANSFORM_CHUNK};
 use crate::db::WorkItem;
-use crate::versions::{Exec, VersionKey, VersionRef};
+use crate::versions::{EnvironmentUnavailable, Exec, VersionKey, VersionRef};
+
+const ENVIRONMENT_UNAVAILABLE: &str = "environment_unavailable";
 
 impl FeedRunner {
     /// Transforms what was received, a chunk at a time; `progress` is told after
     /// each chunk so delivery can start on it.
     pub(super) async fn transform_received(&self, progress: Option<&Notify>) -> Result<()> {
+        self.versions.ready().await;
         // What the source runs now, for records whose load recorded no version.
         let current = match self.versions.resolve_for_source(&self.feed) {
             Ok(v) => Some(v),
@@ -39,6 +45,7 @@ impl FeedRunner {
                 .db
                 .received_records_after(&self.feed.id, after, TRANSFORM_CHUNK)?;
             let Some(last) = items.last() else {
+                self.versions.reclaim().await;
                 return Ok(());
             };
             after = last.id;
@@ -94,9 +101,12 @@ impl FeedRunner {
             }
             return Ok(false);
         };
-        let executor = match self.versions.executor(&version) {
+        let executor = match self.versions.executor(&self.feed.id, &version) {
             Ok(e) => e,
             Err(e) => {
+                if e.downcast_ref::<EnvironmentUnavailable>().is_some() {
+                    self.hold_for_environment(items, true)?;
+                }
                 tracing::error!(target: "hie::pipeline", feed = %self.feed.id, "transform unavailable, will retry: {e:#}");
                 return Ok(false);
             }
@@ -113,6 +123,9 @@ impl FeedRunner {
         let execution = match executor.run(&requests).await {
             Ok(execution) => execution,
             Err(e) => {
+                if e.downcast_ref::<EnvironmentUnavailable>().is_some() {
+                    self.hold_for_environment(items, true)?;
+                }
                 tracing::error!(target: "hie::pipeline", feed = %self.feed.id, "transform unavailable, will retry: {e:#}");
                 return Ok(false);
             }
@@ -122,8 +135,17 @@ impl FeedRunner {
             tracing::warn!(target: "hie::pipeline", feed = %self.feed.id,
                 "transform {}@{} ran in environment {} instead of {}; its records wait",
                 version.transform_id, version.version, execution.environment.id, version.environment.id);
+            self.hold_for_environment(items, true)?;
             return Ok(false);
         }
+        if execution.items.len() != items.len() {
+            anyhow::bail!(
+                "the executor answered {} outcomes for {} records",
+                execution.items.len(),
+                items.len()
+            );
+        }
+        self.hold_for_environment(items, false)?;
         for (item, outcome) in items.iter().zip(execution.items) {
             let exec = Exec {
                 load_id: item.file_id,
@@ -135,5 +157,22 @@ impl FeedRunner {
             }
         }
         Ok(true)
+    }
+
+    /// Marks (or clears) the loads and retries of these records as waiting
+    /// for their version's environment.
+    fn hold_for_environment(&self, items: &[&WorkItem], held: bool) -> Result<()> {
+        let mut done: HashSet<(i64, Option<&str>)> = HashSet::new();
+        for item in items {
+            let key = (item.file_id, item.retry.as_deref());
+            if done.insert(key) {
+                self.db.set_version_waiting(
+                    key.0,
+                    key.1,
+                    held.then_some(ENVIRONMENT_UNAVAILABLE),
+                )?;
+            }
+        }
+        Ok(())
     }
 }
