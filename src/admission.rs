@@ -120,27 +120,11 @@ impl Admission {
     }
 }
 
-/// The parts of a 0.1 connection URL (`postgres://`, `mysql://`,
-/// `sqlserver://`, `sqlite:`), without its user or password.
+/// The parts a 0.1 connection URL (`postgres://`, `mysql://`,
+/// `sqlserver://`, `sqlite:`) connects to, read from the driver's own parsed
+/// options (query overrides, decoding, defaults); `None` when it cannot be read.
 pub fn url_parts(url: &str) -> Option<ConnectionParts> {
-    if let Some(path) = url.strip_prefix("sqlite:") {
-        let path = path.strip_prefix("//").unwrap_or(path);
-        let path = path.split('?').next().unwrap_or(path);
-        return Some(ConnectionParts {
-            engine: "sqlite".into(),
-            host: None,
-            port: None,
-            database: Some(path.to_string()),
-        });
-    }
-    let parsed = url::Url::parse(url).ok()?;
-    let database = parsed.path().trim_start_matches('/');
-    Some(ConnectionParts {
-        engine: parsed.scheme().to_string(),
-        host: parsed.host_str().map(str::to_string),
-        port: parsed.port(),
-        database: (!database.is_empty()).then(|| database.to_string()),
-    })
+    crate::connectors::database::url_parts(url).ok()
 }
 
 #[cfg(test)]
@@ -192,19 +176,52 @@ mod tests {
     }
 
     #[test]
-    fn legacy_urls_give_their_parts() {
+    fn legacy_urls_give_the_parts_the_driver_connects_to() {
+        let host = |url: &str| url_parts(url).unwrap().host;
+        let database = |url: &str| url_parts(url).unwrap().database;
         assert_eq!(
-            url_parts("postgres://u:p@Host:5433/labs")
-                .unwrap()
-                .normalized(),
+            url_parts("postgres://u:p@Host:5433/labs").unwrap(),
             parts("postgres", Some("host"), Some(5433), "labs")
         );
+        // Query overrides win, as they do when the driver connects.
         assert_eq!(
-            url_parts("sqlite:///tmp/a.db?mode=ro")
-                .unwrap()
-                .database
-                .as_deref(),
+            url_parts("postgres://u:p@allowed:5432/labs?host=forbidden&port=9999&dbname=other")
+                .unwrap(),
+            parts("postgres", Some("forbidden"), Some(9999), "other")
+        );
+        assert_eq!(
+            host("postgres://u:p@allowed/labs?host=/var/run/postgresql").as_deref(),
+            Some("/var/run/postgresql")
+        );
+        // Without a database, PostgreSQL connects to the user's.
+        assert_eq!(
+            database("postgres://reader:p@allowed:5432").as_deref(),
+            Some("reader")
+        );
+        assert_eq!(
+            database("postgres://u:p@allowed:5432/l%61bs").as_deref(),
+            Some("labs")
+        );
+        assert_eq!(
+            host("mysql://u:p@db:3307/labs?socket=/tmp/my.sock").as_deref(),
+            Some("/tmp/my.sock")
+        );
+        assert_eq!(
+            database("sqlite:///tmp/a.db?mode=ro").as_deref(),
             Some("/tmp/a.db")
         );
+        assert_eq!(
+            url_parts("sqlserver://u:p@Db:1444/labs?trust_cert=true").unwrap(),
+            parts("sqlserver", Some("db"), Some(1444), "labs")
+        );
+        // Options HIE cannot resolve refuse the URL.
+        assert!(url_parts("sqlserver://u:p@db/labs?server=other").is_none());
+        assert!(url_parts("ftp://db/labs").is_none());
+        let admission = Admission::new(Some(AdmissionConfig {
+            synthetic_only: true,
+            databases: vec![parts("postgres", Some("allowed"), None, "labs")],
+        }));
+        let overridden = url_parts("postgres://u:p@allowed:5432/labs?host=forbidden").unwrap();
+        assert_eq!(admission.check(&overridden).unwrap_err().field, "host");
     }
 }

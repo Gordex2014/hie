@@ -19,8 +19,6 @@ pub(super) fn url(url_env: &str) -> Result<String> {
     {
         bail!("{url_env} must be a postgres://, mysql://, sqlserver:// or sqlite: URL");
     }
-    if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
-        driver::mssql_config(&url)?;
-    }
+    driver::Target::parse(&url)?;
     Ok(url)
 }

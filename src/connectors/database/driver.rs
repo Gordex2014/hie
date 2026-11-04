@@ -13,6 +13,7 @@ use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
 use super::cursor::{Cursor, instant};
 use super::rows::{mssql_row, mysql_row, pg_row, sqlite_row};
+use crate::config::ConnectionParts;
 
 /// An open connection pool, per engine.
 enum Pool {
@@ -91,60 +92,167 @@ async fn mssql_connect(
         .context("connecting to SQL Server")
 }
 
+/// What a 0.1 URL connects to, parsed once into the driver's own options:
+/// the parts admission compares are read from exactly these options (query
+/// overrides such as `?host=`, percent-decoding, defaults from the
+/// environment), and the driver connects with them, never re-reading the URL.
+pub(super) enum Target {
+    Postgres(sqlx::postgres::PgConnectOptions),
+    MySql(sqlx::mysql::MySqlConnectOptions),
+    Sqlite(sqlx::sqlite::SqliteConnectOptions),
+    MsSql(Box<tiberius::Config>, ConnectionParts),
+}
+
+impl Target {
+    /// Parses a URL as the driver for its scheme does.
+    pub(super) fn parse(url: &str) -> Result<Self> {
+        use sqlx::ConnectOptions;
+        use std::str::FromStr;
+        let quiet = log::LevelFilter::Off;
+        Ok(
+            if url.starts_with("sqlserver://") || url.starts_with("mssql://") {
+                let parts = mssql_parts(url)?;
+                Target::MsSql(Box::new(mssql_config(url)?), parts)
+            } else if url.starts_with("mysql://") {
+                Target::MySql(
+                    sqlx::mysql::MySqlConnectOptions::from_str(url)
+                        .context("parsing the MySQL URL")?
+                        .log_statements(quiet)
+                        .log_slow_statements(quiet, Duration::from_secs(3600)),
+                )
+            } else if url.starts_with("sqlite:") {
+                Target::Sqlite(
+                    sqlx::sqlite::SqliteConnectOptions::from_str(url)
+                        .context("parsing the SQLite URL")?
+                        .log_statements(quiet)
+                        .log_slow_statements(quiet, Duration::from_secs(3600)),
+                )
+            } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+                Target::Postgres(
+                    sqlx::postgres::PgConnectOptions::from_str(url)
+                        .context("parsing the PostgreSQL URL")?
+                        .log_statements(quiet)
+                        .log_slow_statements(quiet, Duration::from_secs(3600)),
+                )
+            } else {
+                bail!("the database URL must be postgres://, mysql://, sqlserver:// or sqlite:");
+            },
+        )
+    }
+
+    /// The parts this target connects to, as admission compares them. A
+    /// socket counts as the host; PostgreSQL without a database connects to
+    /// the user's.
+    pub(super) fn parts(&self) -> ConnectionParts {
+        match self {
+            Target::Postgres(o) => ConnectionParts {
+                engine: "postgres".into(),
+                host: Some(match o.get_socket() {
+                    Some(socket) => socket.to_string_lossy().into_owned(),
+                    None => o.get_host().to_string(),
+                }),
+                port: Some(o.get_port()),
+                database: Some(
+                    o.get_database()
+                        .unwrap_or_else(|| o.get_username())
+                        .to_string(),
+                ),
+            },
+            Target::MySql(o) => ConnectionParts {
+                engine: "mysql".into(),
+                host: Some(match o.get_socket() {
+                    Some(socket) => socket.to_string_lossy().into_owned(),
+                    None => o.get_host().to_string(),
+                }),
+                port: Some(o.get_port()),
+                database: o.get_database().map(str::to_string),
+            },
+            Target::Sqlite(o) => ConnectionParts {
+                engine: "sqlite".into(),
+                host: None,
+                port: None,
+                database: Some(o.get_filename().to_string_lossy().into_owned()),
+            },
+            Target::MsSql(_, parts) => parts.clone(),
+        }
+        .normalized()
+    }
+}
+
+/// The parts `mssql_config` connects to: the URL's host, its port or 1433,
+/// and its path as the database, as `mssql_config` reads them.
+fn mssql_parts(url: &str) -> Result<ConnectionParts> {
+    let parsed = url::Url::parse(url).context("parsing the SQL Server URL")?;
+    let database = parsed.path().trim_start_matches('/');
+    Ok(ConnectionParts {
+        engine: "sqlserver".into(),
+        host: Some(
+            parsed
+                .host_str()
+                .context("the SQL Server URL has no host")?
+                .to_string(),
+        ),
+        port: Some(parsed.port().unwrap_or(1433)),
+        database: (!database.is_empty()).then(|| database.to_string()),
+    })
+}
+
+/// The parts a 0.1 connection URL connects to, or why it cannot be read.
+pub fn url_parts(url: &str) -> Result<ConnectionParts> {
+    Ok(Target::parse(url)?.parts())
+}
+
 /// The connection to the source's database, opened on first use.
 pub(super) struct Driver {
-    url: String,
+    target: Target,
     pool: tokio::sync::OnceCell<Pool>,
 }
 
 impl Driver {
-    pub(super) fn new(url: String) -> Self {
-        Self {
-            url,
+    pub(super) fn new(url: &str) -> Result<Self> {
+        Ok(Self {
+            target: Target::parse(url)?,
             pool: tokio::sync::OnceCell::new(),
-        }
+        })
     }
 
-    /// The URL connected to.
-    pub(super) fn url(&self) -> &str {
-        &self.url
+    /// What the driver connects to.
+    pub(super) fn target(&self) -> &Target {
+        &self.target
     }
 
     async fn pool(&self) -> Result<&Pool> {
         self.pool
             .get_or_try_init(|| async {
                 let timeout = Duration::from_secs(30);
-                let pool =
-                    if self.url.starts_with("sqlserver://") || self.url.starts_with("mssql://") {
-                        let config = mssql_config(&self.url)?;
+                let pool = match &self.target {
+                    Target::MsSql(config, _) => {
                         // Connect once now, so a wrong host or password shows at start.
-                        mssql_connect(&config).await?;
-                        Pool::MsSql(Box::new(config))
-                    } else if self.url.starts_with("mysql://") {
-                        Pool::MySql(
-                            MySqlPoolOptions::new()
-                                .max_connections(2)
-                                .acquire_timeout(timeout)
-                                .connect(&self.url)
-                                .await?,
-                        )
-                    } else if self.url.starts_with("sqlite:") {
-                        Pool::Sqlite(
-                            SqlitePoolOptions::new()
-                                .max_connections(1)
-                                .acquire_timeout(timeout)
-                                .connect(&self.url)
-                                .await?,
-                        )
-                    } else {
-                        Pool::Postgres(
-                            PgPoolOptions::new()
-                                .max_connections(2)
-                                .acquire_timeout(timeout)
-                                .connect(&self.url)
-                                .await?,
-                        )
-                    };
+                        mssql_connect(config).await?;
+                        Pool::MsSql(config.clone())
+                    }
+                    Target::MySql(o) => Pool::MySql(
+                        MySqlPoolOptions::new()
+                            .max_connections(2)
+                            .acquire_timeout(timeout)
+                            .connect_with(o.clone())
+                            .await?,
+                    ),
+                    Target::Sqlite(o) => Pool::Sqlite(
+                        SqlitePoolOptions::new()
+                            .max_connections(1)
+                            .acquire_timeout(timeout)
+                            .connect_with(o.clone())
+                            .await?,
+                    ),
+                    Target::Postgres(o) => Pool::Postgres(
+                        PgPoolOptions::new()
+                            .max_connections(2)
+                            .acquire_timeout(timeout)
+                            .connect_with(o.clone())
+                            .await?,
+                    ),
+                };
                 Ok::<_, anyhow::Error>(pool)
             })
             .await

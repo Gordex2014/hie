@@ -10,8 +10,8 @@ use serde_json::{Map, Value};
 use super::endpoint::{Bind, DbError, Engine, Session};
 use crate::config::TableName;
 
-/// What a column's type is, for binding a value of it and for choosing what
-/// may say which rows are new.
+/// What a column's type is, for binding a value of it back in its own type,
+/// and for choosing what may order a read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
     Int,
@@ -22,61 +22,85 @@ pub enum Class {
     Date,
     Time,
     Text,
+    Uuid,
+    Bool,
+    /// A type a keyset cannot compare or bind (binary, JSON, arrays, ...).
+    Unsupported,
 }
 
 impl Class {
     /// The class of an engine's type name.
     pub fn of(engine: Engine, type_name: &str) -> Self {
-        let t = type_name.to_ascii_lowercase();
-        if engine == Engine::Sqlite {
-            // SQLite's affinity rules, by the declared type.
-            return if t.contains("int") {
-                Class::Int
-            } else if t.contains("char") || t.contains("clob") || t.contains("text") {
-                Class::Text
-            } else if t.contains("real") || t.contains("floa") || t.contains("doub") {
-                Class::Float
-            } else if t.contains("dec") || t.contains("num") {
-                Class::Decimal
-            } else if t.contains("datetime") || t.contains("timestamp") {
-                Class::Timestamp
-            } else if t == "date" {
-                Class::Date
-            } else if t.contains("time") {
-                Class::Time
-            } else {
-                Class::Text
-            };
-        }
-        if t == "timestamp" && engine == Engine::SqlServer {
-            // SQL Server's `timestamp` is a row version, not a time.
-            return Class::Text;
-        }
-        if t.contains("with time zone") || t == "timestamptz" || t == "datetimeoffset" {
-            Class::TimestampTz
-        } else if t.contains("timestamp") || t.contains("datetime") {
-            Class::Timestamp
-        } else if t == "date" {
-            Class::Date
-        } else if t.starts_with("time") {
-            Class::Time
-        } else if t.contains("int") || t.contains("serial") {
-            Class::Int
-        } else if t.contains("decimal") || t.contains("numeric") || t.contains("money") {
-            Class::Decimal
-        } else if t.contains("real") || t.contains("float") || t.contains("double") {
-            Class::Float
-        } else {
-            Class::Text
+        let t = type_name.trim().to_ascii_lowercase();
+        match engine {
+            // SQLite's affinity rules, by the declared type; values bind by
+            // their own type, so only blobs cannot order.
+            Engine::Sqlite => {
+                if t.contains("int") {
+                    Class::Int
+                } else if t.contains("char") || t.contains("clob") || t.contains("text") {
+                    Class::Text
+                } else if t.contains("blob") || t.is_empty() {
+                    Class::Unsupported
+                } else if t.contains("real") || t.contains("floa") || t.contains("doub") {
+                    Class::Float
+                } else if t.contains("datetime") || t.contains("timestamp") {
+                    Class::Timestamp
+                } else if t == "date" {
+                    Class::Date
+                } else if t.contains("time") {
+                    Class::Time
+                } else {
+                    Class::Decimal
+                }
+            }
+            Engine::Postgres => match t.as_str() {
+                "smallint" | "integer" | "bigint" => Class::Int,
+                "numeric" | "decimal" => Class::Decimal,
+                "real" | "double precision" => Class::Float,
+                "timestamp without time zone" | "timestamp" => Class::Timestamp,
+                "timestamp with time zone" | "timestamptz" => Class::TimestampTz,
+                "date" => Class::Date,
+                "time without time zone" | "time" => Class::Time,
+                "uuid" => Class::Uuid,
+                "boolean" => Class::Bool,
+                "character varying" | "character" | "text" | "name" | "varchar" | "char"
+                | "bpchar" => Class::Text,
+                _ => Class::Unsupported,
+            },
+            Engine::SqlServer => match t.as_str() {
+                "tinyint" | "smallint" | "int" | "bigint" => Class::Int,
+                "decimal" | "numeric" | "money" | "smallmoney" => Class::Decimal,
+                "real" | "float" => Class::Float,
+                "datetime" | "datetime2" | "smalldatetime" => Class::Timestamp,
+                "datetimeoffset" => Class::TimestampTz,
+                "date" => Class::Date,
+                "time" => Class::Time,
+                "uniqueidentifier" => Class::Uuid,
+                "bit" => Class::Bool,
+                "char" | "varchar" | "nchar" | "nvarchar" => Class::Text,
+                // `timestamp` is a row version; `text`, `ntext` cannot be compared.
+                _ => Class::Unsupported,
+            },
         }
     }
 
     /// Integer, decimal, date or time types: what may say which rows are new.
     pub fn orders_new_rows(self) -> bool {
-        !matches!(self, Class::Text)
+        matches!(
+            self,
+            Class::Int
+                | Class::Float
+                | Class::Decimal
+                | Class::Timestamp
+                | Class::TimestampTz
+                | Class::Date
+                | Class::Time
+        )
     }
 
-    /// A value read from a column of this class, to bind back.
+    /// A value read from a column of this class, to bind back in the
+    /// column's own type.
     pub fn bind(self, engine: Engine, value: &Value) -> Bind {
         if engine == Engine::Sqlite {
             return by_json(value);
@@ -86,6 +110,11 @@ impl Class {
             (Class::Int, Value::Number(n)) if n.is_i64() => Bind::Int(n.as_i64().unwrap_or(0)),
             (Class::Decimal, Value::Number(n)) => Bind::Decimal(n.to_string()),
             (Class::Decimal, Value::String(s)) => Bind::Decimal(s.clone()),
+            (Class::Bool, Value::Bool(b)) => Bind::Bool(*b),
+            (Class::Uuid, Value::String(s)) => Bind::Uuid(s.clone()),
+            (Class::Time, Value::String(s)) => chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+                .map(Bind::Time)
+                .unwrap_or_else(|_| Bind::Text(s.clone())),
             (Class::Timestamp, Value::String(s)) => naive(s)
                 .map(Bind::Timestamp)
                 .unwrap_or_else(|| Bind::Text(s.clone())),
@@ -103,7 +132,7 @@ impl Class {
 fn by_json(value: &Value) -> Bind {
     match value {
         Value::Null => Bind::Null,
-        Value::Bool(b) => Bind::Int(*b as i64),
+        Value::Bool(b) => Bind::Bool(*b),
         Value::Number(n) => n
             .as_i64()
             .map(Bind::Int)
@@ -117,6 +146,23 @@ fn naive(text: &str) -> Option<NaiveDateTime> {
     ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"]
         .iter()
         .find_map(|f| NaiveDateTime::parse_from_str(text, f).ok())
+}
+
+/// Why a column cannot order a table read, if it cannot.
+pub fn cannot_order(column: &ColumnInfo) -> Option<String> {
+    if column.nullable {
+        return Some(format!(
+            "column {:?} may be null; a table read orders by columns that are never null",
+            column.name
+        ));
+    }
+    if column.class == Class::Unsupported {
+        return Some(format!(
+            "column {:?} is of type {}, which cannot order a table read",
+            column.name, column.type_name
+        ));
+    }
+    None
 }
 
 /// One column of a table.
@@ -340,9 +386,15 @@ pub struct Plan {
     classes: Vec<Class>,
 }
 
+/// The alias of an order column's exact text, read beside a row so that a
+/// position never goes through a JSON float.
+fn exact_alias(i: usize) -> String {
+    format!("hie_position_{i}")
+}
+
 impl Plan {
     /// The plan of a table read on a described table. Every named column must
-    /// exist; `key` must not be empty.
+    /// exist, never be null and be of a type that orders; `key` must not be empty.
     pub fn new(info: &TableInfo, key: &[String], new_rows_by: &str) -> Result<Self, String> {
         if key.is_empty() {
             return Err("the table has no primary key; name the read's key".into());
@@ -356,9 +408,13 @@ impl Plan {
         let classes = columns
             .iter()
             .map(|c| {
-                info.column(c)
-                    .map(|c| c.class)
-                    .ok_or_else(|| format!("the table has no column {c:?}"))
+                let column = info
+                    .column(c)
+                    .ok_or_else(|| format!("the table has no column {c:?}"))?;
+                match cannot_order(column) {
+                    Some(reason) => Err(reason),
+                    None => Ok(column.class),
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -366,6 +422,11 @@ impl Plan {
             columns,
             classes,
         })
+    }
+
+    /// Whether order column `i` is read beside the row as exact text.
+    fn exact(&self, engine: Engine, i: usize) -> bool {
+        engine != Engine::Sqlite && self.classes[i] == Class::Decimal
     }
 
     /// The statement reading up to `limit` rows past `after` (the order
@@ -397,23 +458,43 @@ impl Plan {
             }
             filter = format!(" WHERE {}", alternatives.join(" OR "));
         }
+        let mut select = "*".to_string();
+        for (i, column) in quoted.iter().enumerate() {
+            if self.exact(engine, i) {
+                let alias = engine.quote(&exact_alias(i));
+                select.push_str(&match engine {
+                    Engine::SqlServer => format!(", CONVERT(varchar(64), {column}) AS {alias}"),
+                    _ => format!(", {column}::text AS {alias}"),
+                });
+            }
+        }
         let order = quoted.join(", ");
         let table = from(engine, &self.table);
         let sql = match engine {
             Engine::SqlServer => {
-                format!("SELECT TOP ({limit}) * FROM {table}{filter} ORDER BY {order}")
+                format!("SELECT TOP ({limit}) {select} FROM {table}{filter} ORDER BY {order}")
             }
-            _ => format!("SELECT * FROM {table}{filter} ORDER BY {order} LIMIT {limit}"),
+            _ => format!("SELECT {select} FROM {table}{filter} ORDER BY {order} LIMIT {limit}"),
         };
         (sql, binds)
     }
 
-    /// The order columns' values of a row read.
-    pub fn position(&self, row: &Map<String, Value>) -> Vec<Value> {
-        self.columns
-            .iter()
-            .map(|c| row.get(c).cloned().unwrap_or(Value::Null))
-            .collect()
+    /// A row as read: the row itself (without the exact texts read beside
+    /// it) and the order columns' exact values.
+    pub fn split(
+        &self,
+        engine: Engine,
+        mut row: Map<String, Value>,
+    ) -> (Map<String, Value>, Vec<Value>) {
+        let mut position = Vec::with_capacity(self.columns.len());
+        for (i, column) in self.columns.iter().enumerate() {
+            let exact = self
+                .exact(engine, i)
+                .then(|| row.remove(&exact_alias(i)))
+                .flatten();
+            position.push(exact.unwrap_or_else(|| row.get(column).cloned().unwrap_or(Value::Null)));
+        }
+        (row, position)
     }
 }
 
@@ -462,5 +543,124 @@ mod tests {
         assert_eq!(binds[2], Bind::Int(7));
         assert!(Plan::new(&info(), &[], "id").is_err());
         assert!(Plan::new(&info(), &["nope".into()], "id").is_err());
+    }
+
+    fn table(engine: Engine, columns: &[(&str, &str, bool)]) -> TableInfo {
+        TableInfo {
+            table: TableName {
+                schema: None,
+                name: "t".into(),
+            },
+            columns: columns
+                .iter()
+                .map(|(name, t, nullable)| ColumnInfo {
+                    name: (*name).into(),
+                    type_name: (*t).into(),
+                    nullable: *nullable,
+                    class: Class::of(engine, t),
+                })
+                .collect(),
+            primary_key: vec![],
+        }
+    }
+
+    #[test]
+    fn nullable_or_unordered_columns_cannot_order_a_read() {
+        let info = table(
+            Engine::Postgres,
+            &[
+                ("id", "integer", false),
+                ("seen", "timestamp without time zone", true),
+                ("blob", "bytea", false),
+            ],
+        );
+        let nullable = Plan::new(&info, &["id".into()], "seen").unwrap_err();
+        assert!(nullable.contains("may be null"), "{nullable}");
+        let binary = Plan::new(&info, &["blob".into()], "id").unwrap_err();
+        assert!(binary.contains("cannot order"), "{binary}");
+        assert!(Plan::new(&info, &["id".into()], "id").is_ok());
+        let candidates = table(
+            Engine::Postgres,
+            &[
+                ("id", "integer", false),
+                ("flag", "boolean", false),
+                ("u", "uuid", false),
+            ],
+        )
+        .new_rows_candidates();
+        assert_eq!(candidates, ["id"]);
+    }
+
+    #[test]
+    fn decimal_positions_stay_exact_from_the_read_to_the_bind() {
+        let info = table(
+            Engine::Postgres,
+            &[("amount", "numeric", false), ("id", "integer", false)],
+        );
+        let plan = Plan::new(&info, &["id".into()], "amount").unwrap();
+        let (sql, _) = plan.sql(Engine::Postgres, None, 5);
+        assert_eq!(
+            sql,
+            "SELECT *, \"amount\"::text AS \"hie_position_0\" FROM \"public\".\"t\" ORDER BY \"amount\", \"id\" LIMIT 5"
+        );
+        // The decoded row has lost digits; the exact text read beside it has not.
+        let mut row = serde_json::Map::new();
+        row.insert("amount".into(), serde_json::json!(12345678901234567.0));
+        row.insert("id".into(), serde_json::json!(3));
+        row.insert(
+            "hie_position_0".into(),
+            serde_json::json!("12345678901234567.89"),
+        );
+        let (row, position) = plan.split(Engine::Postgres, row);
+        assert!(!row.contains_key("hie_position_0"));
+        assert_eq!(
+            position,
+            [
+                serde_json::json!("12345678901234567.89"),
+                serde_json::json!(3)
+            ]
+        );
+        // Persisted as JSON and bound back as that decimal.
+        let stored: Vec<serde_json::Value> =
+            serde_json::from_str(&serde_json::to_string(&position).unwrap()).unwrap();
+        let (_, binds) = plan.sql(Engine::Postgres, Some(&stored), 5);
+        assert_eq!(binds[0], Bind::Decimal("12345678901234567.89".into()));
+        let mssql = table(
+            Engine::SqlServer,
+            &[("amount", "decimal", false), ("id", "int", false)],
+        );
+        let (sql, _) =
+            Plan::new(&mssql, &["id".into()], "amount")
+                .unwrap()
+                .sql(Engine::SqlServer, None, 5);
+        assert!(
+            sql.contains("CONVERT(varchar(64), [amount]) AS [hie_position_0]"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn keys_bind_in_their_own_type() {
+        let info = table(
+            Engine::Postgres,
+            &[
+                ("u", "uuid", false),
+                ("flag", "boolean", false),
+                ("at", "time without time zone", false),
+            ],
+        );
+        let plan = Plan::new(&info, &["u".into(), "flag".into()], "at").unwrap();
+        let after = [
+            serde_json::json!("10:30:00.5"),
+            serde_json::json!("6f9619ff-8b86-d011-b42d-00c04fc964ff"),
+            serde_json::json!(true),
+        ];
+        let (_, binds) = plan.sql(Engine::Postgres, Some(&after), 5);
+        assert!(matches!(binds[0], Bind::Time(_)));
+        assert_eq!(
+            binds[2],
+            Bind::Uuid("6f9619ff-8b86-d011-b42d-00c04fc964ff".into())
+        );
+        assert_eq!(binds[5], Bind::Bool(true));
     }
 }

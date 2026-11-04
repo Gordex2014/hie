@@ -1135,6 +1135,7 @@ dependencies = [
  "hmac 0.12.1",
  "http",
  "jsonwebtoken",
+ "log",
  "object_store",
  "postgres",
  "rand 0.8.8",

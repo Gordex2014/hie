@@ -20,6 +20,7 @@ mod parts;
 mod rows;
 mod table;
 
+pub use driver::url_parts;
 pub use endpoint::{DbError, Endpoint, Engine, Stage};
 pub use parts::{Check, Described, TestReport};
 pub use parts::{
@@ -257,7 +258,7 @@ impl DatabaseSource {
             cursor_column: cursor_column.to_string(),
             cursor_start,
             max_runs,
-            driver: Driver::new(url),
+            driver: Driver::new(&url)?,
             admission: Default::default(),
             pulled: Mutex::new(None),
         })
@@ -274,9 +275,9 @@ impl DatabaseSource {
         if !self.admission.enforced() {
             return Ok(());
         }
-        let parts = crate::admission::url_parts(self.driver.url())
-            .ok_or_else(|| anyhow::anyhow!("the connection URL cannot be read"))?;
-        self.admission.check(&parts).map_err(anyhow::Error::from)
+        self.admission
+            .check(&self.driver.target().parts())
+            .map_err(anyhow::Error::from)
     }
 
     /// Where the query starts: the stored cursor, else `cursor_start`.

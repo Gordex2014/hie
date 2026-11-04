@@ -58,7 +58,6 @@ pub struct EvidenceRow {
     pub primary_key: Option<Vec<String>>,
     pub tested_at: i64,
     pub expires_at: i64,
-    pub source_id: Option<String>,
 }
 
 /// What a source is bound to.
@@ -307,33 +306,76 @@ impl Evidence {
     pub async fn test(&self, source: &SourceConfig) -> Result<Value, ManagerError> {
         let (connection, read) =
             parts_of(source).ok_or_else(|| invalid("not a database connection by parts"))?;
-        let credential = self.resolve_credential(connection)?;
+        self.resolve_credential(connection)?;
         self.admit(source)?;
-        let endpoint =
-            Endpoint::new(connection, credential.as_ref().map(|c| c.1)).map_err(invalid)?;
-        let report = test_connection(&endpoint, read, &self.ctx).await;
-        let primary_key = report.primary_key.clone();
-        let definition = normalized(connection, read, primary_key.as_deref());
-        let row = self.keep(&report, definition, credential, primary_key)?;
-        Ok(json!({
-            "reachable": report.connect == Check::Passed,
-            "elapsed_ms": report.elapsed_ms,
-            "objects": report.rows.unwrap_or(report.tables.len() as i64),
-            "newest": null,
-            "newest_at": null,
-            "evidence": row.body,
-        }))
+        // The revision is resolved and held for the evidence in one step,
+        // before anything connects: a rotation meanwhile cannot destroy it.
+        let id = crate::ids::new(Kind::Evidence);
+        let credential = self.reserve_credential(connection, SecretUse::Evidence, &id)?;
+        let result = async {
+            let endpoint =
+                Endpoint::new(connection, credential.as_ref().map(|c| c.1)).map_err(invalid)?;
+            let report = test_connection(&endpoint, read, &self.ctx).await;
+            let primary_key = report.primary_key.clone();
+            let definition = normalized(connection, read, primary_key.as_deref());
+            let row = self.keep(&id, &report, definition, credential.clone(), primary_key)?;
+            Ok::<_, ManagerError>(json!({
+                "reachable": report.connect == Check::Passed,
+                "elapsed_ms": report.elapsed_ms,
+                "objects": report.rows.unwrap_or(report.tables.len() as i64),
+                "newest": null,
+                "newest_at": null,
+                "evidence": row.body,
+            }))
+        }
+        .await;
+        if result.is_err()
+            && let Some(secrets) = &self.ctx.secrets
+        {
+            secrets.release(SecretUse::Evidence, &id, None)?;
+        }
+        result
+    }
+
+    /// Resolves the password's revision (the one named, else the current
+    /// one) and holds it for `holder`, atomically.
+    fn reserve_credential(
+        &self,
+        connection: &DatabaseConnection,
+        kind: SecretUse,
+        holder: &str,
+    ) -> Result<Option<(String, u32)>, ManagerError> {
+        let Some(password) = &connection.password else {
+            return Ok(None);
+        };
+        let secrets = self
+            .ctx
+            .secrets
+            .as_ref()
+            .ok_or_else(|| invalid("secrets need custody configured"))?;
+        let revision = secrets
+            .reserve(&password.secret, password.revision, kind, holder)
+            .map_err(|e| match e {
+                SecretError::Store(e) => ManagerError::from(e),
+                SecretError::Unavailable => invalid("secrets need custody configured"),
+                _ => invalid(format!(
+                    "secret {} has no such revision any more",
+                    password.secret
+                )),
+            })?;
+        Ok(Some((password.secret.clone(), revision)))
     }
 
     fn keep(
         &self,
+        id: &str,
         report: &TestReport,
         definition: Value,
         credential: Option<(String, u32)>,
         primary_key: Option<Vec<String>>,
     ) -> Result<EvidenceRow, ManagerError> {
         self.purge()?;
-        let id = crate::ids::new(Kind::Evidence);
+        let id = id.to_string();
         let now = now_ms();
         let check = |name: &str, check: &Check| match check {
             Check::Passed => json!({"name": name, "result": "passed"}),
@@ -371,13 +413,8 @@ impl Evidence {
             primary_key,
             tested_at: now,
             expires_at: now + KEEP_MS,
-            source_id: None,
         };
-        // The revision is held before the evidence exists, so it can never
-        // be destroyed under it.
-        if let (Some((secret, revision)), Some(secrets)) = (&credential, &self.ctx.secrets) {
-            secrets.hold(secret, *revision, SecretUse::Evidence, &id)?;
-        }
+        // Its revision is already held under its id (`reserve_credential`).
         self.db.insert_evidence(&row)?;
         Ok(row)
     }
@@ -533,15 +570,17 @@ impl Evidence {
         if let Some(secrets) = &self.ctx.secrets {
             let keep = binding.credential.as_ref().map(|(s, r)| (s.as_str(), *r));
             if let Some((secret, revision)) = keep {
-                secrets.hold(secret, revision, SecretUse::Source, &binding.source)?;
+                secrets
+                    .reserve(secret, Some(revision), SecretUse::Source, &binding.source)
+                    .map_err(|e| {
+                        anyhow::anyhow!("holding secret {secret} revision {revision}: {e:?}")
+                    })?;
             }
             // What the previous definition held, other than this revision.
             secrets.release(SecretUse::Source, &binding.source, keep)?;
         }
-        match &binding.evidence {
-            Some(id) => self.db.hold_evidence(&binding.source, id)?,
-            None => self.db.release_evidence(&binding.source)?,
-        }
+        // The binding is what keeps its evidence: evidence is kept while
+        // any source's binding names it.
         self.db.set_binding(binding)?;
         self.purge()
     }
@@ -551,7 +590,6 @@ impl Evidence {
         if let Some(secrets) = &self.ctx.secrets {
             secrets.release(SecretUse::Source, source, None)?;
         }
-        self.db.release_evidence(source)?;
         self.db.delete_binding(source)?;
         self.purge()
     }

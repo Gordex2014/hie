@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use serde_json::{Map, Value};
-use sqlx::Connection;
+use sqlx::{ConnectOptions, Connection};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use super::rows::{mssql_row, pg_row, sqlite_row};
@@ -121,6 +121,10 @@ pub enum Bind {
     Timestamp(NaiveDateTime),
     TimestampTz(DateTime<Utc>),
     Date(NaiveDate),
+    Time(chrono::NaiveTime),
+    Bool(bool),
+    /// A UUID as text, bound as the engine's UUID type.
+    Uuid(String),
 }
 
 /// A connection by its parts, with the password's revision resolved.
@@ -238,7 +242,9 @@ impl Endpoint {
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(&path)
             .read_only(true)
-            .create_if_missing(false);
+            .create_if_missing(false)
+            .log_statements(log::LevelFilter::Off)
+            .log_slow_statements(log::LevelFilter::Off, READ_TIMEOUT);
         let connection = tokio::time::timeout(
             CONNECT_TIMEOUT,
             sqlx::SqliteConnection::connect_with(&options),
@@ -255,6 +261,8 @@ impl Endpoint {
     async fn open_postgres(&self, password: &str) -> Result<Session, Failure> {
         use sqlx::postgres::{PgConnectOptions, PgSslMode};
         let mut options = PgConnectOptions::new_without_pgpass()
+            .log_statements(log::LevelFilter::Off)
+            .log_slow_statements(log::LevelFilter::Off, READ_TIMEOUT)
             .host(self.host.as_deref().unwrap_or("localhost"))
             .port(self.port.unwrap_or(5432))
             .ssl_mode(match (self.encrypt, self.trust_cert) {
@@ -476,6 +484,9 @@ impl Session {
                             }
                             Bind::TimestampTz(t) => q.bind(t.to_rfc3339()),
                             Bind::Date(d) => q.bind(d.to_string()),
+                            Bind::Time(t) => q.bind(t.to_string()),
+                            Bind::Bool(b) => q.bind(*b),
+                            Bind::Uuid(u) => q.bind(u.clone()),
                         };
                     }
                     q.fetch_all(&mut *c)
@@ -498,6 +509,12 @@ impl Session {
                             Bind::Timestamp(t) => q.bind(*t),
                             Bind::TimestampTz(t) => q.bind(*t),
                             Bind::Date(d) => q.bind(*d),
+                            Bind::Time(t) => q.bind(*t),
+                            Bind::Bool(b) => q.bind(*b),
+                            Bind::Uuid(u) => match sqlx::types::Uuid::parse_str(u) {
+                                Ok(u) => q.bind(u),
+                                Err(_) => q.bind(u.clone()),
+                            },
                         };
                     }
                     q.fetch_all(&mut *c)
@@ -521,6 +538,12 @@ impl Session {
                                 Bind::Timestamp(t) => Box::new(*t),
                                 Bind::TimestampTz(t) => Box::new(*t),
                                 Bind::Date(d) => Box::new(*d),
+                                Bind::Time(t) => Box::new(*t),
+                                Bind::Bool(b) => Box::new(*b),
+                                Bind::Uuid(u) => match tiberius::Uuid::parse_str(u) {
+                                    Ok(u) => Box::new(u),
+                                    Err(_) => Box::new(u.clone()),
+                                },
                             }
                         })
                         .collect();

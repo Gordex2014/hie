@@ -138,11 +138,14 @@ async fn check_read(
             } else {
                 key
             };
-            if info.column(new_rows_by).is_none() {
+            let Some(column) = info.column(new_rows_by) else {
                 return Err(DbError::new(
                     Stage::Read,
                     format!("the table has no column {new_rows_by:?}"),
                 ));
+            };
+            if let Some(reason) = table::cannot_order(column) {
+                return Err(DbError::new(Stage::Read, reason));
             }
             if !key.is_empty() {
                 let plan =
@@ -246,8 +249,14 @@ pub async fn sample(
                 };
                 let plan = Plan::new(&info, &key, new_rows_by)
                     .map_err(|m| DbError::new(Stage::Read, m))?;
-                let (sql, binds) = plan.sql(session.engine(), None, limit);
-                session.fetch(&sql, &binds, &clean).await?
+                let engine = session.engine();
+                let (sql, binds) = plan.sql(engine, None, limit);
+                session
+                    .fetch(&sql, &binds, &clean)
+                    .await?
+                    .into_iter()
+                    .map(|row| plan.split(engine, row).0)
+                    .collect()
             }
             DatabaseRead::Query {
                 query,
@@ -371,16 +380,18 @@ impl PartsSource {
                     .and_then(|stored| serde_json::from_str::<Position>(&stored).ok())
                     .filter(|p| p.columns == plan.columns)
                     .map(|p| p.after);
+                let engine = session.engine();
                 for _ in 0..self.max_runs {
-                    let (sql, binds) = plan.sql(session.engine(), after.as_deref(), PAGE);
+                    let (sql, binds) = plan.sql(engine, after.as_deref(), PAGE);
                     let rows = session.fetch(&sql, &binds, &clean).await?;
-                    for row in &rows {
-                        push(row);
+                    let read = rows.len();
+                    for row in rows {
+                        // The position keeps each order column's exact value.
+                        let (row, position) = plan.split(engine, row);
+                        push(&row);
+                        after = Some(position);
                     }
-                    if let Some(last) = rows.last() {
-                        after = Some(plan.position(last));
-                    }
-                    if rows.len() < PAGE {
+                    if read < PAGE {
                         break;
                     }
                 }

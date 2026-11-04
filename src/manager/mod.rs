@@ -264,6 +264,7 @@ impl SourceManager {
     }
 
     pub fn start_all(&self, feeds: Vec<FeedConfig>) -> Result<()> {
+        self.reconcile_starts(&feeds)?;
         for feed in feeds {
             // No runner of this process runs yet: a pass it left running died with it.
             self.db
@@ -415,44 +416,129 @@ impl SourceManager {
         recovered: bool,
     ) -> Result<FeedConfig, ManagerError> {
         let (mut submitted, mut resolved) = self.parse(body)?;
-        if recovered && let Some(existing) = self.source(&submitted.id) {
-            return Ok(existing);
+        let id = submitted.id.clone();
+        if recovered {
+            // An earlier attempt with this key stopped somewhere: finish
+            // what it began, or answer what it finished.
+            if let Some(intent) = self.db.start_intents(Some(&id))?.into_iter().next() {
+                if self.file_for(&id).exists() {
+                    return self.finish_start(&intent, by).map_err(ManagerError::from);
+                }
+                self.db.delete_start_intent(&id)?;
+            } else if let Some(existing) = self.source(&id) {
+                return Ok(existing);
+            }
         }
         let binding = self.admit_and_bind(body, &resolved)?;
-        if self.source(&submitted.id).is_some() || self.file_for(&submitted.id).exists() {
-            return Err(ManagerError::conflict(
-                "source_exists",
-                format!("source {} already exists", submitted.id),
-            ));
+        let exists =
+            || ManagerError::conflict("source_exists", format!("source {id} already exists"));
+        if self.source(&id).is_some() || self.file_for(&id).exists() {
+            return Err(exists());
         }
         if let Some(binding) = &binding {
             Self::fill(&mut submitted, binding);
             Self::fill(&mut resolved, binding);
         }
-        if !self.write_new(&submitted)? {
-            if recovered && let Some(existing) = self.source(&submitted.id) {
-                return Ok(existing);
-            }
-            return Err(ManagerError::conflict(
-                "source_exists",
-                format!("source {} already exists", submitted.id),
-            ));
+        // The intent comes first, in the store: whatever stops this Start
+        // after the file exists is finished from it (`finish_start`), by a
+        // recovered request or when the engine starts.
+        let intent = Binding {
+            source: id.clone(),
+            evidence: binding.as_ref().map(|b| b.evidence.clone()),
+            credential: binding.as_ref().and_then(|b| b.credential.clone()),
+            first_load: None,
+        };
+        if !self.db.insert_start_intent(&intent)? {
+            return Err(exists());
         }
-        self.ensure_default_rule(&submitted, by)?;
-        if let Some(binding) = &binding {
+        match self.write_new(&submitted) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.db.delete_start_intent(&id)?;
+                return Err(exists());
+            }
+            Err(e) => {
+                self.db.delete_start_intent(&id)?;
+                return Err(e.into());
+            }
+        }
+        self.finish_start(&intent, by).map_err(ManagerError::from)
+    }
+
+    /// Finishes a Start whose file exists, from its intent: the default rule,
+    /// the first load (once), the binding and holds, then the runner. Safe
+    /// to run again; the intent goes when it is done.
+    fn finish_start(&self, intent: &Binding, by: Option<&str>) -> Result<FeedConfig> {
+        let id = &intent.source;
+        let feed = match self.source(id) {
+            Some(feed) => feed,
+            None => self.load_file(id)?,
+        };
+        self.ensure_default_rule(&feed, by)?;
+        if crate::evidence::needs_evidence(&feed.source) {
             // The first load exists from the Start on, queued, so a client
             // can follow it at once; the first pass adopts it.
-            let first_load = self.db.create_queued_load(&submitted.id)?;
+            let first_load = match intent
+                .first_load
+                .or(self.evidence.binding(id)?.and_then(|b| b.first_load))
+            {
+                Some(load) => load,
+                None => match self.db.queued_load(id)? {
+                    Some(load) => load,
+                    None => self.db.create_queued_load(id)?,
+                },
+            };
+            self.db.set_start_intent_load(id, first_load)?;
             self.evidence.source_started(&Binding {
-                source: submitted.id.clone(),
-                evidence: Some(binding.evidence.clone()),
-                credential: binding.credential.clone(),
                 first_load: Some(first_load),
+                ..intent.clone()
             })?;
         }
-        self.start(resolved.clone())?;
-        self.on_source_created(&resolved)?;
-        Ok(resolved)
+        if self.source(id).is_none() {
+            self.start(feed.clone())?;
+            self.on_source_created(&feed)?;
+        }
+        self.db.delete_start_intent(id)?;
+        Ok(self.source(id).unwrap_or(feed))
+    }
+
+    /// A source's definition as its file holds it, resolved.
+    fn load_file(&self, id: &str) -> Result<FeedConfig> {
+        let path = self.file_for(id);
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let mut feed: FeedConfig =
+            serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        feed.resolve(&self.base_dir)?;
+        Ok(feed)
+    }
+
+    /// Starts left by an engine that stopped: finished when their file
+    /// exists, dropped otherwise. Runs before any source starts.
+    fn reconcile_starts(&self, feeds: &[FeedConfig]) -> Result<()> {
+        for intent in self.db.start_intents(None)? {
+            let Some(feed) = feeds.iter().find(|f| f.id == intent.source) else {
+                self.db.delete_start_intent(&intent.source)?;
+                continue;
+            };
+            if crate::evidence::needs_evidence(&feed.source) {
+                let id = intent.source.clone();
+                let first_load = match intent.first_load {
+                    Some(load) => load,
+                    None => match self.db.queued_load(&id)? {
+                        Some(load) => load,
+                        None => self.db.create_queued_load(&id)?,
+                    },
+                };
+                self.db.set_start_intent_load(&id, first_load)?;
+                self.evidence.source_started(&Binding {
+                    first_load: Some(first_load),
+                    ..intent.clone()
+                })?;
+            }
+            self.db.delete_start_intent(&intent.source)?;
+        }
+        Ok(())
     }
 
     // ---- lifecycle hooks: what other areas keep about a source -------------

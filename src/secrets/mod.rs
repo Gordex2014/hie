@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 
 use crate::crypto::Keyring;
-use crate::db::Db;
+use crate::db::{Db, Tx};
 use crate::ids::rfc3339_ms_at;
 
 /// The value of the secret named `name`, if it is set.
@@ -73,6 +73,15 @@ pub enum DeleteSecret {
     NotFound,
     /// Sources refer to it.
     InUse(Vec<String>),
+}
+
+/// What reserving a revision for a holder found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reserve {
+    /// Held: this revision cannot be destroyed until the holder lets go.
+    Held(u32),
+    NotFound,
+    RevisionNotFound,
 }
 
 /// Why a secret operation did not happen.
@@ -152,28 +161,40 @@ impl Secrets {
         self.keys.as_deref().ok_or(SecretError::Unavailable)
     }
 
-    /// Keeps a new secret; its view.
-    pub fn create(&self, name: &str, value: &str) -> Result<Value, SecretError> {
+    /// Keeps a new secret, inside the caller's transaction; its view.
+    pub fn create_in(
+        &self,
+        tx: &mut Tx<'_>,
+        name: &str,
+        value: &str,
+    ) -> Result<Value, SecretError> {
         let keys = self.keys()?;
         let id = crate::ids::new(crate::ids::Kind::Secret);
-        let created = self.db.insert_secret(&id, name, |id, revision| {
+        let created = Db::insert_secret_in(tx, &id, name, |id, revision| {
             keys.seal(value.as_bytes(), &associated_data(id, revision))
         })?;
         if !created {
             return Err(SecretError::NameInUse);
         }
-        self.get(&id)
+        Self::view_in(tx, &id)
     }
 
-    /// A new revision of a secret; its view.
-    pub fn revise(&self, id: &str, value: &str) -> Result<Value, SecretError> {
+    /// A new revision of a secret, inside the caller's transaction; its view.
+    pub fn revise_in(&self, tx: &mut Tx<'_>, id: &str, value: &str) -> Result<Value, SecretError> {
         let keys = self.keys()?;
-        self.db
-            .add_secret_revision(id, |id, revision| {
-                keys.seal(value.as_bytes(), &associated_data(id, revision))
-            })?
+        Db::add_secret_revision_in(tx, id, |id, revision| {
+            keys.seal(value.as_bytes(), &associated_data(id, revision))
+        })?
+        .ok_or(SecretError::NotFound)?;
+        Self::view_in(tx, id)
+    }
+
+    fn view_in(tx: &mut Tx<'_>, id: &str) -> Result<Value, SecretError> {
+        let row = Db::secret_rows_in(tx, Some(id))?
+            .into_iter()
+            .next()
             .ok_or(SecretError::NotFound)?;
-        self.get(id)
+        Ok(view(&row))
     }
 
     /// One secret's view.
@@ -268,9 +289,22 @@ impl Secrets {
         })
     }
 
-    /// Records that `holder` refers to a revision.
-    pub fn hold(&self, id: &str, revision: u32, kind: SecretUse, holder: &str) -> Result<()> {
-        self.db.use_secret(id, revision, kind, holder)
+    /// Resolves a revision (the one named, else the current one) and holds
+    /// it for `holder`, atomically: from here until `release`, it is not
+    /// destroyed. Errors when the secret or the revision does not exist.
+    pub fn reserve(
+        &self,
+        id: &str,
+        revision: Option<u32>,
+        kind: SecretUse,
+        holder: &str,
+    ) -> Result<u32, SecretError> {
+        self.keys()?;
+        match self.db.reserve_secret(id, revision, kind, holder)? {
+            Reserve::Held(revision) => Ok(revision),
+            Reserve::NotFound => Err(SecretError::NotFound),
+            Reserve::RevisionNotFound => Err(SecretError::RevisionNotFound),
+        }
     }
 
     /// `holder` refers to no revision any more but `keep`; what nothing

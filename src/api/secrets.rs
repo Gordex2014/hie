@@ -92,8 +92,10 @@ fn check_value(value: &str) -> Result<(), ApiError> {
 async fn create(State(s): State<AppState>, idem: Idempotent) -> Result<Response, ApiError> {
     let secrets = secrets(&s)?;
     let idem = idem.keyed(&secrets.request_key().map_err(secret_error)?)?;
-    idem.run(&s.db, true, move |_, body| async move {
-        let NewSecret { name, value } = strict(&body)?;
+    // The secret and the stored answer commit together: an attempt that
+    // never answered left nothing behind, so a recovered one simply redoes it.
+    idem.run_in_tx(&s.db, true, move |tx, _, body| {
+        let NewSecret { name, value } = strict(body)?;
         let chars = name.chars().count();
         if !(1..=64).contains(&chars) || name.trim().is_empty() {
             return Err(
@@ -101,7 +103,7 @@ async fn create(State(s): State<AppState>, idem: Idempotent) -> Result<Response,
             );
         }
         check_value(&value)?;
-        let view = secrets.create(&name, &value).map_err(secret_error)?;
+        let view = secrets.create_in(tx, &name, &value).map_err(secret_error)?;
         Ok((StatusCode::CREATED, view))
     })
     .await
@@ -114,10 +116,10 @@ async fn revise(
 ) -> Result<Response, ApiError> {
     let secrets = secrets(&s)?;
     let idem = idem.keyed(&secrets.request_key().map_err(secret_error)?)?;
-    idem.run(&s.db, true, move |_, body| async move {
-        let NewValue { value } = strict(&body)?;
+    idem.run_in_tx(&s.db, true, move |tx, _, body| {
+        let NewValue { value } = strict(body)?;
         check_value(&value)?;
-        let view = secrets.revise(&id, &value).map_err(secret_error)?;
+        let view = secrets.revise_in(tx, &id, &value).map_err(secret_error)?;
         Ok((StatusCode::OK, view))
     })
     .await
