@@ -1,6 +1,6 @@
 {
   "id": "loads/retry-resolves-group",
-  "title": "A retry that resolves a group keeps it listed: outstanding 0, resolved n, its retries and resolved_at, failed_ever beside the current failed, samples from the history while content is kept",
+  "title": "A retry that resolves a group keeps it listed: outstanding 0, resolved n, its retries and resolved_at, failed_ever beside the current failed; a group whose rows moved to another version's group keeps its line and its samples while content is kept",
   "fixtures": {
     "files": {
       "transforms/lab_csv.py": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
@@ -63,7 +63,8 @@
               "retries": [],
               "transform": {
                 "version": 1
-              }
+              },
+              "first_line": "{{$g1_line}}"
             }
           ]
         }
@@ -132,7 +133,7 @@
       "until_ms": 15000
     },
     {
-      "name": "the rows left the first group for the version's own: both listed",
+      "name": "the rows left the first group for the version's own: both listed, the first keeps its line",
       "request": {
         "method": "GET",
         "path": "/api/loads/{{$load}}"
@@ -184,7 +185,8 @@
                     "value": "alto"
                   }
                 }
-              ]
+              ],
+              "first_line": "{{$g1_line}}"
             }
           ]
         }
@@ -231,7 +233,11 @@
           "retries": [
             "{{$rt1}}"
           ],
-          "records": []
+          "records": [],
+          "count": 0,
+          "resolved": 0,
+          "resolved_at": "{{time}}",
+          "first_line": "{{$g1_line}}"
         }
       }
     },
@@ -299,7 +305,7 @@
       "until_ms": 15000
     },
     {
-      "name": "resolved: rows.failed 0 and rows.failed_ever 2, every group kept with its history",
+      "name": "resolved: rows.failed 0 and rows.failed_ever 2; the first group's rows moved (resolved 0), the second's were written (resolved 2)",
       "request": {
         "method": "GET",
         "path": "/api/loads/{{$load}}"
@@ -318,12 +324,13 @@
             {
               "group": "{{$g1}}",
               "outstanding": 0,
-              "resolved": 2,
+              "resolved": 0,
               "first_failed_at": "{{$first}}",
               "resolved_at": "{{time}}",
               "retries": [
                 "{{$rt1}}"
-              ]
+              ],
+              "first_line": "{{$g1_line}}"
             },
             {
               "group": "{{$g2}}",

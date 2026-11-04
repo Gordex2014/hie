@@ -781,6 +781,8 @@ impl Db {
             format!("CAST(COALESCE(SUM(CASE WHEN {cond} THEN 1 ELSE 0 END), 0) AS BIGINT)")
         };
         let flag = |cond: &str| format!("MAX(CASE WHEN {cond} THEN 1 ELSE 0 END)");
+        // The page of loads is chosen first, so their rows and history are
+        // counted for those loads only, not for every load the page skips.
         let sql = format!(
             "SELECT f.id, f.feed_id, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived,
                     COUNT(r.id),
@@ -793,11 +795,13 @@ impl Db {
                     {wait_validation}, {wait_environment}, {wait_destination},
                     (SELECT CAST(COUNT(DISTINCT e.record_id) AS BIGINT) FROM record_events e
                       WHERE e.load_id = f.id AND e.kind = 'failed' AND COALESCE(e.error_kind, '') <> 'filtered')
-             FROM files f LEFT JOIN records r ON r.file_id = f.id
-             WHERE {condition}
+             FROM (SELECT f.id, f.feed_id, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key,
+                          f.archived, f.finished_at, f.received_at, f.transform_id, f.transform_version, f.environment
+                   FROM files f WHERE {condition} ORDER BY f.id {order} LIMIT ${n}) f
+             LEFT JOIN records r ON r.file_id = f.id
              GROUP BY f.id, f.feed_id, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived,
                       f.finished_at, f.received_at, f.transform_id, f.transform_version, f.environment
-             ORDER BY f.id {order} LIMIT ${n}",
+             ORDER BY f.id {order}",
             sent = count("r.status = 'sent'"),
             rejected = count("r.status = 'rejected'"),
             in_progress_01 = count("r.status IN ('received', 'pending', 'submitted')"),

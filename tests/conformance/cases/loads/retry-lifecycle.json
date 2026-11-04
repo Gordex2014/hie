@@ -252,7 +252,7 @@
       }
     },
     {
-      "name": "rows in flight: the group stays listed, not resolved yet",
+      "name": "rows in flight: not failing now (count 0) but still outstanding, not resolved yet",
       "request": {
         "method": "GET",
         "path": "/api/loads/{{$load}}"
@@ -264,7 +264,7 @@
             {
               "group": "{{$g}}",
               "count": 0,
-              "outstanding": 0,
+              "outstanding": 2,
               "resolved": 0,
               "resolved_at": null,
               "retries": [

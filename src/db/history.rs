@@ -164,17 +164,21 @@ pub struct Group {
     /// `None` for rows whose load recorded no version.
     pub transform: Option<(String, i64)>,
     pub location: Option<Value>,
-    /// Rows failing in it now.
+    /// Rows failing in it now (not those a retry has in flight).
     pub count: i64,
+    /// Rows that failed in it and since were neither written nor failed
+    /// into another group (or filtered): in flight or unknown ones included.
+    pub outstanding: i64,
     pub first_line: Option<i64>,
     /// `kept`, `expired`, `purged` or `none`.
     pub content: String,
-    /// Rows of it written later by a retry or reprocess, from the history.
+    /// Rows that failed in it and left it by being written (by a retry or
+    /// reprocess), from the history.
     pub resolved: i64,
     /// When its first row failed (epoch ms), from the history.
     pub first_failed_at: Option<i64>,
-    /// When no row of it was left failing or in flight in it (epoch ms);
-    /// `None` while some is.
+    /// When `outstanding` reached 0 (epoch ms): when its last row was
+    /// written or failed elsewhere; `None` while `outstanding > 0`.
     pub resolved_at: Option<i64>,
     /// The retries that targeted it, oldest first.
     pub retries: Vec<String>,
@@ -192,7 +196,7 @@ impl Group {
             "location": self.location,
             "content": self.content,
             "complete": true,
-            "outstanding": self.count,
+            "outstanding": self.outstanding,
             "resolved": self.resolved,
             "first_failed_at": at(self.first_failed_at),
             "resolved_at": at(self.resolved_at),
@@ -210,14 +214,17 @@ const GROUP_EVENT_SQL: &str =
             OR (e.transform_id = g.transform_id AND e.transform_version = g.transform_version))";
 
 /// What the history holds of a failure group: its rows (every row that ever
-/// failed in it), how many of them a retry or reprocess wrote later, when the
-/// first failed, when the last one left it, and their content now.
+/// failed in it), and of them those that have not left it, those that left
+/// it written and when the last one left, and their content now. A row
+/// leaves a group with its first `delivered` or `failed` event after its
+/// last failure in the group: written (resolved), or failed into another
+/// group or filtered (moved). `open + resolved + moved = rows`.
 #[derive(Default, Clone, Copy)]
 struct GroupHistory {
     rows: i64,
     resolved: i64,
     first_failed_at: Option<i64>,
-    /// Rows still failing or in flight in the group (no outcome since).
+    /// Rows that have not left the group: failing in it, in flight or unknown.
     open: i64,
     left_at: Option<i64>,
     kept: i64,
@@ -425,6 +432,9 @@ impl Db {
                 };
                 let tid = r.string(3);
                 let h = h.unwrap_or_default();
+                // A row failing in the group without a failure event (from
+                // before the history) is outstanding too.
+                let outstanding = h.open.max(count);
                 Group {
                     load_id,
                     kind: r.string(1),
@@ -434,12 +444,13 @@ impl Db {
                     count,
                     first_line: r
                         .opt_i64(7)
-                        .or_else(|| r.opt_i64(15))
+                        .or_else(|| r.opt_i64(14))
                         .or_else(|| r.opt_i64(8)),
                     content: content.to_string(),
                     resolved: h.resolved,
                     first_failed_at: h.first_failed_at.or_else(|| r.opt_i64(13)),
-                    resolved_at: (count == 0 && h.open == 0).then_some(h.left_at).flatten(),
+                    outstanding,
+                    resolved_at: (outstanding == 0).then_some(h.left_at).flatten(),
                     retries: retries.remove(&id).unwrap_or_default(),
                     id,
                 }
@@ -456,26 +467,23 @@ impl Db {
         let rows = self.query(
             &format!(
                 "WITH m AS (
-                   SELECT g.id AS gid, e.record_id AS rid, MIN(e.at) AS first_at,
-                          MIN(e.id) AS first_ev, MAX(e.id) AS last_ev
+                   SELECT g.id AS gid, e.record_id AS rid, MIN(e.at) AS first_at, MAX(e.id) AS last_ev
                    FROM failure_groups g JOIN record_events e ON {GROUP_EVENT_SQL}
                    WHERE g.load_id = $1 AND (CAST($2 AS TEXT) IS NULL OR g.id = CAST($2 AS TEXT))
                    GROUP BY g.id, e.record_id),
                  n AS (
-                   SELECT m.gid, m.first_at,
-                          CASE WHEN EXISTS (SELECT 1 FROM record_events d WHERE d.record_id = m.rid
-                                              AND d.kind = 'delivered' AND d.id > m.first_ev)
-                               THEN 1 ELSE 0 END AS resolved,
-                          (SELECT MIN(t.at) FROM record_events t WHERE t.record_id = m.rid
-                             AND t.kind IN ('delivered', 'failed') AND t.id > m.last_ev) AS left_at,
-                          r.content
+                   SELECT m.gid, m.first_at, r.content,
+                          (SELECT MIN(t.id) FROM record_events t WHERE t.record_id = m.rid
+                             AND t.kind IN ('delivered', 'failed') AND t.id > m.last_ev) AS left_ev
                    FROM m JOIN records r ON r.id = m.rid)
-                 SELECT gid, CAST(COUNT(*) AS BIGINT), CAST(SUM(resolved) AS BIGINT), MIN(first_at),
-                        CAST(SUM(CASE WHEN left_at IS NULL THEN 1 ELSE 0 END) AS BIGINT), MAX(left_at),
-                        CAST(SUM(CASE WHEN content IS NULL THEN 1 ELSE 0 END) AS BIGINT),
-                        CAST(SUM(CASE WHEN content = 'expired' THEN 1 ELSE 0 END) AS BIGINT),
-                        CAST(SUM(CASE WHEN content = 'purged' THEN 1 ELSE 0 END) AS BIGINT)
-                 FROM n GROUP BY gid"
+                 SELECT n.gid, CAST(COUNT(*) AS BIGINT),
+                        CAST(SUM(CASE WHEN l.kind = 'delivered' THEN 1 ELSE 0 END) AS BIGINT), MIN(n.first_at),
+                        CAST(SUM(CASE WHEN n.left_ev IS NULL THEN 1 ELSE 0 END) AS BIGINT), MAX(l.at),
+                        CAST(SUM(CASE WHEN n.content IS NULL THEN 1 ELSE 0 END) AS BIGINT),
+                        CAST(SUM(CASE WHEN n.content = 'expired' THEN 1 ELSE 0 END) AS BIGINT),
+                        CAST(SUM(CASE WHEN n.content = 'purged' THEN 1 ELSE 0 END) AS BIGINT)
+                 FROM n LEFT JOIN record_events l ON l.id = n.left_ev
+                 GROUP BY n.gid"
             ),
             &params![load_id, only],
         )?;
