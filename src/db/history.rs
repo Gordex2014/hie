@@ -218,7 +218,9 @@ const GROUP_EVENT_SQL: &str =
 /// it written and when the last one left, and their content now. A row
 /// leaves a group with its first `delivered` or `failed` event after its
 /// last failure in the group: written (resolved), or failed into another
-/// group or filtered (moved). `open + resolved + moved = rows`.
+/// group or filtered (moved). A row failing in the group now with no failure
+/// event (from before the history) is one of its rows, still open. Read in
+/// one statement, so `open + resolved + moved = rows` holds.
 #[derive(Default, Clone, Copy)]
 struct GroupHistory {
     rows: i64,
@@ -432,9 +434,11 @@ impl Db {
                 };
                 let tid = r.string(3);
                 let h = h.unwrap_or_default();
-                // A row failing in the group without a failure event (from
-                // before the history) is outstanding too.
-                let outstanding = h.open.max(count);
+                // Read in one statement with the rest of the history, so
+                // `outstanding + resolved + moved = rows` holds even while a
+                // retry writes; a row failing in the group without a failure
+                // event (from before the history) is open there too.
+                let outstanding = h.open;
                 Group {
                     load_id,
                     kind: r.string(1),
@@ -466,11 +470,17 @@ impl Db {
     ) -> Result<BTreeMap<String, GroupHistory>> {
         let rows = self.query(
             &format!(
-                "WITH m AS (
-                   SELECT g.id AS gid, e.record_id AS rid, MIN(e.at) AS first_at, MAX(e.id) AS last_ev
+                "WITH u AS (
+                   SELECT g.id AS gid, e.record_id AS rid, e.at AS at, e.id AS ev
                    FROM failure_groups g JOIN record_events e ON {GROUP_EVENT_SQL}
                    WHERE g.load_id = $1 AND (CAST($2 AS TEXT) IS NULL OR g.id = CAST($2 AS TEXT))
-                   GROUP BY g.id, e.record_id),
+                   UNION ALL
+                   SELECT g.id, r.id, CAST(NULL AS BIGINT), CAST(NULL AS BIGINT)
+                   FROM failure_groups g JOIN records r
+                     ON r.group_id = g.id AND r.file_id = g.load_id AND r.status = 'rejected'
+                   WHERE g.load_id = $1 AND (CAST($2 AS TEXT) IS NULL OR g.id = CAST($2 AS TEXT))),
+                 m AS (
+                   SELECT gid, rid, MIN(at) AS first_at, MAX(ev) AS last_ev FROM u GROUP BY gid, rid),
                  n AS (
                    SELECT m.gid, m.first_at, r.content,
                           (SELECT MIN(t.id) FROM record_events t WHERE t.record_id = m.rid
