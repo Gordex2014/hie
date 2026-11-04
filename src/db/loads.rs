@@ -880,7 +880,7 @@ impl Db {
             let ids: Vec<i64> = match c {
                 Conn::Postgres(_) => c
                     .query(
-                        "SELECT nextval(pg_get_serial_sequence('records', 'id')) FROM generate_series(1, $1)",
+                        "SELECT nextval(pg_get_serial_sequence('records', 'id')) FROM generate_series(1, CAST($1 AS BIGINT))",
                         &params![rows.len()],
                     )?
                     .iter()

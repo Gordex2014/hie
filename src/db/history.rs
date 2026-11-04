@@ -448,7 +448,11 @@ impl Db {
         let (cond, order, key) = match (after, before) {
             (_, Some(k)) => ("AND (line < $3 OR (line = $3 AND id < $4))", "DESC", k),
             (Some(k), None) => ("AND (line > $3 OR (line = $3 AND id > $4))", "ASC", k),
-            (None, None) => ("AND $3 = $3 AND $4 = $4", "ASC", (0, 0)),
+            (None, None) => (
+                "AND CAST($3 AS BIGINT) IS NOT NULL AND CAST($4 AS BIGINT) IS NOT NULL",
+                "ASC",
+                (0, 0),
+            ),
         };
         let mut rows = self.query_json(
             &format!(
