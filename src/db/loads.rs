@@ -1386,9 +1386,15 @@ impl Db {
     /// transaction, a submission, an unknown outcome) or a retry runs it.
     pub fn reprocess(&self, id: i64, raw: Option<&Value>) -> Result<Reprocess> {
         self.atomically(|c| {
+            // Locks in the order retry acceptance takes them (the load, then
+            // its records), so the two never wait on each other in a cycle.
             // The record is locked before its eligibility is read, and the
             // update checks it again: a stored transaction or a retry that
             // takes it meanwhile cannot be erased.
+            c.execute(
+                "UPDATE files SET status = status WHERE id = (SELECT file_id FROM records WHERE id = $1)",
+                &params![id],
+            )?;
             let lock = for_update(c);
             let Some(row) = c
                 .query(
