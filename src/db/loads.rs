@@ -102,8 +102,9 @@ pub(super) const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("records", "run", "INTEGER NOT NULL DEFAULT 1"),
     // A write was sent and not confirmed: outcome unknown until settled.
     ("records", "uncertain", "INTEGER NOT NULL DEFAULT 0"),
-    // Why the row is held without failing: `validation_unavailable`,
-    // `environment_unavailable`, `destination_unavailable`.
+    // Why the row is held without failing: `validation_unavailable` or
+    // `destination_unavailable` (a version held for its environment is in
+    // the version store's `version_waits`).
     ("records", "waiting", "TEXT"),
     // The stored transaction an unconfirmed write belongs to (`dispatches`).
     ("records", "dispatch", "TEXT"),
@@ -184,8 +185,6 @@ pub struct FinishedFile {
 pub enum Waiting {
     /// The destination cannot validate; nothing of the batch was dispatched.
     Validation,
-    /// The executor runs another environment than the version's (track V).
-    Environment,
     /// Writes are not confirmed; they are tried again.
     Destination,
 }
@@ -194,7 +193,6 @@ impl Waiting {
     pub fn as_str(self) -> &'static str {
         match self {
             Waiting::Validation => "validation_unavailable",
-            Waiting::Environment => "environment_unavailable",
             Waiting::Destination => "destination_unavailable",
         }
     }
@@ -1205,25 +1203,6 @@ impl Db {
                 &format!(
                     "UPDATE records SET dispatch = NULL, next_attempt_at = 0 WHERE id IN ({})",
                     marks(1, chunk.len())
-                ),
-                &values,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Says why records wait without failing (`None`: they no longer do); for
-    /// a stage that holds them, such as a version whose environment is not the
-    /// executor's.
-    pub fn set_waiting(&self, ids: &[i64], waiting: Option<Waiting>) -> Result<()> {
-        for chunk in ids.chunks(INSERT_ROWS_PER_STATEMENT) {
-            let mut values: Vec<Param> =
-                vec![super::IntoParam::to_param(&waiting.map(Waiting::as_str))];
-            values.extend(chunk.iter().map(|id| Param::Int(*id)));
-            self.execute(
-                &format!(
-                    "UPDATE records SET waiting = CAST($1 AS TEXT) WHERE id IN ({})",
-                    marks(2, chunk.len())
                 ),
                 &values,
             )?;
