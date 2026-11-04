@@ -335,7 +335,7 @@
               "input": {
                 "record": "{{int}}",
                 "load": "{{$load}}",
-                "line": "{{int}}",
+                "line": 4,
                 "outcome": "written",
                 "attempt": 1,
                 "transform": {
@@ -361,7 +361,7 @@
               "input": {
                 "record": "{{int}}",
                 "load": "{{$load}}",
-                "line": "{{int}}",
+                "line": 5,
                 "outcome": "written",
                 "attempt": 1,
                 "transform": {
@@ -375,7 +375,25 @@
             "requested": 2,
             "reported": 2,
             "complete": true
-          }
+          },
+          "results": [
+            {
+              "record": {
+                "{{exact}}": true,
+                "id": "3",
+                "value": "5.4",
+                "patient": "zq-expired-3"
+              }
+            },
+            {
+              "record": {
+                "{{exact}}": true,
+                "id": "4",
+                "value": "6.1",
+                "patient": "zq-expired-4"
+              }
+            }
+          ]
         }
       }
     },

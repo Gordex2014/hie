@@ -448,9 +448,25 @@ fn records_in_range(records: Vec<Value>) -> Result<Vec<Value>, ApiError> {
     Ok(records)
 }
 
-/// The records an `input` names, and for a `stored` input the stored row
-/// each one is (its item's `input`).
-fn input_records(s: &AppState, input: TryInputBody) -> Result<(Vec<Value>, Vec<Value>), ApiError> {
+/// A Try `input` checked as the body it is, before anything is looked up.
+enum Input {
+    Records(Vec<Value>),
+    Sample {
+        id: String,
+        limit: usize,
+    },
+    Failures(FailuresBody),
+    Stored {
+        load: i64,
+        named: Vec<StoredRef>,
+        passing: usize,
+    },
+}
+
+/// Checks an `input` as a body: one kind of input, its counts, ranges and
+/// duplicates. Every `400` of the input comes from here, before a route
+/// looks up a transform, a version, a sample, a load or a record.
+fn checked_input(input: TryInputBody) -> Result<Input, ApiError> {
     let given = [
         input.records.is_some(),
         input.sample.is_some(),
@@ -469,17 +485,10 @@ fn input_records(s: &AppState, input: TryInputBody) -> Result<(Vec<Value>, Vec<V
     if input.limit.is_some() && input.sample.is_none() {
         return Err(ApiError::unknown_field("input.limit"));
     }
-    if let Some(stored) = input.stored {
-        return stored_records(s, &stored);
+    if let Some(records) = input.records {
+        return records_in_range(records).map(Input::Records);
     }
-    let records = |r: Result<Vec<Value>, ApiError>| r.map(|r| (r, Vec::new()));
-    if let Some(given) = input.records {
-        return records(records_in_range(given));
-    }
-    if let Some(sample) = input.sample {
-        let rows = s.samples.get(&sample).ok_or_else(|| {
-            ApiError::not_found("not_found", format!("sample {sample} not found or expired"))
-        })?;
+    if let Some(id) = input.sample {
         let limit = input.limit.unwrap_or(MAX_RECORDS);
         if !(1..=MAX_RECORDS).contains(&limit) {
             return Err(
@@ -487,36 +496,12 @@ fn input_records(s: &AppState, input: TryInputBody) -> Result<(Vec<Value>, Vec<V
                     .with("field", "input.limit"),
             );
         }
-        return records(records_in_range(rows.into_iter().take(limit).collect()));
+        return Ok(Input::Sample { id, limit });
     }
-    let failures = input.failures.expect("one input");
-    let rows =
-        s.db.failed_rows(failures.load, &failures.group, failures.records.as_deref())
-            .map_err(|e| match e {
-                FailedRowsError::LoadNotFound => {
-                    not_found("load_not_found", &format!("load {}", failures.load))
-                }
-                FailedRowsError::GroupNotFound => not_found(
-                    "group_not_found",
-                    &format!("failure group {}", failures.group),
-                ),
-                FailedRowsError::RecordNotInGroup(id) => not_found(
-                    "record_not_found",
-                    &format!("record {id} in failure group {}", failures.group),
-                ),
-                FailedRowsError::ContentExpired => ApiError::new(
-                    StatusCode::GONE,
-                    "content_expired",
-                    "the failed rows' content is no longer kept",
-                ),
-                FailedRowsError::Store(e) => ApiError::from(e),
-            })?;
-    records(records_in_range(rows.into_iter().map(|r| r.raw).collect()))
-}
-
-/// A `stored` input's rows, opened in memory only, with their references;
-/// refused in the contract's order.
-fn stored_records(s: &AppState, stored: &StoredBody) -> Result<(Vec<Value>, Vec<Value>), ApiError> {
+    if let Some(failures) = input.failures {
+        return Ok(Input::Failures(failures));
+    }
+    let stored = input.stored.expect("one input");
     if stored.passing > MAX_RECORDS {
         return Err(
             ApiError::invalid_body(format!("passing is 0 to {MAX_RECORDS}"))
@@ -537,10 +522,68 @@ fn stored_records(s: &AppState, stored: &StoredBody) -> Result<(Vec<Value>, Vec<
             ApiError::invalid_body("a record is named once").with("field", "input.stored.records")
         );
     }
-    let load = stored.load;
+    Ok(Input::Stored {
+        load: stored.load,
+        named,
+        passing: stored.passing,
+    })
+}
+
+/// The records a checked input names, and for a `stored` input the stored
+/// row each one is (its item's `input`).
+fn resolve_input(s: &AppState, input: Input) -> Result<(Vec<Value>, Vec<Value>), ApiError> {
+    let records = |r: Result<Vec<Value>, ApiError>| r.map(|r| (r, Vec::new()));
+    match input {
+        Input::Records(given) => Ok((given, Vec::new())),
+        Input::Sample { id, limit } => {
+            let rows = s.samples.get(&id).ok_or_else(|| {
+                ApiError::not_found("not_found", format!("sample {id} not found or expired"))
+            })?;
+            records(records_in_range(rows.into_iter().take(limit).collect()))
+        }
+        Input::Failures(failures) => {
+            let rows =
+                s.db.failed_rows(failures.load, &failures.group, failures.records.as_deref())
+                    .map_err(|e| match e {
+                        FailedRowsError::LoadNotFound => {
+                            not_found("load_not_found", &format!("load {}", failures.load))
+                        }
+                        FailedRowsError::GroupNotFound => not_found(
+                            "group_not_found",
+                            &format!("failure group {}", failures.group),
+                        ),
+                        FailedRowsError::RecordNotInGroup(id) => not_found(
+                            "record_not_found",
+                            &format!("record {id} in failure group {}", failures.group),
+                        ),
+                        FailedRowsError::ContentExpired => ApiError::new(
+                            StatusCode::GONE,
+                            "content_expired",
+                            "the failed rows' content is no longer kept",
+                        ),
+                        FailedRowsError::Store(e) => ApiError::from(e),
+                    })?;
+            records(records_in_range(rows.into_iter().map(|r| r.raw).collect()))
+        }
+        Input::Stored {
+            load,
+            named,
+            passing,
+        } => stored_records(s, load, &named, passing),
+    }
+}
+
+/// A checked `stored` input's rows, opened in memory only, with their
+/// references; refused in the contract's order.
+fn stored_records(
+    s: &AppState,
+    load: i64,
+    named: &[StoredRef],
+    passing: usize,
+) -> Result<(Vec<Value>, Vec<Value>), ApiError> {
     let rows = s
         .db
-        .stored_rows(load, &named, stored.passing)
+        .stored_rows(load, named, passing)
         .map_err(|e| match e {
             StoredRowsError::LoadNotFound => not_found("load_not_found", &format!("load {load}")),
             StoredRowsError::RecordNotFound(record) => {
@@ -623,7 +666,8 @@ async fn try_inline(
             "code is at most 256 KiB",
         ));
     }
-    let (records, references) = input_records(&s, body.input)?;
+    let checked = checked_input(body.input)?;
+    let (records, references) = resolve_input(&s, checked)?;
     let input = TryInput {
         run_id: body.run_id,
         code: body.code,
@@ -667,7 +711,8 @@ async fn try_saved(
         (
             body.run_id,
             body.version,
-            Ok(body.input),
+            // The whole body is checked before the version is looked up.
+            Ok(checked_input(body.input)?),
             body.deadline_ms,
             body.validate,
         )
@@ -695,7 +740,7 @@ async fn try_saved(
         .code(&id, number)?
         .ok_or_else(|| transform_missing(&id))?;
     let (records, references) = match given {
-        Ok(input) => input_records(&s, input)?,
+        Ok(input) => resolve_input(&s, input)?,
         Err(records) => (records, Vec::new()),
     };
     let input = TryInput {

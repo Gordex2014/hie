@@ -141,36 +141,9 @@ impl Db {
             {
                 return Err(StoredRowsError::LoadNotFound);
             }
-            let mut rows = named_rows(c, load_id, named)?;
+            let checked = named_rows(c, load_id, named)?;
             between();
-            if !rows.is_empty() {
-                let ids: Vec<Param> = rows.iter().map(|r| Param::Int(r.record_id)).collect();
-                let stored: BTreeMap<i64, Value> = c
-                    .query(
-                        &format!(
-                            "SELECT id, raw FROM records WHERE id IN ({})",
-                            marks(1, ids.len())
-                        ),
-                        &ids,
-                    )?
-                    .iter()
-                    .map(|r| (r.i64(0), r.get(1).clone()))
-                    .collect();
-                let mut gone = Vec::new();
-                for row in &mut rows {
-                    match stored
-                        .get(&row.record_id)
-                        .and_then(|raw| self.open_record(Some(row.record_id), Column::Raw, raw))
-                        .filter(|raw| !raw.is_null())
-                    {
-                        Some(raw) => row.raw = raw,
-                        None => gone.push((row.record_id, "none")),
-                    }
-                }
-                if !gone.is_empty() {
-                    return Err(StoredRowsError::ContentExpired(gone));
-                }
-            }
+            let mut rows = self.named_content(c, checked)?;
             let taken: BTreeSet<i64> = rows.iter().map(|r| r.record_id).collect();
             rows.extend(self.passing_rows(c, load_id, &taken, passing)?);
             if rows.is_empty() {
@@ -178,6 +151,60 @@ impl Db {
             }
             Ok(rows)
         })
+    }
+
+    /// The named rows with their content opened; `410` with every one whose
+    /// content is unavailable, in the order named: gone by its state
+    /// (`expired`, `purged`, `none`) or not opening (`none`).
+    fn named_content(
+        &self,
+        c: &mut Conn,
+        checked: Vec<(StoredRow, Option<&'static str>)>,
+    ) -> std::result::Result<Vec<StoredRow>, StoredRowsError> {
+        let kept: Vec<Param> = checked
+            .iter()
+            .filter(|(_, state)| state.is_none())
+            .map(|(r, _)| Param::Int(r.record_id))
+            .collect();
+        let stored: BTreeMap<i64, Value> = if kept.is_empty() {
+            BTreeMap::new()
+        } else {
+            c.query(
+                &format!(
+                    "SELECT id, raw FROM records WHERE id IN ({})",
+                    marks(1, kept.len())
+                ),
+                &kept,
+            )?
+            .iter()
+            .map(|r| (r.i64(0), r.get(1).clone()))
+            .collect()
+        };
+        let mut rows = Vec::with_capacity(checked.len());
+        let mut gone = Vec::new();
+        for (mut row, state) in checked {
+            let raw = match state {
+                Some(state) => {
+                    gone.push((row.record_id, state));
+                    continue;
+                }
+                None => stored
+                    .get(&row.record_id)
+                    .and_then(|raw| self.open_record(Some(row.record_id), Column::Raw, raw))
+                    .filter(|raw| !raw.is_null()),
+            };
+            match raw {
+                Some(raw) => {
+                    row.raw = raw;
+                    rows.push(row);
+                }
+                None => gone.push((row.record_id, "none")),
+            }
+        }
+        if !gone.is_empty() {
+            return Err(StoredRowsError::ContentExpired(gone));
+        }
+        Ok(rows)
     }
 
     /// Up to `wanted` written rows of the load, not in `taken`, in line
@@ -251,14 +278,15 @@ impl Db {
     }
 }
 
-/// The named rows without their content, refused in the contract's order: a
-/// record that does not exist, then one of another load, then one whose
-/// attempt moved on, then those whose content is gone.
+/// The named rows without their content, each with its content state when
+/// the store says the content is gone (`expired`, `purged`, `none`); refused
+/// in the contract's order: a record that does not exist, then one of another
+/// load, then one whose attempt moved on.
 fn named_rows(
     c: &mut Conn,
     load_id: i64,
     named: &[StoredRef],
-) -> std::result::Result<Vec<StoredRow>, StoredRowsError> {
+) -> std::result::Result<Vec<(StoredRow, Option<&'static str>)>, StoredRowsError> {
     if named.is_empty() {
         return Ok(Vec::new());
     }
@@ -295,24 +323,18 @@ fn named_rows(
             attempt: row(n).attempt,
         });
     }
-    let gone: Vec<(i64, &'static str)> = named
+    Ok(named
         .iter()
-        .filter_map(|n| {
-            let state = found[&n.record].1.as_deref()?;
-            Some((
-                n.record,
-                match state {
-                    "expired" => "expired",
-                    "purged" => "purged",
-                    _ => "none",
-                },
-            ))
+        .map(|n| {
+            let (row, state) = &found[&n.record];
+            let state = state.as_deref().map(|state| match state {
+                "expired" => "expired",
+                "purged" => "purged",
+                _ => "none",
+            });
+            (row.clone(), state)
         })
-        .collect();
-    if !gone.is_empty() {
-        return Err(StoredRowsError::ContentExpired(gone));
-    }
-    Ok(named.iter().map(|n| found[&n.record].0.clone()).collect())
+        .collect())
 }
 
 #[cfg(test)]
@@ -444,6 +466,40 @@ mod tests {
         assert_eq!(rows.iter().map(|r| r.line).collect::<Vec<_>>(), [6]);
         match db.stored_rows(load, &[named(ids[3], None)], 0) {
             Err(StoredRowsError::ContentExpired(gone)) => assert_eq!(gone, [(ids[3], "none")]),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A `410` lists every named row whose content is unavailable, in the
+    /// order named, whatever made it so: expired, purged, or not opening.
+    #[test]
+    fn every_unavailable_named_row_is_listed_in_order() {
+        let db = Db::in_memory().unwrap();
+        let (load, ids) = mixed_load(&db, "src");
+        // Line 1 (failed) expires; line 2 (written) was purged; line 4
+        // (written) holds content sealed for another record; line 6 is kept.
+        db.expire_failed_content(i64::MAX).unwrap();
+        db.execute(
+            "UPDATE records SET raw = 'null', content = 'purged' WHERE id = $1",
+            &params![ids[1]],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE records SET raw = $2 WHERE id = $1",
+            &params![ids[3], "c1.1.not-sealed-for-it"],
+        )
+        .unwrap();
+        let ask = [
+            named(ids[3], Some(1)),
+            named(ids[5], None),
+            named(ids[0], None),
+            named(ids[1], None),
+        ];
+        match db.stored_rows(load, &ask, 0) {
+            Err(StoredRowsError::ContentExpired(gone)) => assert_eq!(
+                gone,
+                [(ids[3], "none"), (ids[0], "expired"), (ids[1], "purged")]
+            ),
             other => panic!("{other:?}"),
         }
     }
