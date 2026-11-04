@@ -1,13 +1,15 @@
 //! Where a connector comes into being for a source definition: the registry's
-//! `build` for its kind. Anything that must hold before a source may connect
-//! anywhere (an admission policy) belongs here, ahead of the build.
+//! `build` for its kind, with the engine's [`Context`]. Building never
+//! connects; the admission policy travels in the context so that a connector
+//! checks it before every connection it opens (a pass, a probe), and so that
+//! nothing reaches a secret or a socket for a connection the policy refuses.
 
 use anyhow::Result;
 
-use super::{Connector, kind};
+use super::{Connector, Context, kind};
 use crate::config::FeedConfig;
 
 /// The connector for a resolved definition.
-pub(super) fn connector(feed: &FeedConfig) -> Result<Box<dyn Connector>> {
-    (kind(&feed.source).build)(feed)
+pub(super) fn connector(feed: &FeedConfig, ctx: &Context) -> Result<Box<dyn Connector>> {
+    (kind(&feed.source).build)(feed, ctx)
 }

@@ -1,12 +1,16 @@
-//! Destination facts (`GET /api/destination`).
-//!
-//! Empty until track S fills it; registered in `api/mod.rs` under the
-//! bearer layer, so adding routes here needs no change elsewhere.
+//! Destination facts (`GET /api/destination`): the destination's `/metadata`,
+//! read at most once a minute, with its display name and the validation mode.
 
-use axum::Router;
+use axum::extract::State;
+use axum::routing::get;
+use axum::{Json, Router};
 
-use super::AppState;
+use super::{ApiResult, AppState};
 
 pub(super) fn router() -> Router<AppState> {
-    Router::new()
+    Router::new().route("/api/destination", get(facts))
+}
+
+async fn facts(State(s): State<AppState>) -> ApiResult {
+    Ok(Json(s.manager.destination().await))
 }

@@ -1,12 +1,15 @@
 //! The admission policy as configured (`GET /api/admission`).
-//!
-//! Empty until track S fills it; registered in `api/mod.rs` under the
-//! bearer layer, so adding routes here needs no change elsewhere.
 
-use axum::Router;
+use axum::extract::State;
+use axum::routing::get;
+use axum::{Json, Router};
 
-use super::AppState;
+use super::{ApiResult, AppState};
 
 pub(super) fn router() -> Router<AppState> {
-    Router::new()
+    Router::new().route("/api/admission", get(policy))
+}
+
+async fn policy(State(s): State<AppState>) -> ApiResult {
+    Ok(Json(s.manager.admission().view()))
 }

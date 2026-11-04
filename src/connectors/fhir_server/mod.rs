@@ -62,7 +62,7 @@ fn describe(source: &SourceConfig) -> String {
     }
 }
 
-fn build(feed: &FeedConfig) -> Result<Box<dyn Connector>> {
+fn build(feed: &FeedConfig, _ctx: &crate::connectors::Context) -> Result<Box<dyn Connector>> {
     let SourceConfig::FhirServer {
         url,
         types,

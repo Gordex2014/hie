@@ -6,11 +6,26 @@
 //! `connection` resolves the URL `url_env` names, `driver` holds the connection
 //! and runs the query per engine (PostgreSQL, MySQL, SQLite, SQL Server), `rows`
 //! decodes their rows, `cursor` is the value followed.
+//!
+//! The 0.2.0 shape (`connection` by parts, `read` a table or a query) is
+//! `parts`: an `endpoint` that opens a session after admission and with the
+//! password's revision, `table` for what a table is and how it is read by
+//! keyset. Its Test, describe and sample are what `crate::evidence` builds on.
 
 mod connection;
 mod cursor;
 mod driver;
+mod endpoint;
+mod parts;
 mod rows;
+mod table;
+
+pub use endpoint::{DbError, Endpoint, Engine, Stage};
+pub use parts::{Check, Described, TestReport};
+pub use parts::{
+    describe as describe_connection, sample as sample_connection, test as test_connection,
+};
+pub use table::{ColumnInfo, TableInfo, qualified};
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -20,8 +35,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
 
-use super::{Connector, Cursors, Incoming, Kind, Listed, Probe};
-use crate::config::{FeedConfig, Format, SourceConfig};
+use super::{Connector, Context as ConnectContext, Cursors, Incoming, Kind, Listed, Probe};
+use crate::config::{DatabaseRead, FeedConfig, Format, SourceConfig};
 use cursor::{Cursor, instant};
 use driver::Driver;
 
@@ -48,6 +63,8 @@ pub struct DatabaseSource {
     cursor_start: Option<String>,
     max_runs: usize,
     driver: Driver,
+    /// The policy every connection is checked against, before it is opened.
+    admission: std::sync::Arc<crate::admission::Admission>,
     pulled: Mutex<Option<Pulled>>,
 }
 
@@ -80,11 +97,46 @@ fn check(source: &SourceConfig) -> Result<()> {
         if url_env.is_some() || query.is_some() || cursor_column.is_some() {
             bail!("database: use either connection and read, or url_env, query and cursor_column");
         }
-        let (Some(connection), Some(_)) = (connection, read) else {
-            bail!("database: connection and read go together");
+        let Some(connection) = connection else {
+            bail!("database: a read needs a connection");
         };
-        if connection.engine.trim().is_empty() {
-            bail!("database: connection.engine is required");
+        Endpoint::new(connection, Some(0)).map_err(|e| anyhow::anyhow!("database: {e}"))?;
+        if Engine::parse(&connection.engine) == Some(Engine::Sqlite) {
+            if connection
+                .database
+                .as_deref()
+                .is_none_or(|d| d.trim().is_empty())
+            {
+                bail!("database: a sqlite connection names its database file");
+            }
+        } else if connection
+            .host
+            .as_deref()
+            .is_none_or(|h| h.trim().is_empty())
+        {
+            bail!("database: connection.host is required");
+        }
+        match read {
+            Some(DatabaseRead::Table {
+                table, new_rows_by, ..
+            }) => {
+                if table.name.trim().is_empty() || new_rows_by.trim().is_empty() {
+                    bail!("database: a table read names its table and new_rows_by");
+                }
+            }
+            Some(DatabaseRead::Query {
+                query,
+                cursor_column,
+                ..
+            }) => {
+                if !query.contains("{cursor}") {
+                    bail!("database: the query must use {{cursor}} where the cursor value goes");
+                }
+                if cursor_column.trim().is_empty() {
+                    bail!("database: cursor_column must be a column name");
+                }
+            }
+            None => {}
         }
         return Ok(());
     }
@@ -136,9 +188,11 @@ fn describe(source: &SourceConfig) -> String {
     }
 }
 
-fn build(feed: &FeedConfig) -> Result<Box<dyn Connector>> {
+fn build(feed: &FeedConfig, ctx: &ConnectContext) -> Result<Box<dyn Connector>> {
     let SourceConfig::Database {
         url_env,
+        connection,
+        read,
         query,
         cursor_column,
         cursor_start,
@@ -148,21 +202,43 @@ fn build(feed: &FeedConfig) -> Result<Box<dyn Connector>> {
     else {
         bail!("source {} is not a database", feed.id);
     };
+    if let Some(connection) = connection {
+        let Some(read) = read else {
+            bail!("source {}: a database source needs a read", feed.id);
+        };
+        if connection.password.is_some() && ctx.secrets.as_ref().is_none_or(|s| !s.available()) {
+            bail!(
+                "source {}: its password is a kept secret, and secrets need custody configured (secrets.key_file or HIE_SECRETS_KEY)",
+                feed.id
+            );
+        }
+        let endpoint = Endpoint::new(connection, None)
+            .map_err(|e| anyhow::anyhow!("source {}: {e}", feed.id))?;
+        return Ok(Box::new(parts::PartsSource::new(
+            &feed.id,
+            endpoint,
+            read.clone(),
+            *max_runs,
+            ctx.clone(),
+        )));
+    }
     let (Some(url_env), Some(query), Some(cursor_column)) = (url_env, query, cursor_column) else {
-        // The 0.2.0 connection shape is built once secrets and admission exist.
         bail!(
-            "source {}: database connections by parts are not supported yet",
+            "source {}: a database source needs url_env, query and cursor_column, or connection and read",
             feed.id
         );
     };
-    Ok(Box::new(DatabaseSource::new(
-        &feed.id,
-        url_env,
-        query,
-        cursor_column,
-        cursor_start.clone(),
-        *max_runs,
-    )?))
+    Ok(Box::new(
+        DatabaseSource::new(
+            &feed.id,
+            url_env,
+            query,
+            cursor_column,
+            cursor_start.clone(),
+            *max_runs,
+        )?
+        .admitted_by(ctx.admission.clone()),
+    ))
 }
 
 impl DatabaseSource {
@@ -182,8 +258,25 @@ impl DatabaseSource {
             cursor_start,
             max_runs,
             driver: Driver::new(url),
+            admission: Default::default(),
             pulled: Mutex::new(None),
         })
+    }
+
+    /// Checks every connection against `admission` before it is opened.
+    pub fn admitted_by(mut self, admission: std::sync::Arc<crate::admission::Admission>) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// The URL's parts must be admitted before the driver connects.
+    fn admit(&self) -> Result<()> {
+        if !self.admission.enforced() {
+            return Ok(());
+        }
+        let parts = crate::admission::url_parts(self.driver.url())
+            .ok_or_else(|| anyhow::anyhow!("the connection URL cannot be read"))?;
+        self.admission.check(&parts).map_err(anyhow::Error::from)
     }
 
     /// Where the query starts: the stored cursor, else `cursor_start`.
@@ -199,6 +292,7 @@ impl DatabaseSource {
     /// Runs the query past the cursor, moving an in-memory cursor between runs,
     /// until a run brings nothing new or `max_runs` is reached.
     async fn pull(&self, cursors: &Cursors) -> Result<Pulled> {
+        self.admit()?;
         let mut cursor = self.cursor(cursors)?;
         let mut bytes = Vec::new();
         let mut count = 0;
@@ -311,6 +405,7 @@ impl Connector for DatabaseSource {
     /// newest cursor value among it.
     async fn probe(&self, cursors: &Cursors) -> Result<Probe> {
         let started = Instant::now();
+        self.admit()?;
         let cursor = self.cursor(cursors)?;
         let rows = self.driver.run(&self.query, cursor.as_ref()).await?;
         let newest = rows
