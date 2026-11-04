@@ -779,6 +779,19 @@ async fn runtime_connection(mut stream: tokio::net::TcpStream, rt: Rt) {
                 return;
             }
             let mut answer = script["body"].clone();
+            // `run`: answer as `/run` does, the fixed lab program over the
+            // records HIE sent (with the replies' ids given below).
+            if script["run"] == true {
+                let rt = rt.lock().unwrap();
+                let replies: Vec<Value> = request["requests"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|r| rt.run_one(&r["record"]))
+                    .collect();
+                answer = json!({"replies": replies});
+            }
             // Replies match requests by position; give them the ids HIE sent.
             if let (Some(replies), Some(requests)) = (
                 answer["replies"].as_array_mut(),

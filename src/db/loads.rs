@@ -14,9 +14,13 @@
 //! (`run`): a result of an attempt that a reprocess or retry replaced since is
 //! dropped, never written over the newer one.
 //!
+//! **Stored rows** (`stored.rs`): rows of a load by reference, as Try's
+//! `stored` input reads them, on one snapshot of the store.
+//!
 //! Every change of a record's fate appends to its history (`history.rs`).
 
 mod custody;
+mod stored;
 
 use std::collections::BTreeMap;
 
@@ -28,6 +32,7 @@ use super::history::{Failure, OUTCOME_SQL, append_events, group_for};
 use super::{Db, Param, Tx, now_ms, params};
 use crate::versions::{VersionKey, VersionRef};
 pub(super) use custody::{Column, ContentKeys};
+pub use stored::{StoredRef, StoredRow, StoredRowsError};
 
 /// The longest error or reason text kept in plaintext; longer ones are cut.
 pub const REASON_MAX_CHARS: usize = 500;
@@ -1486,7 +1491,7 @@ impl Db {
             .query_json(
                 &format!(
                     "SELECT r.id, r.feed_id AS source_id, r.file_id, f.name AS file, f.sha256 AS file_sha256, r.line, r.status,
-                            {OUTCOME_SQL} AS outcome,
+                            {OUTCOME_SQL} AS outcome, r.run AS attempt,
                             r.raw, r.original_raw, r.resources, r.response, r.error_kind, r.error, r.attempts,
                             {} AS received_at, {} AS updated_at, r.content AS content_state
                      FROM records r JOIN files f ON f.id = r.file_id WHERE r.id = $1",
@@ -1510,7 +1515,7 @@ impl Db {
         self.query_json(
             &format!(
                 "SELECT r.id, r.feed_id AS source_id, r.file_id, f.name AS file, r.line, r.status,
-                        {OUTCOME_SQL} AS outcome, r.error_kind, r.error, r.attempts, {} AS updated_at
+                        {OUTCOME_SQL} AS outcome, r.run AS attempt, r.error_kind, r.error, r.attempts, {} AS updated_at
                  FROM records r JOIN files f ON f.id = r.file_id
                  WHERE (CAST($1 AS TEXT) IS NULL OR r.feed_id = CAST($1 AS TEXT)) AND (CAST($2 AS TEXT) IS NULL OR r.status = CAST($2 AS TEXT)) AND (CAST($3 AS BIGINT) IS NULL OR r.file_id = CAST($3 AS BIGINT))
                  ORDER BY r.id DESC LIMIT $4",

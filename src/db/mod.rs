@@ -34,8 +34,8 @@ pub use engine::{IntoParam, Param, Row};
 pub use history::{Group, PeriodCounts, RetryRefusal, VersionRun};
 pub use idempotency::Claim;
 pub use loads::{
-    Deferral, FailedRow, FailedRowsError, FinishedFile, REASON_MAX_CHARS, Reprocess, Waiting,
-    WorkItem,
+    Deferral, FailedRow, FailedRowsError, FinishedFile, REASON_MAX_CHARS, Reprocess, StoredRef,
+    StoredRow, StoredRowsError, Waiting, WorkItem,
 };
 pub use passes::{Pass, PassStatus};
 pub use sources::Lease;

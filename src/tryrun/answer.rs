@@ -184,7 +184,7 @@ pub fn build(input: &TryInput, d: &Dispatched, validation: &str, started_at: &st
     let mut items = Vec::with_capacity(requested);
     let mut results = Vec::with_capacity(requested);
     for (index, (item, record)) in d.items.iter().zip(&input.records).enumerate() {
-        match item {
+        let mut entry = match item {
             Item::Reported {
                 result,
                 diagnostics,
@@ -195,8 +195,8 @@ pub fn build(input: &TryInput, d: &Dispatched, validation: &str, started_at: &st
                 if let Some(diagnostics) = diagnostics {
                     entry["diagnostics"] = diagnostics.clone();
                 }
-                items.push(entry);
                 results.push(legacy_result(record, result));
+                entry
             }
             Item::NotReported | Item::NotStarted => {
                 let disposition = if matches!(item, Item::NotStarted) {
@@ -204,11 +204,16 @@ pub fn build(input: &TryInput, d: &Dispatched, validation: &str, started_at: &st
                 } else {
                     "not_reported"
                 };
-                items.push(json!({"index": index, "disposition": disposition, "validation": null}));
                 results.push(json!({"record": record, "error": {"kind": "transform",
                     "message": format!("the record was not run to the end ({})", d.reason.as_deref().unwrap_or(d.outcome))}}));
+                json!({"index": index, "disposition": disposition, "validation": null})
             }
+        };
+        // A stored row's reference (`stored` input), whatever the item became.
+        if let Some(reference) = input.references.get(index) {
+            entry["input"] = reference.clone();
         }
+        items.push(entry);
     }
     let body = json!({"run": run, "items": items, "coverage": coverage, "results": results});
     Built {

@@ -1,0 +1,655 @@
+{
+  "id": "transforms/try-stored-mixed",
+  "title": "Try on stored rows of a load: failed rows named (one with its attempt) then written rows in line order, each item with its reference; one dispatch per run on both routes; a row that moved on is refused",
+  "fixtures": {
+    "hie": {
+      "runtime": {
+        "url": "{{runtime}}",
+        "token_env": "HIE_CONFORMANCE_NO_TOKEN"
+      }
+    },
+    "runtime": {
+      "try": [
+        {
+          "run": true
+        },
+        {
+          "run": true
+        },
+        {
+          "run": true
+        }
+      ],
+      "run": {
+        "marker": "rt"
+      }
+    },
+    "files": {
+      "inbox/a.csv": "id,value,patient\n1,alto,zq-stored-1\n2,5.4,zq-stored-2\n3,alto,zq-stored-3\n4,6.1,zq-stored-4\n5,7.2,zq-stored-5\n"
+    }
+  },
+  "forbid_at_rest": {
+    "values": [
+      "zq-stored-1",
+      "zq-stored-2",
+      "zq-stored-3",
+      "zq-stored-4",
+      "zq-stored-5"
+    ],
+    "under": [
+      "data"
+    ]
+  },
+  "steps": [
+    {
+      "name": "create Lab results",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms",
+        "headers": {
+          "Idempotency-Key": "c1"
+        },
+        "body": {
+          "display_name": "Lab results",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": "{{$tid}}",
+          "current_version": 1
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "body": {
+          "id": "lab",
+          "name": "Lab lab",
+          "source": {
+            "type": "folder",
+            "path": "inbox",
+            "pattern": "*.csv",
+            "poll_seconds": 3600,
+            "min_file_age_ms": 0
+          },
+          "transform": {
+            "id": "{{$tid}}",
+            "version": 1
+          }
+        }
+      },
+      "expect": {
+        "status": 201
+      }
+    },
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "wait for the load",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "id": "{{$load}}",
+              "status": "done",
+              "rows": {
+                "written": 3,
+                "failed": 2
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "failures": [
+            {
+              "group": "{{$g}}",
+              "count": 2,
+              "content": "kept"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/loads/{{$load}}/failures/{{$g}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "records": [
+            {
+              "id": "{{$r1}}"
+            },
+            {
+              "id": "{{$r3}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a record reads its latest attempt",
+      "request": {
+        "method": "GET",
+        "path": "/api/records/{{$r1}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "id": "{{$r1}}",
+          "outcome": "failed",
+          "attempt": 1
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/records?file_id={{$load}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "records": [
+            "{{each}}",
+            {
+              "attempt": 1,
+              "outcome": "{{string}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "destination": {
+        "writes": "{{$writes}}"
+      }
+    },
+    {
+      "name": "inline code on two failed rows and two written ones",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "stored-1",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": "{{$load}}",
+              "records": [
+                "{{$r3}}",
+                {
+                  "id": "{{$r1}}",
+                  "attempt": 1
+                }
+              ],
+              "passing": 2
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "headers": {
+          "cache-control": "{{contains:no-store}}"
+        },
+        "body": {
+          "run": {
+            "id": "stored-1",
+            "status": "finished",
+            "outcome": "completed",
+            "transform": null
+          },
+          "items": [
+            {
+              "index": 0,
+              "disposition": "reported",
+              "result": {
+                "error": {
+                  "kind": "data",
+                  "message": "{{contains:'alto' is not a number}}"
+                }
+              },
+              "input": {
+                "record": "{{$r3}}",
+                "load": "{{$load}}",
+                "line": "{{int}}",
+                "outcome": "failed",
+                "attempt": 1,
+                "transform": {
+                  "id": "{{$tid}}",
+                  "version": 1
+                }
+              }
+            },
+            {
+              "index": 1,
+              "disposition": "reported",
+              "result": {
+                "error": {
+                  "kind": "data",
+                  "message": "{{contains:'alto' is not a number}}"
+                }
+              },
+              "input": {
+                "record": "{{$r1}}",
+                "load": "{{$load}}",
+                "line": "{{int}}",
+                "outcome": "failed",
+                "attempt": 1,
+                "transform": {
+                  "id": "{{$tid}}",
+                  "version": 1
+                }
+              }
+            },
+            {
+              "index": 2,
+              "disposition": "reported",
+              "result": {
+                "resources": [
+                  {
+                    "resourceType": "Observation",
+                    "id": "obs-2",
+                    "valueQuantity": {
+                      "value": 5.4
+                    }
+                  }
+                ]
+              },
+              "input": {
+                "record": "{{$w2}}",
+                "load": "{{$load}}",
+                "line": "{{int}}",
+                "outcome": "written",
+                "attempt": 1,
+                "transform": {
+                  "id": "{{$tid}}",
+                  "version": 1
+                }
+              }
+            },
+            {
+              "index": 3,
+              "disposition": "reported",
+              "result": {
+                "resources": [
+                  {
+                    "resourceType": "Observation",
+                    "id": "obs-4",
+                    "valueQuantity": {
+                      "value": 6.1
+                    }
+                  }
+                ]
+              },
+              "input": {
+                "record": "{{$w4}}",
+                "load": "{{$load}}",
+                "line": "{{int}}",
+                "outcome": "written",
+                "attempt": 1,
+                "transform": {
+                  "id": "{{$tid}}",
+                  "version": 1
+                }
+              }
+            }
+          ],
+          "coverage": {
+            "requested": 4,
+            "reported": 4,
+            "complete": true
+          }
+        }
+      }
+    },
+    {
+      "runtime": {
+        "calls": {
+          "try": 1
+        }
+      }
+    },
+    {
+      "name": "the saved version on the same rows",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/try",
+        "body": {
+          "run_id": "stored-2",
+          "input": {
+            "stored": {
+              "load": "{{$load}}",
+              "records": [
+                "{{$r3}}",
+                {
+                  "id": "{{$r1}}",
+                  "attempt": 1
+                }
+              ],
+              "passing": 2
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "headers": {
+          "cache-control": "{{contains:no-store}}"
+        },
+        "body": {
+          "run": {
+            "id": "stored-2",
+            "status": "finished",
+            "outcome": "completed",
+            "transform": {
+              "id": "{{$tid}}",
+              "version": 1
+            }
+          },
+          "items": [
+            {
+              "index": 0,
+              "disposition": "reported",
+              "result": {
+                "error": {
+                  "kind": "data",
+                  "message": "{{contains:'alto' is not a number}}"
+                }
+              },
+              "input": {
+                "record": "{{$r3}}",
+                "load": "{{$load}}",
+                "line": "{{int}}",
+                "outcome": "failed",
+                "attempt": 1,
+                "transform": {
+                  "id": "{{$tid}}",
+                  "version": 1
+                }
+              }
+            },
+            {
+              "index": 1,
+              "disposition": "reported",
+              "result": {
+                "error": {
+                  "kind": "data",
+                  "message": "{{contains:'alto' is not a number}}"
+                }
+              },
+              "input": {
+                "record": "{{$r1}}",
+                "load": "{{$load}}",
+                "line": "{{int}}",
+                "outcome": "failed",
+                "attempt": 1,
+                "transform": {
+                  "id": "{{$tid}}",
+                  "version": 1
+                }
+              }
+            },
+            {
+              "index": 2,
+              "disposition": "reported",
+              "result": {
+                "resources": [
+                  {
+                    "resourceType": "Observation",
+                    "id": "obs-2",
+                    "valueQuantity": {
+                      "value": 5.4
+                    }
+                  }
+                ]
+              },
+              "input": {
+                "record": "{{$w2}}",
+                "load": "{{$load}}",
+                "line": "{{int}}",
+                "outcome": "written",
+                "attempt": 1,
+                "transform": {
+                  "id": "{{$tid}}",
+                  "version": 1
+                }
+              }
+            },
+            {
+              "index": 3,
+              "disposition": "reported",
+              "result": {
+                "resources": [
+                  {
+                    "resourceType": "Observation",
+                    "id": "obs-4",
+                    "valueQuantity": {
+                      "value": 6.1
+                    }
+                  }
+                ]
+              },
+              "input": {
+                "record": "{{$w4}}",
+                "load": "{{$load}}",
+                "line": "{{int}}",
+                "outcome": "written",
+                "attempt": 1,
+                "transform": {
+                  "id": "{{$tid}}",
+                  "version": 1
+                }
+              }
+            }
+          ],
+          "coverage": {
+            "requested": 4,
+            "reported": 4,
+            "complete": true
+          }
+        }
+      }
+    },
+    {
+      "runtime": {
+        "calls": {
+          "try": 2
+        }
+      }
+    },
+    {
+      "destination": {
+        "writes": "{{$writes}}"
+      }
+    },
+    {
+      "name": "reprocess a named row",
+      "request": {
+        "method": "POST",
+        "path": "/api/records/{{$r1}}/reprocess"
+      },
+      "expect": {
+        "status": 202,
+        "body": {
+          "id": "{{$r1}}"
+        }
+      }
+    },
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/records/{{$r1}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "outcome": "failed",
+          "attempt": 2
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/records/{{$r1}}/history"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "record": "{{$r1}}",
+          "events": [
+            "{{contains}}",
+            {
+              "kind": "failed",
+              "attempt": 1
+            },
+            {
+              "kind": "retried",
+              "attempt": 2
+            },
+            {
+              "kind": "failed",
+              "attempt": 2
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "the row moved on since attempt 1",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "stored-3",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": "{{$load}}",
+              "records": [
+                "{{$r3}}",
+                {
+                  "id": "{{$r1}}",
+                  "attempt": 1
+                }
+              ],
+              "passing": 2
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}",
+          "code": "attempt_changed",
+          "record": "{{$r1}}",
+          "attempt": 2
+        }
+      }
+    },
+    {
+      "name": "its current attempt is tried",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "stored-4",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": "{{$load}}",
+              "records": [
+                {
+                  "id": "{{$r1}}",
+                  "attempt": 2
+                }
+              ],
+              "passing": 0
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "headers": {
+          "cache-control": "{{contains:no-store}}"
+        },
+        "body": {
+          "items": [
+            {
+              "index": 0,
+              "disposition": "reported",
+              "input": {
+                "record": "{{$r1}}",
+                "load": "{{$load}}",
+                "line": "{{int}}",
+                "outcome": "failed",
+                "attempt": 2,
+                "transform": {
+                  "id": "{{$tid}}",
+                  "version": 1
+                }
+              }
+            }
+          ],
+          "coverage": {
+            "requested": 1,
+            "reported": 1,
+            "complete": true
+          }
+        }
+      }
+    },
+    {
+      "runtime": {
+        "calls": {
+          "try": 3
+        }
+      }
+    }
+  ]
+}

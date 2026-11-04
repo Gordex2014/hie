@@ -13,9 +13,9 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::body::{LooseJson, StrictJson, strict};
+use super::body::{LooseJson, StrictJson, only_members, strict, strict_with};
 use super::{ApiError, ApiResult, AppState, not_found};
-use crate::db::FailedRowsError;
+use crate::db::{FailedRowsError, StoredRef, StoredRowsError};
 use crate::idempotency::Idempotent;
 use crate::tryrun::{MAX_RECORDS, SavedVersion, TryInput};
 use crate::versions::{Draft, USAGE_RUNS};
@@ -304,9 +304,9 @@ async fn usage(
 
 // ---- Try ---------------------------------------------------------------------------
 
-/// `input`: exactly one of `records`, `sample` (with an optional `limit`) or
-/// `failures`. Kept as optional members rather than an enum, so every unknown
-/// member is seen by the strict reader.
+/// `input`: exactly one of `records`, `sample` (with an optional `limit`),
+/// `failures` or `stored`. Kept as optional members rather than an enum, so
+/// every unknown member is seen by the strict reader.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TryInputBody {
@@ -318,6 +318,8 @@ struct TryInputBody {
     limit: Option<usize>,
     #[serde(default)]
     failures: Option<FailuresBody>,
+    #[serde(default)]
+    stored: Option<StoredBody>,
 }
 
 #[derive(Deserialize)]
@@ -327,6 +329,66 @@ struct FailuresBody {
     group: String,
     #[serde(default)]
     records: Option<Vec<i64>>,
+}
+
+/// `{"stored": {"load", "records"?, "passing"?}}`: rows of one load by reference.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredBody {
+    load: i64,
+    #[serde(default)]
+    records: Vec<RecordRef>,
+    #[serde(default)]
+    passing: usize,
+}
+
+/// A record named in `stored`: its id, or `{"id", "attempt"}`. Untagged, so
+/// its members are checked by [`try_members`], which serde cannot do here.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RecordRef {
+    Id(i64),
+    Seen {
+        id: i64,
+        #[serde(default)]
+        attempt: Option<i64>,
+    },
+}
+
+impl RecordRef {
+    fn stored(&self) -> StoredRef {
+        match *self {
+            RecordRef::Id(record) => StoredRef {
+                record,
+                attempt: None,
+            },
+            RecordRef::Seen { id, attempt } => StoredRef {
+                record: id,
+                attempt,
+            },
+        }
+    }
+}
+
+/// The members of a Try body serde reads through a buffer: each record named
+/// in `input.stored.records`.
+fn try_members(body: &Value) -> Result<(), ApiError> {
+    let named = body
+        .pointer("/input/stored/records")
+        .and_then(Value::as_array);
+    for (i, record) in named.into_iter().flatten().enumerate() {
+        only_members(
+            record,
+            &format!("input.stored.records[{i}]"),
+            &["id", "attempt"],
+        )?;
+    }
+    Ok(())
+}
+
+/// A strictly read Try body.
+fn try_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ApiError> {
+    strict_with(bytes, try_members)
 }
 
 #[derive(Deserialize)]
@@ -386,27 +448,33 @@ fn records_in_range(records: Vec<Value>) -> Result<Vec<Value>, ApiError> {
     Ok(records)
 }
 
-/// The records an `input` names.
-fn input_records(s: &AppState, input: TryInputBody) -> Result<Vec<Value>, ApiError> {
+/// The records an `input` names, and for a `stored` input the stored row
+/// each one is (its item's `input`).
+fn input_records(s: &AppState, input: TryInputBody) -> Result<(Vec<Value>, Vec<Value>), ApiError> {
     let given = [
         input.records.is_some(),
         input.sample.is_some(),
         input.failures.is_some(),
+        input.stored.is_some(),
     ]
     .iter()
     .filter(|g| **g)
     .count();
     if given != 1 {
         return Err(ApiError::invalid_body(
-            "input is one of {\"records\"}, {\"sample\"} or {\"failures\"}",
+            "input is one of {\"records\"}, {\"sample\"}, {\"failures\"} or {\"stored\"}",
         )
         .with("field", "input"));
     }
     if input.limit.is_some() && input.sample.is_none() {
         return Err(ApiError::unknown_field("input.limit"));
     }
-    if let Some(records) = input.records {
-        return records_in_range(records);
+    if let Some(stored) = input.stored {
+        return stored_records(s, &stored);
+    }
+    let records = |r: Result<Vec<Value>, ApiError>| r.map(|r| (r, Vec::new()));
+    if let Some(given) = input.records {
+        return records(records_in_range(given));
     }
     if let Some(sample) = input.sample {
         let rows = s.samples.get(&sample).ok_or_else(|| {
@@ -419,7 +487,7 @@ fn input_records(s: &AppState, input: TryInputBody) -> Result<Vec<Value>, ApiErr
                     .with("field", "input.limit"),
             );
         }
-        return records_in_range(rows.into_iter().take(limit).collect());
+        return records(records_in_range(rows.into_iter().take(limit).collect()));
     }
     let failures = input.failures.expect("one input");
     let rows =
@@ -443,7 +511,72 @@ fn input_records(s: &AppState, input: TryInputBody) -> Result<Vec<Value>, ApiErr
                 ),
                 FailedRowsError::Store(e) => ApiError::from(e),
             })?;
-    records_in_range(rows.into_iter().map(|r| r.raw).collect())
+    records(records_in_range(rows.into_iter().map(|r| r.raw).collect()))
+}
+
+/// A `stored` input's rows, opened in memory only, with their references;
+/// refused in the contract's order.
+fn stored_records(s: &AppState, stored: &StoredBody) -> Result<(Vec<Value>, Vec<Value>), ApiError> {
+    if stored.passing > MAX_RECORDS {
+        return Err(
+            ApiError::invalid_body(format!("passing is 0 to {MAX_RECORDS}"))
+                .with("field", "input.stored.passing"),
+        );
+    }
+    let asked = stored.records.len() + stored.passing;
+    if asked == 0 || asked > MAX_RECORDS {
+        return Err(ApiError::invalid_body(format!(
+            "a Try takes 1 to {MAX_RECORDS} rows: records named and passing together"
+        ))
+        .with("field", "input.stored"));
+    }
+    let named: Vec<StoredRef> = stored.records.iter().map(RecordRef::stored).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    if named.iter().any(|n| !seen.insert(n.record)) {
+        return Err(
+            ApiError::invalid_body("a record is named once").with("field", "input.stored.records")
+        );
+    }
+    let load = stored.load;
+    let rows = s
+        .db
+        .stored_rows(load, &named, stored.passing)
+        .map_err(|e| match e {
+            StoredRowsError::LoadNotFound => not_found("load_not_found", &format!("load {load}")),
+            StoredRowsError::RecordNotFound(record) => {
+                not_found("record_not_found", &format!("record {record}")).with("record", record)
+            }
+            StoredRowsError::RecordNotInLoad { record, load: its } => ApiError::conflict(
+                "record_not_in_load",
+                format!("record {record} belongs to load {its}, not load {load}"),
+            )
+            .with("record", record)
+            .with("load", its),
+            StoredRowsError::AttemptChanged { record, attempt } => ApiError::conflict(
+                "attempt_changed",
+                format!("record {record} has had another attempt since (now attempt {attempt})"),
+            )
+            .with("record", record)
+            .with("attempt", attempt),
+            StoredRowsError::ContentExpired(gone) => ApiError::new(
+                StatusCode::GONE,
+                "content_expired",
+                "a named row's content is no longer kept",
+            )
+            .with(
+                "records",
+                gone.iter()
+                    .map(|(id, content)| json!({"id": id, "content": content}))
+                    .collect::<Vec<_>>(),
+            ),
+            StoredRowsError::NothingToTry => ApiError::conflict(
+                "nothing_to_try",
+                format!("load {load} has no stored row left to try"),
+            ),
+            StoredRowsError::Store(e) => ApiError::from(e),
+        })?;
+    let references = rows.iter().map(|r| r.reference()).collect();
+    Ok((rows.into_iter().map(|r| r.raw).collect(), references))
 }
 
 /// Runs a Try and answers it `no-store`; `429 try_busy` carries `Retry-After`.
@@ -478,8 +611,9 @@ async fn run_try(
 /// `POST /api/transforms/try`: code sent inline.
 async fn try_inline(
     State(s): State<AppState>,
-    StrictJson(body): StrictJson<InlineTryBody>,
+    bytes: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
+    let body: InlineTryBody = try_body(&bytes)?;
     check_run_id(&body.run_id)?;
     let deadline = deadline(body.deadline_ms)?;
     if body.code.len() > crate::versions::MAX_CODE_BYTES {
@@ -489,12 +623,13 @@ async fn try_inline(
             "code is at most 256 KiB",
         ));
     }
-    let records = input_records(&s, body.input)?;
+    let (records, references) = input_records(&s, body.input)?;
     let input = TryInput {
         run_id: body.run_id,
         code: body.code,
         saved: None,
         records,
+        references,
         deadline,
         validate: body.validate.unwrap_or(true),
     };
@@ -527,7 +662,7 @@ async fn try_saved(
         );
         (run_id, None, Err(body.records), None, None)
     } else {
-        let body: SavedTryBody = strict(&bytes)?;
+        let body: SavedTryBody = try_body(&bytes)?;
         check_run_id(&body.run_id)?;
         (
             body.run_id,
@@ -559,9 +694,9 @@ async fn try_saved(
         .versions
         .code(&id, number)?
         .ok_or_else(|| transform_missing(&id))?;
-    let records = match given {
+    let (records, references) = match given {
         Ok(input) => input_records(&s, input)?,
-        Err(records) => records,
+        Err(records) => (records, Vec::new()),
     };
     let input = TryInput {
         run_id,
@@ -572,6 +707,7 @@ async fn try_saved(
             environment: v.environment,
         }),
         records,
+        references,
         deadline,
         validate: validate.unwrap_or(true),
     };

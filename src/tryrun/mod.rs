@@ -55,6 +55,9 @@ pub struct TryInput {
     /// `None` for inline code.
     pub saved: Option<SavedVersion>,
     pub records: Vec<Value>,
+    /// The stored row each record is, as its item's `input` (a `stored`
+    /// input, `Db::stored_rows`); empty for records given otherwise.
+    pub references: Vec<Value>,
     pub deadline: Duration,
     pub validate: bool,
 }

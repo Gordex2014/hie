@@ -428,6 +428,7 @@ fn try_input(
         code: code.into(),
         saved: None,
         records: vec![json!({"n": 1})],
+        references: Vec::new(),
         deadline: std::time::Duration::from_millis(deadline_ms),
         validate,
     }
