@@ -423,11 +423,15 @@ async fn an_unconfirmed_transaction_is_sent_again_after_a_restart() {
     assert_eq!(load["rows"]["written"], 2, "{load}");
     assert_eq!(load["rows"]["outcome_unknown"], 0);
     let bundles = dest.lock().unwrap().bundles.clone();
-    assert_eq!(bundles.len(), 2, "{bundles:?}");
+    // At least the attempt before the restart and the one after it (the
+    // engine's own loop may have made one more before the source was paused).
+    assert!(bundles.len() >= 2, "{bundles:?}");
     assert!(bundles.iter().all(|(kind, _)| kind == "transaction"));
-    assert_eq!(
-        bundles[0].1, bundles[1].1,
-        "the same transaction, not split"
+    assert!(
+        bundles
+            .iter()
+            .all(|(_, urls)| *urls == bundles[0].1 && urls.len() == 2),
+        "the same transaction every time, never split: {bundles:?}"
     );
     assert_eq!(
         state
