@@ -536,15 +536,18 @@ async fn retries_chain_and_keep_the_failures_of_their_day() {
     );
 
     // A fixed program: the retry writes the row; the day keeps its failure.
-    std::fs::write(
-        root.join("transforms/lab_csv.py"),
-        LAB_TRANSFORM.replace(
-            "raise DataError(f\"value {value!r} is not a number\")",
-            "number = 0.0",
-        ),
-    )
-    .unwrap();
+    let fixed_code = LAB_TRANSFORM.replace(
+        "raise DataError(f\"value {value!r} is not a number\")",
+        "number = 0.0",
+    );
+    let (_, saved) = state
+        .versions
+        .save_legacy("lab_csv", &fixed_code)
+        .await
+        .unwrap();
+    assert_eq!(saved, 2);
     let fixed = state.versions.latest("lab_csv").unwrap().unwrap();
+    assert_eq!(fixed.version, 2);
     let second = db.create_retry(&again, &fixed).unwrap();
     assert_eq!(second["previous"], first["id"]);
     runner.tick().await.unwrap();
@@ -564,15 +567,13 @@ async fn retries_chain_and_keep_the_failures_of_their_day() {
         db.create_retry(&again, &fixed),
         Err(hie::db::RetryRefusal::NothingToRetry)
     ));
-    let runs = db.version_runs("lab_csv", 1, 10).unwrap();
-    assert_eq!(
-        runs.iter()
-            .map(|r| (r.kind.as_str(), r.outcome.as_str()))
-            .collect::<Vec<_>>(),
-        [
-            ("retry", "written"),
-            ("retry", "failed"),
-            ("load", "partial")
-        ]
-    );
+    let runs = |version| {
+        db.version_runs("lab_csv", version, 10)
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.kind, r.outcome))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(runs(2), ["retry written"]);
+    assert_eq!(runs(1), ["retry failed", "load partial"]);
 }

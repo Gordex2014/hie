@@ -1,167 +1,145 @@
-//! Transforms as resources: one Python file per transform in `transforms_dir`,
-//! listed with the sources that use it, saved (restarting those sources so
-//! they load the new code) and tried on supplied records.
+//! The manager's side of transforms and pins: what only the manager knows
+//! (every source, its definition file) joined with the version store: the
+//! transform list with the sources that use each, deleting a transform no
+//! source uses, moving a source's pin (and its definition with it), and
+//! checking a definition's transform reference.
 
-use std::path::{Path, PathBuf};
-
-use anyhow::{Context, Result};
+use anyhow::Context;
 use chrono::{DateTime, Utc};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::{ManagerError, SourceManager};
-use crate::transform::{Outcome, Transformer, check_resource};
+use crate::config::{FeedConfig, TransformRef};
+use crate::versions::{PinChange, TransformInfo};
 
 impl SourceManager {
-    fn transform_path(&self, name: &str) -> Result<PathBuf, ManagerError> {
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            return Err(ManagerError::invalid(
-                "invalid_body",
-                format!("transform name {name:?} must be letters, digits, underscores and dashes"),
-            ));
+    /// How this engine's executors are made (the version store holds its own copy).
+    pub fn executor_settings(&self) -> crate::versions::ExecutorSettings {
+        crate::versions::ExecutorSettings {
+            python: self.python.clone(),
+            runtime_dir: self.runtime_dir.clone(),
+            terminology: self.terminology_url.clone(),
+            runtime: self.runtime.clone(),
         }
-        Ok(self.transforms_dir.join(format!("{name}.py")))
     }
 
-    fn transform_name(path: &Path) -> Option<String> {
-        (path.extension().and_then(|e| e.to_str()) == Some("py"))
-            .then(|| path.file_stem()?.to_str().map(str::to_string))
-            .flatten()
+    /// Where transform files are found and written.
+    pub fn transforms_dir(&self) -> &std::path::Path {
+        &self.transforms_dir
     }
 
-    /// Every transform file, with the sources that use it.
-    pub fn transforms(&self) -> Result<Vec<Value>> {
-        std::fs::create_dir_all(&self.transforms_dir)?;
+    /// The sources whose pin names the transform (pinned or following).
+    pub fn transform_users(&self, transform_id: &str) -> Vec<String> {
+        self.sources()
+            .iter()
+            .filter(|feed| {
+                self.versions()
+                    .source_transform(feed)
+                    .is_ok_and(|id| id == transform_id)
+            })
+            .map(|feed| feed.id.clone())
+            .collect()
+    }
+
+    /// `GET /api/transforms`: every transform with its 0.1 members (`name`,
+    /// `path`, `size`, `modified_at`, `used_by`) and its 0.2.0 ones.
+    pub fn transforms(&self) -> anyhow::Result<Vec<Value>> {
+        let versions = self.versions();
         let sources = self.sources();
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(&self.transforms_dir)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.is_file() && Self::transform_name(p).is_some())
+        let users: Vec<(String, String)> = sources
+            .iter()
+            .filter_map(|feed| Some((versions.source_transform(feed).ok()?, feed.id.clone())))
             .collect();
-        entries.sort();
         let mut out = Vec::new();
-        for path in entries {
-            let name = Self::transform_name(&path).unwrap_or_default();
-            let meta = std::fs::metadata(&path)?;
-            let modified = meta
-                .modified()
-                .ok()
-                .map(|m| DateTime::<Utc>::from(m).to_rfc3339());
-            let canonical = path.canonicalize().unwrap_or(path.clone());
-            let used_by: Vec<&str> = sources
+        for t in versions.transforms()? {
+            let mut view = versions.transform_json(&t);
+            let (path, size, modified) = self.file_facts(&t)?;
+            view["path"] = path.into();
+            view["size"] = size.into();
+            view["modified_at"] = modified.into();
+            let used_by: Vec<&str> = users
                 .iter()
-                .filter(|f| {
-                    f.transform
-                        .file()
-                        .and_then(|p| p.canonicalize().ok())
-                        .as_ref()
-                        == Some(&canonical)
-                })
-                .map(|f| f.id.as_str())
+                .filter(|(id, _)| *id == t.id)
+                .map(|(_, source)| source.as_str())
                 .collect();
-            let relative = path
-                .strip_prefix(&self.base_dir)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            out.push(json!({
-                "name": name,
-                "path": relative,
-                "size": meta.len(),
-                "modified_at": modified,
-                "used_by": used_by,
-            }));
+            view["used_by"] = used_by.into();
+            out.push(view);
         }
         Ok(out)
     }
 
-    pub fn transform_code(&self, name: &str) -> Result<Option<String>, ManagerError> {
-        let path = self.transform_path(name)?;
-        if !path.is_file() {
-            return Ok(None);
-        }
-        Ok(Some(
-            std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?,
-        ))
-    }
-
-    /// Writes the transform's code and restarts the sources that use it, so their
-    /// Python workers load the new version.
-    pub fn save_transform(&self, name: &str, code: &str) -> Result<bool, ManagerError> {
-        let path = self.transform_path(name)?;
-        std::fs::create_dir_all(&self.transforms_dir).map_err(anyhow::Error::from)?;
-        let existed = path.exists();
-        std::fs::write(&path, code).with_context(|| format!("writing {}", path.display()))?;
-        let canonical = path.canonicalize().unwrap_or(path);
-        for feed in self.sources() {
-            if feed
-                .transform
-                .file()
-                .and_then(|p| p.canonicalize().ok())
-                .as_ref()
-                == Some(&canonical)
-            {
-                self.start(feed)?;
+    /// A transform's file as 0.1 listed it: its path relative to the base
+    /// directory, its size and when it changed; without a file, the current
+    /// version's size and save time.
+    fn file_facts(
+        &self,
+        t: &TransformInfo,
+    ) -> anyhow::Result<(Option<String>, i64, Option<String>)> {
+        let base = self
+            .base_dir
+            .canonicalize()
+            .unwrap_or(self.base_dir.clone());
+        if let Some(path) = &t.file_path {
+            let path = std::path::Path::new(path);
+            if let Ok(meta) = std::fs::metadata(path) {
+                let relative = path
+                    .strip_prefix(&base)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .map(|m| DateTime::<Utc>::from(m).to_rfc3339());
+                return Ok((Some(relative), meta.len() as i64, modified));
             }
         }
-        Ok(existed)
+        let size = self
+            .versions()
+            .code(&t.id, t.current_version)?
+            .map_or(0, |c| c.len() as i64);
+        Ok((None, size, crate::ids::rfc3339_ms_at(t.updated_at)))
     }
 
-    /// Runs a transform on supplied records without loading anything: what each
-    /// record became, or why it was rejected.
-    pub async fn try_transform(
-        &self,
-        name: &str,
-        records: &[Value],
-    ) -> Result<Vec<Value>, ManagerError> {
-        let path = self.transform_path(name)?;
-        if !path.is_file() {
-            return Err(ManagerError::not_found(
-                "transform_not_found",
-                format!("transform {name} not found"),
-            ));
-        }
-        let mut transformer = Transformer::new(&self.python, &self.runtime_dir, &path);
-        transformer.set_terminology(self.terminology_url.as_deref());
-        transformer.set_runtime(self.runtime.as_ref());
-        let items: Vec<(Value, Value)> = records
-            .iter()
-            .enumerate()
-            .map(|(i, record)| {
-                (
-                    record.clone(),
-                    json!({"feed": "try", "file": "try", "line": i + 1}),
-                )
-            })
-            .collect();
-        let outcomes = transformer.try_many(&items).await.map_err(|e| {
-            ManagerError::invalid(
-                "transform_failed",
-                format!("transform failed to run: {e:#}"),
-            )
+    /// `DELETE /api/transforms/{id}`: refused while a source pins or follows it.
+    pub fn delete_transform(&self, id: &str) -> Result<(), ManagerError> {
+        let users = self.transform_users(id);
+        self.versions().delete(id, &users)
+    }
+
+    /// Checks a definition's transform reference against the version store
+    /// (`400 invalid_definition` when the transform or the version does not exist).
+    pub(super) fn check_transform(&self, feed: &FeedConfig) -> Result<(), ManagerError> {
+        self.versions().check_reference(&feed.transform)
+    }
+
+    /// `PUT /api/sources/{id}/pin`: the source's pin moves, its definition
+    /// file with it, and loads that start afterwards run it; a running load
+    /// keeps its version (the runner is not restarted).
+    pub fn set_pin(&self, id: &str, change: PinChange) -> Result<FeedConfig, ManagerError> {
+        let feed = self.source(id).ok_or_else(|| {
+            ManagerError::not_found("source_not_found", format!("source {id} not found"))
         })?;
-        let mut out = Vec::with_capacity(records.len());
-        for (record, outcome) in records.iter().zip(outcomes) {
-            out.push(match outcome {
-                Outcome::Rejected { kind, message } => {
-                    json!({"record": record, "error": {"kind": kind, "message": message}})
-                }
-                Outcome::Transient(message) => {
-                    json!({"record": record, "error": {"kind": "transient", "message": message}})
-                }
-                Outcome::Resources(resources) => {
-                    let problem = resources.iter().find_map(|r| check_resource(r).err());
-                    match problem {
-                        Some(message) => json!({"record": record, "resources": resources,
-                            "error": {"kind": "validation", "message": message}}),
-                        None => json!({"record": record, "resources": resources}),
-                    }
-                }
-            });
+        let pin = self.versions().set_pin(&feed, change)?;
+        self.write_pin(id, &pin)?;
+        let mut sources = self.sources.lock().expect("manager mutex");
+        let managed = sources.get_mut(id).ok_or_else(|| {
+            ManagerError::not_found("source_not_found", format!("source {id} not found"))
+        })?;
+        managed.feed.transform = pin;
+        Ok(managed.feed.clone())
+    }
+
+    /// Writes a pin into the source's definition file, the rest as it is.
+    fn write_pin(&self, id: &str, pin: &TransformRef) -> anyhow::Result<()> {
+        let path = self.file_for(id);
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let mut yaml: serde_yaml::Value = serde_yaml::from_str(&text)?;
+        if let serde_yaml::Value::Mapping(map) = &mut yaml {
+            map.insert("transform".into(), serde_yaml::to_value(pin)?);
         }
-        Ok(out)
+        std::fs::write(&path, serde_yaml::to_string(&yaml)?)
+            .with_context(|| format!("writing {}", path.display()))
     }
 }

@@ -558,11 +558,17 @@ impl Db {
                 } else {
                     (r.i64(13), r.i64(14), r.i64(15))
                 };
+                let held = !finished
+                    && self
+                        .version_waiting(r.i64(1), Some(&r.string(0)))
+                        .ok()
+                        .flatten()
+                        .is_some();
                 let waiting = if finished {
                     Value::Null
                 } else if r.i64(16) == 1 {
                     json!("validation_unavailable")
-                } else if r.i64(17) == 1 {
+                } else if r.i64(17) == 1 || held {
                     json!("environment_unavailable")
                 } else if r.i64(18) == 1 {
                     json!("destination_unavailable")

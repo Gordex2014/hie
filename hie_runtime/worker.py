@@ -1,6 +1,8 @@
 """Runs a transform script for HIE.
 
-Protocol, one JSON object per line:
+Protocol, one JSON object per line. The first line the worker writes is
+{"ready": true}, or {"ready": false, "load_error": {"message", "trace"}} when the
+transform did not load (then it exits). After that:
   request  {"id": 1, "record": {...}, "context": {"feed": ..., "file": ..., "line": ...}}
   response {"id": 1, "resources": [...]}
         or {"id": 1, "error": {"kind": "data" | "transform" | "transient", "message": ...}}
@@ -41,7 +43,14 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="strict")
     protocol = sys.stdout
     sys.stdout = sys.stderr
-    module = load(sys.argv[1])
+    try:
+        module = load(sys.argv[1])
+    except BaseException as e:  # noqa: BLE001 - the engine shows why the code did not load
+        message = str(e) if isinstance(e, SystemExit) else f"{type(e).__name__}: {e}"
+        load_error = {"message": message, "trace": traceback.format_exc(limit=5)}
+        protocol.write(json.dumps({"ready": False, "load_error": load_error}) + "\n")
+        protocol.flush()
+        sys.exit(1)
     protocol.write(json.dumps({"ready": True}) + "\n")
     protocol.flush()
     for line in sys.stdin:

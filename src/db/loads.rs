@@ -725,9 +725,17 @@ impl Db {
                     "processing" | "unpacked" => "delivering",
                     _ => "done",
                 };
+                // The version store holds a load whose version's environment
+                // is not the executor's (`environment_unavailable`).
+                let held = status != "done"
+                    && self
+                        .version_waiting(r.i64(0), None)
+                        .ok()
+                        .flatten()
+                        .is_some();
                 let waiting = if r.i64(25) == 1 {
                     json!("validation_unavailable")
-                } else if r.i64(26) == 1 {
+                } else if r.i64(26) == 1 || held {
                     json!("environment_unavailable")
                 } else if r.i64(27) == 1 {
                     json!("destination_unavailable")

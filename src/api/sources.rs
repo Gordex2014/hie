@@ -80,6 +80,7 @@ pub(super) fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<V
         "rejected_last_24h": rejected_24h,
         "last_alert": last_alert.into_iter().next(),
         "definition": s.manager.definition(&feed.id)?,
+        "pin": s.versions.pin_view(feed).unwrap_or(Value::Null),
     }))
 }
 

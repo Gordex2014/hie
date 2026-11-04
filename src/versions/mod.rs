@@ -1,42 +1,56 @@
-//! Transform versions: which version a load or retry runs, and an executor
-//! that runs exactly that version and says where it ran (decision 35).
+//! Transform versions (decision 35): transforms with a stable id and immutable
+//! numbered versions, each saved in one environment; which version a load or
+//! retry runs; executors that run exactly that version; pins and their
+//! periods; Try runs (`crate::tryrun`) are registered here too.
 //!
 //! The interface the pipeline, the manager and the API use:
 //!
-//! - [`Versions::resolve_for_source`]: the version a load of this source runs
-//!   if it starts now (its pin, or the current version it follows), read
-//!   afresh at every load start; the load keeps it until it finishes.
-//! - [`Versions::latest`] and [`Versions::get`]: a transform's current version,
-//!   and one version by number.
-//! - [`Versions::executor`]: something that runs records for that exact
-//!   version ([`Execute`]) and reports the [`Environment`] it ran in, so a run
-//!   in another environment is not applied.
-//! - Lifecycle hooks the manager calls: [`Versions::source_created`],
-//!   [`Versions::source_replaced`], [`Versions::source_deleted`] (pin periods).
+//! - Reading: [`Versions::transform`], [`Versions::transforms`],
+//!   [`Versions::version`], [`Versions::versions`], [`Versions::code`],
+//!   [`Versions::latest`], [`Versions::get`].
+//! - Saving (`catalog`): [`Versions::environment_for`] (async: the executor's
+//!   default environment, or a named one), then inside the caller's
+//!   transaction [`Versions::create_in`] / [`Versions::save_in`] /
+//!   [`Versions::rename_in`], then [`Versions::saved`] (the transform's file
+//!   follows its current version). [`Versions::save_legacy`] for `PUT
+//!   /api/transforms/{name}`, [`Versions::delete`].
+//! - Pins (`pins`): [`Versions::resolve_for_source`] (read afresh at every
+//!   load start), [`Versions::pin_view`], [`Versions::set_pin`],
+//!   [`Versions::check_reference`], [`Versions::usage`], and the lifecycle
+//!   hooks [`Versions::source_created`], [`Versions::source_replaced`],
+//!   [`Versions::source_deleted`] (pin periods, local workers).
+//! - Running (`execute`, `programs`): [`Versions::executor`] runs records for
+//!   exactly one version (its code from the store, checked against its
+//!   `code_sha256`) and reports the environment it ran in;
+//!   [`Versions::reclaim`] frees what is no longer needed.
 //!
-//! **Phase 0** (what is here now; track V replaces the inside): each transform
-//! is one file and has one version, 1, its current content; a pin may only name
-//! version 1. The executor is the engine's [`Transformer`]: the local Python
-//! worker, or python-runtime when `runtime` is configured. Locally the
-//! environment is `{"executor": "local", "id": "local", "digest": null}`; at the
-//! runtime it is a fixed `{"executor": "python-runtime", "id": "default"}` until
-//! V reads the runtime's capabilities. A file changed while a load runs is
-//! picked up as before 0.2.0.
+//! Files under `transforms/` are imported when the store opens and whenever
+//! a 0.1 reference's file changes (`files`); a file is identified by its
+//! canonical path, so two files with one stem never share a transform.
 
+mod catalog;
+mod environment;
 mod execute;
+mod files;
+mod pins;
+mod programs;
+#[cfg(test)]
+mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
-use crate::config::{FeedConfig, PinMode, TransformRef};
 use crate::db::Db;
-use crate::runtime::RuntimeSettings;
+use crate::runtime::{Facade, RuntimeSettings};
 
-pub use execute::{Execute, Execution, ItemOutcome};
+pub use catalog::{Draft, MAX_CODE_BYTES};
+pub use execute::{EnvironmentUnavailable, Execute, Execution, ItemOutcome};
+pub use pins::{PinChange, USAGE_RUNS};
 
 /// The identity of the place a version runs, as the contract's `environment`
 /// object: `{"executor", "id", "digest"}`.
@@ -103,133 +117,244 @@ pub struct ExecutorSettings {
     pub runtime: Option<RuntimeSettings>,
 }
 
-type ExecutorKey = (String, i64, String);
+/// A transform as the store holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransformInfo {
+    pub id: String,
+    pub display_name: String,
+    pub current_version: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub deleted: bool,
+    /// The canonical path of its file, when it has one.
+    pub file_path: Option<String>,
+    /// The SHA-256 of what HIE last wrote to or read from that file.
+    pub file_sha256: Option<String>,
+}
+
+/// One version's metadata (its code is read apart, [`Versions::code`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionInfo {
+    pub transform_id: String,
+    pub version: i64,
+    pub code_sha256: String,
+    pub note: Option<String>,
+    pub author: Option<String>,
+    pub display_name: String,
+    pub base_version: Option<i64>,
+    pub created_at: i64,
+    pub environment: Environment,
+}
+
+impl VersionInfo {
+    /// The contract's version object, without code.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "version": self.version,
+            "code_sha256": self.code_sha256,
+            "note": self.note,
+            "author": self.author,
+            "display_name": self.display_name,
+            "base_version": self.base_version,
+            "created_at": crate::ids::rfc3339_ms_at(self.created_at),
+            "environment": self.environment,
+        })
+    }
+
+    pub fn reference(&self) -> VersionRef {
+        VersionRef {
+            transform_id: self.transform_id.clone(),
+            version: self.version,
+            code_sha256: self.code_sha256.clone(),
+            environment: self.environment.clone(),
+        }
+    }
+}
+
+/// A source's pin as the store holds it: a version, or (`None`) the current
+/// one; `declared` is the definition's pin it was last set from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinRow {
+    pub transform_id: String,
+    pub version: Option<i64>,
+    pub declared: String,
+}
+
+/// One period a source pinned (`version`) or followed (`None`) a transform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinPeriod {
+    pub source: String,
+    pub version: Option<i64>,
+    pub since: i64,
+    pub until: Option<i64>,
+}
+
+/// A new version's content.
+pub struct NewVersion<'a> {
+    pub code: &'a str,
+    pub code_sha256: &'a str,
+    pub note: Option<&'a str>,
+    pub author: Option<&'a str>,
+    pub environment: &'a Environment,
+}
+
+/// What a save found.
+pub enum Saved {
+    Version(Box<VersionInfo>),
+    /// `base_version` was not the current version.
+    Conflict {
+        current_version: i64,
+    },
+    NotFound,
+}
+
+/// Which executor a cached executor is: local workers are kept per source and
+/// version (module state never crosses sources); the runtime's per version.
+type ExecutorKey = (Option<String>, String, i64, String);
 
 pub struct Versions {
-    #[allow(dead_code)]
     db: Arc<Db>,
     settings: ExecutorSettings,
     transforms_dir: PathBuf,
-    /// Phase 0: the file each transform id was last resolved to.
-    files: Mutex<HashMap<String, PathBuf>>,
+    facade: Option<Facade>,
+    /// The runtime's default environment as last read (`None` until read).
+    default_environment: Arc<Mutex<Option<Environment>>>,
     executors: Mutex<HashMap<ExecutorKey, Arc<dyn Execute>>>,
+    /// Where local workers' code is written from the store, one file per
+    /// version; removed with this value.
+    materialized: PathBuf,
+    /// Sources whose pin was reconciled with their definition in this process.
+    seen: Mutex<HashSet<String>>,
+    tries: crate::tryrun::TryRuns,
+    reclaimed: Mutex<Option<std::time::Instant>>,
+    /// Whether the transform files found at start were imported.
+    imported: std::sync::atomic::AtomicBool,
 }
 
 impl Versions {
     pub fn new(db: Arc<Db>, settings: ExecutorSettings, transforms_dir: &Path) -> Self {
-        Self {
+        let facade = settings.runtime.clone().map(Facade::new);
+        let materialized = std::env::temp_dir().join(format!(
+            "hie-versions-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let versions = Self {
             db,
             settings,
             transforms_dir: transforms_dir.to_path_buf(),
-            files: Mutex::new(HashMap::new()),
+            facade,
+            default_environment: Arc::new(Mutex::new(None)),
             executors: Mutex::new(HashMap::new()),
-        }
+            materialized,
+            seen: Mutex::new(HashSet::new()),
+            tries: crate::tryrun::TryRuns::default(),
+            reclaimed: Mutex::new(None),
+            imported: std::sync::atomic::AtomicBool::new(false),
+        };
+        // Locally at once; at the runtime once its environment is known
+        // ([`Versions::ready`]).
+        versions.import_dir();
+        versions
     }
 
-    /// The version a load of `feed` runs if it starts now: the version its
-    /// pin names, or the current one it follows. Read afresh each time.
-    pub fn resolve_for_source(&self, feed: &FeedConfig) -> Result<VersionRef> {
-        let id = feed.transform.id();
-        let path = match &feed.transform {
-            TransformRef::File(path) => path.clone(),
-            TransformRef::Pin(_) => self.transforms_dir.join(format!("{id}.py")),
-        };
-        self.files
-            .lock()
-            .expect("versions files")
-            .insert(id.clone(), path.clone());
-        let current = self.version_of(&id, &path)?;
-        match feed.transform.mode() {
-            PinMode::FollowCurrent => Ok(current),
-            PinMode::Version(v) if v == current.version => Ok(current),
-            PinMode::Version(v) => bail!("transform {id} has no version {v}"),
+    pub(crate) fn db(&self) -> &Arc<Db> {
+        &self.db
+    }
+
+    /// The shared runtime, when transforms run there.
+    pub fn facade(&self) -> Option<&Facade> {
+        self.facade.as_ref()
+    }
+
+    /// How local workers are started.
+    pub fn settings(&self) -> &ExecutorSettings {
+        &self.settings
+    }
+
+    /// A new file in the engine's scratch directory (code a worker loads).
+    pub fn scratch_file(&self, prefix: &str) -> Result<PathBuf> {
+        std::fs::create_dir_all(&self.materialized)?;
+        Ok(self
+            .materialized
+            .join(format!("{prefix}-{:016x}.py", rand::random::<u64>())))
+    }
+
+    /// The Try runs of this engine.
+    pub fn tries(&self) -> &crate::tryrun::TryRuns {
+        &self.tries
+    }
+
+    // ---- reading ------------------------------------------------------------------
+
+    /// A live transform.
+    pub fn transform(&self, id: &str) -> Result<Option<TransformInfo>> {
+        Ok(self.db.transform_info(id)?.filter(|t| !t.deleted))
+    }
+
+    /// Every live transform, by id.
+    pub fn transforms(&self) -> Result<Vec<TransformInfo>> {
+        self.db.transform_infos()
+    }
+
+    /// One version of a live transform.
+    pub fn version(&self, id: &str, version: i64) -> Result<Option<VersionInfo>> {
+        if self.transform(id)?.is_none() {
+            return Ok(None);
         }
+        self.db.version_info(id, version)
+    }
+
+    /// Every version of a live transform, newest first.
+    pub fn versions(&self, id: &str) -> Result<Vec<VersionInfo>> {
+        self.db.version_infos(id)
+    }
+
+    /// A version's code.
+    pub fn code(&self, id: &str, version: i64) -> Result<Option<String>> {
+        self.db.version_code(id, version)
     }
 
     /// The transform's current version; `None` when there is no such transform.
     pub fn latest(&self, transform_id: &str) -> Result<Option<VersionRef>> {
-        let path = self.file_of(transform_id);
-        if !path.is_file() {
+        let Some(t) = self.transform(transform_id)? else {
             return Ok(None);
-        }
-        self.version_of(transform_id, &path).map(Some)
+        };
+        Ok(self
+            .db
+            .version_info(transform_id, t.current_version)?
+            .map(|v| v.reference()))
     }
 
-    /// One version of a transform; `None` when either does not exist.
+    /// One version of a transform, deleted transforms included (a load that
+    /// started on it still names it); `None` when it does not exist.
     pub fn get(&self, transform_id: &str, version: i64) -> Result<Option<VersionRef>> {
-        Ok(self.latest(transform_id)?.filter(|v| v.version == version))
+        Ok(self
+            .db
+            .version_info(transform_id, version)?
+            .map(|v| v.reference()))
     }
 
-    /// Runs records for exactly `version` and reports the environment it ran in.
-    pub fn executor(&self, version: &VersionRef) -> Result<Arc<dyn Execute>> {
-        let key = (
-            version.transform_id.clone(),
-            version.version,
-            version.code_sha256.clone(),
-        );
-        let mut executors = self.executors.lock().expect("versions executors");
-        if let Some(executor) = executors.get(&key) {
-            return Ok(executor.clone());
-        }
-        let path = self.file_of(&version.transform_id);
-        let executor: Arc<dyn Execute> = Arc::new(execute::TransformerExecutor::new(
-            &self.settings,
-            &path,
-            version.environment.clone(),
-        ));
-        // Phase 0: a transform's earlier content is gone; so is its worker.
-        executors.retain(|(id, _, _), _| id != &version.transform_id);
-        executors.insert(key, executor.clone());
-        Ok(executor)
-    }
-
-    /// A source was created: its pin period starts. Phase 0: nothing to keep.
-    pub fn source_created(&self, feed: &FeedConfig) -> Result<()> {
-        let _ = feed;
-        Ok(())
-    }
-
-    /// A source's definition was replaced: one pin period ends, another starts.
-    /// Phase 0: nothing to keep.
-    pub fn source_replaced(&self, before: &FeedConfig, after: &FeedConfig) -> Result<()> {
-        let _ = (before, after);
-        Ok(())
-    }
-
-    /// A source was deleted: its pin period ends. Phase 0: nothing to keep.
-    pub fn source_deleted(&self, source_id: &str) -> Result<()> {
-        let _ = source_id;
-        Ok(())
-    }
-
-    fn file_of(&self, transform_id: &str) -> PathBuf {
-        self.files
-            .lock()
-            .expect("versions files")
-            .get(transform_id)
-            .cloned()
-            .unwrap_or_else(|| self.transforms_dir.join(format!("{transform_id}.py")))
-    }
-
-    fn version_of(&self, transform_id: &str, path: &Path) -> Result<VersionRef> {
-        let code =
-            std::fs::read(path).with_context(|| format!("reading transform {}", path.display()))?;
-        Ok(VersionRef {
-            transform_id: transform_id.to_string(),
-            version: 1,
-            code_sha256: crate::formats::sha256_hex(&code),
-            environment: self.environment(),
+    /// The contract's transform object (no code, no version).
+    pub fn transform_json(&self, t: &TransformInfo) -> Value {
+        json!({
+            "id": t.id,
+            "name": t.id,
+            "display_name": t.display_name,
+            "current_version": t.current_version,
+            "created_at": crate::ids::rfc3339_ms_at(t.created_at),
+            "updated_at": crate::ids::rfc3339_ms_at(t.updated_at),
         })
     }
+}
 
-    fn environment(&self) -> Environment {
-        match &self.settings.runtime {
-            Some(_) => Environment {
-                executor: "python-runtime".into(),
-                id: "default".into(),
-                digest: None,
-            },
-            None => Environment::local(),
-        }
+impl Drop for Versions {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.materialized);
     }
+}
+
+/// SHA-256 of text, as 64 hex digits.
+fn sha256_hex(text: &str) -> String {
+    crate::formats::sha256_hex(text.as_bytes())
 }
