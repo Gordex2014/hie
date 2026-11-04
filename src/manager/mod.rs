@@ -341,6 +341,8 @@ impl SourceManager {
         }
         Source::from_config_in(&checked, &self.connect)
             .map_err(|e| ManagerError::invalid("invalid_definition", format!("{e:#}")))?;
+        crate::bulk::check_delivery(&resolved, self.config.validation)
+            .map_err(|e| ManagerError::invalid("invalid_definition", format!("{e:#}")))?;
         self.check_transform(&resolved)?;
         Ok((submitted, resolved))
     }
