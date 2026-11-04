@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::history::append_submission_events;
-use super::loads::Column;
+use super::loads::{Column, for_update};
 use super::{Db, Param, now_ms, params};
 
 /// One row per submission, with its manifest and where its status is read.
@@ -53,6 +53,9 @@ pub struct SubmittableFile {
     pub resource_type: String,
     /// Pending records of the file that no submission holds.
     pub count: usize,
+    /// The most delivery attempts one of those records has had: a row sent
+    /// again after unconfirmed receipts makes the submission a new one.
+    pub attempts: i64,
 }
 
 impl Db {
@@ -62,12 +65,13 @@ impl Db {
     /// manifest needs them: counted in the store, never listed record by record.
     pub fn submittable_files(&self, feed: &str, limit: usize) -> Result<Vec<SubmittableFile>> {
         let rows = self.query(
-            "SELECT r.file_id, f.name, f.source_key, COUNT(*)
+            "SELECT r.file_id, f.name, f.source_key, COUNT(*), MAX(r.attempts)
              FROM records r JOIN files f ON f.id = r.file_id
              WHERE r.feed_id = $1 AND r.status = 'pending' AND r.submission IS NULL AND r.exec_retry IS NULL
+               AND r.next_attempt_at <= $3
              GROUP BY r.file_id, f.name, f.source_key
              ORDER BY r.file_id LIMIT $2",
-            &params![feed, limit],
+            &params![feed, limit, now_ms()],
         )?;
         let mut files = Vec::with_capacity(rows.len());
         for r in &rows {
@@ -93,6 +97,7 @@ impl Db {
                 source_key: r.opt_string(2),
                 resource_type,
                 count: r.i64(3) as usize,
+                attempts: r.i64(4),
             });
         }
         Ok(files)
@@ -121,7 +126,7 @@ impl Db {
                     c.execute(
                         "UPDATE records SET status = 'submitted', submission = $1, uncertain = 1, updated_at = $2
                          WHERE file_id = $3 AND feed_id = $4 AND status = 'pending' AND submission IS NULL
-                           AND exec_retry IS NULL",
+                           AND exec_retry IS NULL AND next_attempt_at <= $2",
                         &params![token, now, file_id, feed],
                     )?;
                 }
@@ -271,19 +276,24 @@ impl Db {
     }
 
     /// Takes rows of a settled submission whose receipts did not confirm them
-    /// back to `pending`, outcome unknown, to be submitted again when due.
-    pub fn resubmit(&self, rows: &[(i64, i64)], next_attempt_at: i64, reason: &str) -> Result<()> {
+    /// back to `pending`, outcome unknown, to be submitted again when due, one
+    /// attempt more; answers the most attempts one of them has had now.
+    pub fn resubmit(&self, rows: &[(i64, i64)], next_attempt_at: i64, reason: &str) -> Result<u32> {
         let reason = super::loads::bounded(reason);
+        let mut worst = 0;
         for (id, run) in rows {
-            self.execute(
+            for r in self.query(
                 "UPDATE records SET status = 'pending', submission = NULL, attempts = attempts + 1,
                         next_attempt_at = $3, error_kind = 'transient', error = $4, waiting = 'destination_unavailable',
                         uncertain = 1, updated_at = $5
-                 WHERE id = $1 AND run = $2 AND status = 'submitted'",
+                 WHERE id = $1 AND run = $2 AND status = 'submitted'
+                 RETURNING attempts",
                 &params![id, run, next_attempt_at, reason, now_ms()],
-            )?;
+            )? {
+                worst = worst.max(r.i64(0) as u32);
+            }
         }
-        Ok(())
+        Ok(worst)
     }
 
     /// The source key of a file, only when that file is part of the submission.
@@ -304,30 +314,47 @@ impl Db {
     /// (it holds the rows' resources), its members `(id, run)` and the state
     /// `sending`. A transaction found still `sending` after a restart may have
     /// committed: its rows are outcome unknown, and the same one goes again.
-    /// `None` when none of the rows is pending any more.
+    /// Every member must join as it was read (that attempt, pending, in no
+    /// other transaction), or nothing is kept and `None` says to build it
+    /// again from the rows as they are now: a payload never carries what a
+    /// newer attempt replaced.
     pub fn create_dispatch(
         &self,
         feed: &str,
         payload: &Value,
         members: &[(i64, i64)],
     ) -> Result<Option<String>> {
+        if members.is_empty() {
+            return Ok(None);
+        }
         let id = format!("tx_{}", &crate::ids::new(crate::ids::Kind::Group)[2..]);
         let sealed = self.seal_dispatch(&id, payload);
         self.atomically(|c| {
+            // The members are locked before they are checked, as a reprocess
+            // and a retry lock them (see `loads::for_update`).
+            let lock = for_update(c);
+            for (record, run) in members {
+                let eligible = c.query(
+                    &format!(
+                        "SELECT id FROM records WHERE id = $1 AND run = $2 AND status = 'pending'
+                           AND dispatch IS NULL{lock}"
+                    ),
+                    &params![record, run],
+                )?;
+                if eligible.is_empty() {
+                    return Ok(None);
+                }
+            }
             c.execute(
                 "INSERT INTO dispatches (id, feed_id, payload, state, created_at) VALUES ($1, $2, $3, 'sending', $4)",
                 &params![id, feed, sealed, now_ms()],
             )?;
-            let mut joined = 0;
             for (record, run) in members {
-                joined += c.execute(
+                let joined = c.execute(
                     "UPDATE records SET dispatch = $1 WHERE id = $2 AND run = $3 AND status = 'pending' AND dispatch IS NULL",
                     &params![id, record, run],
                 )?;
-            }
-            if joined == 0 {
-                c.execute("DELETE FROM dispatches WHERE id = $1", &params![id])?;
-                return Ok(None);
+                anyhow::ensure!(joined == 1, "record {record} left the transaction being kept");
             }
             Ok(Some(id.clone()))
         })
