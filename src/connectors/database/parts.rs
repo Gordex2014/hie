@@ -124,7 +124,6 @@ async fn check_read(
     clean: &(dyn Fn(&str) -> bool + Sync),
     report: &mut TestReport,
 ) -> Result<(), DbError> {
-    let engine = session.engine();
     match read {
         DatabaseRead::Table {
             table: name,
@@ -150,7 +149,7 @@ async fn check_read(
             if !key.is_empty() {
                 let plan =
                     Plan::new(&info, key, new_rows_by).map_err(|m| DbError::new(Stage::Read, m))?;
-                let (sql, binds) = plan.sql(engine, None, 1);
+                let (sql, binds) = plan.sql(None, 1);
                 session.fetch(&sql, &binds, clean).await?;
             }
             report.rows = Some(table::row_count(session, name, clean).await?);
@@ -249,13 +248,12 @@ pub async fn sample(
                 };
                 let plan = Plan::new(&info, &key, new_rows_by)
                     .map_err(|m| DbError::new(Stage::Read, m))?;
-                let engine = session.engine();
-                let (sql, binds) = plan.sql(engine, None, limit);
+                let (sql, binds) = plan.sql(None, limit);
                 session
                     .fetch(&sql, &binds, &clean)
                     .await?
                     .into_iter()
-                    .map(|row| plan.split(engine, row).0)
+                    .map(|row| plan.split(row).0)
                     .collect()
             }
             DatabaseRead::Query {
@@ -380,14 +378,13 @@ impl PartsSource {
                     .and_then(|stored| serde_json::from_str::<Position>(&stored).ok())
                     .filter(|p| p.columns == plan.columns)
                     .map(|p| p.after);
-                let engine = session.engine();
                 for _ in 0..self.max_runs {
-                    let (sql, binds) = plan.sql(engine, after.as_deref(), PAGE);
+                    let (sql, binds) = plan.sql(after.as_deref(), PAGE);
                     let rows = session.fetch(&sql, &binds, &clean).await?;
                     let read = rows.len();
                     for row in rows {
                         // The position keeps each order column's exact value.
-                        let (row, position) = plan.split(engine, row);
+                        let (row, position) = plan.split(row);
                         push(&row);
                         after = Some(position);
                     }

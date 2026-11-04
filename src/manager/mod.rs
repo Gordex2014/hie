@@ -265,6 +265,8 @@ impl SourceManager {
 
     pub fn start_all(&self, feeds: Vec<FeedConfig>) -> Result<()> {
         self.reconcile_starts(&feeds)?;
+        // Tests left unfinished by an engine that stopped release their holds.
+        self.evidence.purge()?;
         for feed in feeds {
             // No runner of this process runs yet: a pass it left running died with it.
             self.db

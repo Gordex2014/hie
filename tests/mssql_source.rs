@@ -72,3 +72,144 @@ async fn sql_server_rows_are_read_past_a_cursor() {
     let err = source.list().await.unwrap_err();
     assert!(format!("{err:#}").contains("SQL Server"), "{err:#}");
 }
+
+/// URL percent-decoding, without form rules (a `+` stays a `+`).
+fn percent(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&text[i + 1..i + 3], 16)
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// On SQL Server: a table read by parts ordered by a `money` column (four
+/// decimals) and a `decimal(38, 30)` key, whose values are shared across a
+/// run's boundary, reads every row once and then only the new ones: each
+/// position is read and bound back without losing a digit.
+#[tokio::test]
+async fn sql_server_money_and_wide_decimals_order_a_table_read_exactly() {
+    use std::sync::Arc;
+    use tokio_util::compat::TokioAsyncWriteCompatExt;
+    let Ok(url) = std::env::var("HIE_TEST_MSSQL_URL") else {
+        eprintln!("skipping: HIE_TEST_MSSQL_URL is not set");
+        return;
+    };
+    let parsed = url::Url::parse(&url).unwrap();
+    let (host, port) = (
+        parsed.host_str().unwrap().to_string(),
+        parsed.port().unwrap_or(1433),
+    );
+    let (user, password) = (
+        percent(parsed.username()),
+        percent(parsed.password().unwrap()),
+    );
+    let database = parsed.path().trim_start_matches('/').to_string();
+    let mut config = tiberius::Config::new();
+    config.host(&host);
+    config.port(port);
+    config.database(&database);
+    config.authentication(tiberius::AuthMethod::sql_server(&user, &password));
+    config.trust_cert();
+    let tcp = tokio::net::TcpStream::connect(config.get_addr())
+        .await
+        .unwrap();
+    let mut client = tiberius::Client::connect(config, tcp.compat_write())
+        .await
+        .unwrap();
+    let table = format!("keyset_{}", std::process::id());
+    client
+        .execute(
+            format!(
+                "CREATE TABLE dbo.{table} (id INT NOT NULL PRIMARY KEY, price MONEY NOT NULL, amount DECIMAL(38, 30) NOT NULL);
+                 INSERT INTO dbo.{table} (id, price, amount)
+                 SELECT TOP (1200) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), 1.2345, 1.000000000000000000000000000001
+                 FROM sys.all_objects a CROSS JOIN sys.all_objects b"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let db = Arc::new(hie::db::Db::in_memory().unwrap());
+    let keys = hie::crypto::Keyring::parse("Y29uZm9ybWFuY2Utc2VjcmV0cy1rZXktMzItYnl0ZXM=").unwrap();
+    let secrets = Arc::new(hie::secrets::Secrets::new(db.clone(), Some(keys)));
+    let secret = db
+        .transaction(|tx| {
+            secrets
+                .create_in(tx, "mssql", &password)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))
+        })
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut feed: hie::config::FeedConfig = serde_json::from_value(serde_json::json!({
+        "id": "mskeys", "name": "Keys",
+        "source": {"type": "database",
+                   "connection": {"engine": "sqlserver", "host": host, "port": port, "database": database,
+                                  "user": user, "password": {"secret": secret, "revision": 1},
+                                  "encrypt": false, "trust_cert": true},
+                   "read": {"mode": "table", "table": {"schema": "dbo", "name": table},
+                            "key": ["amount", "id"], "new_rows_by": "price"}},
+        "transform": "transforms/sql_lab_results.py",
+    }))
+    .unwrap();
+    feed.resolve(&repo).unwrap();
+    let ctx = hie::connectors::Context {
+        admission: Default::default(),
+        secrets: Some(secrets),
+    };
+    let source = Source::from_config_in(&feed, &ctx)
+        .unwrap()
+        .with_db(db.clone());
+    let ids = |bytes: Vec<u8>| -> Vec<i64> {
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["id"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect()
+    };
+    let key = source.list().await.unwrap().remove(0);
+    let first = ids(source.fetch(&key).await.unwrap().bytes);
+    source.acknowledge(&key, "").await.unwrap();
+    let mut unique = first.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!((first.len(), unique.len()), (1200, 1200));
+    assert!(source.list().await.unwrap().is_empty());
+
+    client
+        .execute(
+            format!(
+                "INSERT INTO dbo.{table} (id, price, amount) VALUES
+                 (1201, 1.2345, 1.000000000000000000000000000002), (1202, 1.2346, 0)"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let key = source.list().await.unwrap().remove(0);
+    let later = ids(source.fetch(&key).await.unwrap().bytes);
+    source.acknowledge(&key, "").await.unwrap();
+    client
+        .execute(format!("DROP TABLE dbo.{table}"), &[])
+        .await
+        .unwrap();
+    assert_eq!(later, [1201, 1202]);
+}

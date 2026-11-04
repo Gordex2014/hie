@@ -38,6 +38,28 @@ use crate::ids::{Kind, rfc3339_ms_at};
 use crate::manager::{ErrorStatus, ManagerError};
 use crate::secrets::{SecretError, SecretUse};
 
+/// How long a Test may be pending before what it held counts as abandoned
+/// (a Test's statements each stop after two minutes).
+const PENDING_MS: i64 = 3_600_000;
+
+/// A Test under way: unless its evidence is kept, what it reserved is
+/// released when it ends, however it ends (an error, or its future dropped).
+struct Pending<'a> {
+    evidence: &'a Evidence,
+    id: &'a str,
+    kept: bool,
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if !self.kept
+            && let Err(e) = self.evidence.abandon(self.id)
+        {
+            tracing::error!(target: "hie::evidence", evidence = %self.id, "releasing an unfinished Test's hold: {e:#}");
+        }
+    }
+}
+
 /// How long evidence no source holds is kept.
 const KEEP_MS: i64 = 24 * 3_600_000;
 /// How long a sample is held in memory.
@@ -292,13 +314,32 @@ impl Evidence {
         self.ctx.admission.check_source(source).map_err(refused)
     }
 
-    fn purge(&self) -> Result<()> {
+    /// Removes expired evidence and what abandoned Tests held, releasing
+    /// their revisions. Runs with every evidence operation and at start.
+    pub fn purge(&self) -> Result<()> {
         for id in self.db.expire_evidence()? {
             if let Some(secrets) = &self.ctx.secrets {
                 secrets.release(SecretUse::Evidence, &id, None)?;
             }
         }
+        self.purge_pending(now_ms() - PENDING_MS)
+    }
+
+    /// Releases what Tests begun before `before` (epoch ms) and never
+    /// finished still hold.
+    fn purge_pending(&self, before: i64) -> Result<()> {
+        for id in self.db.abandoned_pending_evidence(before)? {
+            self.abandon(&id)?;
+        }
         Ok(())
+    }
+
+    /// A Test that will not keep evidence `id`: what it held is released.
+    fn abandon(&self, id: &str) -> Result<()> {
+        if let Some(secrets) = &self.ctx.secrets {
+            secrets.release(SecretUse::Evidence, id, None)?;
+        }
+        self.db.delete_pending_evidence(id)
     }
 
     /// Tests a database connection by parts: the 0.1 probe members and
@@ -310,31 +351,33 @@ impl Evidence {
         self.admit(source)?;
         // The revision is resolved and held for the evidence in one step,
         // before anything connects: a rotation meanwhile cannot destroy it.
+        // The Test is recorded as pending first, so a hold it leaves behind
+        // (cancelled, or the engine stopped) is released by `purge`; the
+        // guard releases it at once when the Test ends without evidence.
         let id = crate::ids::new(Kind::Evidence);
+        self.db.insert_pending_evidence(&id)?;
+        let mut pending = Pending {
+            evidence: self,
+            id: &id,
+            kept: false,
+        };
         let credential = self.reserve_credential(connection, SecretUse::Evidence, &id)?;
-        let result = async {
-            let endpoint =
-                Endpoint::new(connection, credential.as_ref().map(|c| c.1)).map_err(invalid)?;
-            let report = test_connection(&endpoint, read, &self.ctx).await;
-            let primary_key = report.primary_key.clone();
-            let definition = normalized(connection, read, primary_key.as_deref());
-            let row = self.keep(&id, &report, definition, credential.clone(), primary_key)?;
-            Ok::<_, ManagerError>(json!({
-                "reachable": report.connect == Check::Passed,
-                "elapsed_ms": report.elapsed_ms,
-                "objects": report.rows.unwrap_or(report.tables.len() as i64),
-                "newest": null,
-                "newest_at": null,
-                "evidence": row.body,
-            }))
-        }
-        .await;
-        if result.is_err()
-            && let Some(secrets) = &self.ctx.secrets
-        {
-            secrets.release(SecretUse::Evidence, &id, None)?;
-        }
-        result
+        let endpoint =
+            Endpoint::new(connection, credential.as_ref().map(|c| c.1)).map_err(invalid)?;
+        let report = test_connection(&endpoint, read, &self.ctx).await;
+        let primary_key = report.primary_key.clone();
+        let definition = normalized(connection, read, primary_key.as_deref());
+        let row = self.keep(&id, &report, definition, credential.clone(), primary_key)?;
+        pending.kept = true;
+        self.db.delete_pending_evidence(&id)?;
+        Ok(json!({
+            "reachable": report.connect == Check::Passed,
+            "elapsed_ms": report.elapsed_ms,
+            "objects": report.rows.unwrap_or(report.tables.len() as i64),
+            "newest": null,
+            "newest_at": null,
+            "evidence": row.body,
+        }))
     }
 
     /// Resolves the password's revision (the one named, else the current
@@ -597,5 +640,92 @@ impl Evidence {
     /// What a source is bound to.
     pub fn binding(&self, source: &str) -> Result<Option<Binding>> {
         self.db.binding(source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine_with_secret() -> (Arc<Db>, Arc<crate::secrets::Secrets>, String) {
+        let db = Arc::new(Db::in_memory().unwrap());
+        let keys =
+            crate::crypto::Keyring::parse("Y29uZm9ybWFuY2Utc2VjcmV0cy1rZXktMzItYnl0ZXM=").unwrap();
+        let secrets = Arc::new(crate::secrets::Secrets::new(db.clone(), Some(keys)));
+        let view = db
+            .transaction(|tx| {
+                secrets
+                    .create_in(tx, "reader", "Unit-Secret-1!")
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))
+            })
+            .unwrap();
+        (db, secrets, view["id"].as_str().unwrap().to_string())
+    }
+
+    fn evidence_holders(db: &Db, secret: &str) -> Vec<String> {
+        db.secret_rows(Some(secret)).unwrap()[0]
+            .revisions
+            .iter()
+            .flat_map(|r| r.evidence.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_test_that_never_finishes_leaves_no_hold() {
+        let (db, secrets, secret) = engine_with_secret();
+        // A server that accepts and never answers: the Test waits on it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                open.push(stream);
+            }
+        });
+        let source: SourceConfig = serde_json::from_value(json!({
+            "type": "database",
+            "connection": {"engine": "sqlserver", "host": "127.0.0.1", "port": port,
+                           "database": "labs", "user": "reader",
+                           "password": {"secret": secret}, "encrypt": false},
+            "read": {"mode": "table", "table": {"name": "t"}, "new_rows_by": "id"},
+        }))
+        .unwrap();
+        let evidence = Evidence::new(
+            db.clone(),
+            Context {
+                admission: Default::default(),
+                secrets: Some(secrets.clone()),
+            },
+        );
+        // Cancelled while connecting: the hold goes with it.
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(300), evidence.test(&source)).await;
+        assert!(cancelled.is_err());
+        assert!(evidence_holders(&db, &secret).is_empty());
+        assert!(
+            db.abandoned_pending_evidence(now_ms() + 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A Test the engine died in the middle of: reconciled by the purge.
+        db.insert_pending_evidence("ev_lost").unwrap();
+        secrets
+            .reserve(&secret, None, SecretUse::Evidence, "ev_lost")
+            .unwrap();
+        assert_eq!(evidence_holders(&db, &secret), ["ev_lost"]);
+        evidence.purge().unwrap();
+        assert_eq!(
+            evidence_holders(&db, &secret),
+            ["ev_lost"],
+            "not yet abandoned"
+        );
+        evidence.purge_pending(now_ms() + 1).unwrap();
+        assert!(evidence_holders(&db, &secret).is_empty());
+        assert!(
+            db.abandoned_pending_evidence(now_ms() + 1)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

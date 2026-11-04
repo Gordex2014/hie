@@ -173,11 +173,15 @@ pub struct ColumnInfo {
     pub type_name: String,
     pub nullable: bool,
     pub class: Class,
+    /// A decimal column's precision and scale, as the engine reports them.
+    pub numeric: Option<(i64, i64)>,
 }
 
 /// A table's columns and primary key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableInfo {
+    /// The engine the table lives in.
+    pub engine: Engine,
     pub table: TableName,
     pub columns: Vec<ColumnInfo>,
     pub primary_key: Vec<String>,
@@ -291,6 +295,7 @@ pub async fn table_info(
                         type_name,
                         nullable: !(notnull || rowid),
                         class,
+                        numeric: None,
                     }
                 })
                 .collect();
@@ -299,12 +304,12 @@ pub async fn table_info(
         Engine::Postgres | Engine::SqlServer => {
             let (columns_sql, key_sql) = if engine == Engine::Postgres {
                 (
-                    "SELECT column_name::text AS n, data_type::text AS t, is_nullable::text AS nl FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
+                    "SELECT column_name::text AS n, data_type::text AS t, is_nullable::text AS nl, numeric_precision::int AS p, numeric_scale::int AS sc FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
                     "SELECT kcu.column_name::text AS n FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema AND tc.table_name = kcu.table_name WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1 AND tc.table_name = $2 ORDER BY kcu.ordinal_position",
                 )
             } else {
                 (
-                    "SELECT COLUMN_NAME AS n, DATA_TYPE AS t, IS_NULLABLE AS nl FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 ORDER BY ORDINAL_POSITION",
+                    "SELECT COLUMN_NAME AS n, DATA_TYPE AS t, IS_NULLABLE AS nl, CAST(NUMERIC_PRECISION AS INT) AS p, NUMERIC_SCALE AS sc FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 ORDER BY ORDINAL_POSITION",
                     "SELECT kcu.COLUMN_NAME AS n FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA AND tc.TABLE_NAME = kcu.TABLE_NAME WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' AND tc.TABLE_SCHEMA = @P1 AND tc.TABLE_NAME = @P2 ORDER BY kcu.ORDINAL_POSITION",
                 )
             };
@@ -320,6 +325,10 @@ pub async fn table_info(
                         class: Class::of(engine, &type_name),
                         type_name,
                         nullable: text(r, "nl").eq_ignore_ascii_case("yes"),
+                        numeric: r
+                            .get("p")
+                            .and_then(Value::as_i64)
+                            .zip(r.get("sc").and_then(Value::as_i64)),
                     }
                 })
                 .collect();
@@ -336,6 +345,7 @@ pub async fn table_info(
         return Ok(None);
     }
     Ok(Some(TableInfo {
+        engine,
         table,
         columns,
         primary_key: key,
@@ -378,65 +388,103 @@ pub async fn row_count(
 }
 
 /// A table read by keyset: the order columns (`new_rows_by`, then the key's
-/// other columns) and their classes.
+/// other columns), how each is bound, and how its exact value is read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
     pub table: TableName,
     pub columns: Vec<String>,
+    engine: Engine,
     classes: Vec<Class>,
-}
-
-/// The alias of an order column's exact text, read beside a row so that a
-/// position never goes through a JSON float.
-fn exact_alias(i: usize) -> String {
-    format!("hie_position_{i}")
+    /// Per order column: the expression reading its exact text beside the
+    /// row, and the alias it is read under (never a column of the table).
+    exact: Vec<Option<(String, String)>>,
+    /// Per order column: the placeholder's cast, so a bound position is
+    /// compared exactly in the column's own type (`{}` is the placeholder).
+    casts: Vec<Option<String>>,
 }
 
 impl Plan {
     /// The plan of a table read on a described table. Every named column must
-    /// exist, never be null and be of a type that orders; `key` must not be empty.
+    /// exist, never be null and be of a type that orders and binds exactly;
+    /// `key` must not be empty.
     pub fn new(info: &TableInfo, key: &[String], new_rows_by: &str) -> Result<Self, String> {
         if key.is_empty() {
             return Err("the table has no primary key; name the read's key".into());
         }
+        let engine = info.engine;
         let mut columns = vec![new_rows_by.to_string()];
         for k in key {
             if !columns.contains(k) {
                 columns.push(k.clone());
             }
         }
-        let classes = columns
-            .iter()
-            .map(|c| {
-                let column = info
-                    .column(c)
-                    .ok_or_else(|| format!("the table has no column {c:?}"))?;
-                match cannot_order(column) {
-                    Some(reason) => Err(reason),
-                    None => Ok(column.class),
+        let mut classes = Vec::new();
+        let mut exact = Vec::new();
+        let mut casts = Vec::new();
+        let mut aliases: Vec<String> = Vec::new();
+        for (i, c) in columns.iter().enumerate() {
+            let column = info
+                .column(c)
+                .ok_or_else(|| format!("the table has no column {c:?}"))?;
+            if let Some(reason) = cannot_order(column) {
+                return Err(reason);
+            }
+            classes.push(column.class);
+            // Decimals are read beside the row as exact text and bound back
+            // as text cast to the column's type: never through a float or a
+            // 28-digit decimal. SQLite stores them as floats already.
+            if column.class != Class::Decimal || engine == Engine::Sqlite {
+                exact.push(None);
+                casts.push(None);
+                continue;
+            }
+            let mut alias = format!("hie_position_{i}");
+            while info.column(&alias).is_some() || aliases.contains(&alias) {
+                alias.push('_');
+            }
+            aliases.push(alias.clone());
+            let quoted = engine.quote(c);
+            let (read, cast) = match engine {
+                Engine::Postgres => (format!("{quoted}::text"), "{}::numeric".to_string()),
+                _ => {
+                    let Some((precision, scale)) = column.numeric else {
+                        return Err(format!(
+                            "column {c:?} reports no precision, so it cannot order a table read exactly"
+                        ));
+                    };
+                    // Style 2 keeps money's four decimals; decimal and
+                    // numeric convert with their whole scale.
+                    let style = if matches!(
+                        column.type_name.to_ascii_lowercase().as_str(),
+                        "money" | "smallmoney"
+                    ) {
+                        ", 2"
+                    } else {
+                        ""
+                    };
+                    (
+                        format!("CONVERT(varchar(64), {quoted}{style})"),
+                        format!("CAST({{}} AS DECIMAL({precision}, {scale}))"),
+                    )
                 }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            };
+            exact.push(Some((read, alias)));
+            casts.push(Some(cast));
+        }
         Ok(Self {
             table: info.table.clone(),
             columns,
+            engine,
             classes,
+            exact,
+            casts,
         })
-    }
-
-    /// Whether order column `i` is read beside the row as exact text.
-    fn exact(&self, engine: Engine, i: usize) -> bool {
-        engine != Engine::Sqlite && self.classes[i] == Class::Decimal
     }
 
     /// The statement reading up to `limit` rows past `after` (the order
     /// columns' values of the last row read), and what it binds.
-    pub fn sql(
-        &self,
-        engine: Engine,
-        after: Option<&[Value]>,
-        limit: usize,
-    ) -> (String, Vec<Bind>) {
+    pub fn sql(&self, after: Option<&[Value]>, limit: usize) -> (String, Vec<Bind>) {
+        let engine = self.engine;
         let quoted: Vec<String> = self.columns.iter().map(|c| engine.quote(c)).collect();
         let mut binds = Vec::new();
         let mut filter = String::new();
@@ -447,26 +495,21 @@ impl Plan {
                 let mut terms = Vec::new();
                 for j in 0..=i {
                     binds.push(self.classes[j].bind(engine, &after[j]));
+                    let placeholder = engine.placeholder(binds.len());
+                    let placeholder = match &self.casts[j] {
+                        Some(cast) => cast.replace("{}", &placeholder),
+                        None => placeholder,
+                    };
                     let op = if j == i { ">" } else { "=" };
-                    terms.push(format!(
-                        "{} {op} {}",
-                        quoted[j],
-                        engine.placeholder(binds.len())
-                    ));
+                    terms.push(format!("{} {op} {placeholder}", quoted[j]));
                 }
                 alternatives.push(format!("({})", terms.join(" AND ")));
             }
             filter = format!(" WHERE {}", alternatives.join(" OR "));
         }
         let mut select = "*".to_string();
-        for (i, column) in quoted.iter().enumerate() {
-            if self.exact(engine, i) {
-                let alias = engine.quote(&exact_alias(i));
-                select.push_str(&match engine {
-                    Engine::SqlServer => format!(", CONVERT(varchar(64), {column}) AS {alias}"),
-                    _ => format!(", {column}::text AS {alias}"),
-                });
-            }
+        for (read, alias) in self.exact.iter().flatten() {
+            select.push_str(&format!(", {read} AS {}", engine.quote(alias)));
         }
         let order = quoted.join(", ");
         let table = from(engine, &self.table);
@@ -481,17 +524,12 @@ impl Plan {
 
     /// A row as read: the row itself (without the exact texts read beside
     /// it) and the order columns' exact values.
-    pub fn split(
-        &self,
-        engine: Engine,
-        mut row: Map<String, Value>,
-    ) -> (Map<String, Value>, Vec<Value>) {
+    pub fn split(&self, mut row: Map<String, Value>) -> (Map<String, Value>, Vec<Value>) {
         let mut position = Vec::with_capacity(self.columns.len());
         for (i, column) in self.columns.iter().enumerate() {
-            let exact = self
-                .exact(engine, i)
-                .then(|| row.remove(&exact_alias(i)))
-                .flatten();
+            let exact = self.exact[i]
+                .as_ref()
+                .and_then(|(_, alias)| row.remove(alias));
             position.push(exact.unwrap_or_else(|| row.get(column).cloned().unwrap_or(Value::Null)));
         }
         (row, position)
@@ -508,8 +546,10 @@ mod tests {
             type_name: t.into(),
             nullable: false,
             class: Class::of(Engine::SqlServer, t),
+            numeric: None,
         };
         TableInfo {
+            engine: Engine::SqlServer,
             table: TableName {
                 schema: None,
                 name: "lab_results".into(),
@@ -523,7 +563,7 @@ mod tests {
     fn rows_sharing_new_rows_by_are_read_past_on_the_whole_tuple() {
         let plan = Plan::new(&info(), &["id".into()], "updated_at").unwrap();
         assert_eq!(plan.columns, ["updated_at", "id"]);
-        let (sql, binds) = plan.sql(Engine::SqlServer, None, 10);
+        let (sql, binds) = plan.sql(None, 10);
         assert_eq!(
             sql,
             "SELECT TOP (10) * FROM [dbo].[lab_results] ORDER BY [updated_at], [id]"
@@ -533,7 +573,7 @@ mod tests {
             serde_json::json!("2026-11-03T10:00:00"),
             serde_json::json!(7),
         ];
-        let (sql, binds) = plan.sql(Engine::SqlServer, Some(&after), 10);
+        let (sql, binds) = plan.sql(Some(&after), 10);
         assert_eq!(
             sql,
             "SELECT TOP (10) * FROM [dbo].[lab_results] WHERE ([updated_at] > @P1) OR ([updated_at] = @P2 AND [id] > @P3) ORDER BY [updated_at], [id]"
@@ -547,6 +587,7 @@ mod tests {
 
     fn table(engine: Engine, columns: &[(&str, &str, bool)]) -> TableInfo {
         TableInfo {
+            engine,
             table: TableName {
                 schema: None,
                 name: "t".into(),
@@ -558,6 +599,7 @@ mod tests {
                     type_name: (*t).into(),
                     nullable: *nullable,
                     class: Class::of(engine, t),
+                    numeric: Some((38, 30)).filter(|_| Class::of(engine, t) == Class::Decimal),
                 })
                 .collect(),
             primary_key: vec![],
@@ -598,45 +640,103 @@ mod tests {
             &[("amount", "numeric", false), ("id", "integer", false)],
         );
         let plan = Plan::new(&info, &["id".into()], "amount").unwrap();
-        let (sql, _) = plan.sql(Engine::Postgres, None, 5);
+        let (sql, _) = plan.sql(None, 5);
         assert_eq!(
             sql,
             "SELECT *, \"amount\"::text AS \"hie_position_0\" FROM \"public\".\"t\" ORDER BY \"amount\", \"id\" LIMIT 5"
         );
-        // The decoded row has lost digits; the exact text read beside it has not.
+        // The decoded row has lost digits; the exact text read beside it has
+        // not, whatever its length (30 fractional digits here).
+        let exact = "1234567.123456789012345678901234567890";
         let mut row = serde_json::Map::new();
-        row.insert("amount".into(), serde_json::json!(12345678901234567.0));
+        row.insert("amount".into(), serde_json::json!(1234567.1234567890));
         row.insert("id".into(), serde_json::json!(3));
-        row.insert(
-            "hie_position_0".into(),
-            serde_json::json!("12345678901234567.89"),
-        );
-        let (row, position) = plan.split(Engine::Postgres, row);
+        row.insert("hie_position_0".into(), serde_json::json!(exact));
+        let (row, position) = plan.split(row);
         assert!(!row.contains_key("hie_position_0"));
-        assert_eq!(
-            position,
-            [
-                serde_json::json!("12345678901234567.89"),
-                serde_json::json!(3)
-            ]
-        );
-        // Persisted as JSON and bound back as that decimal.
+        assert_eq!(position, [serde_json::json!(exact), serde_json::json!(3)]);
+        // Persisted as JSON, bound back as that exact text, cast in SQL.
         let stored: Vec<serde_json::Value> =
             serde_json::from_str(&serde_json::to_string(&position).unwrap()).unwrap();
-        let (_, binds) = plan.sql(Engine::Postgres, Some(&stored), 5);
-        assert_eq!(binds[0], Bind::Decimal("12345678901234567.89".into()));
-        let mssql = table(
-            Engine::SqlServer,
-            &[("amount", "decimal", false), ("id", "int", false)],
+        let (sql, binds) = plan.sql(Some(&stored), 5);
+        assert_eq!(binds[0], Bind::Decimal(exact.into()));
+        assert!(
+            sql.contains(
+                "WHERE (\"amount\" > $1::numeric) OR (\"amount\" = $2::numeric AND \"id\" > $3)"
+            ),
+            "{sql}"
         );
-        let (sql, _) =
-            Plan::new(&mssql, &["id".into()], "amount")
-                .unwrap()
-                .sql(Engine::SqlServer, None, 5);
+    }
+
+    #[test]
+    fn sql_server_decimals_and_money_convert_and_bind_losslessly() {
+        let mut info = table(
+            Engine::SqlServer,
+            &[
+                ("amount", "decimal", false),
+                ("price", "money", false),
+                ("id", "int", false),
+            ],
+        );
+        info.columns[1].numeric = Some((19, 4));
+        let plan = Plan::new(&info, &["price".into(), "id".into()], "amount").unwrap();
+        let after = [
+            serde_json::json!("1.5"),
+            serde_json::json!("2.0001"),
+            serde_json::json!(1),
+        ];
+        let (sql, binds) = plan.sql(Some(&after), 5);
         assert!(
             sql.contains("CONVERT(varchar(64), [amount]) AS [hie_position_0]"),
             "{sql}"
         );
+        // Style 2 keeps money's four decimals.
+        assert!(
+            sql.contains("CONVERT(varchar(64), [price], 2) AS [hie_position_1]"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("[amount] > CAST(@P1 AS DECIMAL(38, 30))"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("[price] > CAST(@P3 AS DECIMAL(19, 4))"),
+            "{sql}"
+        );
+        assert_eq!(binds[2], Bind::Decimal("2.0001".into()));
+        // Without a precision there is no exact bind: refused.
+        info.columns[0].numeric = None;
+        assert!(Plan::new(&info, &["id".into()], "amount").is_err());
+    }
+
+    #[test]
+    fn an_exact_value_is_never_read_under_a_column_of_the_table() {
+        let info = table(
+            Engine::Postgres,
+            &[
+                ("amount", "numeric", false),
+                ("hie_position_0", "text", false),
+                ("id", "integer", false),
+            ],
+        );
+        let plan = Plan::new(&info, &["id".into()], "amount").unwrap();
+        let (sql, _) = plan.sql(None, 5);
+        assert!(
+            sql.contains("\"amount\"::text AS \"hie_position_0_\""),
+            "{sql}"
+        );
+        let mut row = serde_json::Map::new();
+        row.insert("amount".into(), serde_json::json!(1.5));
+        row.insert(
+            "hie_position_0".into(),
+            serde_json::json!("the source's own value"),
+        );
+        row.insert("id".into(), serde_json::json!(1));
+        row.insert("hie_position_0_".into(), serde_json::json!("1.50"));
+        let (row, position) = plan.split(row);
+        assert_eq!(row["hie_position_0"], "the source's own value");
+        assert!(!row.contains_key("hie_position_0_"));
+        assert_eq!(position[0], "1.50");
     }
 
     #[test]
@@ -655,7 +755,7 @@ mod tests {
             serde_json::json!("6f9619ff-8b86-d011-b42d-00c04fc964ff"),
             serde_json::json!(true),
         ];
-        let (_, binds) = plan.sql(Engine::Postgres, Some(&after), 5);
+        let (_, binds) = plan.sql(Some(&after), 5);
         assert!(matches!(binds[0], Bind::Time(_)));
         assert_eq!(
             binds[2],

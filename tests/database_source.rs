@@ -369,7 +369,8 @@ async fn a_nullable_ordering_column_is_refused() {
 }
 
 /// On PostgreSQL (`HIE_TEST_DATABASE_URL`): a table read by parts whose
-/// `new_rows_by` is a `numeric` shared across a run's boundary, with a
+/// `new_rows_by` is a `numeric(38, 30)` (30 fractional digits, past what a
+/// float or a 28-digit decimal holds) shared across a run's boundary, with a
 /// `uuid` key, reads every row once, binding each position in its own type
 /// and exactly; the password is a kept secret.
 #[tokio::test]
@@ -385,14 +386,14 @@ async fn a_postgres_table_reads_by_exact_native_positions() {
         .unwrap();
     let table = format!("keyset_{}", std::process::id());
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE TABLE public.{table} (u uuid NOT NULL PRIMARY KEY, amount numeric(30, 2) NOT NULL, note text)"
+        "CREATE TABLE public.{table} (u uuid NOT NULL PRIMARY KEY, amount numeric(38, 30) NOT NULL, note text)"
     )))
     .execute(&pool)
     .await
     .unwrap();
-    // 1200 rows share one amount that a float cannot hold, then two later ones.
+    // 1200 rows share one amount that neither a float nor a 28-digit decimal holds.
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO public.{table} (u, amount) SELECT md5(i::text)::uuid, 12345678901234567.89 FROM generate_series(1, 1200) i"
+        "INSERT INTO public.{table} (u, amount) SELECT md5(i::text)::uuid, 1234567.123456789012345678901234567890 FROM generate_series(1, 1200) i"
     )))
     .execute(&pool)
     .await
@@ -457,7 +458,7 @@ async fn a_postgres_table_reads_by_exact_native_positions() {
     assert!(source.list().await.unwrap().is_empty());
 
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO public.{table} (u, amount) VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', 12345678901234567.89), ('00000000-0000-0000-0000-000000000001', 12345678901234567.90)"
+        "INSERT INTO public.{table} (u, amount) VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', 1234567.123456789012345678901234567890), ('00000000-0000-0000-0000-000000000001', 1234567.123456789012345678901234567891)"
     )))
     .execute(&pool)
     .await

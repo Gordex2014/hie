@@ -21,6 +21,15 @@ mod rows;
 mod table;
 
 pub use driver::url_parts;
+
+/// Whether a `tracing` event comes from a database driver (`tiberius`, or
+/// any of sqlx's crates and targets). The engine's subscriber drops them
+/// unconditionally, whatever `HIE_LOG` says: a server's error or info
+/// message may echo what a login sent, and a statement log its values.
+pub fn is_driver_event(target: &str) -> bool {
+    let crate_name = target.split("::").next().unwrap_or(target);
+    crate_name == "tiberius" || crate_name == "sqlx" || crate_name.starts_with("sqlx_")
+}
 pub use endpoint::{DbError, Endpoint, Engine, Stage};
 pub use parts::{Check, Described, TestReport};
 pub use parts::{
@@ -430,5 +439,34 @@ impl Connector for DatabaseSource {
                 _ => None,
             }),
         })
+    }
+}
+
+#[cfg(test)]
+mod driver_event_tests {
+    use super::is_driver_event;
+
+    #[test]
+    fn every_driver_target_is_recognised_and_nothing_else() {
+        for target in [
+            "tiberius",
+            "tiberius::tds::stream::token",
+            "sqlx",
+            "sqlx::query",
+            "sqlx::postgres::notice",
+            "sqlx_core::pool::inner",
+            "sqlx_postgres::connection",
+        ] {
+            assert!(is_driver_event(target), "{target}");
+        }
+        for target in [
+            "hie",
+            "hie::database",
+            "sqlxtra",
+            "tiberiusly",
+            "tower_http",
+        ] {
+            assert!(!is_driver_event(target), "{target}");
+        }
     }
 }

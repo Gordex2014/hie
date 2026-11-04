@@ -25,6 +25,10 @@ pub(super) const TABLES: &str = "CREATE TABLE IF NOT EXISTS evidence (
   source_id TEXT
 );
 CREATE INDEX IF NOT EXISTS evidence_expires ON evidence(expires_at);
+CREATE TABLE IF NOT EXISTS pending_evidence (
+  id TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS start_intents (
   feed_id TEXT PRIMARY KEY,
   evidence_id TEXT,
@@ -168,6 +172,46 @@ impl Db {
             &params![feed],
         )
         .map(drop)
+    }
+
+    /// Records that a Test is under way for evidence `id`, before it holds
+    /// a secret revision under that id.
+    pub fn insert_pending_evidence(&self, id: &str) -> Result<()> {
+        self.execute(
+            "INSERT INTO pending_evidence (id, created_at) VALUES ($1, $2)",
+            &params![id, now_ms()],
+        )
+        .map(drop)
+    }
+
+    pub fn delete_pending_evidence(&self, id: &str) -> Result<()> {
+        self.execute("DELETE FROM pending_evidence WHERE id = $1", &params![id])
+            .map(drop)
+    }
+
+    /// Tests begun before `before` (epoch ms) that never finished: their ids,
+    /// apart from those whose evidence was kept after all.
+    pub fn abandoned_pending_evidence(&self, before: i64) -> Result<Vec<String>> {
+        let ids: Vec<String> = self
+            .query(
+                "SELECT id FROM pending_evidence WHERE created_at < $1",
+                &params![before],
+            )?
+            .iter()
+            .map(|r| r.string(0))
+            .collect();
+        let mut abandoned = Vec::new();
+        for id in ids {
+            let kept = self
+                .query_one("SELECT 1 FROM evidence WHERE id = $1", &params![id])?
+                .is_some();
+            if kept {
+                self.delete_pending_evidence(&id)?;
+            } else {
+                abandoned.push(id);
+            }
+        }
+        Ok(abandoned)
     }
 
     /// Records that a Start of `intent.source` is under way, before its file

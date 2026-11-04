@@ -501,10 +501,8 @@ impl Session {
                             Bind::Null => q.bind(None::<i64>),
                             Bind::Int(i) => q.bind(*i),
                             Bind::Float(f) => q.bind(*f),
-                            Bind::Decimal(t) => match t.parse::<sqlx::types::Decimal>() {
-                                Ok(d) => q.bind(d),
-                                Err(_) => q.bind(t.clone()),
-                            },
+                            // Exact text; the statement casts it (`$n::numeric`).
+                            Bind::Decimal(t) => q.bind(t.clone()),
                             Bind::Text(t) => q.bind(t.clone()),
                             Bind::Timestamp(t) => q.bind(*t),
                             Bind::TimestampTz(t) => q.bind(*t),
@@ -530,10 +528,9 @@ impl Session {
                                 Bind::Null => Box::new(None::<i64>),
                                 Bind::Int(i) => Box::new(*i),
                                 Bind::Float(f) => Box::new(*f),
-                                Bind::Decimal(t) => match t.parse::<tiberius::numeric::Decimal>() {
-                                    Ok(d) => Box::new(d),
-                                    Err(_) => Box::new(t.clone()),
-                                },
+                                // Exact text; the statement casts it to the
+                                // column's DECIMAL(p, s).
+                                Bind::Decimal(t) => Box::new(t.clone()),
                                 Bind::Text(t) => Box::new(t.clone()),
                                 Bind::Timestamp(t) => Box::new(*t),
                                 Bind::TimestampTz(t) => Box::new(*t),
