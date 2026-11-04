@@ -74,7 +74,6 @@ pub struct FeedRunner {
     fhir: Arc<FhirClient>,
     bulk: Option<BulkSubmitter>,
     versions: Arc<Versions>,
-    #[allow(dead_code)]
     validation: Validation,
     #[allow(dead_code)]
     content_keys: Option<Arc<Keyring>>,
@@ -277,6 +276,8 @@ impl FeedRunner {
     /// while the source is paused or held by another instance; until stopped.
     pub async fn run(self: Arc<Self>, control: Arc<RunnerControl>) {
         tracing::info!(feed = %self.feed.id, source = %self.feed.source.describe(), instance = %self.instance, "watching");
+        // A delivery attempt that came due runs without a pass over the source.
+        let mut delivery_due = false;
         loop {
             if control.stopped.load(Ordering::Acquire) {
                 if let Err(e) = self.db.release_lease(&self.feed.id, &self.instance) {
@@ -285,12 +286,23 @@ impl FeedRunner {
                 tracing::info!(feed = %self.feed.id, "stopped");
                 return;
             }
-            if let Err(e) = self.pass().await {
+            let result = if delivery_due {
+                self.delivery_round().await
+            } else {
+                self.pass().await.map(drop)
+            };
+            if let Err(e) = result {
                 tracing::error!(feed = %self.feed.id, "{e:#}");
             }
+            let poll = self.feed.source.poll_interval();
+            let due = self.next_delivery_in().filter(|d| *d < poll);
+            delivery_due = false;
             tokio::select! {
-                _ = tokio::time::sleep(self.feed.source.poll_interval()) => {}
+                _ = tokio::time::sleep(poll) => {}
                 _ = control.poke.notified() => {}
+                _ = tokio::time::sleep(due.unwrap_or(poll)), if due.is_some() => {
+                    delivery_due = true;
+                }
             }
         }
     }

@@ -16,6 +16,9 @@ use super::{FeedRunner, human};
 
 impl FeedRunner {
     pub(super) fn finish(&self) -> Result<()> {
+        for retry in self.db.finish_retries(&self.feed.id)? {
+            tracing::info!(target: "hie::pipeline", feed = %self.feed.id, retry = %retry, "retry done");
+        }
         for f in self.db.finish_files(&self.feed.id)? {
             tracing::info!(target: "hie::pipeline", feed = %self.feed.id, file = %f.name, total = f.total, sent = f.sent, rejected = f.rejected, "file done");
             // The rules say whether a few rejected rows are worth an alert; without

@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
+use super::history::append_submission_events;
 use super::{Db, Param, now_ms, params};
 
 /// One row per submission, with its manifest and where its status is read.
@@ -20,6 +21,12 @@ pub(super) const SUBMISSIONS: &str = "CREATE TABLE IF NOT EXISTS submissions (
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS submissions_feed_status ON submissions(feed_id, status, next_attempt_at);
+CREATE TABLE IF NOT EXISTS dispatches (
+  id TEXT PRIMARY KEY,
+  feed_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 ";
 
 /// A `$bulk-submit` submission the engine handed to HFS and is waiting on.
@@ -69,7 +76,7 @@ impl Db {
                      WHERE file_id = $1 AND status = 'pending' AND submission IS NULL ORDER BY id LIMIT 1",
                     &params![file_id],
                 )?
-                .and_then(|row| row.json(0))
+                .and_then(|row| self.unseal(row.get(0)))
                 .and_then(|v| {
                     v.get(0)
                         .and_then(|res| res.get("resourceType"))
@@ -86,21 +93,6 @@ impl Db {
             });
         }
         Ok(files)
-    }
-
-    /// Pending records of a feed that no submission holds yet, with their
-    /// resources: what the engine writes out itself on the transformed bulk path.
-    pub fn submittable_records(&self, feed: &str, limit: usize) -> Result<Vec<(i64, Value)>> {
-        Ok(self
-            .query(
-                "SELECT id, resources FROM records
-                 WHERE feed_id = $1 AND status = 'pending' AND submission IS NULL
-                 ORDER BY id LIMIT $2",
-                &params![feed, limit],
-            )?
-            .iter()
-            .map(|r| (r.i64(0), r.json(1).unwrap_or(Value::Null)))
-            .collect())
     }
 
     /// Opens a submission over every pending record of the given files, which move
@@ -124,11 +116,12 @@ impl Db {
                 )?;
                 for file_id in file_ids {
                     c.execute(
-                        "UPDATE records SET status = 'submitted', submission = $1, updated_at = $2
+                        "UPDATE records SET status = 'submitted', submission = $1, uncertain = 1, updated_at = $2
                          WHERE file_id = $3 AND feed_id = $4 AND status = 'pending' AND submission IS NULL",
                         &params![token, now, file_id, feed],
                     )?;
                 }
+                append_submission_events(c, token, "outcome_unknown")?;
                 Ok::<_, anyhow::Error>(())
             })();
             match result {
@@ -161,10 +154,11 @@ impl Db {
                 )?;
                 for id in record_ids {
                     c.execute(
-                        "UPDATE records SET status = 'submitted', submission = $2, updated_at = $3 WHERE id = $1",
+                        "UPDATE records SET status = 'submitted', submission = $2, uncertain = 1, updated_at = $3 WHERE id = $1",
                         &params![id, token, now],
                     )?;
                 }
+                append_submission_events(c, token, "outcome_unknown")?;
                 Ok::<_, anyhow::Error>(())
             })();
             match result {
@@ -259,7 +253,13 @@ impl Db {
                 &params![token, after_id, limit.min(i64::MAX as usize) as i64],
             )?
             .iter()
-            .map(|r| (r.i64(0), r.i64(1), r.json(2).unwrap_or(Value::Null)))
+            .map(|r| {
+                (
+                    r.i64(0),
+                    r.i64(1),
+                    self.unseal(r.get(2)).unwrap_or(Value::Null),
+                )
+            })
             .collect())
     }
 
@@ -273,5 +273,35 @@ impl Db {
                 &params![token, file_id],
             )?
             .and_then(|r| r.opt_string(0)))
+    }
+
+    // ---- stored transactions ---------------------------------------------------
+
+    /// Keeps a transaction whose answer did not confirm it, sealed (it holds the
+    /// rows' resources), so the same one is sent again until it settles.
+    pub fn create_dispatch(&self, feed: &str, payload: &Value) -> Result<String> {
+        let id = format!("tx_{}", &crate::ids::new(crate::ids::Kind::Group)[2..]);
+        self.execute(
+            "INSERT INTO dispatches (id, feed_id, payload, created_at) VALUES ($1, $2, $3, $4)",
+            &params![id, feed, self.seal(payload), now_ms()],
+        )?;
+        Ok(id)
+    }
+
+    /// A stored transaction, opened.
+    pub fn dispatch_payload(&self, id: &str) -> Result<Option<Value>> {
+        Ok(self
+            .query_one("SELECT payload FROM dispatches WHERE id = $1", &params![id])?
+            .and_then(|r| self.unseal(r.get(0))))
+    }
+
+    /// Drops a stored transaction once no pending row belongs to it.
+    pub fn drop_dispatch_if_settled(&self, id: &str) -> Result<()> {
+        self.execute(
+            "DELETE FROM dispatches WHERE id = $1
+               AND NOT EXISTS (SELECT 1 FROM records WHERE dispatch = $1 AND status = 'pending')",
+            &params![id],
+        )
+        .map(drop)
     }
 }

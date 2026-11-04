@@ -13,6 +13,7 @@ use crate::fhir::{self, SendError};
 use crate::transform;
 
 use super::FeedRunner;
+use super::deliver::Checked;
 
 /// Records settled per page when a submission's receipts come back.
 const SETTLE_PAGE: usize = 5_000;
@@ -237,11 +238,23 @@ impl FeedRunner {
     /// `bulk_dir` served by the engine, and opens one submission over them.
     pub(super) async fn submit_transformed(&self, bulk: &BulkSubmitter) -> Result<()> {
         loop {
-            let records = self
+            let items = self
                 .db
-                .submittable_records(&self.feed.id, self.feed.delivery.bulk_records_max)?;
-            if records.is_empty() {
+                .submittable_items(&self.feed.id, self.feed.delivery.bulk_records_max)?;
+            if items.is_empty() {
                 return Ok(());
+            }
+            // With validation required, nothing of the batch goes while the
+            // destination cannot validate, and invalid rows never go.
+            let records: Vec<(i64, serde_json::Value)> = match self.validate(&items).await? {
+                Checked::Held => return Ok(()),
+                Checked::Deliver(items) => items
+                    .into_iter()
+                    .map(|i| (i.id, i.resources.unwrap_or(serde_json::Value::Null)))
+                    .collect(),
+            };
+            if records.is_empty() {
+                continue;
             }
             let token = bulk::token();
             let ttl = Duration::from_secs(self.feed.delivery.url_ttl_seconds);

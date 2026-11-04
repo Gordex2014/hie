@@ -31,9 +31,9 @@ use serde_json::Value;
 pub use alerts::Rule;
 use engine::{Conn, PgHandle};
 pub use engine::{IntoParam, Param, Row};
-pub use history::VersionRun;
+pub use history::{Group, PeriodCounts, RetryRefusal, VersionRun};
 pub use idempotency::Claim;
-pub use loads::{FailedRow, FailedRowsError, FinishedFile, WorkItem};
+pub use loads::{Deferral, FailedRow, FailedRowsError, FinishedFile, Waiting, WorkItem};
 pub use passes::{Pass, PassStatus};
 pub use sources::Lease;
 pub use submissions::{Submission, SubmittableFile};
@@ -136,6 +136,8 @@ pub struct Db {
     postgres: bool,
     /// A schema created for one test run on PostgreSQL, dropped with the store.
     test_schema: Option<String>,
+    /// The keys record content is sealed with (`loads.rs`).
+    content: loads::ContentKeys,
 }
 
 impl Db {
@@ -187,6 +189,7 @@ impl Db {
             conn: Mutex::new(Conn::Sqlite(conn)),
             postgres: false,
             test_schema: None,
+            content: Default::default(),
         })
     }
 
@@ -214,6 +217,7 @@ impl Db {
             conn: Mutex::new(Conn::Postgres(client)),
             postgres: true,
             test_schema,
+            content: Default::default(),
         })
     }
 
@@ -294,10 +298,14 @@ impl Db {
 
     /// Runs a read-only query and returns each row as a JSON object keyed by column
     /// name; the JSON columns (`raw`, `original_raw`, `resources`, `response`) come
-    /// back parsed.
+    /// back parsed, and opened when sealed.
     pub fn query_json(&self, sql: &str, p: impl Into<Vec<Param>>) -> Result<Vec<Value>> {
         let p = p.into();
-        Ok(self.query(sql, &p)?.iter().map(Row::object).collect())
+        Ok(self
+            .query(sql, &p)?
+            .iter()
+            .map(|r| self.reveal(r.object()))
+            .collect())
     }
 }
 

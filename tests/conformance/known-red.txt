@@ -21,11 +21,7 @@ database/first-load-progress H-connectors                 # also H-history: rows
 database/sample H-connectors
 database/start-binds-evidence H-connectors
 database/test-evidence H-connectors
-delivery/transaction-for-conditional-references H-connectors   # also H-history: rows on loads, kind reference
-delivery/transaction-uncertain-not-split H-connectors     # also H-history: rows, waiting and outcome unknown on loads
 sequences/invalid-resource-retained-not-delivered H-connectors # also H-history and H-versions: rows, retries, a saved version
-sequences/sources-namespaced-apart H-connectors            # also H-history: rows on loads
-sequences/validation-unavailable-delivers-nothing H-connectors # also H-history: rows and outcome on loads and records
 sources/check-now-pass H-connectors
 sources/destination-facts H-connectors
 transforms/try-validation-issues H-connectors              # also H-history: the Try answer
@@ -44,12 +40,8 @@ transforms/versions-and-metadata H-versions
 
 # H-history: immutable failure and attempt history, retries, period counts, loads paging and rows,
 # outcome unknown, failed-content custody, usage history, Try answers with dispositions.
-loads/failed-content-purge-keeps-totals H-history
-loads/failure-groups-and-samples H-history custody          # failed rows are stored in plaintext today
 loads/history-and-period-counts H-history                  # also H-versions: saving a version of a file transform
 loads/legacy-retry-creates-retries H-history
-loads/outcome-unknown H-history
-loads/paging-cursor H-history
 loads/retry-lifecycle H-history                            # also H-versions: saving a version of a file transform
 sequences/lost-try-not-replayed H-history
 sequences/pinned-retry-runs-latest H-history               # also H-versions: pins and versions

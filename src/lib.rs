@@ -58,6 +58,7 @@ pub fn build(
     credentials: credentials::Credentials,
 ) -> Result<(Arc<manager::SourceManager>, api::AppState)> {
     let db = Arc::new(db::Db::connect(&config.database.to_string_lossy())?);
+    purge::install(&db, config)?;
     let fhir = Arc::new(fhir::FhirClient::with_credentials(
         &config.fhir_base_url,
         credentials,

@@ -50,31 +50,77 @@ impl FhirClient {
     }
 
     pub async fn post_bundle(&self, bundle: &Value) -> Result<Value, SendError> {
+        match self.send_bundle(bundle).await {
+            BundleAnswer::Answered { status, body } => match status {
+                200..=299 => Ok(body),
+                _ => Err(SendError::Refused(status, body)),
+            },
+            BundleAnswer::Unsent(reason) | BundleAnswer::Lost(reason) => {
+                Err(SendError::Transient(reason))
+            }
+        }
+    }
+
+    /// Sends a Bundle and says what is known of it: answered (2xx or a
+    /// definitive 4xx), never sent (the connection or the token failed before
+    /// the request left), or lost (a timeout, a broken answer, a `429` or a
+    /// `5xx`: the destination may have applied it).
+    pub async fn send_bundle(&self, bundle: &Value) -> BundleAnswer {
         let request = self
             .http
             .post(&self.base)
             .header("Content-Type", "application/fhir+json")
             .header("Accept", "application/fhir+json")
             .json(bundle);
-        let resp = authorize(request, &self.credentials)
-            .await?
-            .send()
-            .await
-            .map_err(|e| SendError::Transient(format!("cannot reach {}: {e}", self.base)))?;
-        let status = resp.status().as_u16();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
-        match status {
-            200..=299 => Ok(body),
-            429 | 500..=599 => Err(SendError::Transient(format!(
-                "HTTP {status} from {}",
-                self.base
-            ))),
-            401 | 403 if self.credentials.is_some() => {
-                Err(refused_token(status, &self.credentials).await)
+        let request = match authorize(request, &self.credentials).await {
+            Ok(r) => r,
+            Err(SendError::Transient(reason)) => return BundleAnswer::Unsent(reason),
+            Err(SendError::Refused(status, _)) => {
+                return BundleAnswer::Unsent(format!("HTTP {status} getting a token"));
             }
-            _ => Err(SendError::Refused(status, body)),
+        };
+        let resp = match request.send().await {
+            Ok(r) => r,
+            Err(e) if e.is_connect() => {
+                return BundleAnswer::Unsent(format!("cannot reach {}: {e}", self.base));
+            }
+            Err(e) => return BundleAnswer::Lost(format!("no answer from {}: {e}", self.base)),
+        };
+        let status = resp.status().as_u16();
+        let body = match resp.bytes().await {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            Err(e) if (200..300).contains(&status) => {
+                return BundleAnswer::Lost(format!("the answer from {} broke off: {e}", self.base));
+            }
+            Err(_) => Value::Null,
+        };
+        match status {
+            200..=299 if body.is_object() => BundleAnswer::Answered { status, body },
+            200..=299 => {
+                BundleAnswer::Lost(format!("HTTP {status} from {} without a Bundle", self.base))
+            }
+            429 | 500..=599 => BundleAnswer::Lost(format!("HTTP {status} from {}", self.base)),
+            401 | 403 if self.credentials.is_some() => {
+                BundleAnswer::Unsent(match refused_token(status, &self.credentials).await {
+                    SendError::Transient(reason) => reason,
+                    SendError::Refused(status, _) => format!("HTTP {status}"),
+                })
+            }
+            _ => BundleAnswer::Answered { status, body },
         }
     }
+}
+
+/// What is known of a Bundle sent to the destination.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BundleAnswer {
+    /// An answer that settles it: `2xx` with the response Bundle, or a
+    /// definitive refusal (`4xx`) with its body.
+    Answered { status: u16, body: Value },
+    /// It never left: nothing was applied.
+    Unsent(String),
+    /// Sent without a confirming answer: it may have been applied.
+    Lost(String),
 }
 
 /// What the destination's `$validate` said of one resource.
@@ -179,8 +225,15 @@ impl FhirClient {
             Ok(body)
                 if body.get("resourceType").and_then(Value::as_str) == Some("OperationOutcome") =>
             {
-                Validated::Outcome {
-                    issues: issues(&body),
+                match issues(&body) {
+                    Some(issues) => Validated::Outcome { issues },
+                    None => {
+                        tracing::warn!(
+                            "$validate at {} answered a malformed OperationOutcome (HTTP {status})",
+                            self.base
+                        );
+                        Validated::Unavailable
+                    }
                 }
             }
             _ => {
@@ -224,45 +277,44 @@ impl FhirClient {
     }
 }
 
-/// The issues of an `OperationOutcome`.
-fn issues(outcome: &Value) -> Vec<Issue> {
-    outcome
-        .get("issue")
-        .and_then(Value::as_array)
-        .map(|issues| {
-            issues
-                .iter()
-                .map(|i| Issue {
-                    severity: i
-                        .get("severity")
-                        .and_then(Value::as_str)
-                        .unwrap_or("error")
-                        .to_string(),
-                    code: i
-                        .get("code")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    diagnostics: i
-                        .get("diagnostics")
-                        .or_else(|| i.pointer("/details/text"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    expression: i
-                        .get("expression")
-                        .or_else(|| i.get("location"))
-                        .and_then(Value::as_array)
-                        .map(|e| {
-                            e.iter()
-                                .filter_map(Value::as_str)
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                })
-                .collect()
+/// The issues of an `OperationOutcome`, when it is one: a non-empty `issue`
+/// array whose every issue has a `severity` of the FHIR vocabulary (`fatal`,
+/// `error`, `warning`, `information`) and a `code`. Anything else is not a
+/// verdict (`None`), so a malformed answer never passes a resource.
+fn issues(outcome: &Value) -> Option<Vec<Issue>> {
+    let issues = outcome.get("issue")?.as_array()?;
+    if issues.is_empty() {
+        return None;
+    }
+    issues
+        .iter()
+        .map(|i| {
+            let severity = i.get("severity")?.as_str()?;
+            if !matches!(severity, "fatal" | "error" | "warning" | "information") {
+                return None;
+            }
+            let code = i.get("code")?.as_str()?;
+            let diagnostics = match i.get("diagnostics").or_else(|| i.pointer("/details/text")) {
+                None | Some(Value::Null) => None,
+                Some(Value::String(text)) => Some(text.clone()),
+                Some(_) => return None,
+            };
+            let expression = match i.get("expression").or_else(|| i.get("location")) {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|e| e.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()?,
+                Some(_) => return None,
+            };
+            Some(Issue {
+                severity: severity.to_string(),
+                code: code.to_string(),
+                diagnostics,
+                expression,
+            })
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Adds the engine's bearer token to a request towards HFS, when it has one.
@@ -337,11 +389,132 @@ pub fn request_url(key: &DeliveryKey) -> String {
 /// Builds a `batch` Bundle of conditional updates: an entry fails alone, and sending
 /// the same record twice updates the resource instead of creating a second one.
 pub fn batch_bundle(entries: &[(String, Value)]) -> Value {
+    bundle("batch", entries)
+}
+
+/// A `batch` or `transaction` Bundle of conditional updates.
+pub fn bundle(kind: &str, entries: &[(String, Value)]) -> Value {
     let entry: Vec<Value> = entries
         .iter()
         .map(|(url, resource)| json!({"resource": resource, "request": {"method": "PUT", "url": url}}))
         .collect();
-    json!({"resourceType": "Bundle", "type": "batch", "entry": entry})
+    json!({"resourceType": "Bundle", "type": kind, "entry": entry})
+}
+
+/// Every `reference` string in a resource.
+fn references(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                match (k.as_str(), v) {
+                    ("reference", Value::String(r)) => out.push(r.clone()),
+                    _ => references(v, out),
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|v| references(v, out)),
+        _ => {}
+    }
+}
+
+/// Whether a reference is conditional (`Type?query`), resolved by the
+/// destination inside a transaction.
+fn is_conditional(reference: &str) -> bool {
+    !reference.contains("://")
+        && !reference.starts_with('#')
+        && !reference.starts_with("urn:")
+        && reference
+            .split_once('?')
+            .is_some_and(|(t, _)| !t.is_empty() && t.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// The conditional references (`Type?query`) a resource holds.
+pub fn conditional_references(resource: &Value) -> Vec<String> {
+    let mut all = Vec::new();
+    references(resource, &mut all);
+    all.retain(|r| is_conditional(r));
+    all
+}
+
+/// The system of the tag a namespaced resource carries, with its source id.
+pub const SOURCE_TAG_SYSTEM: &str = "urn:helios:hie:source";
+
+/// The id a namespaced source writes a resource under: the first 48 hex
+/// characters of SHA-256 over `{source}|{type}|{origin id}`.
+pub fn namespaced_id(source: &str, resource_type: &str, id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{source}|{resource_type}|{id}").as_bytes());
+    hex::encode(digest)[..48].to_string()
+}
+
+/// Rewrites relative `Type/id` references to the source's derived ids.
+fn rewrite_references(source: &str, value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if k == "reference"
+                    && let Value::String(r) = v
+                {
+                    if let Some((t, id)) = r.split_once('/')
+                        && !t.is_empty()
+                        && t.bytes().all(|b| b.is_ascii_alphanumeric())
+                        && t.as_bytes()[0].is_ascii_uppercase()
+                        && !id.is_empty()
+                        && !id.contains(['/', '?', '#'])
+                    {
+                        *r = format!("{t}/{}", namespaced_id(source, t, id));
+                    }
+                } else {
+                    rewrite_references(source, v);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|v| rewrite_references(source, v)),
+        _ => {}
+    }
+}
+
+/// A resource as a namespaced source delivers it: its `id` derived from the
+/// source, its relative references to the same source's derived ids (absolute,
+/// conditional, contained and `urn:` ones left as written), and the source's
+/// tag in `meta.tag`.
+pub fn namespace(source: &str, resource: &mut Value) {
+    let Some(resource_type) = resource
+        .get("resourceType")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let origin = resource
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    rewrite_references(source, resource);
+    let Value::Object(map) = resource else { return };
+    if let Some(origin) = origin {
+        map.insert(
+            "id".into(),
+            Value::String(namespaced_id(source, &resource_type, &origin)),
+        );
+    }
+    let meta = map.entry("meta").or_insert_with(|| json!({}));
+    if !meta.is_object() {
+        *meta = json!({});
+    }
+    let tags = meta
+        .as_object_mut()
+        .expect("meta is an object")
+        .entry("tag")
+        .or_insert_with(|| json!([]));
+    if !tags.is_array() {
+        *tags = json!([]);
+    }
+    let tag = json!({"system": SOURCE_TAG_SYSTEM, "code": source});
+    let tags = tags.as_array_mut().expect("tag is an array");
+    if !tags.contains(&tag) {
+        tags.push(tag);
+    }
 }
 
 pub fn entry_results(response: &Value, expected: usize) -> Vec<EntryResult> {
@@ -413,6 +586,61 @@ mod tests {
             ),
             "Observation?identifier=urn:helios:hie:lab-results|Patient/1%202345-7%26x"
         );
+    }
+
+    #[test]
+    fn namespaced_ids_and_references_are_derived_from_the_source() {
+        let mut patient = json!({"resourceType": "Patient", "id": "1"});
+        namespace("alpha", &mut patient);
+        assert_eq!(
+            patient["id"],
+            "dc5b31240df4416c42a9972426cc8ac89697b75b8851b742"
+        );
+        assert_eq!(
+            patient["meta"]["tag"],
+            json!([{"system": "urn:helios:hie:source", "code": "alpha"}])
+        );
+        let mut obs = json!({"resourceType": "Observation", "id": "o1",
+            "subject": {"reference": "Patient/1"},
+            "performer": [{"reference": "https://x.org/fhir/Practitioner/9"},
+                          {"reference": "Practitioner?identifier=urn:x|9"},
+                          {"reference": "#c1"}, {"reference": "urn:uuid:abc"}]});
+        namespace("alpha", &mut obs);
+        assert_eq!(
+            obs["subject"]["reference"],
+            "Patient/dc5b31240df4416c42a9972426cc8ac89697b75b8851b742"
+        );
+        assert_eq!(
+            obs["performer"][0]["reference"],
+            "https://x.org/fhir/Practitioner/9"
+        );
+        assert_eq!(
+            obs["performer"][1]["reference"],
+            "Practitioner?identifier=urn:x|9"
+        );
+        assert_eq!(obs["performer"][2]["reference"], "#c1");
+        assert_eq!(obs["performer"][3]["reference"], "urn:uuid:abc");
+        assert_eq!(
+            conditional_references(&obs),
+            vec!["Practitioner?identifier=urn:x|9".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_malformed_outcome_is_not_a_verdict() {
+        for body in [
+            json!({"resourceType": "OperationOutcome", "issue": "malformed"}),
+            json!({"resourceType": "OperationOutcome", "issue": []}),
+            json!({"resourceType": "OperationOutcome", "issue": [{"severity": "bad", "code": "x"}]}),
+            json!({"resourceType": "OperationOutcome", "issue": [{"code": "x"}]}),
+            json!({"resourceType": "OperationOutcome", "issue": [{"severity": "error"}]}),
+        ] {
+            assert_eq!(issues(&body), None, "{body}");
+        }
+        let ok = issues(&json!({"resourceType": "OperationOutcome",
+            "issue": [{"severity": "warning", "code": "x", "diagnostics": "w", "expression": ["A.b"]}]}))
+        .unwrap();
+        assert_eq!(ok[0].expression, vec!["A.b".to_string()]);
     }
 
     #[test]
