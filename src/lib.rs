@@ -6,18 +6,33 @@ pub mod api;
 pub mod auth;
 pub mod bulk;
 pub mod config;
+pub mod connectors;
 pub mod credentials;
-pub mod database;
 pub mod db;
 pub mod fhir;
-pub mod hl7;
+pub mod formats;
 pub mod manager;
 pub mod pipeline;
-pub mod reader;
 pub mod runtime;
-pub mod source;
-pub mod sqs;
+pub mod secrets;
 pub mod transform;
+
+/// The source handle and the object connector, as they were reached before
+/// connectors had modules of their own.
+pub mod source {
+    pub use crate::connectors::object::ObjectSource;
+    pub use crate::connectors::{Incoming, Probe, Source};
+}
+
+/// The SQS queue of the object connector, as it was reached before.
+pub use connectors::object::sqs;
+
+/// HL7 v2, as it was reached before the formats and the MLLP connector had
+/// modules of their own: the message format, and MLLP framing.
+pub mod hl7 {
+    pub use crate::connectors::mllp::{END, START, ack, frame, serve};
+    pub use crate::formats::hl7v2::*;
+}
 
 use std::path::Path;
 use std::sync::Arc;
