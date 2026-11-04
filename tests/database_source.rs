@@ -263,3 +263,238 @@ fn a_database_source_is_checked_on_resolve() {
     let err = Source::from_config(&ok).map(drop).unwrap_err();
     assert!(format!("{err:#}").contains("X"), "{err:#}");
 }
+
+/// A table read by parts follows the keyset (`new_rows_by`, `key`): rows that
+/// share a `new_rows_by` value across a run's boundary (1000 rows) are all
+/// read once, and rows added later with that same value are read next.
+#[tokio::test]
+async fn a_table_read_never_skips_rows_that_share_new_rows_by() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("labs.db").display().to_string();
+    let pool = SqlitePoolOptions::new()
+        .connect(&format!("sqlite:{path}?mode=rwc"))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE lab_results (id INTEGER NOT NULL PRIMARY KEY, batch INTEGER NOT NULL, value TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // 1500 rows in one batch value: a run of 1000 ends inside it.
+    let insert = |from: i64, to: i64, batch: i64| {
+        let pool = pool.clone();
+        async move {
+            for id in from..=to {
+                sqlx::query("INSERT INTO lab_results (id, batch, value) VALUES (?1, ?2, 'x')")
+                    .bind(id)
+                    .bind(batch)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+    };
+    insert(1, 1500, 7).await;
+
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut feed: hie::config::FeedConfig = serde_json::from_value(json!({
+        "id": "labs", "name": "Labs",
+        "source": {"type": "database",
+                   "connection": {"engine": "sqlite", "database": path},
+                   "read": {"mode": "table", "table": {"name": "lab_results"}, "key": ["id"], "new_rows_by": "batch"}},
+        "transform": "transforms/sql_lab_results.py",
+    }))
+    .unwrap();
+    feed.resolve(&repo).unwrap();
+    let db = Arc::new(Db::in_memory().unwrap());
+    let source = Source::from_config_in(&feed, &hie::connectors::Context::default())
+        .unwrap()
+        .with_db(db);
+
+    let ids = |bytes: Vec<u8>| -> Vec<i64> {
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["id"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect()
+    };
+    let key = source.list().await.unwrap().remove(0);
+    let first = ids(source.fetch(&key).await.unwrap().bytes);
+    assert_eq!(first, (1..=1500).collect::<Vec<_>>());
+    source.acknowledge(&key, "").await.unwrap();
+    assert!(source.list().await.unwrap().is_empty());
+
+    // Later rows in the same batch, and in a later one.
+    insert(1501, 1502, 7).await;
+    insert(1503, 1503, 8).await;
+    let key = source.list().await.unwrap().remove(0);
+    assert_eq!(
+        ids(source.fetch(&key).await.unwrap().bytes),
+        [1501, 1502, 1503]
+    );
+    source.acknowledge(&key, "").await.unwrap();
+    assert!(source.list().await.unwrap().is_empty());
+}
+
+/// A column that may be null cannot order a table read: its rows would be
+/// skipped by the keyset.
+#[tokio::test]
+async fn a_nullable_ordering_column_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("labs.db").display().to_string();
+    let pool = SqlitePoolOptions::new()
+        .connect(&format!("sqlite:{path}?mode=rwc"))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE lab_results (id INTEGER NOT NULL PRIMARY KEY, seen TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut feed: hie::config::FeedConfig = serde_json::from_value(json!({
+        "id": "labs", "name": "Labs",
+        "source": {"type": "database",
+                   "connection": {"engine": "sqlite", "database": path},
+                   "read": {"mode": "table", "table": {"name": "lab_results"}, "new_rows_by": "seen"}},
+        "transform": "transforms/sql_lab_results.py",
+    }))
+    .unwrap();
+    feed.resolve(&repo).unwrap();
+    let source = Source::from_config_in(&feed, &hie::connectors::Context::default()).unwrap();
+    let error = format!("{:#}", source.list().await.unwrap_err());
+    assert!(error.contains("may be null"), "{error}");
+}
+
+/// On PostgreSQL (`HIE_TEST_DATABASE_URL`): a table read by parts whose
+/// `new_rows_by` is a `numeric(38, 30)` (30 fractional digits, past what a
+/// float or a 28-digit decimal holds) shared across a run's boundary, with a
+/// `uuid` key, reads every row once, binding each position in its own type
+/// and exactly; the password is a kept secret.
+#[tokio::test]
+async fn a_postgres_table_reads_by_exact_native_positions() {
+    let Ok(url) = std::env::var("HIE_TEST_DATABASE_URL") else {
+        eprintln!("skipping: HIE_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let parsed = url::Url::parse(&url).unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect(&url)
+        .await
+        .unwrap();
+    let table = format!("keyset_{}", std::process::id());
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE public.{table} (u uuid NOT NULL PRIMARY KEY, amount numeric(38, 30) NOT NULL, note text)"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    // 1200 rows share one amount that neither a float nor a 28-digit decimal holds.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO public.{table} (u, amount) SELECT md5(i::text)::uuid, 1234567.123456789012345678901234567890 FROM generate_series(1, 1200) i"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let db = Arc::new(Db::in_memory().unwrap());
+    let keys = hie::crypto::Keyring::parse("Y29uZm9ybWFuY2Utc2VjcmV0cy1rZXktMzItYnl0ZXM=").unwrap();
+    let secrets = Arc::new(hie::secrets::Secrets::new(db.clone(), Some(keys)));
+    let password = percent(parsed.password().unwrap_or_default());
+    let secret = db
+        .transaction(|tx| {
+            secrets
+                .create_in(tx, "pg", &password)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))
+        })
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut feed: hie::config::FeedConfig = serde_json::from_value(json!({
+        "id": "pgkeys", "name": "Keys",
+        "source": {"type": "database",
+                   "connection": {"engine": "postgres", "host": parsed.host_str().unwrap(),
+                                  "port": parsed.port().unwrap_or(5432),
+                                  "database": parsed.path().trim_start_matches('/'),
+                                  "user": percent(parsed.username()),
+                                  "password": {"secret": secret, "revision": 1},
+                                  "encrypt": false},
+                   "read": {"mode": "table", "table": {"schema": "public", "name": table},
+                            "key": ["u"], "new_rows_by": "amount"}},
+        "transform": "transforms/sql_lab_results.py",
+    }))
+    .unwrap();
+    feed.resolve(&repo).unwrap();
+    let ctx = hie::connectors::Context {
+        admission: Default::default(),
+        secrets: Some(secrets),
+    };
+    let source = Source::from_config_in(&feed, &ctx)
+        .unwrap()
+        .with_db(db.clone());
+    let read = |bytes: Vec<u8>| -> Vec<String> {
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["u"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+    let key = source.list().await.unwrap().remove(0);
+    let first = read(source.fetch(&key).await.unwrap().bytes);
+    source.acknowledge(&key, "").await.unwrap();
+    let mut unique = first.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!((first.len(), unique.len()), (1200, 1200));
+    assert!(source.list().await.unwrap().is_empty());
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO public.{table} (u, amount) VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', 1234567.123456789012345678901234567890), ('00000000-0000-0000-0000-000000000001', 1234567.123456789012345678901234567891)"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let key = source.list().await.unwrap().remove(0);
+    let later = read(source.fetch(&key).await.unwrap().bytes);
+    source.acknowledge(&key, "").await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE public.{table}")))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        later,
+        [
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            "00000000-0000-0000-0000-000000000001"
+        ]
+    );
+}
+
+/// URL percent-decoding, without form rules (a `+` stays a `+`).
+fn percent(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&text[i + 1..i + 3], 16)
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}

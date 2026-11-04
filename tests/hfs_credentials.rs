@@ -143,7 +143,7 @@ async fn the_engine_fetches_caches_refreshes_and_drops_its_token() {
     std::fs::write(
         root.join("sources/lab-results.yaml"),
         "id: lab-results\nname: Lab results\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  min_file_age_ms: 0\n\
-         transform: transforms/lab_results.py\ndelivery:\n  initial_backoff_ms: 10\n  alert_after_attempts: 2\n",
+         transform: transforms/lab_results.py\ndelivery:\n  initial_backoff_ms: 1000\n  alert_after_attempts: 2\n",
     )
     .unwrap();
     let source = Arc::new(TokenSource::new(CredentialSettings {
@@ -219,7 +219,10 @@ async fn the_engine_fetches_caches_refreshes_and_drops_its_token() {
             .contains("did not accept the engine's token"),
         "{pending:?}"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    // The backoff is longer than a pass: a pass delivers again what came due
+    // while it transformed, so a shorter one could send these rows within the
+    // same pass (on a slower store), before the assertions above.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     runner.tick().await.unwrap();
     assert_eq!(count(&state, "sent"), 6);
     {

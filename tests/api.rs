@@ -695,3 +695,96 @@ async fn a_load_shows_its_failures_grouped_and_retries_them() {
         404
     );
 }
+
+/// A Start that stopped after writing its source file (the engine died) is
+/// finished from its intent when the engine starts again: the source holds
+/// its evidence and has its queued first load.
+#[tokio::test]
+async fn a_start_stopped_after_its_file_is_finished_when_the_engine_starts() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let urls: Urls = Arc::default();
+    let fhir = serve(Router::new().route("/", post(batch)).with_state(urls)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::copy(
+        repo().join("transforms/lab_results.py"),
+        root.join("transforms/lab_results.py"),
+    )
+    .unwrap();
+    let labs = root.join("labs.db");
+    rusqlite::Connection::open(&labs)
+        .unwrap()
+        .execute_batch("CREATE TABLE lab_results (id INTEGER NOT NULL PRIMARY KEY, value TEXT)")
+        .unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {fhir}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    let source = json!({
+        "type": "database",
+        "connection": {"engine": "sqlite", "database": labs.display().to_string()},
+        "read": {"mode": "table", "table": {"name": "lab_results"}, "new_rows_by": "id"},
+        "poll_seconds": 3600,
+    });
+
+    // The first engine tests the connection.
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (_first, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let api = serve(hie::api::router(state)).await;
+    let http = reqwest::Client::new();
+    let tested: Value = http
+        .post(format!("{api}/api/sources/test"))
+        .json(&json!({"source": source}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let evidence = tested["evidence"]["id"].as_str().unwrap().to_string();
+    assert_eq!(tested["evidence"]["verdict"], "passed", "{tested}");
+
+    // A Start stopped between writing its file and binding it.
+    let db = hie::db::Db::open(&root.join("data/hie.db")).unwrap();
+    assert!(
+        db.insert_start_intent(&hie::evidence::Binding {
+            source: "labs".into(),
+            evidence: Some(evidence.clone()),
+            credential: None,
+            first_load: None,
+        })
+        .unwrap()
+    );
+    let mut definition = json!({"id": "labs", "name": "Labs", "source": source,
+                                "format": "ndjson", "transform": "transforms/lab_results.py"});
+    definition["source"]["read"]["key"] = json!(["id"]);
+    std::fs::write(
+        root.join("sources/labs.yaml"),
+        serde_yaml::to_string(&definition).unwrap(),
+    )
+    .unwrap();
+
+    // The engine starts again and finishes it.
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (_second, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let api = serve(hie::api::router(state)).await;
+    let view: Value = http
+        .get(format!("{api}/api/sources/labs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["evidence"], evidence.as_str(), "{view}");
+    assert!(view["first_load"]["id"].is_i64(), "{view}");
+    assert!(db.start_intents(None).unwrap().is_empty());
+    assert!(db.evidence(&evidence).unwrap().is_some());
+}

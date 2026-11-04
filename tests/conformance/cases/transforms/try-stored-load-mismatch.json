@@ -1,0 +1,663 @@
+{
+  "id": "transforms/try-stored-load-mismatch",
+  "title": "Stored-row refusals in order: the body, an unknown load, an unknown record, a record of another load, nothing left to try; nothing dispatched",
+  "fixtures": {
+    "hie": {
+      "runtime": {
+        "url": "{{runtime}}",
+        "token_env": "HIE_CONFORMANCE_NO_TOKEN"
+      }
+    },
+    "runtime": {
+      "try": [],
+      "run": {
+        "marker": "rt"
+      }
+    },
+    "files": {
+      "inbox/a.csv": "id,value,patient\n1,alto,zq-mismatch-1\n2,5.4,zq-mismatch-2\n",
+      "inbox/b.csv": "id,value,patient\n3,alto,zq-mismatch-3\n4,xyz,zq-mismatch-4\n"
+    }
+  },
+  "forbid_at_rest": {
+    "values": [
+      "zq-mismatch-1",
+      "zq-mismatch-2",
+      "zq-mismatch-3",
+      "zq-mismatch-4"
+    ],
+    "under": [
+      "data"
+    ]
+  },
+  "steps": [
+    {
+      "name": "create Lab results",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms",
+        "headers": {
+          "Idempotency-Key": "c1"
+        },
+        "body": {
+          "display_name": "Lab results",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n"
+        }
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": "{{$tid}}",
+          "current_version": 1
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/sources",
+        "body": {
+          "id": "lab",
+          "name": "Lab lab",
+          "source": {
+            "type": "folder",
+            "path": "inbox",
+            "pattern": "*.csv",
+            "poll_seconds": 3600,
+            "min_file_age_ms": 0
+          },
+          "transform": {
+            "id": "{{$tid}}",
+            "version": 1
+          }
+        }
+      },
+      "expect": {
+        "status": 201
+      }
+    },
+    {
+      "name": "check lab now",
+      "request": {
+        "method": "POST",
+        "path": "/api/sources/lab/check-now"
+      },
+      "expect": {
+        "status": 202
+      }
+    },
+    {
+      "name": "wait for both loads",
+      "request": {
+        "method": "GET",
+        "path": "/api/sources/lab/loads"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "loads": [
+            "{{contains}}",
+            {
+              "id": "{{$la}}",
+              "name": "a.csv",
+              "status": "done",
+              "rows": {
+                "written": 1,
+                "failed": 1
+              }
+            },
+            {
+              "id": "{{$lb}}",
+              "name": "b.csv",
+              "status": "done",
+              "rows": {
+                "written": 0,
+                "failed": 2
+              }
+            }
+          ]
+        }
+      },
+      "until_ms": 15000
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/records?file_id={{$lb}}"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "records": [
+            "{{contains}}",
+            {
+              "id": "{{$rb}}",
+              "attempt": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/records?file_id={{$la}}&status=rejected"
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "records": [
+            {
+              "id": "{{$ra}}",
+              "outcome": "failed"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "nothing asked",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "m-1",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "records": [],
+              "passing": 0
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input.stored"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "m-2",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "passing": 101
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input.stored.passing"
+        }
+      }
+    },
+    {
+      "name": "at most 100 in all",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "m-3",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "records": [
+                "{{$ra}}"
+              ],
+              "passing": 100
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input.stored"
+        }
+      }
+    },
+    {
+      "name": "a record named twice",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "m-4",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "records": [
+                "{{$ra}}",
+                {
+                  "id": "{{$ra}}"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input.stored.records"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "m-5",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "records": [
+                {
+                  "id": "{{$ra}}",
+                  "attempt": 1,
+                  "seen": true
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "unknown_field",
+          "field": "input.stored.records[0].seen"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "m-6",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "passing": 1,
+              "limit": 1
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "unknown_field",
+          "field": "input.stored.limit"
+        }
+      }
+    },
+    {
+      "name": "the body before an unknown load",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "m-c1",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": 999999,
+              "passing": 101
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input.stored.passing"
+        }
+      }
+    },
+    {
+      "name": "saved route: the body before an unknown version",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/try",
+        "body": {
+          "run_id": "m-c2",
+          "version": 99,
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "passing": 101
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input.stored.passing"
+        }
+      }
+    },
+    {
+      "name": "saved route: a duplicate before an unknown version",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/try",
+        "body": {
+          "run_id": "m-c3",
+          "version": 99,
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "records": [
+                "{{$ra}}",
+                "{{$ra}}"
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input.stored.records"
+        }
+      }
+    },
+    {
+      "name": "saved route: an unknown member before an unknown version",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/try",
+        "body": {
+          "run_id": "m-c4",
+          "version": 99,
+          "input": {
+            "stored": {
+              "load": 999999,
+              "records": [
+                {
+                  "id": "{{$ra}}",
+                  "seen": 1
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "unknown_field",
+          "field": "input.stored.records[0].seen"
+        }
+      }
+    },
+    {
+      "name": "saved route: two inputs before an unknown version",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/try",
+        "body": {
+          "run_id": "m-c5",
+          "version": 99,
+          "input": {
+            "records": [],
+            "stored": {
+              "load": "{{$la}}",
+              "passing": 1
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input"
+        }
+      }
+    },
+    {
+      "name": "saved route: the body before an unknown transform",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/no-such-transform/try",
+        "body": {
+          "run_id": "m-c6",
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "records": [],
+              "passing": 0
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input.stored"
+        }
+      }
+    },
+    {
+      "name": "saved route: a valid body reaches the version, then the load",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/try",
+        "body": {
+          "run_id": "m-c7",
+          "version": 99,
+          "input": {
+            "stored": {
+              "load": 999999,
+              "passing": 1
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "version_not_found"
+        }
+      }
+    },
+    {
+      "name": "an unknown load comes first",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "m-7",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": 999999,
+              "records": [
+                999998,
+                "{{$rb}}"
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "load_not_found"
+        }
+      }
+    },
+    {
+      "name": "an unknown record comes before one of another load",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "m-8",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "records": [
+                "{{$rb}}",
+                999998
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "record_not_found",
+          "record": 999998
+        }
+      }
+    },
+    {
+      "name": "a record of another load comes before an attempt that moved on",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "m-9",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "records": [
+                "{{$ra}}",
+                {
+                  "id": "{{$rb}}",
+                  "attempt": 9
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}",
+          "code": "record_not_in_load",
+          "record": "{{$rb}}",
+          "load": "{{$lb}}"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/try",
+        "body": {
+          "run_id": "m-10",
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "records": [
+                "{{$rb}}"
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}",
+          "code": "record_not_in_load",
+          "record": "{{$rb}}",
+          "load": "{{$lb}}"
+        }
+      }
+    },
+    {
+      "name": "a load without written rows",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "m-11",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": "{{$lb}}",
+              "passing": 3
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 409,
+        "body": {
+          "error": "{{string}}",
+          "code": "nothing_to_try"
+        }
+      }
+    },
+    {
+      "runtime": {
+        "calls": {
+          "try": "{{absent}}"
+        }
+      }
+    },
+    {
+      "name": "a refused run keeps no id",
+      "request": {
+        "method": "GET",
+        "path": "/api/transforms/try-runs/m-11"
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "run_not_found"
+        }
+      }
+    }
+  ]
+}

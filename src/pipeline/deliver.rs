@@ -1,17 +1,50 @@
-//! REST delivery: batch Bundles of conditional updates, with retries and
-//! backoff, while the transform works on the next chunk.
+//! REST delivery: Bundles of conditional updates, with retries and backoff,
+//! while the transform works on the next chunk.
+//!
+//! - **Validation.** With `validation: required` every resource goes through
+//!   the destination's `$validate` first. Errors fail the row (`validation`);
+//!   a destination that cannot validate holds the whole batch
+//!   (`validation_unavailable`), retried with the delivery backoff.
+//! - **Bundle type.** `delivery.bundle`: `batch`, `transaction`, or `auto`
+//!   (a transaction when a resource holds a conditional reference).
+//! - **Answers.** A definitive refusal of a transaction splits it into one
+//!   transaction per row (`reference` when the row's conditional reference
+//!   matched nothing or several, else `server`). A `429`, a `5xx`, a timeout or
+//!   a lost answer leaves the rows `outcome_unknown`: a batch's rows are sent
+//!   again, a transaction is kept as it was sent (`dispatches`) and the same
+//!   one is sent again until an answer settles it, across restarts.
+//! - **Schedule.** Deferred rows and open submissions are retried when due,
+//!   independently of the source's poll interval ([`FeedRunner::next_delivery_in`]).
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::Result;
-use serde_json::Value;
+use futures::StreamExt;
+use serde_json::{Value, json};
 
-use crate::db::{WorkItem, now_ms};
-use crate::fhir::{self, EntryResult, SendError};
+use crate::config::{BundleType, Validation};
+use crate::db::{Deferral, Waiting, WorkItem, now_ms};
+use crate::fhir::{self, BundleAnswer, EntryResult, Validated};
 use crate::transform;
 use tokio::sync::Notify;
 
 use super::FeedRunner;
+
+/// `$validate` calls in flight at once.
+const VALIDATE_CONCURRENCY: usize = 8;
+
+/// The shortest wait before a due delivery round, so a row due now cannot spin.
+const MIN_WAIT: Duration = Duration::from_millis(50);
+
+/// What a batch's validation decided.
+pub(super) enum Checked {
+    /// The rows that may be delivered.
+    Deliver(Vec<WorkItem>),
+    /// The destination could not validate: nothing of the batch goes.
+    Held,
+}
 
 impl FeedRunner {
     /// Transforms and delivers at the same time: HFS takes each transformed
@@ -39,65 +72,211 @@ impl FeedRunner {
         delivered
     }
 
+    /// How long until the feed's next delivery attempt is due: a deferred row
+    /// or an open submission; `None` when nothing waits.
+    pub(super) fn next_delivery_in(&self) -> Option<Duration> {
+        match self.db.next_attempt_at(&self.feed.id) {
+            Ok(at) => {
+                at.map(|at| Duration::from_millis((at - now_ms()).max(0) as u64).max(MIN_WAIT))
+            }
+            Err(e) => {
+                tracing::error!(target: "hie::pipeline", feed = %self.feed.id, "{e:#}");
+                None
+            }
+        }
+    }
+
+    /// A delivery round without a pass over the source: what is due is sent
+    /// (or its submissions polled), then loads and retries that settled end.
+    pub(super) async fn delivery_round(&self) -> Result<()> {
+        if !self
+            .db
+            .acquire_lease(&self.feed.id, &self.instance, self.lease_ttl_ms())?
+            || self.db.is_paused(&self.feed.id)?
+        {
+            return Ok(());
+        }
+        if self.bulk.is_none() || self.initial_bulk_only() {
+            self.deliver_due().await?;
+        }
+        if self.bulk.is_some() {
+            self.submit_pending().await?;
+            self.poll_submissions().await?;
+        }
+        self.finish()
+    }
+
     pub(super) async fn deliver_due(&self) -> Result<()> {
+        self.deliver_due_where(false).await
+    }
+
+    /// Delivers what is due; only the rows retries run when `retries_only`
+    /// (the source-objects bulk path, whose retries go by REST).
+    pub(super) async fn deliver_due_where(&self, retries_only: bool) -> Result<()> {
         loop {
-            let items = self
-                .db
-                .due_records(&self.feed.id, self.feed.delivery.batch_size)?;
+            // The first load of an `initial_method: bulk_submit` source goes by `$bulk-submit`.
+            let bulk_load = self.initial_bulk_load()?;
+            let items = self.db.due_records(
+                &self.feed.id,
+                self.feed.delivery.batch_size,
+                bulk_load,
+                retries_only,
+            )?;
             if items.is_empty() {
                 return Ok(());
             }
-            if !self.deliver(&items).await? {
+            // A transaction kept as it was sent goes again as it was.
+            let stored: BTreeSet<String> =
+                items.iter().filter_map(|i| i.dispatch.clone()).collect();
+            for dispatch in stored {
+                if !self.resend(&dispatch).await? {
+                    return Ok(());
+                }
+            }
+            let fresh: Vec<WorkItem> = items.into_iter().filter(|i| i.dispatch.is_none()).collect();
+            if !fresh.is_empty() && !self.deliver(&fresh).await? {
                 return Ok(());
             }
         }
     }
 
-    /// Sends `items` in one batch Bundle. Returns false when HFS is unavailable,
-    /// so the caller stops until the next pass instead of hammering it.
+    /// Validates (when required) and sends `items` in one Bundle. Returns
+    /// false when the destination is unavailable, so the caller stops until
+    /// the next round instead of hammering it.
     pub(super) async fn deliver(&self, items: &[WorkItem]) -> Result<bool> {
-        let mut entries = Vec::new();
-        let mut owner = Vec::new();
-        for (i, item) in items.iter().enumerate() {
-            for resource in item
-                .resources
-                .as_ref()
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
+        let items = match self.validate(items).await? {
+            Checked::Held => return Ok(false),
+            Checked::Deliver(items) if items.is_empty() => return Ok(true),
+            Checked::Deliver(items) => items,
+        };
+        let transaction = match self.feed.delivery.bundle {
+            BundleType::Batch => false,
+            BundleType::Transaction => true,
+            BundleType::Auto => items.iter().any(|i| {
+                resources(i)
+                    .iter()
+                    .any(|r| !fhir::conditional_references(r).is_empty())
+            }),
+        };
+        if transaction {
+            self.send_transaction(&items, None).await
+        } else {
+            self.send_batch(&items).await
+        }
+    }
+
+    /// Checks every resource not yet validated with the destination's
+    /// `$validate`. Invalid rows fail and are not delivered; when the
+    /// destination cannot validate, the whole batch waits.
+    pub(super) async fn validate(&self, items: &[WorkItem]) -> Result<Checked> {
+        if self.validation != Validation::Required {
+            return Ok(Checked::Deliver(items.to_vec()));
+        }
+        let pending: Vec<(usize, Value)> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| !i.validated)
+            .flat_map(|(n, i)| resources(i).into_iter().map(move |r| (n, r)))
+            .collect();
+        let verdicts: Vec<(usize, Validated)> = futures::stream::iter(pending)
+            .map(|(n, resource)| async move { (n, self.fhir.validate(&resource).await) })
+            .buffered(VALIDATE_CONCURRENCY)
+            .collect()
+            .await;
+        if verdicts
+            .iter()
+            .any(|(_, v)| matches!(v, Validated::Unavailable))
+        {
+            tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, rows = items.len(), "the destination cannot validate; the batch waits");
+            self.hold(
+                items,
+                &Deferral {
+                    waiting: Waiting::Validation,
+                    reason: "the destination cannot validate now",
+                    sent: false,
+                    dispatch: None,
+                },
+            )?;
+            return Ok(Checked::Held);
+        }
+        let mut invalid: Vec<Option<String>> = vec![None; items.len()];
+        for (n, verdict) in &verdicts {
+            if let Validated::Outcome { issues } = verdict
+                && invalid[*n].is_none()
+                && let Some(issue) = issues.iter().find(|i| i.is_error())
             {
-                let key = transform::check_resource(resource).map_err(anyhow::Error::msg)?;
-                entries.push((fhir::request_url(&key), resource.clone()));
-                owner.push(i);
+                let text = issue
+                    .diagnostics
+                    .clone()
+                    .unwrap_or_else(|| issue.code.clone());
+                let reason = match issue.expression.first() {
+                    Some(path) if !text.contains(path.as_str()) => format!("{text} ({path})"),
+                    _ => text,
+                };
+                invalid[*n] = Some(reason);
             }
         }
-        match self.fhir.post_bundle(&fhir::batch_bundle(&entries)).await {
-            Err(SendError::Transient(reason)) => {
-                for item in items {
-                    self.defer(item, &reason)?;
+        let mut deliver = Vec::new();
+        let mut valid = Vec::new();
+        for (item, reason) in items.iter().zip(invalid) {
+            match reason {
+                Some(reason) => {
+                    self.db
+                        .mark_failed(item.id, item.run, "validation", &reason, None, None)?
                 }
-                let worst = items.iter().map(|i| i.attempts + 1).max().unwrap_or(0);
-                self.outage(worst, &reason)?;
-                Ok(false)
-            }
-            Err(SendError::Refused(status, _)) if items.len() > 1 => {
-                tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, status, "batch refused as a whole; sending records one by one");
-                for item in items {
-                    if !Box::pin(self.deliver(std::slice::from_ref(item))).await? {
-                        return Ok(false);
+                None => {
+                    if !item.validated {
+                        valid.push((item.id, item.run));
                     }
+                    deliver.push(item.clone());
                 }
-                Ok(true)
             }
-            Err(SendError::Refused(status, body)) => {
-                let reason = format!("HTTP {status}: {}", fhir::outcome_text(&body));
-                self.db
-                    .mark_rejected(items[0].id, "server", &reason, Some(&body))?;
-                Ok(true)
-            }
-            Ok(response) => {
+        }
+        self.db.mark_validated(&valid)?;
+        Ok(Checked::Deliver(deliver))
+    }
+
+    /// Sends a `batch`: each entry settles its own row.
+    async fn send_batch(&self, items: &[WorkItem]) -> Result<bool> {
+        let (entries, owner) = entries(items)?;
+        match self
+            .fhir
+            .send_bundle(&fhir::bundle("batch", &entries))
+            .await
+        {
+            BundleAnswer::Unsent(reason) => self.unconfirmed(items, &reason, false, None),
+            BundleAnswer::Lost(reason) => self.unconfirmed(items, &reason, true, None),
+            BundleAnswer::Answered { status, body } if status >= 300 => {
+                if !fhir::is_definitive_refusal(status, &body) {
+                    // Not a refusal the contract reads as "nothing written".
+                    return self.unconfirmed(items, &format!("HTTP {status}"), true, None);
+                }
                 self.recovered()?;
-                let results = fhir::entry_results(&response, entries.len());
+                if items.len() > 1 {
+                    tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, status, "batch refused as a whole; sending records one by one");
+                    for item in items {
+                        if !Box::pin(self.send_batch(std::slice::from_ref(item))).await? {
+                            return Ok(false);
+                        }
+                    }
+                    return Ok(true);
+                }
+                let item = &items[0];
+                self.db.mark_failed(
+                    item.id,
+                    item.run,
+                    "server",
+                    &fhir::refusal_reason(status, &body),
+                    Some(&body),
+                    None,
+                )?;
+                Ok(true)
+            }
+            BundleAnswer::Answered { body, .. } => {
+                self.recovered()?;
+                let results = fhir::entry_results(&body, entries.len());
+                let mut sent = Vec::new();
+                let mut unknown = Vec::new();
                 for (i, item) in items.iter().enumerate() {
                     let mine: Vec<&EntryResult> = results
                         .iter()
@@ -113,38 +292,328 @@ impl FeedRunner {
                             | EntryResult::Transient(_, v) => v.clone(),
                         })
                         .collect();
-                    if let Some(EntryResult::Rejected(status, v)) =
-                        mine.iter().find(|r| matches!(r, EntryResult::Rejected(..)))
-                    {
-                        let reason = format!("HTTP {status}: {}", fhir::outcome_text(v));
-                        self.db.mark_rejected(
-                            item.id,
-                            "server",
-                            &reason,
-                            Some(&Value::Array(responses)),
-                        )?;
-                    } else if let Some(EntryResult::Transient(status, _)) = mine
+                    if let Some(EntryResult::Transient(status, _)) = mine
                         .iter()
                         .find(|r| matches!(r, EntryResult::Transient(..)))
                     {
-                        self.defer(item, &format!("HTTP {status} for this entry"))?;
+                        unknown.push((item.clone(), format!("HTTP {status} for this entry")));
+                    } else if let Some(EntryResult::Rejected(status, v)) =
+                        mine.iter().find(|r| matches!(r, EntryResult::Rejected(..)))
+                    {
+                        self.db.mark_failed(
+                            item.id,
+                            item.run,
+                            "server",
+                            &fhir::refusal_reason(*status, v),
+                            Some(&Value::Array(responses)),
+                            None,
+                        )?;
                     } else {
-                        self.db.mark_sent(item.id, &Value::Array(responses))?;
+                        sent.push((item.id, item.run, Value::Array(responses)));
                     }
+                }
+                self.db.mark_sent_many(&sent)?;
+                for (item, reason) in unknown {
+                    self.hold(
+                        std::slice::from_ref(&item),
+                        &Deferral {
+                            waiting: Waiting::Destination,
+                            reason: &reason,
+                            sent: true,
+                            dispatch: None,
+                        },
+                    )?;
                 }
                 Ok(true)
             }
         }
     }
 
-    pub(super) fn defer(&self, item: &WorkItem, reason: &str) -> Result<()> {
-        let attempts = item.attempts + 1;
-        let d = &self.feed.delivery;
-        let backoff = d
-            .initial_backoff_ms
-            .saturating_mul(1u64 << (attempts - 1).min(20))
-            .min(d.max_backoff_ms);
-        self.db
-            .defer(item.id, attempts, now_ms() + backoff as i64, reason)
+    /// Sends `items` as one `transaction`. A new one is kept first (payload,
+    /// members, `sending`), so a restart in the middle finds it and sends the
+    /// same one again; a stored one (`dispatch`) goes again unchanged. All of
+    /// it commits or none does.
+    async fn send_transaction(&self, items: &[WorkItem], dispatch: Option<&str>) -> Result<bool> {
+        let (dispatch, bundle, owner) = match dispatch {
+            Some(d) => match self.db.dispatch_payload(d)? {
+                Some((stored, state)) => {
+                    if state == "sending" {
+                        // Found mid-send (the engine stopped): it may have committed.
+                        self.hold(
+                            items,
+                            &Deferral {
+                                waiting: Waiting::Destination,
+                                reason: "the engine stopped while this transaction was sent",
+                                sent: true,
+                                dispatch: Some(d),
+                            },
+                        )?;
+                    }
+                    (d.to_string(), stored["bundle"].clone(), owners(&stored))
+                }
+                None => {
+                    // Nothing kept to send again: the rows go as new ones.
+                    let items = self.release(items)?;
+                    return Box::pin(self.deliver(&items)).await;
+                }
+            },
+            None => {
+                let (entries, owner) = entries(items)?;
+                let owner: Vec<i64> = owner.iter().map(|i| items[*i].id).collect();
+                let bundle = fhir::bundle("transaction", &entries);
+                let members: Vec<(i64, i64)> = items.iter().map(|i| (i.id, i.run)).collect();
+                match self.db.create_dispatch(
+                    &self.feed.id,
+                    &json!({"bundle": bundle, "owners": owner}),
+                    &members,
+                )? {
+                    Some(d) => (d, bundle, owner),
+                    None => return Ok(true),
+                }
+            }
+        };
+        self.db.set_dispatch_state(&dispatch, "sending")?;
+        let answer = self.fhir.send_bundle(&bundle).await;
+        // Who is still in it now (a reprocess cannot take a member meanwhile).
+        let members = self.db.dispatch_records(&dispatch)?;
+        match answer {
+            BundleAnswer::Unsent(reason) => {
+                self.db.set_dispatch_state(&dispatch, "held")?;
+                self.unconfirmed(&members, &reason, false, Some(&dispatch))
+            }
+            BundleAnswer::Lost(reason) => {
+                self.db.set_dispatch_state(&dispatch, "held")?;
+                self.unconfirmed(&members, &reason, true, Some(&dispatch))
+            }
+            BundleAnswer::Answered { status, body } if status >= 300 => {
+                if !fhir::is_definitive_refusal(status, &body) {
+                    self.db.set_dispatch_state(&dispatch, "held")?;
+                    return self.unconfirmed(
+                        &members,
+                        &format!("HTTP {status}"),
+                        true,
+                        Some(&dispatch),
+                    );
+                }
+                // A definitive refusal: nothing was committed.
+                self.recovered()?;
+                let alone = self.release(&members)?;
+                self.db.drop_dispatch_if_settled(&dispatch)?;
+                if alone.len() > 1 {
+                    tracing::warn!(target: "hie::pipeline", feed = %self.feed.id, status, "transaction refused; sending each row in a transaction of its own");
+                    for item in &alone {
+                        if !Box::pin(self.send_transaction(std::slice::from_ref(item), None))
+                            .await?
+                        {
+                            break;
+                        }
+                    }
+                } else if let Some(item) = alone.first() {
+                    let kind = if refuses_reference(item, &body) {
+                        "reference"
+                    } else {
+                        "server"
+                    };
+                    self.db.mark_failed(
+                        item.id,
+                        item.run,
+                        kind,
+                        &fhir::refusal_reason(status, &body),
+                        Some(&body),
+                        None,
+                    )?;
+                }
+                Ok(true)
+            }
+            BundleAnswer::Answered { body, .. } => {
+                let Some(answers) = transaction_answers(&body, owner.len()) else {
+                    // A success that does not confirm every entry: unknown, sent again.
+                    self.db.set_dispatch_state(&dispatch, "held")?;
+                    return self.unconfirmed(
+                        &members,
+                        "the destination's answer does not confirm every entry of the transaction",
+                        true,
+                        Some(&dispatch),
+                    );
+                };
+                self.recovered()?;
+                let sent: Vec<(i64, i64, Value)> = members
+                    .iter()
+                    .map(|item| {
+                        let mine: Vec<Value> = owner
+                            .iter()
+                            .zip(&answers)
+                            .filter(|(o, _)| **o == item.id)
+                            .map(|(_, a)| a.clone())
+                            .collect();
+                        (item.id, item.run, Value::Array(mine))
+                    })
+                    .collect();
+                self.db.mark_sent_many(&sent)?;
+                self.db.drop_dispatch_if_settled(&dispatch)?;
+                Ok(true)
+            }
+        }
     }
+
+    /// Sends a stored transaction again, with every row it holds. `false`
+    /// when the destination is still unavailable.
+    async fn resend(&self, dispatch: &str) -> Result<bool> {
+        let items = self.db.dispatch_records(dispatch)?;
+        if items.is_empty() {
+            self.db.drop_dispatch_if_settled(dispatch)?;
+            return Ok(true);
+        }
+        self.send_transaction(&items, Some(dispatch)).await
+    }
+
+    /// Takes rows out of their stored transaction (it was refused, or is
+    /// gone), so each can go on its own.
+    fn release(&self, items: &[WorkItem]) -> Result<Vec<WorkItem>> {
+        let ids: Vec<i64> = items.iter().map(|i| i.id).collect();
+        self.db.leave_dispatch(&ids)?;
+        Ok(items
+            .iter()
+            .cloned()
+            .map(|mut i| {
+                i.dispatch = None;
+                i
+            })
+            .collect())
+    }
+
+    /// The destination did not confirm `items`: they wait with the delivery
+    /// backoff, outcome unknown when the write was sent. Answers `false`.
+    fn unconfirmed(
+        &self,
+        items: &[WorkItem],
+        reason: &str,
+        sent: bool,
+        dispatch: Option<&str>,
+    ) -> Result<bool> {
+        self.hold(
+            items,
+            &Deferral {
+                waiting: Waiting::Destination,
+                reason,
+                sent,
+                dispatch,
+            },
+        )?;
+        let worst = items.iter().map(|i| i.attempts + 1).max().unwrap_or(0);
+        self.outage(worst, reason)?;
+        Ok(false)
+    }
+
+    /// Defers rows with the delivery backoff.
+    pub(super) fn hold(&self, items: &[WorkItem], deferral: &Deferral) -> Result<()> {
+        let now = now_ms();
+        let plan: Vec<(i64, i64, u32, i64)> = items
+            .iter()
+            .map(|item| {
+                let attempts = item.attempts + 1;
+                (item.id, item.run, attempts, now + self.backoff_ms(attempts))
+            })
+            .collect();
+        self.db.defer_many(&plan, deferral)
+    }
+
+    pub(super) fn backoff_ms(&self, attempts: u32) -> i64 {
+        let d = &self.feed.delivery;
+        d.initial_backoff_ms
+            .saturating_mul(1u64 << (attempts.max(1) - 1).min(20))
+            .min(d.max_backoff_ms) as i64
+    }
+}
+
+/// A Bundle entry: its request url and its resource.
+type Entry = (String, Value);
+
+/// A record's resources.
+fn resources(item: &WorkItem) -> Vec<Value> {
+    item.resources
+        .as_ref()
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The Bundle entries of `items` (request url, resource), and which item
+/// (by position) each entry belongs to.
+fn entries(items: &[WorkItem]) -> Result<(Vec<Entry>, Vec<usize>)> {
+    let mut entries = Vec::new();
+    let mut owner = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        for resource in resources(item) {
+            let key = transform::check_resource(&resource).map_err(anyhow::Error::msg)?;
+            entries.push((fhir::request_url(&key), resource));
+            owner.push(i);
+        }
+    }
+    Ok((entries, owner))
+}
+
+/// The record ids each entry of a stored transaction belongs to.
+fn owners(stored: &Value) -> Vec<i64> {
+    stored["owners"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_i64)
+        .collect()
+}
+
+/// The entry responses of a `transaction-response` Bundle that confirms every
+/// one of `expected` entries with a `2xx`; `None` for anything less (another
+/// Bundle type, entries missing or extra, an entry that is not a success).
+fn transaction_answers(body: &Value, expected: usize) -> Option<Vec<Value>> {
+    if body.get("resourceType").and_then(Value::as_str) != Some("Bundle")
+        || body.get("type").and_then(Value::as_str) != Some("transaction-response")
+    {
+        return None;
+    }
+    let entries = body.get("entry")?.as_array()?;
+    if entries.len() != expected {
+        return None;
+    }
+    entries
+        .iter()
+        .map(|e| {
+            let response = e.get("response")?;
+            let status: u16 = response
+                .get("status")?
+                .as_str()?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()?;
+            (200..300).contains(&status).then(|| response.clone())
+        })
+        .collect()
+}
+
+/// Whether a row's own transaction was refused over a conditional reference
+/// of it that matched no resource, or several.
+fn refuses_reference(item: &WorkItem, body: &Value) -> bool {
+    let references: Vec<String> = resources(item)
+        .iter()
+        .flat_map(fhir::conditional_references)
+        .collect();
+    if references.is_empty() {
+        return false;
+    }
+    let outcome = body.get("outcome").unwrap_or(body);
+    outcome["issue"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|issue| {
+            let code = issue["code"].as_str().unwrap_or_default();
+            let text = issue["diagnostics"]
+                .as_str()
+                .or_else(|| issue.pointer("/details/text").and_then(Value::as_str))
+                .unwrap_or_default();
+            matches!(code, "not-found" | "multiple-matches" | "duplicate")
+                || references.iter().any(|r| text.contains(r.as_str()))
+        })
 }

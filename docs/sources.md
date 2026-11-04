@@ -29,9 +29,38 @@ With a **notification queue** (`queue:` the URL of an SQS queue the bucket's `s3
 
 A **zip** that arrives on any file source is a drop of several files: every entry whose extension fits the source's format (`.csv`, `.ndjson`/`.jsonl`, `.json` for Bundles, `.hl7`) becomes a load of its own, named `drop.zip!/path/inside`; the other entries (a manifest, a README, a CSV in an NDJSON drop) are skipped. The zip is recorded as `unpacked`, archived like any file, and not read twice. Entries are unpacked in memory, so a zip should hold a few hundred megabytes at most. On the `source_objects` bulk path HFS cannot read a zip, so each unpacked entry is **staged** where HFS can fetch it: in the source's own store under `{archive_prefix}/unpacked/` when the store can be written and can sign URLs, otherwise under the engine's `bulk_dir`, served at `/bulk/{token}/files/{n}`; staged entries go once the receipts are in.
 
-A **FHIR server** source (`type: fhir_server`, see `sources/other-fhir.yaml.example`) pulls another server into HFS: it names the server's `url`, the resource `types` to pull, and optionally `since` (a FHIR instant to start from) and `auth` (`method: client_credentials` with `token_url`, `client_id`, `client_secret_env`, or `method: bearer` with `token_env`; secrets are read from the named environment variable, never written in the file). Each pass searches every type for `_lastUpdated=gt{cursor}` sorted by `_lastUpdated`, `page_size` per page and up to `max_pages` pages, and hands the resources on as one NDJSON load per type; the cursor moves to the newest `meta.lastUpdated` once the records are stored, so a crash repeats a page rather than losing it. The format is `ndjson` whatever the file says, resources go out by their id, and `bulk_submit` is refused. The connection test reads `/metadata` and counts what waits past each cursor.
+A **FHIR server** source (`type: fhir_server`, see `sources/other-fhir.yaml.example`) pulls another server into HFS: it names the server's `url`, the resource `types` to pull, and optionally `since` (a FHIR instant to start from) and `auth` (`method: client_credentials` with `token_url`, `client_id`, `client_secret_env`, or `method: bearer` with `token_env`; secrets are read from the named environment variable, never written in the file). Each pass searches every type for `_lastUpdated=gt{cursor}` sorted by `_lastUpdated`, `page_size` per page and up to `max_pages` pages, and hands the resources on as one NDJSON load per type; the cursor moves to the newest `meta.lastUpdated` once the records are stored, so a crash repeats a page rather than losing it. The format is `ndjson` whatever the file says and resources go out by their id. `bulk_submit` works with `bulk_from: transformed` (the engine writes the NDJSON); only `bulk_from: source_objects` is refused, since there is no file for HFS to fetch. The connection test reads `/metadata` and counts what waits past each cursor.
 
 A **database** source (`type: database`, see `sources/lab-database.yaml.example` and `transforms/sql_lab_results.py`) reads a SQL database with the operator's own query: `url_env` names the environment variable holding the connection URL (`postgres://`, `mysql://`, `sqlserver://` or `sqlite:`; the URL carries the password, so it is never in the file), `query` is the SQL with `{cursor}` where the cursor value goes, an `ORDER BY` on the cursor column and a `LIMIT`, and `cursor_column` is the column the cursor follows. Prefer a **unique, increasing column** such as an id: with an updated-at column, rows that share one timestamp (a multi-row `INSERT` gets a single `now()`) and fall on both sides of a `LIMIT` are never read, because the next run asks for values strictly past the cursor; the engine logs a warning when a whole run shares one cursor value. Each pass binds the cursor as a parameter, runs the query up to `max_runs` times moving the cursor between runs, and hands the rows on as one NDJSON load; each row reaches the transform as a JSON object with the database's types (numbers, ISO timestamps, JSON). The cursor keeps its kind (integer, float, timestamp, date, text) and moves to the largest value seen once the records are stored. `cursor_start` says where to begin the first time. PostgreSQL is the target; MySQL/MariaDB and SQLite go through the same code (the tests run on SQLite), and **SQL Server** through its own driver with the same definition: `sqlserver://user:password@host:1433/database?encrypt=on&trust_cert=true` (`mssql://` too; `encrypt` is on by default, `trust_cert=true` accepts a self-signed certificate; the placeholder is bound as `@P1`, and a `TOP n` plays the part of `LIMIT`). SQL Server authentication only; Windows authentication is not supported. The connection test connects and runs the query once past the cursor.
+
+A database source can also name its **connection by its parts** and **what to read** (0.2.0), with the password kept by HIE as a [secret](api.md#secrets) rather than in an environment variable:
+
+```yaml
+source:
+  type: database
+  connection:
+    engine: sqlserver          # sqlserver, postgres or sqlite (mssql and postgresql are read as aliases)
+    host: db.lab.internal
+    port: 1433                 # the engine's default (1433, 5432) when left out
+    database: labs
+    user: hie_reader
+    password: {secret: sec_7f3k2, revision: 1}   # a reference; the value never appears in the file
+    encrypt: true              # default true
+    trust_cert: false          # default false; true accepts a self-signed certificate
+  read:
+    mode: table
+    table: {schema: dbo, name: lab_results}      # the schema defaults to dbo, public or main
+    key: [id]                  # defaults to the table's primary key
+    new_rows_by: id            # not nullable; describe suggests integer, decimal, date or time columns
+  poll_seconds: 900
+```
+
+- `read.mode: table` reads the whole table by **keyset** on (`new_rows_by`, `key`): each run takes up to 1000 rows strictly past the last row stored on that whole tuple, ordered the same way, up to `max_runs` runs per pass, so rows that share a `new_rows_by` value are never skipped at a run's boundary, and rows added later with the same value are read next. The position moves once the rows are stored. A table without a primary key needs `key`; a Start without either is refused (`409 read_not_admitted`). Each row reaches the transform as a JSON object of all its columns.
+- `read.mode: query` is the operator's own SQL as above (`query` with `{cursor}`, `cursor_column`, `cursor_start`).
+- `sqlite` takes only `database`, a file path, and opens it read-only; it exists for tests and local work. SQL Server authentication only.
+- A source with a `connection` is created through the API after a **Test** (`POST /api/sources/test` answers `evidence`): the Start names that evidence, must define exactly what was tested, and uses the secret revision the Test used ([Start](api.md#start-creating-a-database-source)). Describe (tables, a table's columns, key and row count) and sample (the first rows of a read, held in memory for 30 minutes) work through passing evidence.
+- Every connection is checked against the **admission policy** in `hie.yaml` before a secret is opened or a socket is opened: on Test, describe, sample, Start, replace and every pass ([Admission](api.md#admission-policy)). The legacy `url_env` shape is checked on the parts of its URL. A running source the policy no longer admits reads `paused` by `admission` and is not passed.
+- Each pass opens its own connection and closes it after; the password is opened only while the connection is being opened. Connection errors are reduced to a fixed sentence (`authentication failed`, `connection refused`, `TLS handshake failed`, `timed out`, ...); a driver's own message is kept only when it holds no secret value HIE keeps.
 
 ### HL7 v2
 

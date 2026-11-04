@@ -27,12 +27,28 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("HIE_LOG")
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // The database drivers' own events are never logged, whatever HIE_LOG
+    // says (no directive, however specific, re-enables them): tiberius logs a
+    // server's error and info messages (a login failure may echo what was
+    // sent) and sqlx its statements and connect parameters. HIE logs its own
+    // sanitized account of a failure instead.
+    {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let env = tracing_subscriber::EnvFilter::try_from_env("HIE_LOG")
+            .unwrap_or_else(|_| "info".into());
+        let drivers = tracing_subscriber::filter::filter_fn(|metadata| {
+            !hie::connectors::database::is_driver_event(metadata.target())
+        });
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_filter(env)
+                    .with_filter(drivers),
+            )
+            .init();
+    }
     let cli = Cli::parse();
     let (mut config, feeds) = hie::config::load(&cli.config)?;
     // The store may be a PostgreSQL URL with a password: it comes from the

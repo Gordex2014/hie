@@ -240,26 +240,39 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
         .unwrap();
     let mut raw = alto[0]["raw"].clone();
     raw["value"] = json!("101");
-    assert!(
+    assert_eq!(
         state
             .db
             .reprocess(alto[0]["id"].as_i64().unwrap(), Some(&raw))
-            .unwrap()
+            .unwrap(),
+        hie::db::Reprocess::Done
     );
     runner.tick().await.unwrap();
     assert_eq!(count(&state, "sent"), 8);
     assert_eq!(count(&state, "rejected"), 5);
+    // Written by the reprocess, the row's failed content goes (0.2.0: failed
+    // content is purged once a retry or reprocess writes the row); its history
+    // keeps both attempts.
+    let id = alto[0]["id"].as_i64().unwrap();
     let fixed = state
         .db
         .query_json(
-            "SELECT raw, original_raw FROM records WHERE id = $1",
-            hie::db::params![alto[0]["id"].as_i64().unwrap()],
+            "SELECT raw, original_raw, content FROM records WHERE id = $1",
+            hie::db::params![id],
         )
         .unwrap();
-    assert_eq!(fixed[0]["raw"]["value"], "101");
+    assert_eq!(fixed[0]["raw"], Value::Null);
+    assert_eq!(fixed[0]["original_raw"], Value::Null);
+    assert_eq!(fixed[0]["content"], "purged");
+    let kinds: Vec<String> = state.db.record_history(id).unwrap().unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_string())
+        .collect();
     assert_eq!(
-        fixed[0]["original_raw"]["value"], "alto",
-        "the data as received is kept"
+        kinds,
+        ["admitted", "failed", "retried", "transformed", "delivered"]
     );
     assert_eq!(
         alert_kinds(&state)
@@ -280,5 +293,416 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
             .filter(|k| *k == "silence")
             .count(),
         1
+    );
+}
+
+/// A stand-in destination that records every Bundle (its type and entry urls)
+/// and answers `503` while `down`, resolving `Patient?identifier=` references
+/// in transactions against a seeded patient.
+#[derive(Default)]
+struct Recorder {
+    down: bool,
+    /// Answers this many Bundles with a bare `200 {}`, confirming nothing.
+    unconfirming: u32,
+    bundles: Vec<(String, Vec<String>)>,
+    stored: HashMap<String, Value>,
+}
+
+type Recorded = Arc<Mutex<Recorder>>;
+
+async fn record_bundle(
+    State(s): State<Recorded>,
+    Json(bundle): Json<Value>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    let mut s = s.lock().unwrap();
+    let kind = bundle["type"].as_str().unwrap_or_default().to_string();
+    let entries = bundle["entry"].as_array().cloned().unwrap_or_default();
+    let urls = entries
+        .iter()
+        .map(|e| e["request"]["url"].as_str().unwrap_or_default().to_string())
+        .collect();
+    s.bundles.push((kind.clone(), urls));
+    if s.unconfirming > 0 {
+        s.unconfirming -= 1;
+        return (axum::http::StatusCode::OK, Json(json!({})));
+    }
+    if s.down {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"resourceType": "OperationOutcome"})),
+        );
+    }
+    let mut answers = Vec::new();
+    for e in entries {
+        let mut resource = e["resource"].clone();
+        if kind == "transaction"
+            && resource["subject"]["reference"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("Patient?"))
+        {
+            resource["subject"]["reference"] = json!("Patient/pt-1");
+        }
+        s.stored.insert(
+            e["request"]["url"].as_str().unwrap_or_default().to_string(),
+            resource,
+        );
+        answers.push(json!({"response": {"status": "201 Created"}}));
+    }
+    (
+        axum::http::StatusCode::OK,
+        Json(
+            json!({"resourceType": "Bundle", "type": format!("{kind}-response"), "entry": answers}),
+        ),
+    )
+}
+
+async fn recorder() -> (String, Recorded) {
+    let state: Recorded = Arc::default();
+    let app = Router::new()
+        .route("/", post(record_bundle))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), state)
+}
+
+/// An engine over `root`, its source paused so the test drives the passes.
+fn engine(
+    root: &Path,
+    base: &str,
+    python: &str,
+) -> (Arc<hie::manager::SourceManager>, hie::api::AppState) {
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {base}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    manager.pause("lab", None).unwrap();
+    (manager, state)
+}
+
+const LAB_TRANSFORM: &str = "from hie import DataError\n\n\ndef transform(record, context):\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\"resourceType\": \"Observation\", \"id\": f\"obs-{record['id']}\", \"status\": \"final\",\n            \"code\": {\"text\": \"glucose\"}, \"valueQuantity\": {\"value\": number}}\n";
+
+/// A transaction sent without a confirming answer is kept as it was sent and
+/// the same one goes again after a restart, never split nor re-built.
+#[tokio::test]
+async fn an_unconfirmed_transaction_is_sent_again_after_a_restart() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let (base, dest) = recorder().await;
+    dest.lock().unwrap().down = true;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::write(
+        root.join("transforms/cond.py"),
+        "def transform(record, context):\n    return {\"resourceType\": \"Observation\", \"id\": f\"obs-{record['id']}\", \"status\": \"final\",\n            \"code\": {\"text\": \"glucose\"}, \"subject\": {\"reference\": f\"Patient?identifier=urn:mrn|{record['mrn']}\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sources/lab.yaml"),
+        "id: lab\nname: Lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  min_file_age_ms: 0\n\
+         transform: transforms/cond.py\ndelivery:\n  initial_backoff_ms: 10\n  max_backoff_ms: 20\n",
+    )
+    .unwrap();
+    drop_file(&root.join("inbox"), "a.csv", "id,mrn\n1,123\n2,123\n");
+
+    let (manager, state) = engine(root, &base, &python);
+    manager.runner("lab").unwrap().tick().await.unwrap();
+    let load = state.db.load_views("lab", None, None, false, 1).unwrap()[0].clone();
+    assert_eq!(load["rows"]["outcome_unknown"], 2);
+    assert_eq!(load["waiting"], "destination_unavailable");
+    drop((manager, state));
+
+    // A new engine on the same store; the destination answers again.
+    dest.lock().unwrap().down = false;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (manager, state) = engine(root, &base, &python);
+    manager.runner("lab").unwrap().tick().await.unwrap();
+    let load = state.db.load_views("lab", None, None, false, 1).unwrap()[0].clone();
+    assert_eq!(load["rows"]["written"], 2, "{load}");
+    assert_eq!(load["rows"]["outcome_unknown"], 0);
+    let bundles = dest.lock().unwrap().bundles.clone();
+    // At least the attempt before the restart and the one after it (the
+    // engine's own loop may have made one more before the source was paused).
+    assert!(bundles.len() >= 2, "{bundles:?}");
+    assert!(bundles.iter().all(|(kind, _)| kind == "transaction"));
+    assert!(
+        bundles
+            .iter()
+            .all(|(_, urls)| *urls == bundles[0].1 && urls.len() == 2),
+        "the same transaction every time, never split: {bundles:?}"
+    );
+    assert_eq!(
+        state
+            .db
+            .query_json("SELECT id FROM dispatches", [])
+            .unwrap(),
+        Vec::<Value>::new(),
+        "a settled transaction is not kept"
+    );
+    let facts = state.db.destination_written("lab").unwrap();
+    assert_eq!(facts["resources_written"], 2);
+    assert_eq!(facts["by_type"], json!({"Observation": 2}));
+    assert!(facts["last_written_at"].is_string());
+    let record = load["id"].as_i64().unwrap();
+    let rec = state
+        .db
+        .query_json(
+            "SELECT id FROM records WHERE file_id = $1 ORDER BY id",
+            hie::db::params![record],
+        )
+        .unwrap()[0]["id"]
+        .as_i64()
+        .unwrap();
+    let kinds: Vec<String> = state.db.record_history(rec).unwrap().unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "admitted",
+            "transformed",
+            "outcome_unknown",
+            "settled",
+            "delivered"
+        ]
+    );
+}
+
+/// Retries form a chain per group, run the version given at acceptance, never
+/// cover a row twice, and a later retry never lowers the day's failures.
+#[tokio::test]
+async fn retries_chain_and_keep_the_failures_of_their_day() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let (base, _dest) = recorder().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::write(root.join("transforms/lab_csv.py"), LAB_TRANSFORM).unwrap();
+    std::fs::write(
+        root.join("sources/lab.yaml"),
+        "id: lab\nname: Lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  min_file_age_ms: 0\n\
+         transform: transforms/lab_csv.py\n",
+    )
+    .unwrap();
+    drop_file(&root.join("inbox"), "a.csv", "id,value\n1,alto\n2,5.4\n");
+    let (manager, state) = engine(root, &base, &python);
+    let runner = manager.runner("lab").unwrap();
+    runner.tick().await.unwrap();
+    let db = &state.db;
+    let load = db.load_views("lab", None, None, false, 1).unwrap()[0]["id"]
+        .as_i64()
+        .unwrap();
+    let group = db
+        .failure_group(
+            load,
+            db.load_failures(load).unwrap()[0]["group"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let day = (hie::db::now_ms() - 3_600_000, hie::db::now_ms() + 3_600_000);
+    assert_eq!(
+        db.period_counts(Some("lab"), day.0, day.1).unwrap().failed,
+        1
+    );
+
+    // The same program again: the row fails again, in the same group.
+    let v1 = state.versions.latest("lab_csv").unwrap().unwrap();
+    let first = db.create_retry(&group, &v1).unwrap();
+    assert!(matches!(
+        db.create_retry(&group, &v1),
+        Err(hie::db::RetryRefusal::InProgress(id)) if id == first["id"]
+    ));
+    runner.tick().await.unwrap();
+    let first = db
+        .retry(load, first["id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (first["status"].as_str(), first["failed"].as_i64()),
+        (Some("done"), Some(1))
+    );
+    let again = db.failure_group(load, &group.id).unwrap().unwrap();
+    assert_eq!(again.count, 1);
+    assert_eq!(
+        db.period_counts(Some("lab"), day.0, day.1).unwrap().failed,
+        1
+    );
+
+    // A fixed program: the retry writes the row; the day keeps its failure.
+    let fixed_code = LAB_TRANSFORM.replace(
+        "raise DataError(f\"value {value!r} is not a number\")",
+        "number = 0.0",
+    );
+    let (_, saved) = state
+        .versions
+        .save_legacy("lab_csv", &fixed_code)
+        .await
+        .unwrap();
+    assert_eq!(saved, 2);
+    let fixed = state.versions.latest("lab_csv").unwrap().unwrap();
+    assert_eq!(fixed.version, 2);
+    let second = db.create_retry(&again, &fixed).unwrap();
+    assert_eq!(second["previous"], first["id"]);
+    runner.tick().await.unwrap();
+    let second = db
+        .retry(load, second["id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (second["status"].as_str(), second["written"].as_i64()),
+        (Some("done"), Some(1))
+    );
+    let counts = db.period_counts(Some("lab"), day.0, day.1).unwrap();
+    assert_eq!((counts.failed, counts.written, counts.rows_read), (1, 2, 2));
+    assert_eq!(db.failure_group(load, &group.id).unwrap().unwrap().count, 0);
+    assert!(db.load_failures(load).unwrap().is_empty());
+    assert!(matches!(
+        db.create_retry(&again, &fixed),
+        Err(hie::db::RetryRefusal::NothingToRetry)
+    ));
+    let runs = |version| {
+        db.version_runs("lab_csv", version, 10)
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.kind, r.outcome))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(runs(2), ["retry written"]);
+    assert_eq!(runs(1), ["retry failed", "load partial"]);
+}
+
+fn lab_source(root: &Path) {
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::write(
+        root.join("transforms/cond.py"),
+        "def transform(record, context):\n    return {\"resourceType\": \"Observation\", \"id\": f\"obs-{record['id']}\", \"status\": \"final\",\n            \"code\": {\"text\": \"glucose\"}, \"subject\": {\"reference\": f\"Patient?identifier=urn:mrn|{record['mrn']}\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sources/lab.yaml"),
+        "id: lab\nname: Lab\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  min_file_age_ms: 0\n\
+         transform: transforms/cond.py\ndelivery:\n  initial_backoff_ms: 10\n  max_backoff_ms: 20\n",
+    )
+    .unwrap();
+}
+
+fn event_kinds(state: &hie::api::AppState, record: i64) -> Vec<String> {
+    state.db.record_history(record).unwrap().unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A success that does not confirm every entry of a transaction (here a bare
+/// `{}`) is no confirmation: the rows are outcome unknown and the same
+/// transaction goes again.
+#[tokio::test]
+async fn a_transaction_answer_that_confirms_nothing_leaves_the_outcome_unknown() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let (base, dest) = recorder().await;
+    dest.lock().unwrap().unconfirming = 1;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    lab_source(root);
+    drop_file(&root.join("inbox"), "a.csv", "id,mrn\n1,123\n2,123\n");
+    let (manager, state) = engine(root, &base, &python);
+    let runner = manager.runner("lab").unwrap();
+    runner.tick().await.unwrap();
+    let load = state.db.load_views("lab", None, None, false, 1).unwrap()[0].clone();
+    assert_eq!(load["rows"]["outcome_unknown"], 2, "{load}");
+    assert_eq!(load["rows"]["written"], 0);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    runner.tick().await.unwrap();
+    let load = state.db.load_views("lab", None, None, false, 1).unwrap()[0].clone();
+    assert_eq!(load["rows"]["written"], 2, "{load}");
+    let bundles = dest.lock().unwrap().bundles.clone();
+    assert!(
+        bundles.len() >= 2
+            && bundles
+                .iter()
+                .all(|(k, u)| k == "transaction" && *u == bundles[0].1)
+    );
+}
+
+/// A transaction is kept before it is sent: one found still `sending` (the
+/// engine stopped mid-send) is outcome unknown, and goes again as it was.
+#[tokio::test]
+async fn a_transaction_kept_while_sending_is_unknown_and_sent_again() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let (base, dest) = recorder().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    lab_source(root);
+    let (manager, state) = engine(root, &base, &python);
+    // What an engine stopped mid-send left: a transformed row in a stored
+    // transaction still marked `sending`.
+    let db = &state.db;
+    let load = db.open_load("lab", "a.csv", "sha", 3, None, None).unwrap();
+    db.insert_records(load, "lab", &[(1, json!({"id": "1", "mrn": "123"}), None)])
+        .unwrap();
+    let item = db.received_records("lab", 1).unwrap()[0].clone();
+    let resource = json!({"resourceType": "Observation", "id": "obs-1", "status": "final",
+        "code": {"text": "glucose"}, "subject": {"reference": "Patient?identifier=urn:mrn|123"}});
+    db.mark_transformed(item.id, item.run, &json!([resource.clone()]))
+        .unwrap();
+    let bundle = hie::fhir::bundle("transaction", &[("Observation/obs-1".into(), resource)]);
+    db.create_dispatch(
+        "lab",
+        &json!({"bundle": bundle, "owners": [item.id]}),
+        &[(item.id, item.run)],
+    )
+    .unwrap()
+    .unwrap();
+    manager.runner("lab").unwrap().tick().await.unwrap();
+    let load = db.load_view(load).unwrap().unwrap();
+    assert_eq!(load["rows"]["written"], 1, "{load}");
+    assert_eq!(
+        event_kinds(&state, item.id),
+        [
+            "admitted",
+            "transformed",
+            "outcome_unknown",
+            "settled",
+            "delivered"
+        ]
+    );
+    assert_eq!(
+        dest.lock().unwrap().bundles,
+        [(
+            "transaction".to_string(),
+            vec!["Observation/obs-1".to_string()]
+        )]
+    );
+    assert!(
+        db.query_json("SELECT id FROM dispatches", [])
+            .unwrap()
+            .is_empty()
     );
 }

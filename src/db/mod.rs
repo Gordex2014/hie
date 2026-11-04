@@ -4,14 +4,23 @@
 //! Placeholders are `$1`, `$2`, ...; SQLite gets them as `?1`, `?2`.
 //!
 //! `mod.rs` opens the store and creates or upgrades its schema; each area
-//! (`loads`, `submissions`, `sources`, `alerts`) owns its tables, the columns
-//! added to them since, and its queries. `engine` holds the two drivers.
+//! (`loads`, `submissions`, `sources`, `alerts`, `idempotency`, `settings`,
+//! `passes`, `versions`, `secrets`, `connectors`, `history`) owns its tables,
+//! the columns added to them since, and its queries. `engine` holds the two
+//! drivers; [`Db::transaction`] runs several statements as one.
 
 mod alerts;
+mod connectors;
 mod engine;
+mod history;
+mod idempotency;
 mod loads;
+mod passes;
+mod secrets;
+mod settings;
 mod sources;
 mod submissions;
+mod versions;
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -22,7 +31,13 @@ use serde_json::Value;
 pub use alerts::Rule;
 use engine::{Conn, PgHandle};
 pub use engine::{IntoParam, Param, Row};
-pub use loads::{FinishedFile, WorkItem};
+pub use history::{Group, PeriodCounts, RetryRefusal, VersionRun};
+pub use idempotency::Claim;
+pub use loads::{
+    Deferral, FailedRow, FailedRowsError, FinishedFile, REASON_MAX_CHARS, Reprocess, StoredRef,
+    StoredRow, StoredRowsError, Waiting, WorkItem,
+};
+pub use passes::{Pass, PassStatus};
 pub use sources::Lease;
 pub use submissions::{Submission, SubmittableFile};
 
@@ -39,12 +54,26 @@ const TABLES: &[&str] = &[
     sources::LEASES,
     submissions::SUBMISSIONS,
     alerts::RULES,
+    idempotency::IDEMPOTENCY,
+    settings::SETTINGS,
+    passes::PASSES,
+    versions::TABLES,
+    secrets::TABLES,
+    connectors::TABLES,
+    history::TABLES,
 ];
 
 /// Columns added after a store was first created, per area, in the order they
 /// are added; each is added when missing, after the tables exist. A new area's
 /// list appends here.
-const ADDED_COLUMNS: &[&[(&str, &str, &str)]] = &[loads::ADDED_COLUMNS, alerts::ADDED_COLUMNS];
+const ADDED_COLUMNS: &[&[(&str, &str, &str)]] = &[
+    loads::ADDED_COLUMNS,
+    alerts::ADDED_COLUMNS,
+    versions::ADDED_COLUMNS,
+    secrets::ADDED_COLUMNS,
+    connectors::ADDED_COLUMNS,
+    history::ADDED_COLUMNS,
+];
 
 /// The DDL of every table, as one batch.
 fn schema() -> String {
@@ -110,6 +139,8 @@ pub struct Db {
     postgres: bool,
     /// A schema created for one test run on PostgreSQL, dropped with the store.
     test_schema: Option<String>,
+    /// The keys record content is sealed with (`loads.rs`).
+    content: loads::ContentKeys,
 }
 
 impl Db {
@@ -161,6 +192,7 @@ impl Db {
             conn: Mutex::new(Conn::Sqlite(conn)),
             postgres: false,
             test_schema: None,
+            content: Default::default(),
         })
     }
 
@@ -188,6 +220,7 @@ impl Db {
             conn: Mutex::new(Conn::Postgres(client)),
             postgres: true,
             test_schema,
+            content: Default::default(),
         })
     }
 
@@ -224,6 +257,28 @@ impl Db {
             .context("INSERT returned no id")
     }
 
+    /// Runs `f` as one transaction: committed when it returns `Ok`, rolled back
+    /// when it returns `Err`. The store is held for the whole of it, so `f`
+    /// must use the [`Tx`] it is given, never `self`.
+    pub fn transaction<T, E: From<anyhow::Error>>(
+        &self,
+        f: impl FnOnce(&mut Tx<'_>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let mut conn = self.conn.lock().expect("database mutex poisoned");
+        conn.batch("BEGIN").map_err(E::from)?;
+        let mut tx = Tx { conn: &mut conn };
+        match f(&mut tx) {
+            Ok(value) => {
+                conn.batch("COMMIT").map_err(E::from)?;
+                Ok(value)
+            }
+            Err(e) => {
+                let _ = conn.batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     /// The SQL that formats an epoch-milliseconds column as an ISO instant.
     pub fn iso(&self, col: &str) -> String {
         if self.postgres {
@@ -246,10 +301,44 @@ impl Db {
 
     /// Runs a read-only query and returns each row as a JSON object keyed by column
     /// name; the JSON columns (`raw`, `original_raw`, `resources`, `response`) come
-    /// back parsed.
+    /// back parsed, and opened when sealed.
     pub fn query_json(&self, sql: &str, p: impl Into<Vec<Param>>) -> Result<Vec<Value>> {
         let p = p.into();
-        Ok(self.query(sql, &p)?.iter().map(Row::object).collect())
+        Ok(self
+            .query(sql, &p)?
+            .iter()
+            .map(|r| self.reveal(r.object()))
+            .collect())
+    }
+}
+
+/// Statements inside [`Db::transaction`].
+pub struct Tx<'a> {
+    conn: &'a mut Conn,
+}
+
+impl Tx<'_> {
+    pub fn execute(&mut self, sql: &str, params: &[Param]) -> Result<u64> {
+        self.conn.execute(sql, params)
+    }
+
+    /// Rows as JSON objects, as [`Db::query_json`] returns them.
+    pub fn query_json(&mut self, sql: &str, params: &[Param]) -> Result<Vec<Value>> {
+        Ok(self
+            .conn
+            .query(sql, params)?
+            .iter()
+            .map(Row::object)
+            .collect())
+    }
+
+    /// An inserted row's id.
+    pub fn insert_returning_id(&mut self, sql: &str, params: &[Param]) -> Result<i64> {
+        self.conn
+            .query(&format!("{sql} RETURNING id"), params)?
+            .first()
+            .map(|r| r.i64(0))
+            .context("INSERT returned no id")
     }
 }
 
@@ -328,6 +417,91 @@ mod tests {
         assert!(!db.acquire_lease("lab", "a", 60_000).unwrap());
         db.release_lease("lab", "b").unwrap();
         assert!(db.acquire_lease("lab", "a", 60_000).unwrap());
+    }
+
+    #[test]
+    fn a_load_runs_its_snapshot_unless_a_retry_names_another_version() {
+        use crate::versions::{Environment, VersionKey, VersionRef};
+        let db = Db::in_memory().unwrap();
+        let v1 = VersionRef {
+            transform_id: "lab".into(),
+            version: 1,
+            code_sha256: "a".repeat(64),
+            environment: Environment::local(),
+        };
+        // A queued load is adopted by the next object, and fixes its version then.
+        let queued = db.create_queued_load("src").unwrap();
+        let load = db
+            .open_load("src", "a.csv", "sha", 3, None, Some(&v1))
+            .unwrap();
+        assert_eq!(load, queued);
+        let other = db.open_load("src", "b.csv", "sha2", 3, None, None).unwrap();
+        assert_ne!(other, load);
+        db.insert_records(
+            load,
+            "src",
+            &[
+                (1, serde_json::json!({}), None),
+                (2, serde_json::json!({}), None),
+            ],
+        )
+        .unwrap();
+        db.insert_records(other, "src", &[(1, serde_json::json!({}), None)])
+            .unwrap();
+        let second = db.received_records("src", 10).unwrap()[1].id;
+        db.execute(
+            "UPDATE records SET exec_retry = 'rt_x', exec_transform_id = 'lab', exec_version = 2 WHERE id = $1",
+            &params![second],
+        )
+        .unwrap();
+        let items = db.received_records_after("src", 0, 10).unwrap();
+        let runs: Vec<(Option<String>, Option<VersionKey>)> = items
+            .iter()
+            .map(|i| (i.retry.clone(), i.version.clone()))
+            .collect();
+        let key = |version| {
+            Some(VersionKey {
+                transform_id: "lab".into(),
+                version,
+            })
+        };
+        assert_eq!(
+            runs,
+            [(None, key(1)), (Some("rt_x".into()), key(2)), (None, None)]
+        );
+        assert_eq!(
+            db.received_records_after("src", items[1].id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        let environment = db
+            .query_json("SELECT environment FROM files WHERE id = $1", params![load])
+            .unwrap();
+        assert_eq!(
+            environment[0]["environment"],
+            serde_json::to_string(&Environment::local()).unwrap()
+        );
+    }
+
+    #[test]
+    fn passes_asked_for_are_served_by_the_next_pass() {
+        let db = Db::in_memory().unwrap();
+        let a = db.request_pass("src").unwrap();
+        let b = db.request_pass("src").unwrap();
+        assert!(a.starts_with("ps_") && a != b);
+        let started = db.start_passes("src").unwrap();
+        assert_eq!(started, [a.clone(), b.clone()]);
+        assert!(db.start_passes("src").unwrap().is_empty());
+        assert_eq!(db.pass("src", &a).unwrap().unwrap().status, "running");
+        db.finish_passes(&started, PassStatus::Done, None, None, &[7], 3)
+            .unwrap();
+        let pass = db.pass("src", &b).unwrap().unwrap();
+        assert_eq!(
+            (pass.status.as_str(), pass.loads, pass.new_rows),
+            ("done", vec![7], 3)
+        );
+        assert!(db.pass("other", &b).unwrap().is_none());
     }
 
     #[test]

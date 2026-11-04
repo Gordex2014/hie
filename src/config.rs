@@ -35,9 +35,161 @@ pub struct Config {
     pub transforms_dir: PathBuf,
     #[serde(default)]
     pub alerts: AlertConfig,
+    /// The connections the engine may open; nothing is enforced without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<AdmissionConfig>,
+    /// Whether resources are checked with the destination's `$validate` before
+    /// they are delivered.
+    #[serde(default)]
+    pub validation: Validation,
+    #[serde(default)]
+    pub retention: RetentionConfig,
+    #[serde(default)]
+    pub destination: DestinationConfig,
+    /// Custody of secret values: `key_file`, or `HIE_SECRETS_KEY`.
+    #[serde(default)]
+    pub secrets: KeyFileConfig,
+    /// Custody of failed rows' content: `key_file`, or `HIE_CONTENT_KEY`, or a
+    /// random key file in the store's directory.
+    #[serde(default)]
+    pub content: KeyFileConfig,
+    #[serde(default, rename = "try")]
+    pub try_runs: TryConfig,
     /// The directory holding `hie.yaml`; relative paths in source files resolve against it.
     #[serde(skip)]
     pub base_dir: PathBuf,
+}
+
+/// `admission` in `hie.yaml`: the whole connections the engine may open.
+/// Entries are normalized when `hie.yaml` is loaded (see [`ConnectionParts`]).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct AdmissionConfig {
+    /// The installation declares it holds synthetic data only.
+    #[serde(default)]
+    pub synthetic_only: bool,
+    #[serde(default)]
+    pub databases: Vec<ConnectionParts>,
+}
+
+/// The parts of a database connection admission compares, normalized:
+/// `engine` lower case with `mssql` read as `sqlserver` and `postgresql` as
+/// `postgres`; `host` lower case without a trailing dot; `port` the engine's
+/// default (1433, 5432) when left out; `database` exactly as written.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ConnectionParts {
+    pub engine: String,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default, deserialize_with = "flex::opt_port")]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub database: Option<String>,
+}
+
+impl ConnectionParts {
+    /// The same parts, normalized.
+    pub fn normalized(&self) -> Self {
+        let engine = normalize_engine(&self.engine);
+        Self {
+            port: self.port.or_else(|| default_port(&engine)),
+            host: self
+                .host
+                .as_deref()
+                .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase()),
+            database: self.database.clone(),
+            engine,
+        }
+    }
+}
+
+/// `sqlserver`, `postgres`, `sqlite`, ...: lower case, with the aliases read.
+pub fn normalize_engine(engine: &str) -> String {
+    match engine.trim().to_ascii_lowercase().as_str() {
+        "mssql" => "sqlserver".into(),
+        "postgresql" => "postgres".into(),
+        other => other.into(),
+    }
+}
+
+/// The port an engine listens on when a definition leaves it out.
+pub fn default_port(engine: &str) -> Option<u16> {
+    match engine {
+        "sqlserver" => Some(1433),
+        "postgres" => Some(5432),
+        "mysql" => Some(3306),
+        _ => None,
+    }
+}
+
+/// `validation` in `hie.yaml`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Validation {
+    /// As in 0.1: resources are not checked before delivery.
+    #[default]
+    Off,
+    /// Every resource is checked with the destination's `$validate` first.
+    Required,
+}
+
+/// `retention` in `hie.yaml`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RetentionConfig {
+    /// How long failed rows' content is kept (`30d` by default).
+    #[serde(
+        default = "default_failed_content",
+        deserialize_with = "flex::duration",
+        serialize_with = "flex::serialize_duration"
+    )]
+    pub failed_content: Duration,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            failed_content: default_failed_content(),
+        }
+    }
+}
+
+fn default_failed_content() -> Duration {
+    Duration::from_secs(30 * 86_400)
+}
+
+/// `destination` in `hie.yaml`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct DestinationConfig {
+    /// What people call the destination; `null` in the API when unset.
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+/// `secrets` and `content` in `hie.yaml`: where a key lives.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct KeyFileConfig {
+    /// A file holding the key (32 bytes, base64); relative to `hie.yaml`.
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
+}
+
+/// `try` in `hie.yaml`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TryConfig {
+    /// Try runs at once per engine; more are `429 try_busy`.
+    #[serde(default = "default_try_max_concurrent")]
+    pub max_concurrent: usize,
+}
+
+impl Default for TryConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: default_try_max_concurrent(),
+        }
+    }
+}
+
+fn default_try_max_concurrent() -> usize {
+    1
 }
 
 /// The shared Python runtime (python-runtime's HIE facade).
@@ -87,6 +239,88 @@ pub struct AlertConfig {
     pub webhook_url: Option<String>,
 }
 
+/// What a source's `transform` names: a pin (`{"id", "version"}` or
+/// `{"id", "follow": "current"}`), or the 0.1 file path, which follows the
+/// current version of that file's transform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TransformRef {
+    Pin(TransformPin),
+    File(PathBuf),
+}
+
+/// A transform pin as a definition writes it; exactly one of `version` and
+/// `follow` (checked by [`FeedConfig::resolve`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransformPin {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow: Option<Follow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Follow {
+    Current,
+}
+
+/// How a source chooses its version, once the reference is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinMode {
+    Version(i64),
+    FollowCurrent,
+}
+
+impl TransformRef {
+    /// The transform's id: the pin's, or a file's stem.
+    pub fn id(&self) -> String {
+        match self {
+            TransformRef::Pin(p) => p.id.clone(),
+            TransformRef::File(path) => path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        }
+    }
+
+    /// Pinned to a version, or following the current one (a file path follows).
+    pub fn mode(&self) -> PinMode {
+        match self {
+            TransformRef::Pin(TransformPin {
+                version: Some(v), ..
+            }) => PinMode::Version(*v),
+            _ => PinMode::FollowCurrent,
+        }
+    }
+
+    /// The file a 0.1 reference names; `None` for a pin.
+    pub fn file(&self) -> Option<&Path> {
+        match self {
+            TransformRef::File(path) => Some(path),
+            TransformRef::Pin(_) => None,
+        }
+    }
+
+    /// For logs: the path, or `id@version` / `id@current`.
+    pub fn display(&self) -> String {
+        match (self, self.mode()) {
+            (TransformRef::File(path), _) => path.display().to_string(),
+            (_, PinMode::Version(v)) => format!("{}@{v}", self.id()),
+            (_, PinMode::FollowCurrent) => format!("{}@current", self.id()),
+        }
+    }
+}
+
+impl From<PathBuf> for TransformRef {
+    fn from(path: PathBuf) -> Self {
+        TransformRef::File(path)
+    }
+}
+
 /// A source: one connection, its format, its transform, how it is delivered and
 /// how often data is expected. Serialized as the source's YAML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +330,9 @@ pub struct FeedConfig {
     pub source: SourceConfig,
     #[serde(default)]
     pub format: Format,
-    pub transform: PathBuf,
+    /// The transform a load runs: a pin, or (0.1) a file path. A path is made
+    /// absolute by [`FeedConfig::resolve`].
+    pub transform: TransformRef,
     #[serde(default)]
     pub delivery: DeliveryConfig,
     #[serde(
@@ -181,15 +417,24 @@ pub enum SourceConfig {
     /// A SQL database, read with a query that follows a cursor column: each pass
     /// binds the cursor where the query says `{cursor}` and takes the rows past it.
     Database {
-        /// Environment variable holding the connection URL
+        /// 0.1: the environment variable holding the connection URL
         /// (`postgres://user:pass@host/db`, `mysql://...`, `sqlite://path`).
-        url_env: String,
-        /// The query, with `{cursor}` where the cursor value goes and an
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url_env: Option<String>,
+        /// 0.2.0: the connection by its parts, with the password a secret reference.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection: Option<DatabaseConnection>,
+        /// 0.2.0: what to read (a table by keyset, or the operator's query).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read: Option<DatabaseRead>,
+        /// 0.1: the query, with `{cursor}` where the cursor value goes and an
         /// `ORDER BY` on the cursor column; a `LIMIT` bounds each run.
-        query: String,
-        /// The column the cursor follows: its largest value in a run becomes the
-        /// next cursor. A monotonic column (an id, an updated-at with a sequence).
-        cursor_column: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+        /// 0.1: the column the cursor follows: its largest value in a run becomes
+        /// the next cursor. A monotonic column (an id, an updated-at with a sequence).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor_column: Option<String>,
         /// The first cursor value, when the table should not be read from the start.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor_start: Option<String>,
@@ -211,6 +456,91 @@ pub enum SourceConfig {
         #[serde(default = "default_mllp_poll_seconds")]
         poll_seconds: u64,
     },
+}
+
+/// A database connection by its parts (0.2.0). `sqlite` takes only `database`,
+/// a file path. Ports and flags may be written as strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseConnection {
+    /// `sqlserver`, `postgres` or `sqlite` (aliases `mssql`, `postgresql`).
+    pub engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "flex::opt_port"
+    )]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<SecretRef>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "flex::opt_bool"
+    )]
+    pub encrypt: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "flex::opt_bool"
+    )]
+    pub trust_cert: Option<bool>,
+}
+
+impl DatabaseConnection {
+    /// The parts admission compares, normalized.
+    pub fn parts(&self) -> ConnectionParts {
+        ConnectionParts {
+            engine: self.engine.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            database: self.database.clone(),
+        }
+        .normalized()
+    }
+}
+
+/// A reference to a kept secret: `{"secret": "sec_...", "revision": n}`; a
+/// reference without `revision` takes the one the source's evidence recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretRef {
+    pub secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u32>,
+}
+
+/// What a database source reads (0.2.0).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum DatabaseRead {
+    /// One table by keyset on (`new_rows_by`, `key`); `key` defaults to the
+    /// table's primary key.
+    Table {
+        table: TableName,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        key: Vec<String>,
+        new_rows_by: String,
+    },
+    /// The operator's own SQL, as in 0.1.
+    Query {
+        query: String,
+        cursor_column: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor_start: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableName {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    pub name: String,
 }
 
 fn default_spool() -> PathBuf {
@@ -289,6 +619,39 @@ pub struct DeliveryConfig {
     /// Records per submission on the `transformed` path.
     #[serde(default = "default_bulk_records_max")]
     pub bulk_records_max: usize,
+    /// `as_sent` (default) or `namespaced`: ids derived from the source.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ids: DeliveryIds,
+    /// `auto` (default), `batch` or `transaction`.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub bundle: BundleType,
+    /// The method of a source's first load, when it differs from `method`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_method: Option<DeliveryMethod>,
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryIds {
+    /// Ids as the transform returns them, as in 0.1.
+    #[default]
+    AsSent,
+    /// Every id derived from the source, the type and the origin id.
+    Namespaced,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleType {
+    /// A `transaction` when a chunk holds a conditional reference, else a `batch`.
+    #[default]
+    Auto,
+    Batch,
+    Transaction,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -324,6 +687,9 @@ impl Default for DeliveryConfig {
             manifest_objects_max: default_manifest_objects_max(),
             bulk_from: BulkFrom::Auto,
             bulk_records_max: default_bulk_records_max(),
+            ids: DeliveryIds::default(),
+            bundle: BundleType::default(),
+            initial_method: None,
         }
     }
 }
@@ -450,13 +816,32 @@ impl FeedConfig {
                 );
             }
         }
-        self.transform = base.join(&self.transform);
-        if !self.transform.is_file() {
-            bail!(
-                "source {}: transform {} not found",
-                self.id,
-                self.transform.display()
-            );
+        match &mut self.transform {
+            TransformRef::File(path) => {
+                *path = base.join(&*path);
+                if !path.is_file() {
+                    bail!("source {}: transform {} not found", self.id, path.display());
+                }
+            }
+            // Whether the transform and its version exist is the version
+            // store's to say, when the source starts.
+            TransformRef::Pin(pin) => {
+                if !is_transform_id(&pin.id) {
+                    bail!(
+                        "source {}: transform id {:?} must be 1 to 64 lowercase letters, digits, dashes and underscores",
+                        self.id,
+                        pin.id
+                    );
+                }
+                match (pin.version, pin.follow) {
+                    (Some(v), None) if v >= 1 => {}
+                    (None, Some(Follow::Current)) => {}
+                    _ => bail!(
+                        "source {}: transform takes either {{\"id\", \"version\": n}} or {{\"id\", \"follow\": \"current\"}}",
+                        self.id
+                    ),
+                }
+            }
         }
         self.expect_every = self
             .expect_every_text
@@ -468,7 +853,59 @@ impl FeedConfig {
     }
 }
 
+/// Whether `id` can name a transform: `[a-z0-9][a-z0-9_-]{0,63}`.
+pub fn is_transform_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'-')
+}
+
 impl Config {
+    /// The keys secret values are sealed with: `HIE_SECRETS_KEY`, else
+    /// `secrets.key_file`; `None` when neither is set (the secret routes then
+    /// answer `503 secrets_unavailable`). An unreadable key is an error.
+    pub fn secrets_keys(&self) -> Result<Option<crate::crypto::Keyring>> {
+        if let Some(keys) = crate::crypto::Keyring::from_env("HIE_SECRETS_KEY")? {
+            return Ok(Some(keys));
+        }
+        self.secrets
+            .key_file
+            .as_deref()
+            .map(crate::crypto::Keyring::from_file)
+            .transpose()
+    }
+
+    /// The keys failed rows' content is sealed with: `HIE_CONTENT_KEY`, else
+    /// `content.key_file`, else `content.key` in the store's directory,
+    /// created with a random key the first time.
+    pub fn content_keys(&self) -> Result<crate::crypto::Keyring> {
+        if let Some(keys) = crate::crypto::Keyring::from_env("HIE_CONTENT_KEY")? {
+            return Ok(keys);
+        }
+        match &self.content.key_file {
+            Some(path) => crate::crypto::Keyring::from_file(path),
+            None => crate::crypto::Keyring::load_or_create(&self.store_dir().join("content.key")),
+        }
+    }
+
+    /// The directory of the store: the SQLite file's, or `data/` under
+    /// `hie.yaml`'s directory when the store is PostgreSQL.
+    pub fn store_dir(&self) -> PathBuf {
+        let spec = self.database.to_string_lossy();
+        if spec.starts_with("postgres://") || spec.starts_with("postgresql://") {
+            self.base_dir.join("data")
+        } else {
+            self.database
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+        }
+    }
+
     /// Where the engine writes the NDJSON it serves for transformed submissions:
     /// next to the SQLite file, or under `data/bulk` when the store is PostgreSQL.
     pub fn bulk_dir(&self) -> PathBuf {
@@ -495,11 +932,7 @@ impl FeedConfig {
             BulkFrom::Transformed => true,
             BulkFrom::SourceObjects => false,
             BulkFrom::Auto => {
-                let passthrough = self
-                    .transform
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n == "fhir_passthrough.py");
+                let passthrough = self.transform.id() == "fhir_passthrough";
                 !(matches!(self.format, Format::Ndjson | Format::FhirBundle) && passthrough)
             }
         }
@@ -523,6 +956,20 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     config.database = base.join(&config.database);
     config.sources_dir = base.join(&config.sources_dir);
     config.transforms_dir = base.join(&config.transforms_dir);
+    for path in [&mut config.secrets.key_file, &mut config.content.key_file]
+        .into_iter()
+        .flatten()
+    {
+        *path = base.join(&*path);
+    }
+    if let Some(admission) = &mut config.admission {
+        for entry in &mut admission.databases {
+            *entry = entry.normalized();
+        }
+    }
+    if config.try_runs.max_concurrent == 0 {
+        bail!("try.max_concurrent must be at least 1");
+    }
     std::fs::create_dir_all(&config.sources_dir)
         .with_context(|| format!("creating {}", config.sources_dir.display()))?;
 
@@ -565,6 +1012,70 @@ pub fn parse_duration(text: &str) -> Result<Duration> {
         _ => bail!("invalid duration unit in {text:?} (use s, m, h or d)"),
     };
     Ok(Duration::from_secs(secs))
+}
+
+/// Lenient readers for values a definition may write as numbers or strings.
+mod flex {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumberOrText {
+        Number(u64),
+        Text(String),
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrText {
+        Bool(bool),
+        Text(String),
+    }
+
+    /// A port as a number or a numeric string.
+    pub fn opt_port<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u16>, D::Error> {
+        use serde::de::Error;
+        let port = match Option::<NumberOrText>::deserialize(d)? {
+            None => return Ok(None),
+            Some(NumberOrText::Number(n)) => n,
+            Some(NumberOrText::Text(t)) => t
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| D::Error::custom("port must be a number"))?,
+        };
+        u16::try_from(port)
+            .ok()
+            .filter(|p| *p > 0)
+            .map(Some)
+            .ok_or_else(|| D::Error::custom("port must be 1 to 65535"))
+    }
+
+    /// A flag as a boolean or `"true"` / `"false"`.
+    pub fn opt_bool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+        use serde::de::Error;
+        match Option::<BoolOrText>::deserialize(d)? {
+            None => Ok(None),
+            Some(BoolOrText::Bool(b)) => Ok(Some(b)),
+            Some(BoolOrText::Text(t)) => match t.trim().to_ascii_lowercase().as_str() {
+                "true" | "yes" | "1" => Ok(Some(true)),
+                "false" | "no" | "0" => Ok(Some(false)),
+                _ => Err(D::Error::custom("expected true or false")),
+            },
+        }
+    }
+
+    /// A duration written as `30d`, `24h`, `30m` or `90s`.
+    pub fn duration<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        use serde::de::Error;
+        let text = String::deserialize(d)?;
+        super::parse_duration(&text).map_err(|e| D::Error::custom(format!("{e:#}")))
+    }
+
+    pub fn serialize_duration<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("{}s", d.as_secs()))
+    }
 }
 
 /// Matches a file name against a pattern with at most one `*`, ignoring case.
@@ -643,6 +1154,6 @@ mod tests {
         );
         feed.id = "good-id".into();
         feed.resolve(dir.path()).unwrap();
-        assert!(feed.transform.is_absolute());
+        assert!(feed.transform.file().is_some_and(Path::is_absolute));
     }
 }

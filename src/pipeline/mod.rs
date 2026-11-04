@@ -11,20 +11,20 @@ mod submit;
 mod transforming;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 
 use crate::alerts::Alerter;
 use crate::bulk::BulkSubmitter;
-use crate::config::{DeliveryMethod, FeedConfig};
+use crate::config::{DeliveryMethod, FeedConfig, Validation};
 use crate::connectors::Source;
-use crate::db::{Db, now_ms};
+use crate::crypto::Keyring;
+use crate::db::{Db, PassStatus, now_ms};
 use crate::fhir::FhirClient;
-use crate::runtime::RuntimeSettings;
-use crate::transform::Transformer;
+use crate::versions::{ExecutorSettings, Versions};
 
 /// Records transformed or checked per chunk.
 const TRANSFORM_CHUNK: usize = 200;
@@ -36,6 +36,34 @@ pub struct RunnerControl {
     pub stopped: AtomicBool,
 }
 
+/// What every runner of the engine shares, handed to [`FeedRunner::new`]. A
+/// new engine-wide dependency of the pipeline is a member here.
+#[derive(Clone)]
+pub struct Services {
+    pub db: Arc<Db>,
+    pub fhir: Arc<FhirClient>,
+    pub alerts: Arc<Alerter>,
+    /// Which version a load runs, and its executor.
+    pub versions: Arc<Versions>,
+    pub fhir_base_url: String,
+    /// The URL HFS reaches this engine at, for `$bulk-submit` manifests.
+    pub public_url: String,
+    /// Where transformed submissions are written when the engine serves them.
+    pub bulk_dir: PathBuf,
+    /// Whether resources go through the destination's `$validate` first.
+    pub validation: Validation,
+    /// The keys failed rows' content is sealed with; `None` in tests that
+    /// build a runner without an engine.
+    pub content_keys: Option<Arc<Keyring>>,
+}
+
+/// What the pass being run took: the loads it opened and the rows they hold.
+#[derive(Default)]
+struct PassTally {
+    loads: Vec<i64>,
+    new_rows: i64,
+}
+
 /// Moves one feed's data through: source -> stored rows -> transform -> HFS.
 /// Every row is in the database before its object leaves the source, so a crash or an
 /// HFS outage never loses data, and every row keeps its object name and line number.
@@ -45,7 +73,10 @@ pub struct FeedRunner {
     db: Arc<Db>,
     fhir: Arc<FhirClient>,
     bulk: Option<BulkSubmitter>,
-    transformer: Transformer,
+    versions: Arc<Versions>,
+    validation: Validation,
+    #[allow(dead_code)]
+    content_keys: Option<Arc<Keyring>>,
     alerts: Arc<Alerter>,
     started_at: i64,
     outage_alerted: AtomicBool,
@@ -55,6 +86,7 @@ pub struct FeedRunner {
     bulk_dir: PathBuf,
     /// `$bulk-submit` over the engine's transformed NDJSON, not the source objects.
     bulk_transformed: bool,
+    tally: Mutex<PassTally>,
 }
 
 /// This process's name among the instances sharing a store: `HIE_INSTANCE_ID`,
@@ -80,33 +112,44 @@ pub fn instance_id() -> &'static str {
 }
 
 impl FeedRunner {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        feed: FeedConfig,
-        db: Arc<Db>,
-        fhir: Arc<FhirClient>,
-        alerts: Arc<Alerter>,
-        python: &str,
-        runtime_dir: &Path,
-        fhir_base_url: &str,
-        public_url: &str,
-    ) -> Result<Self> {
-        let source = Source::from_config(&feed)?.with_db(db.clone());
-        Ok(Self::with_source(
-            feed,
-            source,
-            db,
-            fhir,
-            alerts,
-            python,
-            runtime_dir,
-            fhir_base_url,
-            public_url,
-        ))
+    /// The runner of a configured source, over the engine's shared services.
+    pub fn new(feed: FeedConfig, services: &Services) -> Result<Self> {
+        let source = Source::from_config(&feed)?.with_db(services.db.clone());
+        Ok(Self::from_services(feed, source, services))
     }
 
-    /// Builds a runner over a given source, for tests and for sources that are
-    /// not configured from a file.
+    /// A runner over a given source and the engine's shared services.
+    pub fn from_services(feed: FeedConfig, source: Source, services: &Services) -> Self {
+        // `initial_method: bulk_submit` sends the first load by `$bulk-submit`
+        // over the transformed resources, and every later one by `method`.
+        let initial_bulk = feed.delivery.initial_method == Some(DeliveryMethod::BulkSubmit);
+        let feed_bulk_transformed = feed.bulk_transformed() || initial_bulk;
+        let bulk =
+            (feed.delivery.method == DeliveryMethod::BulkSubmit || initial_bulk).then(|| {
+                BulkSubmitter::new(&services.fhir_base_url, &services.public_url)
+                    .with_credentials(services.fhir.credentials().clone())
+            });
+        Self {
+            feed,
+            source,
+            db: services.db.clone(),
+            fhir: services.fhir.clone(),
+            bulk,
+            versions: services.versions.clone(),
+            validation: services.validation,
+            content_keys: services.content_keys.clone(),
+            alerts: services.alerts.clone(),
+            started_at: now_ms(),
+            instance: instance_id().to_string(),
+            bulk_dir: services.bulk_dir.clone(),
+            bulk_transformed: feed_bulk_transformed,
+            outage_alerted: AtomicBool::new(false),
+            tally: Mutex::new(PassTally::default()),
+        }
+    }
+
+    /// Builds a runner over a given source without an engine around it, for
+    /// tests: the transform runs on the local worker, validation is off.
     #[allow(clippy::too_many_arguments)]
     pub fn with_source(
         feed: FeedConfig,
@@ -119,26 +162,34 @@ impl FeedRunner {
         fhir_base_url: &str,
         public_url: &str,
     ) -> Self {
-        let transformer = Transformer::new(python, runtime_dir, &feed.transform);
-        let feed_bulk_transformed = feed.bulk_transformed();
-        let bulk = (feed.delivery.method == DeliveryMethod::BulkSubmit).then(|| {
-            BulkSubmitter::new(fhir_base_url, public_url)
-                .with_credentials(fhir.credentials().clone())
-        });
-        Self {
-            feed,
-            source,
+        let transforms_dir = feed
+            .transform
+            .file()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let versions = Arc::new(Versions::new(
+            db.clone(),
+            ExecutorSettings {
+                python: python.to_string(),
+                runtime_dir: runtime_dir.to_path_buf(),
+                terminology: None,
+                runtime: None,
+            },
+            &transforms_dir,
+        ));
+        let services = Services {
             db,
             fhir,
-            bulk,
-            transformer,
             alerts,
-            started_at: now_ms(),
-            instance: instance_id().to_string(),
+            versions,
+            fhir_base_url: fhir_base_url.to_string(),
+            public_url: public_url.to_string(),
             bulk_dir: std::env::temp_dir().join("hie-bulk"),
-            bulk_transformed: feed_bulk_transformed,
-            outage_alerted: AtomicBool::new(false),
-        }
+            validation: Validation::Off,
+            content_keys: None,
+        };
+        Self::from_services(feed, source, &services)
     }
 
     pub fn source(&self) -> &Source {
@@ -167,18 +218,6 @@ impl FeedRunner {
         self
     }
 
-    /// The terminology server the transform may ask.
-    pub fn with_terminology(mut self, url: Option<&str>) -> Self {
-        self.transformer.set_terminology(url);
-        self
-    }
-
-    /// The shared runtime the transform runs at, instead of a local process.
-    pub fn with_runtime(mut self, settings: Option<&RuntimeSettings>) -> Self {
-        self.transformer.set_runtime(settings);
-        self
-    }
-
     /// How long a pass may hold the source before another instance may take it:
     /// a few polls, and never less than half a minute.
     fn lease_ttl_ms(&self) -> i64 {
@@ -204,16 +243,45 @@ impl FeedRunner {
                 &format!("{}: {e:#}", self.feed.name),
             )?;
         }
-        if !self.db.is_paused(&self.feed.id)? {
-            self.tick().await?;
+        // Every pass asked for until now is served by this one.
+        let passes = self.db.start_passes(&self.feed.id)?;
+        if self.db.is_paused(&self.feed.id)? {
+            self.db
+                .finish_passes(&passes, PassStatus::Skipped, Some("paused"), None, &[], 0)?;
+            return Ok(true);
         }
-        Ok(true)
+        *self.tally.lock().expect("pass tally") = PassTally::default();
+        let result = self.run_pass().await;
+        let tally = std::mem::take(&mut *self.tally.lock().expect("pass tally"));
+        let (status, error) = match &result {
+            Ok(None) => (PassStatus::Done, None),
+            // The reason stays in the log: a source's error may carry what
+            // its connection used.
+            Ok(Some(_)) | Err(_) => (
+                PassStatus::Failed,
+                Some("the source could not be read; the engine's log has the reason"),
+            ),
+        };
+        self.db
+            .finish_passes(&passes, status, None, error, &tally.loads, tally.new_rows)?;
+        result.map(|_| true)
+    }
+
+    /// Counts a load the pass opened and the rows stored for it.
+    pub(crate) fn tally_load(&self, load_id: i64, rows: usize) {
+        let mut tally = self.tally.lock().expect("pass tally");
+        if !tally.loads.contains(&load_id) {
+            tally.loads.push(load_id);
+        }
+        tally.new_rows += rows as i64;
     }
 
     /// The feed's loop: a pass every poll interval, or sooner when poked; nothing
     /// while the source is paused or held by another instance; until stopped.
     pub async fn run(self: Arc<Self>, control: Arc<RunnerControl>) {
         tracing::info!(feed = %self.feed.id, source = %self.feed.source.describe(), instance = %self.instance, "watching");
+        // A delivery attempt that came due runs without a pass over the source.
+        let mut delivery_due = false;
         loop {
             if control.stopped.load(Ordering::Acquire) {
                 if let Err(e) = self.db.release_lease(&self.feed.id, &self.instance) {
@@ -222,12 +290,23 @@ impl FeedRunner {
                 tracing::info!(feed = %self.feed.id, "stopped");
                 return;
             }
-            if let Err(e) = self.pass().await {
+            let result = if delivery_due {
+                self.delivery_round().await
+            } else {
+                self.pass().await.map(drop)
+            };
+            if let Err(e) = result {
                 tracing::error!(feed = %self.feed.id, "{e:#}");
             }
+            let poll = self.feed.source.poll_interval();
+            let due = self.next_delivery_in().filter(|d| *d < poll);
+            delivery_due = false;
             tokio::select! {
-                _ = tokio::time::sleep(self.feed.source.poll_interval()) => {}
+                _ = tokio::time::sleep(poll) => {}
                 _ = control.poke.notified() => {}
+                _ = tokio::time::sleep(due.unwrap_or(poll)), if due.is_some() => {
+                    delivery_due = true;
+                }
             }
         }
     }
@@ -235,25 +314,39 @@ impl FeedRunner {
     /// One pass of the whole pipeline. Each step picks up whatever the previous
     /// passes left, so a step that fails is simply retried on the next pass.
     pub async fn tick(&self) -> Result<()> {
+        self.run_pass().await.map(drop)
+    }
+
+    /// [`FeedRunner::tick`], answering the error that kept the source from
+    /// being read, if any (the rest of the pass still ran).
+    async fn run_pass(&self) -> Result<Option<anyhow::Error>> {
         // A source that cannot be read this pass must not hold back what is
         // already in the store: the rest of the pass runs, the scan is retried next.
-        if let Err(e) = self.scan().await {
-            tracing::error!(feed = %self.feed.id, "scan failed, will retry next pass: {e:#}");
-        }
-        if self.bulk.is_some() {
+        let unread = match self.scan().await {
+            Ok(()) => None,
+            Err(e) => {
+                tracing::error!(feed = %self.feed.id, "scan failed, will retry next pass: {e:#}");
+                Some(e)
+            }
+        };
+        if self.bulk.is_some() && !self.initial_bulk_only() {
             if self.bulk_transformed {
                 self.transform_received(None).await?;
             } else {
-                self.preflight_received()?;
+                self.preflight_received().await?;
             }
             self.submit_pending().await?;
             self.poll_submissions().await?;
         } else {
             self.transform_and_deliver().await?;
+            if self.initial_bulk_only() {
+                self.submit_pending().await?;
+                self.poll_submissions().await?;
+            }
         }
         self.finish()?;
         self.check_silence()?;
-        Ok(())
+        Ok(unread)
     }
 }
 

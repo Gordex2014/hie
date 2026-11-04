@@ -9,7 +9,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{ApiError, ApiResult, AppState};
+use super::body::LooseJson;
+use super::{ApiError, ApiResult, AppState, not_found};
 use crate::db::{Rule, params};
 
 pub(super) fn router() -> Router<AppState> {
@@ -77,22 +78,19 @@ async fn list_rules(State(s): State<AppState>, Query(q): Query<AlertQuery>) -> A
 async fn get_rule(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult {
     let rule =
         s.db.rule(id)?
-            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("rule {id} not found")))?;
+            .ok_or_else(|| not_found("rule_not_found", &format!("rule {id}")))?;
     Ok(Json(json!(rule)))
 }
 
 /// Parses a rule body, checks its shape and that the source it names exists.
 fn parse_rule(s: &AppState, body: Value) -> Result<Rule, ApiError> {
-    let rule: Rule = serde_json::from_value(body)
-        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
-    crate::alerts::validate_rule(&rule).map_err(|m| ApiError(StatusCode::BAD_REQUEST, m))?;
+    let rule: Rule =
+        serde_json::from_value(body).map_err(|e| ApiError::invalid_body(e.to_string()))?;
+    crate::alerts::validate_rule(&rule).map_err(ApiError::invalid_body)?;
     if let Some(source) = &rule.source_id
         && s.manager.source(source).is_none()
     {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            format!("source {source} not found"),
-        ));
+        return Err(ApiError::invalid_body(format!("source {source} not found")));
     }
     Ok(rule)
 }
@@ -100,7 +98,7 @@ fn parse_rule(s: &AppState, body: Value) -> Result<Rule, ApiError> {
 async fn create_rule(
     State(s): State<AppState>,
     principal: Option<axum::Extension<Arc<helios_auth::Principal>>>,
-    Json(body): Json<Value>,
+    LooseJson(body): LooseJson<Value>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let mut rule = parse_rule(&s, body)?;
     if rule.created_by.is_none() {
@@ -113,14 +111,11 @@ async fn create_rule(
 async fn replace_rule(
     State(s): State<AppState>,
     Path(id): Path<i64>,
-    Json(body): Json<Value>,
+    LooseJson(body): LooseJson<Value>,
 ) -> ApiResult {
     let mut rule = parse_rule(&s, body)?;
     if !s.db.update_rule(id, &rule)? {
-        return Err(ApiError(
-            StatusCode::NOT_FOUND,
-            format!("rule {id} not found"),
-        ));
+        return Err(not_found("rule_not_found", &format!("rule {id}")));
     }
     rule.id = id;
     Ok(Json(json!(rule)))
@@ -131,10 +126,7 @@ async fn delete_rule(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
     if !s.db.delete_rule(id)? {
-        return Err(ApiError(
-            StatusCode::NOT_FOUND,
-            format!("rule {id} not found"),
-        ));
+        return Err(not_found("rule_not_found", &format!("rule {id}")));
     }
     Ok(StatusCode::NO_CONTENT)
 }

@@ -69,6 +69,9 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
         "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'sent' AND updated_at >= $1", params![since])?,
         "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'rejected' AND updated_at >= $1", params![since])?,
         "alerts": count(&s.db, "SELECT COUNT(*) AS n FROM alerts WHERE created_at >= $1", params![since])?,
+        // Rows that failed in the last 24 hours, by when they failed: a later
+        // retry never lowers it.
+        "failed": s.db.period_counts(None, since, now_ms() + 1)?.failed,
     });
     Ok(Json(json!({
         "state": if needs_you.is_empty() { "all_receiving" } else { "needs_you" },

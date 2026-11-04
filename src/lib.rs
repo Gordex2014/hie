@@ -1,6 +1,7 @@
 //! Helios Integration Engine: gets data from sources into HFS,
 //! with per-record traceability, idempotent delivery, retries and alerts.
 
+pub mod admission;
 pub mod alerts;
 pub mod api;
 pub mod auth;
@@ -8,14 +9,22 @@ pub mod bulk;
 pub mod config;
 pub mod connectors;
 pub mod credentials;
+pub mod crypto;
 pub mod db;
+pub mod diagnostics;
+pub mod evidence;
 pub mod fhir;
 pub mod formats;
+pub mod idempotency;
+pub mod ids;
 pub mod manager;
 pub mod pipeline;
+pub mod purge;
 pub mod runtime;
 pub mod secrets;
 pub mod transform;
+pub mod tryrun;
+pub mod versions;
 
 /// The source handle and the object connector, as they were reached before
 /// connectors had modules of their own.
@@ -49,6 +58,7 @@ pub fn build(
     credentials: credentials::Credentials,
 ) -> Result<(Arc<manager::SourceManager>, api::AppState)> {
     let db = Arc::new(db::Db::connect(&config.database.to_string_lossy())?);
+    purge::install(&db, config)?;
     let fhir = Arc::new(fhir::FhirClient::with_credentials(
         &config.fhir_base_url,
         credentials,
@@ -57,16 +67,19 @@ pub fn build(
         db.clone(),
         config.alerts.webhook_url.clone(),
     ));
-    let manager = manager::SourceManager::new(config, runtime_dir, db.clone(), fhir, alerts);
+    let manager = manager::SourceManager::new(config, runtime_dir, db.clone(), fhir, alerts)?;
     manager.start_all(feeds)?;
     Ok((
         manager.clone(),
         api::AppState {
             db,
-            manager,
             auth,
             started: api::Started::now(),
             bulk_dir: config.bulk_dir(),
+            config: manager.config().clone(),
+            versions: manager.versions().clone(),
+            samples: Arc::new(evidence::SampleRegistry::default()),
+            manager,
         },
     ))
 }
