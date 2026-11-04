@@ -148,10 +148,12 @@
         "body": {
           "records": [
             {
-              "id": "{{$r1}}"
+              "id": "{{$r1}}",
+              "line": 2
             },
             {
-              "id": "{{$r3}}"
+              "id": "{{$r3}}",
+              "line": 4
             }
           ]
         }
@@ -243,7 +245,7 @@
               "input": {
                 "record": "{{$r3}}",
                 "load": "{{$load}}",
-                "line": "{{int}}",
+                "line": 4,
                 "outcome": "failed",
                 "attempt": 1,
                 "transform": {
@@ -264,7 +266,7 @@
               "input": {
                 "record": "{{$r1}}",
                 "load": "{{$load}}",
-                "line": "{{int}}",
+                "line": 2,
                 "outcome": "failed",
                 "attempt": 1,
                 "transform": {
@@ -290,7 +292,7 @@
               "input": {
                 "record": "{{$w2}}",
                 "load": "{{$load}}",
-                "line": "{{int}}",
+                "line": 3,
                 "outcome": "written",
                 "attempt": 1,
                 "transform": {
@@ -316,7 +318,7 @@
               "input": {
                 "record": "{{$w4}}",
                 "load": "{{$load}}",
-                "line": "{{int}}",
+                "line": 5,
                 "outcome": "written",
                 "attempt": 1,
                 "transform": {
@@ -330,7 +332,57 @@
             "requested": 4,
             "reported": 4,
             "complete": true
-          }
+          },
+          "results": [
+            {
+              "record": {
+                "{{exact}}": true,
+                "id": "3",
+                "value": "alto",
+                "patient": "zq-stored-3"
+              },
+              "error": {
+                "kind": "data"
+              }
+            },
+            {
+              "record": {
+                "{{exact}}": true,
+                "id": "1",
+                "value": "alto",
+                "patient": "zq-stored-1"
+              },
+              "error": {
+                "kind": "data"
+              }
+            },
+            {
+              "record": {
+                "{{exact}}": true,
+                "id": "2",
+                "value": "5.4",
+                "patient": "zq-stored-2"
+              },
+              "resources": [
+                {
+                  "id": "obs-2"
+                }
+              ]
+            },
+            {
+              "record": {
+                "{{exact}}": true,
+                "id": "4",
+                "value": "6.1",
+                "patient": "zq-stored-4"
+              },
+              "resources": [
+                {
+                  "id": "obs-4"
+                }
+              ]
+            }
+          ]
         }
       }
     },
@@ -391,7 +443,7 @@
               "input": {
                 "record": "{{$r3}}",
                 "load": "{{$load}}",
-                "line": "{{int}}",
+                "line": 4,
                 "outcome": "failed",
                 "attempt": 1,
                 "transform": {
@@ -412,7 +464,7 @@
               "input": {
                 "record": "{{$r1}}",
                 "load": "{{$load}}",
-                "line": "{{int}}",
+                "line": 2,
                 "outcome": "failed",
                 "attempt": 1,
                 "transform": {
@@ -438,7 +490,7 @@
               "input": {
                 "record": "{{$w2}}",
                 "load": "{{$load}}",
-                "line": "{{int}}",
+                "line": 3,
                 "outcome": "written",
                 "attempt": 1,
                 "transform": {
@@ -464,7 +516,7 @@
               "input": {
                 "record": "{{$w4}}",
                 "load": "{{$load}}",
-                "line": "{{int}}",
+                "line": 5,
                 "outcome": "written",
                 "attempt": 1,
                 "transform": {
@@ -478,7 +530,57 @@
             "requested": 4,
             "reported": 4,
             "complete": true
-          }
+          },
+          "results": [
+            {
+              "record": {
+                "{{exact}}": true,
+                "id": "3",
+                "value": "alto",
+                "patient": "zq-stored-3"
+              },
+              "error": {
+                "kind": "data"
+              }
+            },
+            {
+              "record": {
+                "{{exact}}": true,
+                "id": "1",
+                "value": "alto",
+                "patient": "zq-stored-1"
+              },
+              "error": {
+                "kind": "data"
+              }
+            },
+            {
+              "record": {
+                "{{exact}}": true,
+                "id": "2",
+                "value": "5.4",
+                "patient": "zq-stored-2"
+              },
+              "resources": [
+                {
+                  "id": "obs-2"
+                }
+              ]
+            },
+            {
+              "record": {
+                "{{exact}}": true,
+                "id": "4",
+                "value": "6.1",
+                "patient": "zq-stored-4"
+              },
+              "resources": [
+                {
+                  "id": "obs-4"
+                }
+              ]
+            }
+          ]
         }
       }
     },
@@ -626,13 +728,23 @@
               "input": {
                 "record": "{{$r1}}",
                 "load": "{{$load}}",
-                "line": "{{int}}",
+                "line": 2,
                 "outcome": "failed",
                 "attempt": 2,
                 "transform": {
                   "id": "{{$tid}}",
                   "version": 1
                 }
+              }
+            }
+          ],
+          "results": [
+            {
+              "record": {
+                "{{exact}}": true,
+                "id": "1",
+                "value": "alto",
+                "patient": "zq-stored-1"
               }
             }
           ],

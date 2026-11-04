@@ -319,6 +319,189 @@
       }
     },
     {
+      "name": "the body before an unknown load",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/try",
+        "body": {
+          "run_id": "m-c1",
+          "code": "import time\nfrom hie import DataError\n\n\ndef transform(record, context):\n    pass\n    value = str(record[\"value\"])\n    try:\n        number = float(value)\n    except ValueError:\n        raise DataError(f\"value {value!r} is not a number\")\n    return {\n        \"resourceType\": \"Observation\",\n        \"id\": f\"obs-{record['id']}\",\n        \"status\": record.get(\"status\") or \"final\",\n        \"code\": {\"text\": \"glucose\"},\n        \"valueQuantity\": {\"value\": number},\n        \"note\": [{\"text\": \"v1\"}],\n    }\n",
+          "input": {
+            "stored": {
+              "load": 999999,
+              "passing": 101
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input.stored.passing"
+        }
+      }
+    },
+    {
+      "name": "saved route: the body before an unknown version",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/try",
+        "body": {
+          "run_id": "m-c2",
+          "version": 99,
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "passing": 101
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input.stored.passing"
+        }
+      }
+    },
+    {
+      "name": "saved route: a duplicate before an unknown version",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/try",
+        "body": {
+          "run_id": "m-c3",
+          "version": 99,
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "records": [
+                "{{$ra}}",
+                "{{$ra}}"
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input.stored.records"
+        }
+      }
+    },
+    {
+      "name": "saved route: an unknown member before an unknown version",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/try",
+        "body": {
+          "run_id": "m-c4",
+          "version": 99,
+          "input": {
+            "stored": {
+              "load": 999999,
+              "records": [
+                {
+                  "id": "{{$ra}}",
+                  "seen": 1
+                }
+              ]
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "unknown_field",
+          "field": "input.stored.records[0].seen"
+        }
+      }
+    },
+    {
+      "name": "saved route: two inputs before an unknown version",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/try",
+        "body": {
+          "run_id": "m-c5",
+          "version": 99,
+          "input": {
+            "records": [],
+            "stored": {
+              "load": "{{$la}}",
+              "passing": 1
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input"
+        }
+      }
+    },
+    {
+      "name": "saved route: the body before an unknown transform",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/no-such-transform/try",
+        "body": {
+          "run_id": "m-c6",
+          "input": {
+            "stored": {
+              "load": "{{$la}}",
+              "records": [],
+              "passing": 0
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "{{string}}",
+          "code": "invalid_body",
+          "field": "input.stored"
+        }
+      }
+    },
+    {
+      "name": "saved route: a valid body reaches the version, then the load",
+      "request": {
+        "method": "POST",
+        "path": "/api/transforms/{{$tid}}/try",
+        "body": {
+          "run_id": "m-c7",
+          "version": 99,
+          "input": {
+            "stored": {
+              "load": 999999,
+              "passing": 1
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 404,
+        "body": {
+          "error": "{{string}}",
+          "code": "version_not_found"
+        }
+      }
+    },
+    {
       "name": "an unknown load comes first",
       "request": {
         "method": "POST",
