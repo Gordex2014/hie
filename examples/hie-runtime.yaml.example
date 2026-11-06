@@ -1,9 +1,0 @@
-# An hie.yaml whose transforms run at the shared Python runtime (python-runtime)
-# instead of a local Python process. HIE_RUNTIME_URL overrides the URL; the
-# consumer's bearer token is read from the environment variable token_env names.
-fhir_base_url: http://localhost:8080
-database: data/hie.db
-runtime:
-  url: http://127.0.0.1:8790
-  token_env: HIE_RUNTIME_TOKEN
-  batch_size: 200

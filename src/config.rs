@@ -22,10 +22,6 @@ pub struct Config {
     /// `translate`; `HIE_TERMINOLOGY_SERVER` overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminology_url: Option<String>,
-    /// The shared Python runtime transforms run at, instead of a local process;
-    /// `HIE_RUNTIME_URL` overrides its URL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<RuntimeConfig>,
     /// One YAML file per source. The engine writes here when a source is created
     /// through the API, so the definitions stay files under version control.
     #[serde(default = "default_sources_dir", alias = "feeds_dir")]
@@ -38,48 +34,6 @@ pub struct Config {
     /// The directory holding `hie.yaml`; relative paths in source files resolve against it.
     #[serde(skip)]
     pub base_dir: PathBuf,
-}
-
-/// The shared Python runtime (python-runtime's HIE facade).
-#[derive(Debug, Clone, Deserialize)]
-pub struct RuntimeConfig {
-    pub url: String,
-    /// The environment variable holding the consumer's bearer token.
-    #[serde(default = "default_runtime_token_env")]
-    pub token_env: String,
-    /// Requests per call; the runtime partitions them further itself.
-    #[serde(default = "default_runtime_batch_size")]
-    pub batch_size: usize,
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            token_env: default_runtime_token_env(),
-            batch_size: default_runtime_batch_size(),
-        }
-    }
-}
-
-impl RuntimeConfig {
-    /// What a transformer needs: the URL and the token read from the environment now.
-    pub fn settings(&self) -> crate::runtime::RuntimeSettings {
-        crate::runtime::RuntimeSettings {
-            url: self.url.clone(),
-            token: std::env::var(&self.token_env)
-                .ok()
-                .filter(|t| !t.trim().is_empty()),
-            batch_size: self.batch_size,
-        }
-    }
-}
-
-fn default_runtime_token_env() -> String {
-    "HIE_RUNTIME_TOKEN".into()
-}
-fn default_runtime_batch_size() -> usize {
-    200
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -617,6 +571,21 @@ impl FeedConfig {
 pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    // The `runtime:` backend is gone. A leftover key would otherwise be ignored
+    // and its transforms run in the local worker instead: refuse to start, whatever
+    // its value (`runtime: null` and a bare `runtime:` included) and however the
+    // key is tagged (`as_str` sees through YAML tags).
+    let raw: serde_yaml::Value =
+        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    if raw
+        .as_mapping()
+        .is_some_and(|m| m.keys().any(|k| k.as_str() == Some("runtime")))
+    {
+        bail!(
+            "`runtime:` in {} is no longer supported: transforms run in the local worker; remove it",
+            path.display()
+        );
+    }
     let mut config: Config =
         serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -745,5 +714,36 @@ mod tests {
         feed.id = "good-id".into();
         feed.resolve(dir.path()).unwrap();
         assert!(feed.transform.is_absolute());
+    }
+
+    fn load_engine_yaml(yaml: &str) -> Result<(Config, Vec<FeedConfig>)> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prod-engine.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        load(&path)
+    }
+
+    #[test]
+    fn a_config_without_runtime_loads() {
+        let (config, feeds) = load_engine_yaml("fhir_base_url: http://hfs\n").unwrap();
+        assert_eq!(config.fhir_base_url, "http://hfs");
+        assert!(feeds.is_empty());
+    }
+
+    #[test]
+    fn a_leftover_runtime_key_stops_the_load() {
+        for yaml in [
+            "fhir_base_url: http://hfs\nruntime:\n  url: http://127.0.0.1:8790\n",
+            "fhir_base_url: http://hfs\nruntime: null\n",
+            "fhir_base_url: http://hfs\nruntime:\n",
+            "fhir_base_url: http://hfs\nruntime: http://127.0.0.1:8790\n",
+            "fhir_base_url: http://hfs\n!legacy runtime:\n  url: http://127.0.0.1:8790\n",
+        ] {
+            let err = load_engine_yaml(yaml).unwrap_err().to_string();
+            assert!(
+                err.contains("is no longer supported") && err.contains("prod-engine.yaml"),
+                "{yaml}: {err}"
+            );
+        }
     }
 }

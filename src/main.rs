@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -34,6 +34,14 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    // The `runtime:` backend is gone: an operator who still points transforms at
+    // the remote runtime service must not have them run here unnoticed.
+    // `var_os`, so a value that is not UTF-8 is refused too rather than ignored.
+    if std::env::var_os("HIE_RUNTIME_URL").is_some_and(|v| !v.to_string_lossy().trim().is_empty()) {
+        bail!(
+            "HIE_RUNTIME_URL is no longer supported: transforms run in the local worker; unset it"
+        );
+    }
     let (mut config, feeds) = hie::config::load(&cli.config)?;
     // The store may be a PostgreSQL URL with a password: it comes from the
     // environment, never from the file.
@@ -48,12 +56,6 @@ async fn main() -> Result<()> {
         .filter(|v| !v.trim().is_empty())
     {
         config.terminology_url = Some(url);
-    }
-    if let Some(url) = std::env::var("HIE_RUNTIME_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-    {
-        config.runtime.get_or_insert_with(Default::default).url = url;
     }
     let runtime_dir = std::env::var_os("HIE_RUNTIME_DIR")
         .map(PathBuf::from)

@@ -14,7 +14,6 @@ pub mod hl7;
 pub mod manager;
 pub mod pipeline;
 pub mod reader;
-pub mod runtime;
 pub mod source;
 pub mod sqs;
 pub mod transform;
