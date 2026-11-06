@@ -69,8 +69,6 @@ To build the image yourself: `docker build -t hie .`
 | `HIE_INSTANCE_ID` | host, pid and a random tail | This instance's name in the leases, when several share one store |
 | `HIE_TERMINOLOGY_SERVER` | `terminology_url` in `hie.yaml` | The HTS transforms may ask through `lookup` and `translate` |
 | `HIE_TERMINOLOGY_TOKEN` | | A bearer token for that HTS, when it requires one |
-| `HIE_RUNTIME_URL` | `runtime.url` in `hie.yaml` | The shared Python runtime transforms run at, instead of a local process (see [Transforms](transforms.md#transforms)) |
-| `HIE_RUNTIME_TOKEN` | | The consumer's bearer token for that runtime (`runtime.token_env` names another variable) |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` | | Credentials for S3 sources, as for any AWS tool (profiles work too) |
 
 ### The store, and more than one instance

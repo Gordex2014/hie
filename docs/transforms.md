@@ -25,16 +25,7 @@ def transform(record, context):
 
 ### Where transforms run
 
-By default each source runs its transform in a Python process of its own, started by the engine from `hie_runtime/worker.py`, fed one record at a time over stdin/stdout as JSON lines, and restarted if it dies. With a **shared runtime** configured, transforms run at [python-runtime](https://github.com/HeliosSoftware/python-runtime) instead, in a sandbox, through its HIE facade:
-
-```yaml
-runtime:
-  url: http://127.0.0.1:8790        # HIE_RUNTIME_URL overrides it
-  token_env: HIE_RUNTIME_TOKEN      # the consumer's bearer token, read from the environment
-  batch_size: 200                   # records per call (at most 1000; the runtime partitions them further)
-```
-
-The engine stores a transform's code under the file's name (`PUT /transforms/{name}`, once per version of the file; the sha256 the runtime answers must match), sends each chunk as one call (`POST /transforms/{name}/run`) and reads one reply per record, in the worker's own line format, so the outcomes (`resources`, `data` error, `transform` error with its trace) are the same as locally. A runtime that forgot the code (`404 transform_unknown`, after a restart without its store) gets it stored again before the batch runs. A runtime that is busy, not ready or unreachable, or a transform that fails to load there, leaves the records received and the batch is tried again on the next pass; the reason is in the log. Try (`POST /api/transforms/{name}/try`) runs the code inline at the runtime (`POST /transforms/try`) without storing it. The runtime's sandbox has no network, so the terminology helpers answer `None` there, and `hie.py` is the runtime's own pinned copy.
+Each source runs its transform in a Python process of its own, started by the engine from `hie_runtime/worker.py`, fed one record at a time over stdin/stdout as JSON lines, and restarted if it dies. Try (`POST /api/transforms/{name}/try`) runs the code the same way, in a worker of its own. The engine no longer sends transforms to a remote runtime service, and does not ignore the old configuration: a top-level `runtime` key in `hie.yaml` (whatever its value) or a non-empty `HIE_RUNTIME_URL` stops it at start, `hie check` included.
 
 ### Terminology
 
