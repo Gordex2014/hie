@@ -18,12 +18,20 @@ use crate::fhir::FhirClient;
 use crate::pipeline::{FeedRunner, RunnerControl};
 use crate::source::{Probe, Source};
 use crate::transform::{Outcome, Transformer, check_resource};
+use crate::worker::WorkerLimits;
+
+/// Transform tries that may run at once, each with its own worker process.
+const TRY_CONCURRENCY: usize = 4;
+/// How long a try waits for its turn before it is turned away.
+const TRY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum ManagerError {
     Invalid(String),
     NotFound(String),
     Conflict(String),
+    /// Too much running already; the same request may succeed later.
+    Busy(String),
     Internal(anyhow::Error),
 }
 
@@ -49,6 +57,8 @@ pub struct SourceManager {
     base_dir: PathBuf,
     bulk_dir: PathBuf,
     terminology_url: Option<String>,
+    worker_limits: WorkerLimits,
+    tries: tokio::sync::Semaphore,
     db: Arc<Db>,
     fhir: Arc<FhirClient>,
     alerts: Arc<Alerter>,
@@ -73,6 +83,8 @@ impl SourceManager {
             base_dir: config.base_dir.clone(),
             bulk_dir: config.bulk_dir(),
             terminology_url: config.terminology_url.clone(),
+            worker_limits: config.worker.limits(),
+            tries: tokio::sync::Semaphore::new(TRY_CONCURRENCY),
             db,
             fhir,
             alerts,
@@ -94,7 +106,8 @@ impl SourceManager {
                 &self.public_url,
             )?
             .with_bulk_dir(&self.bulk_dir)
-            .with_terminology(self.terminology_url.as_deref()),
+            .with_terminology(self.terminology_url.as_deref())
+            .with_worker_limits(self.worker_limits.clone()),
         );
         let control = Arc::new(RunnerControl::default());
         tokio::spawn(runner.clone().run(control.clone()));
@@ -412,8 +425,13 @@ impl SourceManager {
                 "transform {name} not found"
             )));
         }
+        let _permit = tokio::time::timeout(TRY_WAIT, self.tries.acquire())
+            .await
+            .map_err(|_| ManagerError::Busy("too many transform tries at once, try again".into()))?
+            .map_err(|e| ManagerError::Internal(e.into()))?;
         let mut transformer = Transformer::new(&self.python, &self.runtime_dir, &path);
         transformer.set_terminology(self.terminology_url.as_deref());
+        transformer.set_limits(self.worker_limits.clone());
         let items: Vec<(Value, Value)> = records
             .iter()
             .enumerate()
@@ -424,9 +442,9 @@ impl SourceManager {
                 )
             })
             .collect();
-        let outcomes = transformer
-            .transform_many(&items)
-            .await
+        let outcomes = transformer.transform_many(&items).await;
+        transformer.close().await;
+        let outcomes = outcomes
             .map_err(|e| ManagerError::Invalid(format!("transform failed to run: {e:#}")))?;
         let mut out = Vec::with_capacity(records.len());
         for (record, outcome) in records.iter().zip(outcomes) {

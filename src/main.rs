@@ -84,6 +84,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Registered before any source starts, so a signal from the first moment
+    // stops the engine instead of killing it with its workers left behind.
+    let mut stop = StopSignals::new()?;
     let auth = hie::auth::build(&hie::auth::AuthSettings::from_env()).await?;
     match &auth {
         Some(_) => tracing::info!("API authentication on: bearer tokens required under /api"),
@@ -114,6 +117,58 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding {}", config.listen))?;
     tracing::info!("API on http://{}", config.listen);
-    axum::serve(listener, hie::api::router(state)).await?;
+    // The transform workers run in process groups of their own, so a signal to
+    // the engine does not reach them: the engine stops on it instead of dying,
+    // and returning from here drops every runner and call, which kills each
+    // worker's group and removes its run directory.
+    tokio::select! {
+        served = axum::serve(listener, hie::api::router(state)) => served?,
+        signal = stop.recv() => tracing::info!("{signal}: stopping"),
+    }
     Ok(())
+}
+
+/// Ctrl-C, and SIGTERM where there is one. Each stream registers its handler
+/// when it is created.
+struct StopSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+impl StopSignals {
+    fn new() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
+                terminate: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                ctrl_c: tokio::signal::windows::ctrl_c().context("listening for Ctrl-C")?,
+            })
+        }
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => "SIGINT",
+                _ = self.terminate.recv() => "SIGTERM",
+            }
+        }
+        #[cfg(windows)]
+        {
+            self.ctrl_c.recv().await;
+            "Ctrl-C"
+        }
+    }
 }

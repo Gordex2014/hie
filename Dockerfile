@@ -6,6 +6,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+# The launcher pin is compiled in.
+COPY hie_runtime/limits.pin hie_runtime/
 RUN cargo build --release --locked --bin hie
 
 FROM debian:bookworm-slim

@@ -1,13 +1,15 @@
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Value, json};
+use anyhow::{Result, anyhow};
+use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::fhir::DeliveryKey;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use crate::worker::{
+    Exchange, Generation, GenerationReport, Launch, MAX_LINE, Verdict, WorkerLimits,
+    resolve_interpreter,
+};
 
 /// What a transform made of one record.
 #[derive(Debug, Clone, PartialEq)]
@@ -22,32 +24,39 @@ pub enum Outcome {
     Transient(String),
 }
 
-/// One feed's transform script, run by a long-lived Python process of this
-/// engine.
+/// One feed's transform script, run by a long-lived Python worker under the
+/// `limited-process@1` contract (see `crate::worker`).
 pub struct Transformer {
+    /// The interpreter as configured; resolved again for every new worker, so
+    /// an interpreter installed or a `PATH` fixed later is picked up.
     python: String,
+    launcher: PathBuf,
     worker_script: PathBuf,
     transform_script: PathBuf,
     /// The HTS the worker may ask, handed over as `HIE_TERMINOLOGY_SERVER`.
     terminology: Option<String>,
-    worker: Mutex<Option<Worker>>,
+    limits: WorkerLimits,
+    run_root: Option<PathBuf>,
+    /// The current generation; taken out for the length of a call, so a call
+    /// that is cancelled takes its half-used process with it.
+    worker: Arc<Mutex<Option<Generation>>>,
 }
 
-struct Worker {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    next_id: u64,
+fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 impl Transformer {
     pub fn new(python: &str, runtime_dir: &Path, transform_script: &Path) -> Self {
         Self {
             python: python.to_string(),
-            worker_script: runtime_dir.join("worker.py"),
-            transform_script: transform_script.to_path_buf(),
+            launcher: absolute(&runtime_dir.join("limits.py")),
+            worker_script: absolute(&runtime_dir.join("worker.py")),
+            transform_script: absolute(transform_script),
             terminology: None,
-            worker: Mutex::new(None),
+            limits: WorkerLimits::default(),
+            run_root: None,
+            worker: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -55,9 +64,21 @@ impl Transformer {
         self.terminology = url.map(str::to_string);
     }
 
+    /// The limits and deadlines each worker process runs under.
+    pub fn set_limits(&mut self, limits: WorkerLimits) {
+        self.limits = limits;
+    }
+
+    /// Where the workers' run directories are made; the system temporary
+    /// directory by default.
+    pub fn set_run_root(&mut self, dir: &Path) {
+        self.run_root = Some(absolute(dir));
+    }
+
     /// Transforms a batch of `(record, context)` pairs, one worker round trip
-    /// per record. One outcome per pair, in order. An error means the process
-    /// failed, not the data: nothing in the batch is decided.
+    /// per record. One outcome per pair, in order. An error means the worker
+    /// could not run, not the data; the outcomes decided before it are not
+    /// returned.
     pub async fn transform_many(&self, items: &[(Value, Value)]) -> Result<Vec<Outcome>> {
         let mut outcomes = Vec::with_capacity(items.len());
         for (record, context) in items {
@@ -66,97 +87,169 @@ impl Transformer {
         Ok(outcomes)
     }
 
-    async fn spawn(&self) -> Result<Worker> {
-        let mut command = Command::new(&self.python);
-        command
-            .arg("-u")
-            .arg(&self.worker_script)
-            .arg(&self.transform_script)
-            // The protocol is UTF-8 on every platform, whatever the locale.
-            .env("PYTHONIOENCODING", "utf-8")
-            .env("PYTHONUTF8", "1");
+    fn launch(&self) -> Launch {
+        let mut extra_env = Vec::new();
         if let Some(url) = &self.terminology {
-            command.env("HIE_TERMINOLOGY_SERVER", url);
+            extra_env.push(("HIE_TERMINOLOGY_SERVER".to_string(), url.clone()));
         }
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| {
-                format!("starting {} {}", self.python, self.worker_script.display())
-            })?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
-        let mut stdout = BufReader::new(child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?);
-        let mut line = String::new();
-        stdout.read_line(&mut line).await?;
-        if serde_json::from_str::<Value>(&line)
-            .ok()
-            .and_then(|v| v.get("ready").cloned())
-            != Some(json!(true))
-        {
-            bail!(
-                "transform {} failed to load",
-                self.transform_script.display()
-            );
+        // Passed on purpose: the transform's `lookup` and `translate` send it.
+        if let Ok(token) = std::env::var("HIE_TERMINOLOGY_TOKEN") {
+            extra_env.push(("HIE_TERMINOLOGY_TOKEN".to_string(), token));
         }
-        Ok(Worker {
-            child,
-            stdin,
-            stdout,
-            next_id: 1,
-        })
+        Launch {
+            python: resolve_interpreter(&self.python, std::env::var_os("PATH").as_deref()),
+            launcher: self.launcher.clone(),
+            program: self.worker_script.clone(),
+            args: vec![self.transform_script.clone()],
+            extra_env,
+            limits: self.limits.clone(),
+            run_root: self.run_root.clone(),
+            label: self.transform_script.display().to_string(),
+        }
     }
 
-    async fn call(worker: &mut Worker, record: &Value, context: &Value) -> Result<Value> {
-        let id = worker.next_id;
-        worker.next_id += 1;
-        let mut request = json!({"id": id, "record": record, "context": context}).to_string();
-        request.push('\n');
-        worker.stdin.write_all(request.as_bytes()).await?;
-        worker.stdin.flush().await?;
-        let mut line = String::new();
-        if worker.stdout.read_line(&mut line).await? == 0 {
-            bail!("transform process exited");
-        }
-        // A reply that cannot be read is the transform's fault for this record,
-        // not the process's: the worker answered in order and stays; the record
-        // is rejected with the reason rather than tried again forever.
-        let reply: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => json!({"id": id, "error": {"kind": "transform",
-                "message": format!("the transform's reply could not be read as JSON ({e}); the resources it returned are not valid JSON")}}),
-        };
-        if reply.get("id") != Some(&json!(id)) {
-            bail!("transform reply out of order");
-        }
-        Ok(reply)
-    }
-
-    /// Transforms one record. An error here means the transform process itself failed,
-    /// not the data: the record stays queued and is tried again.
+    /// Transforms one record. An error means the worker could not be started
+    /// (or the call was cancelled): the record stays queued and is tried again.
+    /// A worker that times out, dies or breaks the protocol on this record is
+    /// the record's outcome instead: it is rejected, never sent again by the
+    /// engine, and the next record gets a new worker.
     pub async fn transform(&self, record: &Value, context: &Value) -> Result<Outcome> {
-        let mut guard = self.worker.lock().await;
-        for attempt in 0..2 {
-            if guard.is_none() {
-                *guard = Some(self.spawn().await?);
-            }
-            let worker = guard.as_mut().expect("worker present");
-            match Self::call(worker, record, context).await {
-                Ok(reply) => return Ok(parse_reply(&reply)),
-                Err(e) => {
-                    if let Some(mut w) = guard.take() {
-                        let _ = w.child.kill().await;
-                    }
-                    if attempt == 1 {
-                        return Err(e);
-                    }
+        let mut slot = self.worker.lock().await;
+        let mut generation = match slot.take() {
+            Some(generation) if !generation.has_exited() => generation,
+            exited => {
+                if let Some(generation) = exited {
+                    generation.close().await;
                 }
+                let generation = Generation::start(&self.launch()).await.map_err(|reason| {
+                    anyhow!(
+                        "transform {} could not start: {reason}",
+                        self.transform_script.display()
+                    )
+                })?;
+                self.watch_idle(&generation);
+                generation
+            }
+        };
+        let request = self.limits.request;
+        let rejected = |headline: String, report: GenerationReport| {
+            Ok(Outcome::Rejected {
+                kind: "transform".into(),
+                message: rejection(&headline, &report),
+            })
+        };
+        match generation.exchange(record, context, request).await {
+            Exchange::Reply(reply) => {
+                *slot = Some(generation);
+                Ok(parse_reply(&reply))
+            }
+            // A reply that cannot be read is the transform's fault for this
+            // record, not the process's: the worker answered in order and stays.
+            Exchange::NotJson(e) => {
+                *slot = Some(generation);
+                Ok(Outcome::Rejected {
+                    kind: "transform".into(),
+                    message: format!(
+                        "the transform's reply could not be read as JSON ({e}); the resources it returned are not valid JSON"
+                    ),
+                })
+            }
+            Exchange::TimedOut => {
+                let report = generation.retire(Verdict::TimedOut, None).await;
+                rejected(
+                    format!(
+                        "the transform did not answer within {}",
+                        crate::worker::seconds(request)
+                    ),
+                    report,
+                )
+            }
+            Exchange::OutOfOrder => {
+                let report = generation.retire(Verdict::UserError, Some("unknown")).await;
+                rejected("the transform's reply was out of order".into(), report)
+            }
+            Exchange::Overlong => {
+                let report = generation.retire(Verdict::UserError, Some("unknown")).await;
+                rejected(
+                    format!(
+                        "the transform's reply exceeded {} MiB",
+                        MAX_LINE / (1024 * 1024)
+                    ),
+                    report,
+                )
+            }
+            Exchange::Ended => {
+                let report = generation.ended().await;
+                let headline = match (report.verdict, report.cause) {
+                    (Verdict::LimitExceeded, Some("memory")) => format!(
+                        "the transform exceeded its memory limit ({} MiB)",
+                        self.limits.memory_mib
+                    ),
+                    (Verdict::LimitExceeded, Some("file")) => format!(
+                        "the transform wrote a file past its size limit ({} MiB)",
+                        self.limits.file_mib
+                    ),
+                    _ => match (report.exit_code, report.signal) {
+                        (Some(code), _) => {
+                            format!("the transform's process exited with code {code}")
+                        }
+                        (_, Some(signal)) => {
+                            format!("the transform's process was killed by signal {signal}")
+                        }
+                        _ => "the transform's process stopped answering".into(),
+                    },
+                };
+                rejected(headline, report)
             }
         }
-        unreachable!()
     }
+
+    /// Closes the generation as soon as its process exits while it waits for
+    /// the next record, so nothing it started runs on and its directory goes.
+    /// A call in progress notices the exit itself.
+    fn watch_idle(&self, generation: &Generation) {
+        let slot = Arc::downgrade(&self.worker);
+        let serial = generation.serial();
+        let mut exited = generation.exit_watch();
+        tokio::spawn(async move {
+            let _ = exited.wait_for(Option::is_some).await;
+            let Some(slot) = slot.upgrade() else {
+                return;
+            };
+            let mut slot = slot.lock().await;
+            if slot.as_ref().is_some_and(|g| g.serial() == serial) {
+                let generation = slot.take().expect("checked above");
+                drop(slot);
+                generation.close().await;
+            }
+        });
+    }
+
+    /// Ends the worker normally, if one is running: its stdin is closed and it
+    /// exits. The report says how it went.
+    pub async fn close(&self) -> Option<GenerationReport> {
+        let generation = self.worker.lock().await.take()?;
+        Some(generation.close().await)
+    }
+}
+
+/// A rejected record's message: what happened, the contract's verdict and the
+/// end of the worker's stderr.
+fn rejection(headline: &str, report: &GenerationReport) -> String {
+    let cause = report
+        .cause
+        .map(|c| format!(", cause {c}"))
+        .unwrap_or_default();
+    let mut message = format!(
+        "{headline}; its worker was restarted (verdict {}{cause})",
+        report.verdict
+    );
+    let tail = report.short_tail();
+    if !tail.is_empty() {
+        message.push('\n');
+        message.push_str(tail);
+    }
+    message
 }
 
 fn parse_reply(reply: &Value) -> Outcome {
@@ -257,6 +350,7 @@ pub fn check_resource(resource: &Value) -> std::result::Result<DeliveryKey, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn replies_map_to_outcomes() {

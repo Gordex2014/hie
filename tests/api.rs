@@ -42,7 +42,7 @@ fn python() -> Option<String> {
     candidates.into_iter().find(|p| {
         std::process::Command::new(p)
             .arg("-c")
-            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)")
+            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)")
             .output()
             .is_ok_and(|o| o.status.success())
     })
@@ -69,7 +69,7 @@ async fn wait_until(
 #[tokio::test]
 async fn a_source_lives_through_the_api() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let urls: Urls = Arc::default();
@@ -340,7 +340,7 @@ async fn a_source_lives_through_the_api() {
 #[tokio::test]
 async fn transforms_and_monitoring_are_served() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let urls: Urls = Arc::default();
@@ -523,7 +523,7 @@ async fn transforms_and_monitoring_are_served() {
 #[tokio::test]
 async fn a_load_shows_its_failures_grouped_and_retries_them() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let urls: Urls = Arc::default();
@@ -694,4 +694,83 @@ async fn a_load_shows_its_failures_grouped_and_retries_them() {
             .status(),
         404
     );
+}
+
+/// A transform that waits as long as its record says, then reports the
+/// process and directory it ran in.
+const SLOW: &str = r#"
+import os, time
+
+def transform(record, context):
+    time.sleep(record.get("sleep", 0))
+    return {"resourceType": "Observation", "id": "slow", "status": "final",
+            "code": {"text": "slow"}, "valueString": "%d %s" % (os.getpid(), os.getcwd())}
+"#;
+
+#[tokio::test]
+async fn transform_tries_are_bounded_and_leave_nothing_behind() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::write(root.join("transforms/slow.py"), SLOW).unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: http://127.0.0.1:9\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (_manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let api = serve(hie::api::router(state)).await;
+    let http = reqwest::Client::new();
+    let try_once = |sleep: f64| {
+        let (http, api) = (http.clone(), api.clone());
+        async move {
+            http.post(format!("{api}/api/transforms/slow/try"))
+                .json(&json!({"records": [{"sleep": sleep}]}))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // A try runs in its own worker, which is gone with its directory once it answers.
+    let tried: Value = try_once(0.0).await.json().await.unwrap();
+    let ran = tried["results"][0]["resources"][0]["valueString"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (pid, cwd) = ran.split_once(' ').unwrap();
+    let run_dir = PathBuf::from(cwd).parent().unwrap().to_path_buf();
+    assert!(!run_dir.exists(), "{run_dir:?}");
+    #[cfg(target_os = "linux")]
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    let _ = pid;
+
+    // Four at once take every turn: a fifth waits, then is told to come back.
+    let busy: Vec<_> = (0..4).map(|_| tokio::spawn(try_once(13.0))).collect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let started = Instant::now();
+    let refused = try_once(0.0).await;
+    assert_eq!(refused.status(), 503);
+    // Turned away after its 10 s wait, not when a busy try finishes (13 s).
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_secs(9) && waited < Duration::from_secs(12),
+        "{waited:?}"
+    );
+    assert!(
+        refused
+            .text()
+            .await
+            .unwrap()
+            .contains("too many transform tries")
+    );
+    for call in busy {
+        assert_eq!(call.await.unwrap().status(), 200);
+    }
 }

@@ -114,7 +114,7 @@ fn python() -> Option<&'static str> {
     ["py", "python3", "python"].into_iter().find(|p| {
         std::process::Command::new(p)
             .arg("-c")
-            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)")
+            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)")
             .output()
             .is_ok_and(|o| o.status.success())
     })
@@ -135,7 +135,7 @@ async fn put(store: &InMemory, key: &str, id: &str) {
 #[tokio::test]
 async fn a_queue_announces_objects_between_listings() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.8+ found");
+        eprintln!("skipping: no Python 3.11+ found");
         return;
     };
     let queue: Shared = Arc::default();

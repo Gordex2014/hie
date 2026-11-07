@@ -1039,6 +1039,7 @@ dependencies = [
  "hex",
  "http",
  "jsonwebtoken",
+ "libc",
  "object_store",
  "postgres",
  "rand 0.8.8",

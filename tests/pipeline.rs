@@ -72,7 +72,7 @@ fn python() -> Option<String> {
     candidates.into_iter().find(|p| {
         std::process::Command::new(p)
             .arg("-c")
-            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)")
+            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)")
             .output()
             .is_ok_and(|o| o.status.success())
     })
@@ -106,7 +106,7 @@ fn alert_kinds(state: &hie::api::AppState) -> Vec<String> {
 #[tokio::test]
 async fn a_feed_survives_an_outage_bad_rows_and_resends() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let (base, fhir) = fhir_server().await;
@@ -280,5 +280,341 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
             .filter(|k| *k == "silence")
             .count(),
         1
+    );
+}
+
+// ---- the transform worker's failures, as the pipeline sees them ----------
+
+/// A probe transform: every record it is sent is noted in `seen`, and its
+/// `mode` says what to do. Its resources carry the worker's process id.
+const PROBE: &str = r#"
+import os, time
+from hie import TerminologyError
+
+STATE = __STATE__
+if os.path.exists(os.path.join(STATE, "broken")):
+    raise RuntimeError("the probe cannot load while broken")
+
+def transform(record, context):
+    with open(os.path.join(STATE, "seen"), "a") as f:
+        f.write(record["id"] + "\n")
+    mode = record["mode"]
+    if mode == "hang":
+        time.sleep(3600)
+    if mode == "hang-then-break":
+        open(os.path.join(STATE, "broken"), "w").close()
+        time.sleep(3600)
+    if mode == "exit":
+        os._exit(3)
+    if mode == "alloc":
+        bytearray(1 << 30)
+    if mode == "bigfile":
+        with open("big.bin", "wb") as f:
+            f.write(b"x" * (2 << 20))
+    if mode == "transient":
+        raise TerminologyError("the terminology server is down")
+    if mode == "slow":
+        time.sleep(float(record["seconds"]))
+    return {"resourceType": "Observation", "id": "obs-" + record["id"], "status": "final",
+            "code": {"text": "probe"}, "valueString": str(os.getpid())}
+"#;
+
+struct Probe {
+    _dir: tempfile::TempDir,
+    state: PathBuf,
+    manager: Arc<hie::manager::SourceManager>,
+    app: hie::api::AppState,
+    feed: hie::config::FeedConfig,
+}
+
+impl Probe {
+    /// An engine with one folder source over the probe transform. `paused`: the
+    /// test drives the passes itself.
+    async fn new(python: &str, worker: &str, paused: bool, csv: &str) -> Self {
+        let (base, _fhir) = fhir_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let state = root.join("state");
+        for d in ["sources", "transforms", "state", "inbox"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(
+            root.join("transforms/probe.py"),
+            PROBE.replace("__STATE__", &format!("{:?}", state.to_str().unwrap())),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("hie.yaml"),
+            format!(
+                "fhir_base_url: {base}\ndatabase: data/hie.db\npython: {python}\nworker:\n{worker}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("sources/probe.yaml"),
+            "id: probe\nname: Probe\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  poll_seconds: 1\n  min_file_age_ms: 0\n\
+             transform: transforms/probe.py\ndelivery:\n  initial_backoff_ms: 10\n",
+        )
+        .unwrap();
+        if !paused {
+            drop_file(&root.join("inbox"), "rows.csv", csv);
+        }
+        let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+        let feed = feeds[0].clone();
+        let (manager, app) =
+            hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+        if paused {
+            manager.pause("probe", None).unwrap();
+            drop_file(&root.join("inbox"), "rows.csv", csv);
+        }
+        Self {
+            _dir: dir,
+            state,
+            manager,
+            app,
+            feed,
+        }
+    }
+
+    async fn tick(&self) {
+        self.manager.runner("probe").unwrap().tick().await.unwrap();
+    }
+
+    fn seen(&self) -> Vec<String> {
+        std::fs::read_to_string(self.state.join("seen"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Each row by its `id`: status, error kind, error, and the worker's pid.
+    fn rows(&self) -> HashMap<String, (String, String, String, String)> {
+        self.app
+            .db
+            .query_json(
+                "SELECT raw, status, error_kind, error, resources FROM records WHERE feed_id = 'probe'",
+                [],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
+                let resources = match &r["resources"] {
+                    Value::String(s) => serde_json::from_str(s).unwrap(),
+                    v => v.clone(),
+                };
+                (
+                    text(&r["raw"]["id"]),
+                    (
+                        text(&r["status"]),
+                        text(&r["error_kind"]),
+                        text(&r["error"]),
+                        text(&resources[0]["valueString"]),
+                    ),
+                )
+            })
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn a_record_that_hangs_crashes_or_runs_out_of_memory_is_rejected_once() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    // The memory and file-size limits are enforced on Linux only; elsewhere
+    // the rows end at 5.
+    let memory = cfg!(target_os = "linux");
+    let mut csv = String::from("id,mode\n1,ok\n2,hang\n3,ok\n4,exit\n5,ok\n");
+    if memory {
+        csv.push_str("6,alloc\n7,ok\n8,bigfile\n9,ok\n");
+    }
+    let csv = csv.as_str();
+    let probe = Probe::new(
+        &python,
+        "  request_seconds: 2\n  memory_mib: 512\n  file_mib: 1\n",
+        true,
+        csv,
+    )
+    .await;
+    probe.tick().await;
+    let rows = probe.rows();
+    let mut failures = vec![
+        ("2", "did not answer within 2 s"),
+        ("4", "exited with code 3"),
+    ];
+    let mut good = vec!["1", "3", "5"];
+    if memory {
+        failures.push(("6", "exceeded its memory limit (512 MiB)"));
+        good.push("7");
+        // EFBIG ends the worker with the launcher's file code (66).
+        failures.push(("8", "wrote a file past its size limit (1 MiB)"));
+        good.push("9");
+    }
+    for (id, reason) in failures {
+        let (status, kind, error, _) = &rows[id];
+        assert_eq!((status.as_str(), kind.as_str()), ("rejected", "transform"));
+        assert!(error.contains(reason), "row {id}: {error}");
+    }
+    if memory {
+        // The launcher's exit codes, 65 and 66, as the contract classifies them.
+        assert!(
+            rows["6"].2.contains("verdict limit_exceeded, cause memory"),
+            "{:?}",
+            rows["6"]
+        );
+        assert!(
+            rows["8"].2.contains("verdict limit_exceeded, cause file"),
+            "{:?}",
+            rows["8"]
+        );
+    }
+    let pids: Vec<&str> = good
+        .iter()
+        .map(|id| {
+            assert_eq!(rows[*id].0, "sent", "row {id}: {:?}", rows[*id]);
+            rows[*id].3.as_str()
+        })
+        .collect();
+    let distinct: std::collections::HashSet<_> = pids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        good.len(),
+        "a new worker after each failure: {pids:?}"
+    );
+    let all: Vec<String> = (1..=if memory { 9 } else { 5 })
+        .map(|i| i.to_string())
+        .collect();
+    assert_eq!(probe.seen(), all);
+
+    // Later passes send nothing again.
+    probe.tick().await;
+    probe.tick().await;
+    assert_eq!(probe.seen(), all);
+
+    // An operator's reprocess is the one way it runs again: once.
+    let api = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = hie::api::router(probe.app.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{addr}")
+    };
+    let hung = probe
+        .app
+        .db
+        .query_json(
+            "SELECT id FROM records WHERE feed_id = 'probe' AND line = 3",
+            [],
+        )
+        .unwrap()[0]["id"]
+        .as_i64()
+        .unwrap();
+    let status = reqwest::Client::new()
+        .post(format!("{api}/api/records/{hung}/reprocess"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 202);
+    probe.tick().await;
+    probe.tick().await;
+    let mut again = all.clone();
+    again.push("2".into());
+    assert_eq!(probe.seen(), again);
+    assert_eq!(probe.rows()["2"].0, "rejected");
+}
+
+#[tokio::test]
+async fn a_timed_out_record_is_not_sent_again_when_the_worker_then_cannot_start() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let probe = Probe::new(
+        &python,
+        "  request_seconds: 1\n",
+        true,
+        "id,mode\n1,hang-then-break\n2,ok\n",
+    )
+    .await;
+    probe.tick().await;
+    probe.tick().await;
+    probe.tick().await;
+    let rows = probe.rows();
+    assert_eq!(rows["1"].0, "rejected");
+    assert_eq!(
+        rows["2"].0, "received",
+        "left for when the worker starts again"
+    );
+    assert_eq!(probe.seen(), ["1"]);
+
+    std::fs::remove_file(probe.state.join("broken")).unwrap();
+    probe.tick().await;
+    assert_eq!(probe.rows()["2"].0, "sent");
+    assert_eq!(probe.seen(), ["1", "2"]);
+}
+
+#[tokio::test]
+async fn a_transient_record_ends_the_pass_before_the_next_is_sent() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let probe = Probe::new(
+        &python,
+        "  request_seconds: 1\n",
+        true,
+        "id,mode\n1,transient\n2,hang\n",
+    )
+    .await;
+    probe.tick().await;
+    assert_eq!(probe.seen(), ["1"]);
+    let rows = probe.rows();
+    assert_eq!(
+        (rows["1"].0.as_str(), rows["2"].0.as_str()),
+        ("received", "received")
+    );
+}
+
+#[tokio::test]
+async fn a_source_replaced_mid_record_does_not_resend_the_one_already_decided() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let probe = Probe::new(
+        &python,
+        "  request_seconds: 1\n",
+        false,
+        "id,mode,seconds\n1,hang,\n2,slow,3\n3,ok,\n",
+    )
+    .await;
+    let started = std::time::Instant::now();
+    while !probe.seen().contains(&"2".to_string()) {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "record 2 never sent"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Record 1 timed out and is decided; record 2 is in flight.
+    probe.manager.delete("probe").unwrap();
+    probe.manager.start(probe.feed.clone()).unwrap();
+    while probe.rows()["3"].0 != "sent" {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "record 3 never sent"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(probe.rows()["1"].0, "rejected");
+    assert_eq!(
+        probe.seen().iter().filter(|id| *id == "1").count(),
+        1,
+        "{:?}",
+        probe.seen()
     );
 }

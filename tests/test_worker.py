@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -39,6 +41,51 @@ class WorkerProtocol(unittest.TestCase):
         reply = self.run_worker({"resourceType": "Observation"})
         self.assertEqual(reply["error"]["kind"], "data")
         self.assertIn("neither id nor identifier", reply["error"]["message"])
+
+
+class Interpreter(unittest.TestCase):
+    def test_the_interpreter_is_recent_enough_for_the_launcher(self):
+        self.assertGreaterEqual(sys.version_info, (3, 11))
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "the memory limit is enforced on Linux")
+class UnderTheLauncher(unittest.TestCase):
+    """The worker run as the engine runs it: a transform that allocates past
+    the memory limit ends the process with the launcher's memory code."""
+
+    def test_running_out_of_memory_ends_the_process_with_65(self):
+        with tempfile.TemporaryDirectory() as run:
+            work, control = Path(run, "work"), Path(run, "control")
+            work.mkdir()
+            control.mkdir()
+            transform = Path(run, "greedy.py")
+            transform.write_text("def transform(record, context):\n    return bytearray(1 << 30)\n")
+            proc = subprocess.Popen(
+                [sys.executable, "-I", "-B", "-u", "-X", "utf8", str(ROOT / "hie_runtime" / "limits.py"),
+                 "--control", str(control), "--memory", "256", "--",
+                 str(ROOT / "hie_runtime" / "worker.py"), str(transform)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                cwd=work, env={"PATH": os.environ.get("PATH", "")},
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while not (control / "ready.json").exists():
+                    self.assertLess(time.monotonic(), deadline, "no ready.json")
+                    time.sleep(0.005)
+                ready = json.loads((control / "ready.json").read_text())
+                self.assertIsNone(ready["error"])
+                (control / "ack").touch()
+                self.assertEqual(json.loads(proc.stdout.readline()), {"ready": True})
+                request = {"id": 1, "record": {}, "context": {"feed": "t", "file": "t", "line": 1}}
+                proc.stdin.write((json.dumps(request) + "\n").encode())
+                proc.stdin.flush()
+                self.assertEqual(proc.wait(timeout=30), 65, proc.stderr.read().decode("utf-8", "replace"))
+                self.assertEqual(proc.stdout.read(), b"", "no reply for the record that ran out of memory")
+            finally:
+                proc.kill()
+                proc.wait()
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    stream.close()
 
 
 if __name__ == "__main__":

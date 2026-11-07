@@ -13,6 +13,7 @@ The script defines `transform(record, context)` returning a resource, a list of
 resources or None. It raises `hie.DataError` for bad source data.
 """
 
+import errno
 import importlib.util
 import json
 import sys
@@ -59,7 +60,11 @@ def main():
             reply = {"id": request["id"], "error": {"kind": "data", "message": str(e)}}
         except TerminologyError as e:  # the server, not the row: the engine retries later
             reply = {"id": request["id"], "error": {"kind": "transient", "message": str(e)}}
+        except MemoryError:  # past the memory limit: the process ends and the engine says why
+            raise
         except Exception as e:  # a bug in the transform, kept with its traceback
+            if isinstance(e, OSError) and e.errno == errno.EFBIG:
+                raise  # a file past the size limit: likewise
             reply = {
                 "id": request["id"],
                 "error": {

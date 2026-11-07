@@ -37,7 +37,7 @@ fn python() -> Option<&'static str> {
     ["py", "python3", "python"].into_iter().find(|p| {
         std::process::Command::new(p)
             .arg("-c")
-            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)")
+            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)")
             .output()
             .is_ok_and(|o| o.status.success())
     })
@@ -72,7 +72,7 @@ fn export_zip() -> Vec<u8> {
 #[tokio::test]
 async fn a_zip_in_a_read_only_bucket_is_unpacked_once_and_left_in_place() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.8+ found");
+        eprintln!("skipping: no Python 3.11+ found");
         return;
     };
     let urls: Urls = Arc::default();
@@ -190,7 +190,7 @@ async fn a_zip_in_a_read_only_bucket_is_unpacked_once_and_left_in_place() {
 #[tokio::test]
 async fn a_zip_in_a_folder_is_unpacked_and_archived() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.8+ found");
+        eprintln!("skipping: no Python 3.11+ found");
         return;
     };
     let urls: Urls = Arc::default();
