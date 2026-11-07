@@ -406,6 +406,18 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 
 **Cost / not yet:** the local worker still runs a transform with the engine's own rights until it runs under operating-system limits (next).
 
+## 36. The local worker runs under `limited-process@1`
+
+**Chosen:** The transform worker is started through the reference launcher of the `limited-process@1` contract, vendored unchanged as `hie_runtime/limits.py` and pinned by contract id and SHA-256 in `hie_runtime/limits.pin`, which the engine compiles in. The engine is the contract's host in its long-lived worker pattern: a fresh run directory and an environment built from nothing for each process, the control handshake and the pin check before the transform runs, a startup budget that includes the worker's own ready line, a deadline per record taken before the write, bounded reply lines and a continuously drained stderr tail, the process group killed whenever a process ends, and one report per process in the log. Memory, file size and open files are limited per process from the `worker:` block. A record that times out, exceeds a limit, crashes the process or breaks the protocol is rejected as a `transform` error and never retried; its process is replaced for the next record. The pipeline stores each outcome before it sends the next record.
+
+**Why:**
+- Customer code ran with the engine's rights and no bounds: one endless loop held its source forever, one runaway allocation could take the host down, and a child it started outlived it.
+- A contract with a reference launcher gives one tested way to apply the limits, a handshake that separates "could not start" from "the transform failed", and evidence of what was applied; pinning the hash means the engine runs the launcher it was built and tested with.
+- Rejecting rather than retrying: a record that timed out may already have had effects, and one that always hangs would otherwise block its source on every pass. A person sees it with its reason and reprocesses it.
+- Storing each outcome before the next record is sent means a record that was decided is never sent again, whatever stops the pass afterwards.
+
+**Cost / not yet:** limits are per process, not per transform with its children, and nothing bounds the number of processes; the network stays open and the filesystem readable and writable with the engine's rights; CPU time is deliberately unlimited, because it accumulates over a long-lived worker and would end a healthy one, so the per-record deadline is what stops a spinning transform; a process that leaves its group survives the kill; on macOS and Windows only the deadline, the group kill and the bounded output are guaranteed. A transform's in-memory state (caches) is lost whenever its process is replaced.
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.

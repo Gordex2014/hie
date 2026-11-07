@@ -18,7 +18,7 @@ Available today in the current release. The reasons behind each choice are in [d
 **Transforms**
 
 - Python transforms, one record in, FHIR resources out, with terminology lookups and translations against a FHIR terminology server — see [docs/transforms.md](docs/transforms.md)
-- Transforms run in a local Python worker, one per source
+- Transforms run in a local Python worker, one per source, under operating-system limits (memory, files written, open files) and a per-record deadline
 
 **Delivery**
 
@@ -38,7 +38,6 @@ Available today in the current release. The reasons behind each choice are in [d
 
 | Area | Item | Status |
 |------|------|--------|
-| **Runtime** | The local worker runs each transform under operating-system limits (memory, files written, open files) and a per-request deadline | 🟡 In progress |
 | **Customers** | First real loads: lab CSV drops in S3, zipped FHIR exports from a public bucket | 🟡 In progress |
 | **Documentation** | Restructure the documentation; publish a book like HFS's | 🟡 In progress |
 

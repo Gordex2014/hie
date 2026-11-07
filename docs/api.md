@@ -22,7 +22,7 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /api/transforms` | Every transform file: name, path, size, modified, and the sources that use it |
 | `GET /api/transforms/{name}` | The transform's code |
 | `PUT /api/transforms/{name}` | Saves the code (`{"code": "..."}`); the sources using it restart their Python worker. `201` when new |
-| `POST /api/transforms/{name}/try` | Runs the transform on `{"records": [...]}` (up to 100) without loading: per record, the resources it became or the rejection reason |
+| `POST /api/transforms/{name}/try` | Runs the transform on `{"records": [...]}` (up to 100) without loading: per record, the resources it became or the rejection reason. At most four tries run at once; `503` when one cannot start within 10 s |
 | `GET /api/monitoring/status` | What the monitoring page opens on: `needs_you` (late, paused, or rejecting sources with the reason), `last_24h` (files, sent, rejected, alerts), every source |
 | `GET /api/records?source=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
 | `GET /api/records/{id}` | One record: file, line, original and corrected row, resources sent, HFS response |
