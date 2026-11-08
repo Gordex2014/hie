@@ -17,6 +17,8 @@ struct Fhir {
     down: bool,
     versions: HashMap<String, u32>,
     requests: u32,
+    /// The next batch is written at once but answered only after a minute.
+    hold_next: bool,
 }
 
 type Shared = Arc<Mutex<Fhir>>;
@@ -25,8 +27,18 @@ async fn batch(
     State(s): State<Shared>,
     Json(bundle): Json<Value>,
 ) -> (axum::http::StatusCode, Json<Value>) {
-    let mut s = s.lock().unwrap();
-    s.requests += 1;
+    let (hold, answer) = {
+        let mut s = s.lock().unwrap();
+        s.requests += 1;
+        (std::mem::take(&mut s.hold_next), write(&mut s, &bundle))
+    };
+    if hold {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+    answer
+}
+
+fn write(s: &mut Fhir, bundle: &Value) -> (axum::http::StatusCode, Json<Value>) {
     if s.down {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -298,7 +310,16 @@ if os.path.exists(os.path.join(STATE, "broken")):
 def transform(record, context):
     with open(os.path.join(STATE, "seen"), "a") as f:
         f.write(record["id"] + "\n")
+    with open(os.path.join(STATE, "calls"), "a") as f:
+        f.write(f"{record['id']} {os.getpid()}\n")
     mode = record["mode"]
+    if mode == "gate":
+        open(os.path.join(STATE, "entered-" + record["id"]), "w").close()
+        deadline = time.monotonic() + 60
+        while not os.path.exists(os.path.join(STATE, "release-" + record["id"])):
+            if time.monotonic() > deadline:
+                raise RuntimeError("never released")
+            time.sleep(0.05)
     if mode == "hang":
         time.sleep(3600)
     if mode == "hang-then-break":
@@ -325,13 +346,14 @@ struct Probe {
     manager: Arc<hie::manager::SourceManager>,
     app: hie::api::AppState,
     feed: hie::config::FeedConfig,
+    fhir: Shared,
 }
 
 impl Probe {
     /// An engine with one folder source over the probe transform. `paused`: the
     /// test drives the passes itself.
     async fn new(python: &str, worker: &str, paused: bool, csv: &str) -> Self {
-        let (base, _fhir) = fhir_server().await;
+        let (base, fhir) = fhir_server().await;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let state = root.join("state");
@@ -373,7 +395,91 @@ impl Probe {
             manager,
             app,
             feed,
+            fhir,
         }
+    }
+
+    /// The engine's API, served on a free port.
+    async fn api(&self) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = hie::api::router(self.app.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Every call of the transform: the record's id and the worker's pid.
+    fn calls(&self) -> Vec<(String, String)> {
+        std::fs::read_to_string(self.state.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| {
+                let (id, pid) = l.split_once(' ').unwrap();
+                (id.to_string(), pid.to_string())
+            })
+            .collect()
+    }
+
+    fn calls_of(&self, id: &str) -> usize {
+        self.calls().iter().filter(|(i, _)| i == id).count()
+    }
+
+    /// Waits until a gated record's transform is running.
+    async fn wait_entered(&self, id: &str) {
+        let started = std::time::Instant::now();
+        while !self.state.join(format!("entered-{id}")).exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "record {id} never reached the transform"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Lets a gated record go once the replacement is waiting for the runner that
+    /// holds it, or once a second runner has reached the record too.
+    async fn release(&self, id: &str) {
+        let started = std::time::Instant::now();
+        while self.calls_of(id) < 2 && self.manager.unfinished_runners("probe") < 2 {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "no replacement is waiting"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        std::fs::write(self.state.join(format!("release-{id}")), "").unwrap();
+    }
+
+    async fn wait_sent(&self, ids: &[&str]) {
+        let started = std::time::Instant::now();
+        loop {
+            let rows = self.rows();
+            if ids
+                .iter()
+                .all(|id| rows.get(*id).is_some_and(|r| r.0 == "sent"))
+            {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "not all sent: {rows:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Each record transformed once and each of its resources written to FHIR once.
+    fn assert_once(&self, ids: &[&str]) {
+        for id in ids {
+            assert_eq!(self.calls_of(id), 1, "record {id}: {:?}", self.calls());
+        }
+        let fhir = self.fhir.lock().unwrap();
+        assert_eq!(fhir.versions.len(), ids.len(), "{:?}", fhir.versions);
+        assert!(
+            fhir.versions.values().all(|v| *v == 1),
+            "a resource written twice: {:?}",
+            fhir.versions
+        );
     }
 
     async fn tick(&self) {
@@ -611,10 +717,245 @@ async fn a_source_replaced_mid_record_does_not_resend_the_one_already_decided() 
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(probe.rows()["1"].0, "rejected");
-    assert_eq!(
-        probe.seen().iter().filter(|id| *id == "1").count(),
-        1,
-        "{:?}",
-        probe.seen()
+    for id in ["1", "2"] {
+        assert_eq!(
+            probe.seen().iter().filter(|seen| *seen == id).count(),
+            1,
+            "record {id}: {:?}",
+            probe.seen()
+        );
+    }
+}
+
+// ---- a replaced source: one runner at a time --------------------------------
+
+const GATED: &str = "id,mode\n1,gate\n2,ok\n3,ok\n";
+
+async fn gated_probe() -> Option<Probe> {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        return None;
+    };
+    let probe = Probe::new(&python, "  request_seconds: 30\n", false, GATED).await;
+    probe.wait_entered("1").await;
+    Some(probe)
+}
+
+#[tokio::test]
+async fn a_source_replaced_mid_record_runs_each_record_once() {
+    let Some(probe) = gated_probe().await else {
+        return;
+    };
+    let api = probe.api().await;
+    let definition = probe.manager.definition("probe").unwrap().unwrap();
+    let status = reqwest::Client::new()
+        .put(format!("{api}/api/sources/probe"))
+        .json(&definition)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+    probe.release("1").await;
+    probe.wait_sent(&["1", "2", "3"]).await;
+    probe.assert_once(&["1", "2", "3"]);
+}
+
+#[tokio::test]
+async fn a_source_replaced_twice_mid_record_runs_its_runners_in_turn() {
+    let Some(probe) = gated_probe().await else {
+        return;
+    };
+    probe.manager.start(probe.feed.clone()).unwrap();
+    probe.manager.start(probe.feed.clone()).unwrap();
+    probe.release("1").await;
+    probe.wait_sent(&["1", "2", "3"]).await;
+    probe.assert_once(&["1", "2", "3"]);
+    // The first runner finished its record; the middle one never ran; the last did the rest.
+    let calls = probe.calls();
+    assert_ne!(calls[0].1, calls[1].1, "{calls:?}");
+    assert_eq!(calls[1].1, calls[2].1, "{calls:?}");
+}
+
+#[tokio::test]
+async fn a_source_deleted_and_created_again_mid_record_runs_each_record_once() {
+    let Some(probe) = gated_probe().await else {
+        return;
+    };
+    let api = probe.api().await;
+    let definition = probe.manager.definition("probe").unwrap().unwrap();
+    let client = reqwest::Client::new();
+    let status = client
+        .delete(format!("{api}/api/sources/probe"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 204);
+    let status = client
+        .post(format!("{api}/api/sources"))
+        .json(&definition)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 201);
+    probe.release("1").await;
+    probe.wait_sent(&["1", "2", "3"]).await;
+    probe.assert_once(&["1", "2", "3"]);
+}
+
+#[tokio::test]
+async fn a_transform_saved_mid_record_runs_each_record_once() {
+    let Some(probe) = gated_probe().await else {
+        return;
+    };
+    let api = probe.api().await;
+    let code = probe.manager.transform_code("probe").unwrap().unwrap();
+    let status = reqwest::Client::new()
+        .put(format!("{api}/api/transforms/probe"))
+        .json(&json!({"code": code}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+    probe.release("1").await;
+    probe.wait_sent(&["1", "2", "3"]).await;
+    probe.assert_once(&["1", "2", "3"]);
+}
+
+#[tokio::test]
+async fn a_replacement_aborts_a_runner_that_does_not_stop_within_the_grace() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let probe = Probe::new(&python, "  request_seconds: 30\n", true, "id,mode\n1,ok\n").await;
+    probe.fhir.lock().unwrap().hold_next = true;
+    probe.manager.resume("probe").unwrap();
+    // The runner has sent its record's batch, and FHIR keeps it waiting.
+    let started = std::time::Instant::now();
+    while probe.fhir.lock().unwrap().requests == 0 {
+        assert!(started.elapsed() < Duration::from_secs(30), "nothing sent");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let grace = Duration::from_secs(2);
+    probe.manager.set_handover_grace(grace);
+    let replaced = std::time::Instant::now();
+    probe.manager.start(probe.feed.clone()).unwrap();
+    probe.wait_sent(&["1"]).await;
+    let waited = replaced.elapsed();
+    assert!(
+        waited >= grace && waited < Duration::from_secs(30),
+        "{waited:?}"
     );
+    assert_eq!(probe.calls_of("1"), 1, "{:?}", probe.calls());
+    // FHIR had written the batch the aborted runner was waiting on: only a forced
+    // abort sends a batch again, and the second write is an update by id.
+    let fhir = probe.fhir.lock().unwrap();
+    assert_eq!(fhir.requests, 2);
+    assert_eq!(
+        fhir.versions,
+        HashMap::from([("Observation/obs-1".to_string(), 2)])
+    );
+}
+
+// A regression test for the handover itself, not for the overlap fixed before
+// it: an older runner that times out must never abort a newer one. It passes on
+// a build without any handover, which has no aborts at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn runners_replaced_in_a_row_never_abort_a_newer_one() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let probe = Probe::new(&python, "  request_seconds: 30\n", false, "id,mode\n0,ok\n").await;
+    probe.wait_sent(&["0"]).await;
+    let grace = Duration::from_millis(500);
+    probe.manager.set_handover_grace(grace);
+    let inbox = probe.state.parent().unwrap().join("inbox");
+    let mut ids = vec!["0".to_string()];
+    for round in 1..=5 {
+        // Replaced twice from a runtime worker, as an API call does.
+        let manager = probe.manager.clone();
+        let feed = probe.feed.clone();
+        tokio::spawn(async move {
+            manager.start(feed.clone()).unwrap();
+            manager.start(feed).unwrap();
+        })
+        .await
+        .unwrap();
+        // Past the grace, the last runner is the one left, and it still works.
+        tokio::time::sleep(grace * 3).await;
+        drop_file(
+            &inbox,
+            &format!("round-{round}.csv"),
+            &format!("id,mode\n{round},ok\n"),
+        );
+        ids.push(round.to_string());
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        probe.wait_sent(&ids).await;
+    }
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    probe.assert_once(&ids);
+}
+
+#[tokio::test]
+async fn a_halted_runner_delivers_nothing_more() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let probe = Probe::new(
+        &python,
+        "  request_seconds: 30\n",
+        true,
+        "id,mode\n1,ok\n2,ok\n",
+    )
+    .await;
+    // FHIR is down for one pass: both records are transformed and wait to be delivered.
+    probe.fhir.lock().unwrap().down = true;
+    probe.tick().await;
+    let requests = probe.fhir.lock().unwrap().requests;
+    assert!(requests > 0);
+    probe.fhir.lock().unwrap().down = false;
+    let runner = probe.manager.runner("probe").unwrap();
+    probe.manager.delete("probe").unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await; // past the 10 ms backoff
+    runner.tick().await.unwrap();
+    assert_eq!(probe.fhir.lock().unwrap().requests, requests);
+    let rows = probe.rows();
+    assert!(rows.values().all(|r| r.0 != "sent"), "{rows:?}");
+}
+
+#[tokio::test]
+async fn deleted_sources_leave_no_runner_slots_behind() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let probe = Probe::new(&python, "  request_seconds: 30\n", true, "id,mode\n").await;
+    let definition = probe.manager.definition("probe").unwrap().unwrap();
+    let ids: Vec<String> = (0..10).map(|i| format!("extra-{i}")).collect();
+    for id in &ids {
+        let mut body = definition.clone();
+        body["id"] = json!(id);
+        probe.manager.create(&body, None).unwrap();
+    }
+    assert_eq!(probe.manager.runner_slots(), 11);
+    for id in &ids {
+        probe.manager.delete(id).unwrap();
+    }
+    let started = std::time::Instant::now();
+    while probe.manager.runner_slots() != probe.manager.sources().len() {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{} slots for {} sources",
+            probe.manager.runner_slots(),
+            probe.manager.sources().len()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(probe.manager.runner_slots(), 1);
 }

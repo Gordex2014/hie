@@ -609,6 +609,10 @@ impl FeedRunner {
             return self.submit_transformed(bulk).await;
         }
         loop {
+            // A halted or replaced source opens no more submissions.
+            if self.halted() {
+                return Ok(());
+            }
             let files = self
                 .db
                 .submittable_files(&self.feed.id, self.feed.delivery.manifest_objects_max)?;
@@ -818,6 +822,9 @@ impl FeedRunner {
     /// `bulk_dir` served by the engine, and opens one submission over them.
     async fn submit_transformed(&self, bulk: &BulkSubmitter) -> Result<()> {
         loop {
+            if self.halted() {
+                return Ok(());
+            }
             let records = self
                 .db
                 .submittable_records(&self.feed.id, self.feed.delivery.bulk_records_max)?;
@@ -922,6 +929,11 @@ impl FeedRunner {
 
     async fn deliver_due(&self) -> Result<()> {
         loop {
+            // A halted or replaced source stops between batches: what is due stays
+            // for the runner that replaces it.
+            if self.halted() {
+                return Ok(());
+            }
             let items = self
                 .db
                 .due_records(&self.feed.id, self.feed.delivery.batch_size)?;
@@ -964,6 +976,10 @@ impl FeedRunner {
             Err(SendError::Refused(status, _)) if items.len() > 1 => {
                 tracing::warn!(feed = %self.feed.id, status, "batch refused as a whole; sending records one by one");
                 for item in items {
+                    // Halted: the rest stays due, for the runner that replaces this one.
+                    if self.halted() {
+                        break;
+                    }
                     if !Box::pin(self.deliver(std::slice::from_ref(item))).await? {
                         return Ok(false);
                     }

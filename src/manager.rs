@@ -2,10 +2,11 @@
 //! through the API, persisted as the files `config::load` reads, and run without
 //! a restart.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -23,7 +24,10 @@ use crate::worker::WorkerLimits;
 /// Transform tries that may run at once, each with its own worker process.
 const TRY_CONCURRENCY: usize = 4;
 /// How long a try waits for its turn before it is turned away.
-const TRY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const TRY_WAIT: Duration = Duration::from_secs(10);
+/// Beyond the longest single step (one record, or one HTTP call to FHIR), how
+/// long a replaced runner has to store its outcome and stop before it is aborted.
+const HANDOVER_SLACK: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum ManagerError {
@@ -47,6 +51,47 @@ struct Managed {
     control: Arc<RunnerControl>,
 }
 
+/// A runner task of a source that may not have finished yet.
+#[derive(Clone)]
+struct RunnerTask {
+    /// Closed when the task ends, aborted or not: its sender lives in the task.
+    done: tokio::sync::watch::Receiver<()>,
+    abort: tokio::task::AbortHandle,
+}
+
+impl RunnerTask {
+    fn finished(&self) -> bool {
+        self.done.has_changed().is_err()
+    }
+}
+
+/// Waits until every runner in `predecessors` has ended. After each `grace`, the
+/// ones still running are aborted and waited for again: an aborted task ends at
+/// its next await, so only one blocked inside a synchronous call stays, and the
+/// warning repeats while it does.
+async fn hand_over(id: &str, mut predecessors: Vec<RunnerTask>, grace: Duration) {
+    predecessors.retain(|p| !p.finished());
+    if predecessors.is_empty() {
+        return;
+    }
+    async fn all_ended(tasks: &mut [RunnerTask]) {
+        for task in tasks {
+            // Nothing is ever sent: `changed` returns only once the task has ended.
+            while task.done.changed().await.is_ok() {}
+        }
+    }
+    tracing::info!(feed = %id, "waiting for the previous runner to stop");
+    while tokio::time::timeout(grace, all_ended(&mut predecessors))
+        .await
+        .is_err()
+    {
+        tracing::warn!(feed = %id, "the previous runner did not stop within {}; aborting it", crate::pipeline::human(grace));
+        for p in predecessors.iter().filter(|p| !p.finished()) {
+            p.abort.abort();
+        }
+    }
+}
+
 pub struct SourceManager {
     python: String,
     runtime_dir: PathBuf,
@@ -63,6 +108,10 @@ pub struct SourceManager {
     fhir: Arc<FhirClient>,
     alerts: Arc<Alerter>,
     sources: Mutex<BTreeMap<String, Managed>>,
+    /// Per source id, in the order they were started, the runner tasks that may
+    /// still run, deleted sources included. Locked only inside `sources`.
+    runners: Mutex<HashMap<String, Vec<RunnerTask>>>,
+    handover_grace_ms: AtomicU64,
 }
 
 impl SourceManager {
@@ -89,7 +138,52 @@ impl SourceManager {
             fhir,
             alerts,
             sources: Mutex::new(BTreeMap::new()),
+            runners: Mutex::new(HashMap::new()),
+            handover_grace_ms: AtomicU64::new(
+                (config
+                    .worker
+                    .limits()
+                    .request
+                    .max(crate::fhir::HTTP_TIMEOUT)
+                    + HANDOVER_SLACK)
+                    .as_millis() as u64,
+            ),
         })
+    }
+
+    /// How long a replacement waits for the runner it replaces before aborting it.
+    pub fn set_handover_grace(&self, grace: Duration) {
+        self.handover_grace_ms
+            .store(grace.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Source ids that still have runners: the live sources, and deleted ones
+    /// whose runner has not stopped yet. Also forgets the runners that have
+    /// finished.
+    pub fn runner_slots(&self) -> usize {
+        let sources = self.sources.lock().expect("manager mutex");
+        let mut runners = self.runners.lock().expect("manager mutex");
+        Self::reap(&mut runners, &sources);
+        runners.len()
+    }
+
+    /// The runners of a source that have not finished: more than one while a
+    /// replacement waits for the runner it replaces. Also forgets the runners
+    /// that have finished.
+    pub fn unfinished_runners(&self, id: &str) -> usize {
+        let sources = self.sources.lock().expect("manager mutex");
+        let mut runners = self.runners.lock().expect("manager mutex");
+        Self::reap(&mut runners, &sources);
+        runners.get(id).map_or(0, Vec::len)
+    }
+
+    /// Forgets the runners that have finished, and the ids of deleted sources
+    /// that have none left.
+    fn reap(runners: &mut HashMap<String, Vec<RunnerTask>>, sources: &BTreeMap<String, Managed>) {
+        runners.retain(|id, tasks| {
+            tasks.retain(|t| !t.finished());
+            !tasks.is_empty() || sources.contains_key(id)
+        });
     }
 
     /// Builds and spawns the runner for a resolved definition, replacing a running one.
@@ -110,18 +204,37 @@ impl SourceManager {
             .with_worker_limits(self.worker_limits.clone()),
         );
         let control = Arc::new(RunnerControl::default());
-        tokio::spawn(runner.clone().run(control.clone()));
-        let previous = self.sources.lock().expect("manager mutex").insert(
-            feed.id.clone(),
+        let id = feed.id.clone();
+        let grace = Duration::from_millis(self.handover_grace_ms.load(Ordering::Relaxed));
+        let mut sources = self.sources.lock().expect("manager mutex");
+        let previous = sources.insert(
+            id.clone(),
             Managed {
                 feed,
-                runner,
-                control,
+                runner: runner.clone(),
+                control: control.clone(),
             },
         );
         if let Some(p) = previous {
             Self::halt(&p);
         }
+        let mut runners = self.runners.lock().expect("manager mutex");
+        Self::reap(&mut runners, &sources);
+        let tasks = runners.entry(id.clone()).or_default();
+        // The call returns at once. The runner starts when every runner of the
+        // source started before it has ended: after its current record, or
+        // aborted after `grace`. Spawned here, so the order is the order of `start`.
+        let predecessors = tasks.clone();
+        let (done, ended) = tokio::sync::watch::channel(());
+        let task = tokio::spawn(async move {
+            let _done = done;
+            hand_over(&id, predecessors, grace).await;
+            runner.run(control).await;
+        });
+        tasks.push(RunnerTask {
+            done: ended,
+            abort: task.abort_handle(),
+        });
         Ok(())
     }
 
@@ -253,7 +366,12 @@ impl SourceManager {
 
     /// Stops the source and removes its definition. Its records and alerts stay.
     pub fn delete(&self, id: &str) -> Result<(), ManagerError> {
-        let removed = self.sources.lock().expect("manager mutex").remove(id);
+        let removed = {
+            let mut sources = self.sources.lock().expect("manager mutex");
+            let removed = sources.remove(id);
+            Self::reap(&mut self.runners.lock().expect("manager mutex"), &sources);
+            removed
+        };
         let Some(managed) = removed else {
             return Err(ManagerError::NotFound(format!("source {id} not found")));
         };

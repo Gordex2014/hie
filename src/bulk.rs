@@ -7,7 +7,6 @@
 //! carries.
 
 use std::collections::HashSet;
-use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -39,7 +38,7 @@ pub const SUBMITTER_SYSTEM: &str = "urn:helios:hie:source";
 impl BulkSubmitter {
     pub fn new(fhir_base: &str, public_url: &str) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(crate::fhir::HTTP_TIMEOUT)
             .build()
             .expect("HTTP client");
         Self {

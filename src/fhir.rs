@@ -27,6 +27,9 @@ pub struct FhirClient {
     credentials: Credentials,
 }
 
+/// How long one HTTP call to FHIR may take, `$bulk-submit` calls included.
+pub const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
 impl FhirClient {
     /// A client that calls HFS anonymously.
     pub fn new(base: &str) -> Self {
@@ -35,7 +38,7 @@ impl FhirClient {
 
     pub fn with_credentials(base: &str, credentials: Credentials) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(HTTP_TIMEOUT)
             .build()
             .expect("HTTP client");
         Self {
