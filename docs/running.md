@@ -6,7 +6,7 @@ How to run the engine: the binary, the Docker image, the environment variables, 
 
 You need:
 - Rust 1.90 or later;
-- Python 3.11 or later (`py` on Windows, `python3` elsewhere; set `python:` in `hie.yaml` to change it, to a virtual environment's interpreter for instance). On Linux and macOS it must be the interpreter itself, not a script that starts Python as a child: the engine refuses a worker it did not start directly. On Windows the engine asks the configured interpreter which `python.exe` it runs and starts that one, so the `py` launcher works;
+- Python 3.11 or later (`py` on Windows, `python3` elsewhere; set `python:` in `hie.yaml` to change it, to a virtual environment's interpreter for instance). The floor is the `limited-process@1` launcher's, not HIE's: an older interpreter (Ubuntu 22.04's 3.10, say) leaves every source's records received, with "the launcher could not set up the worker: python_version: Python 3.11 or later is required" in the log, until `python:` points at a newer one. On Linux and macOS it must be the interpreter itself, not a script that starts Python as a child: the engine refuses a worker it did not start directly. On Windows the engine asks the configured interpreter which `python.exe` it runs and starts that one, so the `py` launcher works;
 - HFS running at the URL in `hie.yaml` (default `http://localhost:8080`), with its search parameters loaded (`HFS_DATA_DIR`): a row delivered by business identifier is a conditional `PUT Type?identifier=...`, which HFS refuses with `400` when it does not know `identifier` for that type, and the engine then rejects the row as a data error.
 
 ```sh
