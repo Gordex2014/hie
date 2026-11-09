@@ -103,6 +103,20 @@ fn count(state: &hie::api::AppState, status: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// Ends the backoff of the source's deferred rows, as the time running out would.
+fn make_pending_due(database: &Path, expected: usize) {
+    let conn = rusqlite::Connection::open(database).unwrap();
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let n = conn
+        .execute(
+            "UPDATE records SET next_attempt_at = 0 WHERE feed_id = 'lab-results' AND status = 'pending'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(n, expected);
+}
+
 #[tokio::test]
 async fn the_engine_fetches_caches_refreshes_and_drops_its_token() {
     let Some(python) = python() else {
@@ -143,7 +157,7 @@ async fn the_engine_fetches_caches_refreshes_and_drops_its_token() {
     std::fs::write(
         root.join("sources/lab-results.yaml"),
         "id: lab-results\nname: Lab results\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  min_file_age_ms: 0\n\
-         transform: transforms/lab_results.py\ndelivery:\n  initial_backoff_ms: 10\n  alert_after_attempts: 2\n",
+         transform: transforms/lab_results.py\ndelivery:\n  initial_backoff_ms: 3600000\n  max_backoff_ms: 3600000\n  alert_after_attempts: 2\n",
     )
     .unwrap();
     let source = Arc::new(TokenSource::new(CredentialSettings {
@@ -219,7 +233,10 @@ async fn the_engine_fetches_caches_refreshes_and_drops_its_token() {
             .contains("did not accept the engine's token"),
         "{pending:?}"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    // The backoff is an hour, so the refused rows cannot come due inside the
+    // tick that deferred them (its final drain would send them with a fresh
+    // token); they are made due here instead.
+    make_pending_due(&root.join("data/hie.db"), 3);
     runner.tick().await.unwrap();
     assert_eq!(count(&state, "sent"), 6);
     {
