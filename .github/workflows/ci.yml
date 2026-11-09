@@ -32,6 +32,10 @@ jobs:
 
   image:
     name: Container image (Linux)
+    # A pull request from a fork gets no secrets, so it cannot reach the shared
+    # Docker server: skip it there. The image is still built on every push to
+    # main, so a merged change is checked before any release.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: self-hosted
     env:
       # The Docker server is shared, so the tag is per run.
