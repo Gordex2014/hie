@@ -560,11 +560,13 @@ async fn a_launcher_that_does_not_match_the_pin_never_runs_the_program() {
     assert_eq!(reports.len(), 1, "{reports:?}");
     assert!(
         reports[0].contains(&format!("\"reference_sha256\":\"{changed_sha}\""))
-            && reports[0].contains("\"not_enforced\":[]")
             && reports[0].contains("\"verdict\":\"unavailable\""),
         "{}",
         reports[0]
     );
+    // Elsewhere the launcher reports what it cannot enforce there.
+    #[cfg(target_os = "linux")]
+    assert!(reports[0].contains("\"not_enforced\":[]"), "{}", reports[0]);
 }
 
 #[tokio::test]
@@ -643,7 +645,12 @@ async fn a_stderr_flood_neither_blocks_the_worker_nor_grows_without_bound() {
     assert_eq!(report.verdict, Verdict::Completed);
     assert!(report.stderr_truncated);
     assert_eq!(report.stderr_tail_bytes, 64 * 1024);
-    assert!(report.stderr_tail.ends_with("eeeeend-of-flood\n"));
+    // Windows writes the line end as \r\n.
+    assert!(
+        report.stderr_tail.trim_end().ends_with("eeeeend-of-flood"),
+        "{:?}",
+        &report.stderr_tail[report.stderr_tail.len() - 40..]
+    );
 }
 
 #[tokio::test]
