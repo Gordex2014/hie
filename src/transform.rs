@@ -143,16 +143,15 @@ impl Transformer {
                 *slot = Some(generation);
                 Ok(parse_reply(&reply))
             }
-            // A reply that cannot be read is the transform's fault for this
-            // record, not the process's: the worker answered in order and stays.
-            Exchange::NotJson(e) => {
-                *slot = Some(generation);
-                Ok(Outcome::Rejected {
-                    kind: "transform".into(),
-                    message: format!(
-                        "the transform's reply could not be read as JSON ({e}); the resources it returned are not valid JSON"
-                    ),
-                })
+            // worker.py keeps file descriptor 1 off the protocol, so a line
+            // that is not JSON came from something else: its reply may still
+            // be in the pipe, and the next record needs a new worker.
+            Exchange::NotJson(stray) => {
+                let report = generation.retire(Verdict::UserError, Some("unknown")).await;
+                rejected(
+                    format!("something wrote to the worker's stdout: {stray:?}"),
+                    report,
+                )
             }
             Exchange::TimedOut => {
                 let report = generation.retire(Verdict::TimedOut, None).await;

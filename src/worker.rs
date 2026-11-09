@@ -41,6 +41,8 @@ pub(crate) const MAX_LINE: usize = 32 * 1024 * 1024;
 const STDERR_TAIL: usize = 64 * 1024;
 /// How much of that tail goes into a rejected record's message.
 const MESSAGE_TAIL: usize = 2 * 1024;
+/// How much of a stray line on stdout goes into a rejected record's message.
+const STRAY_SHOWN: usize = 300;
 const POLL: Duration = Duration::from_millis(5);
 /// Draining and reaping after the group is killed; separate from every deadline.
 const CLEANUP_BUDGET: Duration = Duration::from_millis(1000);
@@ -184,7 +186,9 @@ pub(crate) struct Launch {
 pub(crate) enum Exchange {
     /// A JSON reply carrying the request's id.
     Reply(Value),
-    /// A line that is not JSON: framing is intact, the worker stays.
+    /// A line that is not JSON, cut to [`STRAY_SHOWN`] characters: something
+    /// other than the worker wrote to its stdout, and the real reply, if any,
+    /// is still in the pipe. The protocol is broken.
     NotJson(String),
     /// JSON with another id.
     OutOfOrder,
@@ -867,7 +871,12 @@ impl Generation {
                 Line::Text(text) => match serde_json::from_slice::<Value>(&text) {
                     Ok(reply) if reply.get("id") == Some(&json!(id)) => Exchange::Reply(reply),
                     Ok(_) => Exchange::OutOfOrder,
-                    Err(e) => Exchange::NotJson(e.to_string()),
+                    Err(_) => Exchange::NotJson(
+                        String::from_utf8_lossy(&text)
+                            .chars()
+                            .take(STRAY_SHOWN)
+                            .collect(),
+                    ),
                 },
             }
         };
@@ -895,7 +904,7 @@ impl Generation {
                     .unwrap_or(Exchange::Ended)
             }
         };
-        if matches!(exchange, Exchange::Reply(_) | Exchange::NotJson(_)) {
+        if matches!(exchange, Exchange::Reply(_)) {
             self.busy = false;
         }
         exchange

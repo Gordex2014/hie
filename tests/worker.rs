@@ -79,6 +79,9 @@ for line in sys.stdin:
     if record.get("overlong"):
         sys.stdout.write("x" * (33 * 1024 * 1024))
         time.sleep(60)
+    if "stray" in record:
+        # Not the protocol: a line on stdout before the reply.
+        sys.stdout.write(record["stray"] + "\n")
     resource = {"echo": record.get("echo"), "pid": os.getpid(), "cwd": os.getcwd(),
                 "listing": sorted(os.listdir("."))}
     if record.get("env"):
@@ -450,6 +453,37 @@ async fn an_overlong_reply_or_a_wrong_id_ends_the_process() {
     assert!(message.contains("out of order"), "{message}");
     let third = reply(t.transform(&json!({"echo": "c"}), &ctx()).await.unwrap());
     assert_ne!(third["pid"], second["pid"]);
+    t.close().await;
+}
+
+#[tokio::test]
+async fn a_line_that_is_not_json_ends_the_process_and_the_next_record_gets_its_own_reply() {
+    let rig = need_python!();
+    let t = rig.transformer("normal", limits());
+    let first = reply(t.transform(&json!({"echo": "a"}), &ctx()).await.unwrap());
+    let message = rejection(
+        t.transform(&json!({"echo": "stray", "stray": "stray"}), &ctx())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        message.starts_with(
+            "something wrote to the worker's stdout: \"stray\"; its worker was restarted (verdict user_error, cause unknown)"
+        ),
+        "{message}"
+    );
+    // The reply the old process wrote after the stray line is never read as
+    // this one's.
+    let next = reply(t.transform(&json!({"echo": "b"}), &ctx()).await.unwrap());
+    assert_eq!(next["echo"], "b");
+    assert_ne!(next["pid"], first["pid"]);
+    let after = reply(t.transform(&json!({"echo": "c"}), &ctx()).await.unwrap());
+    assert_eq!(after["echo"], "c");
+    assert_eq!(after["pid"], next["pid"]);
+    // A long stray line is cut short in the message.
+    let long = "y".repeat(10_000);
+    let message = rejection(t.transform(&json!({"stray": long}), &ctx()).await.unwrap());
+    assert!(message.len() < 1000, "{} bytes: {message}", message.len());
     t.close().await;
 }
 
@@ -886,6 +920,104 @@ async fn cancelling_during_a_reply_leaves_nothing_behind() {
         |rig| !rig.seen().is_empty(),
     )
     .await;
+}
+
+// ---- the real worker: a write to file descriptor 1 is not a reply ----------
+
+/// The real `hie_runtime/` (launcher, `worker.py`, `hie.py`) running `script`.
+fn real_worker(python: &str, dir: &Path, script: &str) -> Transformer {
+    let path = dir.join("transform.py");
+    std::fs::write(&path, script).unwrap();
+    let mut t = Transformer::new(python, &repo().join("hie_runtime"), &path);
+    t.set_limits(limits());
+    t
+}
+
+/// Sends records 1..=5 and expects each one's own resource back.
+async fn every_record_gets_its_own_reply(t: &Transformer) -> Vec<Value> {
+    let mut resources = Vec::new();
+    for n in 1..=5 {
+        let outcome = t.transform(&json!({"n": n}), &ctx()).await.unwrap();
+        let Outcome::Resources(found) = outcome else {
+            panic!("record {n}: {outcome:?}");
+        };
+        assert_eq!(found.len(), 1, "record {n}: {found:?}");
+        assert_eq!(found[0]["id"], n.to_string(), "record {n}: {found:?}");
+        resources.push(found[0].clone());
+    }
+    resources
+}
+
+#[tokio::test]
+async fn a_transform_that_writes_to_fd_1_once_still_gets_every_reply() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let t = real_worker(
+        &python,
+        dir.path(),
+        r#"
+import os
+
+wrote = False
+
+def transform(record, context):
+    global wrote
+    if not wrote:
+        os.write(1, b"stray\n")
+        wrote = True
+    return {"resourceType": "Observation", "id": str(record["n"]), "pid": os.getpid()}
+"#,
+    );
+    let resources = every_record_gets_its_own_reply(&t).await;
+    assert!(
+        resources.iter().all(|r| r["pid"] == resources[0]["pid"]),
+        "the worker was restarted: {resources:?}"
+    );
+    let report = t.close().await.unwrap();
+    assert_eq!(report.verdict, Verdict::Completed);
+    assert!(report.stderr_tail.contains("stray"), "{report:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_transform_whose_child_writes_to_fd_1_every_time_still_gets_every_reply() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let t = real_worker(
+        &python,
+        dir.path(),
+        r#"
+import os, subprocess
+
+def transform(record, context):
+    os.write(1, b"from-fd1\n")
+    subprocess.run(["sh", "-c", "echo from-child"], check=True)
+    return {"resourceType": "Observation", "id": str(record["n"]), "pid": os.getpid()}
+"#,
+    );
+    let resources = every_record_gets_its_own_reply(&t).await;
+    assert!(
+        resources.iter().all(|r| r["pid"] == resources[0]["pid"]),
+        "the worker was restarted: {resources:?}"
+    );
+    let report = t.close().await.unwrap();
+    assert_eq!(report.verdict, Verdict::Completed);
+    assert_eq!(
+        report.stderr_tail.matches("from-child").count(),
+        5,
+        "{report:?}"
+    );
+    assert_eq!(
+        report.stderr_tail.matches("from-fd1").count(),
+        5,
+        "{report:?}"
+    );
 }
 
 // ---- a process that exits on its own ----------------------------------------

@@ -42,6 +42,28 @@ class WorkerProtocol(unittest.TestCase):
         self.assertEqual(reply["error"]["kind"], "data")
         self.assertIn("neither id nor identifier", reply["error"]["message"])
 
+    def test_a_write_to_file_descriptor_1_goes_to_stderr_not_the_protocol(self):
+        with tempfile.TemporaryDirectory() as run:
+            transform = Path(run, "stray.py")
+            transform.write_text(
+                "import os\n"
+                "def transform(record, context):\n"
+                "    os.write(1, b'stray\\n')\n"
+                "    return {'resourceType': 'Observation', 'id': 'o1'}\n"
+            )
+            request = json.dumps({"id": 7, "record": {}, "context": {"feed": "t", "file": "t", "line": 1}})
+            proc = subprocess.run(
+                [sys.executable, "-u", str(ROOT / "hie_runtime" / "worker.py"), str(transform)],
+                input=(request + "\n").encode("utf-8"),
+                capture_output=True,
+                timeout=30,
+            )
+        lines = proc.stdout.decode("utf-8").splitlines()
+        self.assertEqual(json.loads(lines[0]), {"ready": True})
+        self.assertEqual(json.loads(lines[1]), {"id": 7, "resources": [{"resourceType": "Observation", "id": "o1"}]})
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn(b"stray", proc.stderr)
+
 
 class Interpreter(unittest.TestCase):
     def test_the_interpreter_is_recent_enough_for_the_launcher(self):
