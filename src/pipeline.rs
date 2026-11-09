@@ -14,7 +14,6 @@ use crate::config::{DeliveryMethod, FeedConfig, Format, parse_duration};
 use crate::db::{Db, Rule, WorkItem, now_ms};
 use crate::fhir::{self, DeliveryKey, EntryResult, FhirClient, SendError};
 use crate::reader;
-use crate::runtime::RuntimeSettings;
 use crate::source::{Incoming, Source};
 use crate::transform::{self, Outcome, Transformer};
 use tokio::sync::Notify;
@@ -164,12 +163,6 @@ impl FeedRunner {
     /// The terminology server the transform may ask.
     pub fn with_terminology(mut self, url: Option<&str>) -> Self {
         self.transformer.set_terminology(url);
-        self
-    }
-
-    /// The shared runtime the transform runs at, instead of a local process.
-    pub fn with_runtime(mut self, settings: Option<&RuntimeSettings>) -> Self {
-        self.transformer.set_runtime(settings);
         self
     }
 

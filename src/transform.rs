@@ -5,7 +5,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::fhir::DeliveryKey;
-use crate::runtime::{RemoteRuntime, RuntimeSettings};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
@@ -23,8 +22,8 @@ pub enum Outcome {
     Transient(String),
 }
 
-/// One feed's transform script: run by a long-lived Python process of this
-/// engine, or by the shared runtime when one is configured.
+/// One feed's transform script, run by a long-lived Python process of this
+/// engine.
 pub struct Transformer {
     python: String,
     worker_script: PathBuf,
@@ -32,8 +31,6 @@ pub struct Transformer {
     /// The HTS the worker may ask, handed over as `HIE_TERMINOLOGY_SERVER`.
     terminology: Option<String>,
     worker: Mutex<Option<Worker>>,
-    /// The shared runtime, when transforms run there instead of locally.
-    remote: Option<RemoteRuntime>,
 }
 
 struct Worker {
@@ -51,7 +48,6 @@ impl Transformer {
             transform_script: transform_script.to_path_buf(),
             terminology: None,
             worker: Mutex::new(None),
-            remote: None,
         }
     }
 
@@ -59,42 +55,15 @@ impl Transformer {
         self.terminology = url.map(str::to_string);
     }
 
-    /// Runs the transform at the shared runtime instead of a local process.
-    pub fn set_runtime(&mut self, settings: Option<&RuntimeSettings>) {
-        self.remote = settings.map(|s| RemoteRuntime::new(s.clone(), &self.transform_script));
-    }
-
-    /// Whether transforms run at the shared runtime.
-    pub fn is_remote(&self) -> bool {
-        self.remote.is_some()
-    }
-
-    /// Transforms a batch of `(record, context)` pairs: one call to the shared
-    /// runtime, or one worker round trip per record locally. One outcome per
-    /// pair, in order. An error means the process or the runtime failed, not
-    /// the data: nothing in the batch is decided.
+    /// Transforms a batch of `(record, context)` pairs, one worker round trip
+    /// per record. One outcome per pair, in order. An error means the process
+    /// failed, not the data: nothing in the batch is decided.
     pub async fn transform_many(&self, items: &[(Value, Value)]) -> Result<Vec<Outcome>> {
-        if let Some(remote) = &self.remote {
-            let replies = remote.run(&self.transform_script, items).await?;
-            return Ok(replies.iter().map(parse_reply).collect());
-        }
         let mut outcomes = Vec::with_capacity(items.len());
         for (record, context) in items {
             outcomes.push(self.transform(record, context).await?);
         }
         Ok(outcomes)
-    }
-
-    /// Like [`Transformer::transform_many`], for code that is being tried: the
-    /// shared runtime runs it inline without storing it.
-    pub async fn try_many(&self, items: &[(Value, Value)]) -> Result<Vec<Outcome>> {
-        let Some(remote) = &self.remote else {
-            return self.transform_many(items).await;
-        };
-        let code = std::fs::read_to_string(&self.transform_script)
-            .with_context(|| format!("reading {}", self.transform_script.display()))?;
-        let replies = remote.try_code(&code, items).await?;
-        Ok(replies.iter().map(parse_reply).collect())
     }
 
     async fn spawn(&self) -> Result<Worker> {

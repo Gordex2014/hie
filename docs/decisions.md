@@ -353,7 +353,7 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 **Why:**
 - A lab's codes are local and must become LOINC; the mapping belongs in the terminology server, where it is maintained by the people who own terminology, not in a dictionary inside a script.
 - A code HTS does not know is a data error worth stopping on; a server that is down is not, and must not turn rows into rejections.
-- Two helpers rather than a FHIR client in every transform: the transform author writes `lookup` and `translate`, and the runtime decides how to reach the server, which is also what the shared Python runtime will do.
+- Two helpers rather than a FHIR client in every transform: the transform author writes `lookup` and `translate`, and the worker decides how to reach the server.
 
 **Cost / not yet:** `$validate-code` against a ValueSet, `$expand`, and `$subsumes` are not wrapped; the cache is per worker process and forgets on restart; a token for HTS is a single static one, not the engine's client credentials.
 
@@ -391,17 +391,20 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 
 **Cost / not yet:** an anonymous source cannot have a queue; FIFO queues and message attributes are not handled; the queue must be the bucket's own notification target (the engine does not subscribe or configure anything); MinIO cannot feed a real queue, so the lab runs this only against the stand-in.
 
-## 34. Transforms may run at the shared Python runtime
+## 34. Transforms may run at a remote runtime service (superseded by 35)
 
-**Chosen:** `runtime:` in `hie.yaml` (URL, the environment variable holding the consumer's token, records per call) makes every transform run at python-runtime through its HIE facade: the code is stored under the file's name once per version (`PUT /transforms/{name}`, verified by the sha256 the runtime answers), each chunk is one `POST /transforms/{name}/run` and each reply is the worker's own line, parsed as the local worker's output is. Try uses `POST /transforms/try`. A `404 transform_unknown` stores the code again and retries once; any other non-200 leaves the records received for the next pass, with the facade's status explained in the log.
+**Chosen:** `runtime:` in `hie.yaml` sent each chunk of records to a remote runtime service over HTTP instead of the local worker.
+
+## 35. Transforms run only in the local worker
+
+**Chosen:** The `runtime:` backend and its configuration are removed. Every transform runs in the source's local worker, and Try runs in a worker of its own. A leftover `runtime:` in `hie.yaml` (whatever its value) or a non-empty `HIE_RUNTIME_URL` stops the engine at start, `hie check` included.
 
 **Why:**
-- The runtime exists now and is the agreed place for customer code (discussion #3): a sandbox per attempt, a budget, no network, whereas the local worker runs any script with the engine's own rights.
-- The facade speaks HIE's own envelope, so the engine's outcome handling, rejection kinds and traces are unchanged; the backend is a switch in the configuration, not a different pipeline.
-- Storing by sha avoids a `PUT` per pass, and comparing the runtime's digest catches a store that holds something else under the name.
-- Records never move on a runtime failure: the facade's non-200 answers mean nothing ran (its ADR 0003), so keeping the batch received and retrying is exact, not optimistic.
+- The service the backend called no longer exists, and no deployment configures it.
+- One backend keeps one outcome path, and one place to constrain customer code.
+- Failing at start rather than ignoring the block means no operator silently loses the isolation they configured: their transforms would otherwise run locally, with the engine's rights, without a word.
 
-**Cost / not yet:** no backoff on `503 Retry-After` beyond the poll interval, and no runtime outage alert yet (the facade's ADR 0006 items 2 and 4); terminology helpers answer `None` in the sandbox, so a transform that needs HTS runs locally; one oversize record (over 8 MiB) fails its whole batch and is retried every pass; authentication is the runtime's development token, JWT later.
+**Cost / not yet:** the local worker still runs a transform with the engine's own rights until it runs under operating-system limits (next).
 
 ## Not in the prototype
 
