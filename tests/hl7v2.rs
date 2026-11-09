@@ -45,7 +45,7 @@ fn python() -> Option<&'static str> {
     ["py", "python3", "python"].into_iter().find(|p| {
         std::process::Command::new(p)
             .arg("-c")
-            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)")
+            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)")
             .output()
             .is_ok_and(|o| o.status.success())
     })
@@ -78,7 +78,7 @@ fn runner(
 #[tokio::test]
 async fn a_file_of_messages_becomes_patients() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found");
+        eprintln!("skipping: no Python 3.9+ found");
         return;
     };
     let urls: Urls = Arc::default();
@@ -171,7 +171,7 @@ async fn send(stream: &mut tokio::net::TcpStream, message: &str) -> String {
 #[tokio::test]
 async fn messages_over_mllp_are_spooled_acknowledged_and_delivered() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found");
+        eprintln!("skipping: no Python 3.9+ found");
         return;
     };
     let urls: Urls = Arc::default();

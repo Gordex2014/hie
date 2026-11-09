@@ -48,7 +48,7 @@ Paths:
 - The host MUST NOT resolve symbolic links in `<python>`: a virtual environment's interpreter is usually a link, and resolving it would select the base interpreter without the environment's packages.
 - Program arguments are passed unchanged.
 
-The minimum interpreter version is **Python 3.11**.
+The launcher runs on **Python 3.9** or later. Which interpreter runs it is the host's choice (section 1): the host documents the interpreter, and so the minimum version, it supports. HIE supports 3.9 or later (`python:` in `hie.yaml`); its container image ships 3.11.
 
 The launcher MUST NOT write to stdout. Its diagnostics go to the control directory and, as human-readable text, to stderr.
 
@@ -279,6 +279,7 @@ A consumer records two values: the contract id, `limited-process@1`, and the SHA
 | SHA-256 | Date | Change |
 |---|---|---|
 | `1e6c8a988d9e6a40b4d5e0014206af094713cde74dc2685d22c6473e9911c17f` | 2026-11-05 | First version |
+| `0aead09a395ce83aa7236bbd1f7321b0d41f832b747c7b9a3725f2f67befc6b0` | 2026-11-09 | Runs on Python 3.9 or later (was 3.11); nothing else changed. The revision HIE ships. |
 
 ## 11. The long-lived worker
 

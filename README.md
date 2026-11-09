@@ -32,7 +32,7 @@ docker run --rm -p 8090:8090 \
   ghcr.io/heliossoftware/hie:latest
 ```
 
-From source, with Rust 1.90+ and Python 3.11+:
+From source, with Rust 1.90+ and Python 3.9+:
 
 ```bash
 cargo run -- check      # validate hie.yaml and sources/
