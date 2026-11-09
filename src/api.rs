@@ -149,6 +149,7 @@ impl From<ManagerError> for ApiError {
             ManagerError::Invalid(m) => ApiError(StatusCode::BAD_REQUEST, m),
             ManagerError::NotFound(m) => ApiError(StatusCode::NOT_FOUND, m),
             ManagerError::Conflict(m) => ApiError(StatusCode::CONFLICT, m),
+            ManagerError::Busy(m) => ApiError(StatusCode::SERVICE_UNAVAILABLE, m),
             ManagerError::Internal(e) => e.into(),
         }
     }

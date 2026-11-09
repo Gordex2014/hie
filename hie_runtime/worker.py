@@ -13,8 +13,10 @@ The script defines `transform(record, context)` returning a resource, a list of
 resources or None. It raises `hie.DataError` for bad source data.
 """
 
+import errno
 import importlib.util
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -38,8 +40,11 @@ def main():
     # otherwise read the engine's UTF-8 as cp1252 and turn every accented letter
     # into a lone surrogate that the engine cannot parse back.
     sys.stdin.reconfigure(encoding="utf-8", errors="strict")
-    sys.stdout.reconfigure(encoding="utf-8", errors="strict")
-    protocol = sys.stdout
+    # The protocol gets a descriptor of its own and file descriptor 1 becomes
+    # stderr, so nothing else can write into the protocol: not a print(), not
+    # a child process that inherits stdout, not a native library.
+    protocol = os.fdopen(os.dup(1), "w", encoding="utf-8", errors="strict")
+    os.dup2(2, 1)
     sys.stdout = sys.stderr
     module = load(sys.argv[1])
     protocol.write(json.dumps({"ready": True}) + "\n")
@@ -59,7 +64,11 @@ def main():
             reply = {"id": request["id"], "error": {"kind": "data", "message": str(e)}}
         except TerminologyError as e:  # the server, not the row: the engine retries later
             reply = {"id": request["id"], "error": {"kind": "transient", "message": str(e)}}
+        except MemoryError:  # past the memory limit: the process ends and the engine says why
+            raise
         except Exception as e:  # a bug in the transform, kept with its traceback
+            if isinstance(e, OSError) and e.errno == errno.EFBIG:
+                raise  # a file past the size limit: likewise
             reply = {
                 "id": request["id"],
                 "error": {

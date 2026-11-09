@@ -33,7 +33,7 @@ fn python() -> Option<String> {
     candidates.into_iter().find(|p| {
         std::process::Command::new(p)
             .arg("-c")
-            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)")
+            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)")
             .output()
             .is_ok_and(|o| o.status.success())
     })
@@ -42,7 +42,7 @@ fn python() -> Option<String> {
 #[tokio::test]
 async fn delivery_starts_before_the_transform_ends() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.8+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let seen: Seen = Arc::default();

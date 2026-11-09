@@ -31,6 +31,9 @@ pub struct Config {
     pub transforms_dir: PathBuf,
     #[serde(default)]
     pub alerts: AlertConfig,
+    /// What each transform's worker process may use and how long it may take.
+    #[serde(default)]
+    pub worker: WorkerConfig,
     /// The directory holding `hie.yaml`; relative paths in source files resolve against it.
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -39,6 +42,62 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AlertConfig {
     pub webhook_url: Option<String>,
+}
+
+/// The `worker:` block: the limits every transform worker process runs under.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkerConfig {
+    /// Address space per process, in MiB (`RLIMIT_AS` on Linux).
+    pub memory_mib: u64,
+    /// The largest file a transform may write, in MiB.
+    pub file_mib: u64,
+    /// Open file descriptors per process.
+    pub open_files: u64,
+    /// Per record, from before it is written to the worker until the reply line.
+    pub request_seconds: u64,
+    /// From starting the worker until it is ready.
+    pub startup_seconds: u64,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        let limits = crate::worker::WorkerLimits::default();
+        Self {
+            memory_mib: limits.memory_mib,
+            file_mib: limits.file_mib,
+            open_files: limits.open_files,
+            request_seconds: limits.request.as_secs(),
+            startup_seconds: limits.startup.as_secs(),
+        }
+    }
+}
+
+impl WorkerConfig {
+    pub fn check(&self) -> Result<()> {
+        for (name, value) in [
+            ("memory_mib", self.memory_mib),
+            ("file_mib", self.file_mib),
+            ("open_files", self.open_files),
+            ("request_seconds", self.request_seconds),
+            ("startup_seconds", self.startup_seconds),
+        ] {
+            if value < 1 {
+                bail!("worker.{name} must be at least 1");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn limits(&self) -> crate::worker::WorkerLimits {
+        crate::worker::WorkerLimits {
+            memory_mib: self.memory_mib,
+            file_mib: self.file_mib,
+            open_files: self.open_files,
+            request: Duration::from_secs(self.request_seconds),
+            startup: Duration::from_secs(self.startup_seconds),
+        }
+    }
 }
 
 /// A source: one connection, its format, its transform, how it is delivered and
@@ -588,6 +647,10 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     }
     let mut config: Config =
         serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    config
+        .worker
+        .check()
+        .with_context(|| format!("checking {}", path.display()))?;
     let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
     config.base_dir = base.clone();
     config.database = base.join(&config.database);
@@ -728,6 +791,32 @@ mod tests {
         let (config, feeds) = load_engine_yaml("fhir_base_url: http://hfs\n").unwrap();
         assert_eq!(config.fhir_base_url, "http://hfs");
         assert!(feeds.is_empty());
+    }
+
+    #[test]
+    fn the_worker_block_has_defaults_and_is_checked() {
+        let (config, _) = load_engine_yaml("fhir_base_url: http://hfs\n").unwrap();
+        assert_eq!(
+            config.worker.limits(),
+            crate::worker::WorkerLimits::default()
+        );
+        let (config, _) = load_engine_yaml(
+            "fhir_base_url: http://hfs\nworker:\n  memory_mib: 4096\n  request_seconds: 5\n",
+        )
+        .unwrap();
+        assert_eq!(config.worker.memory_mib, 4096);
+        assert_eq!(config.worker.request_seconds, 5);
+        assert_eq!(config.worker.file_mib, 256);
+        let err =
+            load_engine_yaml("fhir_base_url: http://hfs\nworker:\n  open_files: 0\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("worker.open_files must be at least 1"),
+            "{err:#}"
+        );
+        // A misspelt key is refused, not silently left at its default.
+        let err =
+            load_engine_yaml("fhir_base_url: http://hfs\nworker:\n  memroy_mib: 1\n").unwrap_err();
+        assert!(format!("{err:#}").contains("memroy_mib"), "{err:#}");
     }
 
     #[test]

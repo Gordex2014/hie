@@ -6,7 +6,7 @@ How to run the engine: the binary, the Docker image, the environment variables, 
 
 You need:
 - Rust 1.90 or later;
-- Python 3.8 or later (`py` on Windows, `python3` elsewhere; set `python:` in `hie.yaml` to change it);
+- Python 3.11 or later (`py` on Windows, `python3` elsewhere; set `python:` in `hie.yaml` to change it, to a virtual environment's interpreter for instance). The floor is the `limited-process@1` launcher's, not HIE's: an older interpreter (Ubuntu 22.04's 3.10, say) leaves every source's records received, with "the launcher could not set up the worker: python_version: Python 3.11 or later is required" in the log, until `python:` points at a newer one. On Linux and macOS it must be the interpreter itself, not a script that starts Python as a child: the engine refuses a worker it did not start directly. On Windows the engine asks the configured interpreter which `python.exe` it runs and starts that one, so the `py` launcher works;
 - HFS running at the URL in `hie.yaml` (default `http://localhost:8080`), with its search parameters loaded (`HFS_DATA_DIR`): a row delivered by business identifier is a conditional `PUT Type?identifier=...`, which HFS refuses with `400` when it does not know `identifier` for that type, and the engine then rejects the row as a data error.
 
 ```sh
@@ -70,6 +70,21 @@ To build the image yourself: `docker build -t hie .`
 | `HIE_TERMINOLOGY_SERVER` | `terminology_url` in `hie.yaml` | The HTS transforms may ask through `lookup` and `translate` |
 | `HIE_TERMINOLOGY_TOKEN` | | A bearer token for that HTS, when it requires one |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` | | Credentials for S3 sources, as for any AWS tool (profiles work too) |
+
+### The transform worker
+
+Each source's transform runs in a Python worker under operating-system limits (see [Where transforms run](transforms.md#where-transforms-run)). The `worker:` block in `hie.yaml` sets them for every worker; all of it is optional:
+
+```yaml
+worker:
+  memory_mib: 2048        # address space per process (RLIMIT_AS on Linux)
+  file_mib: 256           # largest file a transform may write
+  open_files: 256         # open file descriptors per process
+  request_seconds: 60     # per record, from before it is written until its reply
+  startup_seconds: 10     # starting the worker until it is ready
+```
+
+Every value must be at least 1. A transform that imports a heavy library may need a larger `memory_mib`. A reply line is at most 32 MiB. Each worker process gets a fresh run directory under the system temporary directory, deleted when it ends.
 
 ### The store, and more than one instance
 

@@ -16,6 +16,7 @@ use crate::fhir::{self, DeliveryKey, EntryResult, FhirClient, SendError};
 use crate::reader;
 use crate::source::{Incoming, Source};
 use crate::transform::{self, Outcome, Transformer};
+use crate::worker::WorkerLimits;
 use tokio::sync::Notify;
 
 const TRANSFORM_CHUNK: usize = 200;
@@ -48,6 +49,8 @@ pub struct FeedRunner {
     bulk_dir: PathBuf,
     /// `$bulk-submit` over the engine's transformed NDJSON, not the source objects.
     bulk_transformed: bool,
+    /// How the manager drives this runner, once it runs: a halt is seen between records.
+    control: std::sync::OnceLock<Arc<RunnerControl>>,
 }
 
 /// This process's name among the instances sharing a store: `HIE_INSTANCE_ID`,
@@ -131,6 +134,7 @@ impl FeedRunner {
             bulk_dir: std::env::temp_dir().join("hie-bulk"),
             bulk_transformed: feed_bulk_transformed,
             outage_alerted: AtomicBool::new(false),
+            control: std::sync::OnceLock::new(),
         }
     }
 
@@ -164,6 +168,18 @@ impl FeedRunner {
     pub fn with_terminology(mut self, url: Option<&str>) -> Self {
         self.transformer.set_terminology(url);
         self
+    }
+
+    /// The limits the transform's worker runs under.
+    pub fn with_worker_limits(mut self, limits: WorkerLimits) -> Self {
+        self.transformer.set_limits(limits);
+        self
+    }
+
+    fn halted(&self) -> bool {
+        self.control
+            .get()
+            .is_some_and(|c| c.stopped.load(Ordering::Acquire))
     }
 
     /// How long a pass may hold the source before another instance may take it:
@@ -201,8 +217,10 @@ impl FeedRunner {
     /// while the source is paused or held by another instance; until stopped.
     pub async fn run(self: Arc<Self>, control: Arc<RunnerControl>) {
         tracing::info!(feed = %self.feed.id, source = %self.feed.source.describe(), instance = %self.instance, "watching");
+        let _ = self.control.set(control.clone());
         loop {
             if control.stopped.load(Ordering::Acquire) {
+                self.transformer.close().await;
                 if let Err(e) = self.db.release_lease(&self.feed.id, &self.instance) {
                     tracing::error!(feed = %self.feed.id, "{e:#}");
                 }
@@ -486,31 +504,29 @@ impl FeedRunner {
         self.db.mark_file_archived(container, &archived)
     }
 
-    /// Transforms what was received, a chunk at a time; `progress` is told after
-    /// each chunk so delivery can start on it.
+    /// Transforms what was received, one record at a time, each outcome stored
+    /// before the next record is sent, so a decided record is never sent again;
+    /// `progress` is told after each chunk so delivery can start on it.
     async fn transform_received(&self, progress: Option<&Notify>) -> Result<()> {
         loop {
             let items = self.db.received_records(&self.feed.id, TRANSFORM_CHUNK)?;
             if items.is_empty() {
                 return Ok(());
             }
-            let requests: Vec<(Value, Value)> = items
-                .iter()
-                .map(|item| {
-                    (
-                        item.raw.clone(),
-                        json!({"feed": self.feed.id, "file": item.file_name, "line": item.line}),
-                    )
-                })
-                .collect();
-            let outcomes = match self.transformer.transform_many(&requests).await {
-                Ok(o) => o,
-                Err(e) => {
-                    tracing::error!(feed = %self.feed.id, "transform unavailable, will retry: {e:#}");
+            for item in &items {
+                // A halted or replaced source stops after its current record.
+                if self.halted() {
                     return Ok(());
                 }
-            };
-            for (item, outcome) in items.iter().zip(outcomes) {
+                let context =
+                    json!({"feed": self.feed.id, "file": item.file_name, "line": item.line});
+                let outcome = match self.transformer.transform(&item.raw, &context).await {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        tracing::error!(feed = %self.feed.id, "transform unavailable, will retry: {e:#}");
+                        return Ok(());
+                    }
+                };
                 match outcome {
                     Outcome::Transient(message) => {
                         // Not the row's fault: leave it and the rest for the next pass.
@@ -593,6 +609,10 @@ impl FeedRunner {
             return self.submit_transformed(bulk).await;
         }
         loop {
+            // A halted or replaced source opens no more submissions.
+            if self.halted() {
+                return Ok(());
+            }
             let files = self
                 .db
                 .submittable_files(&self.feed.id, self.feed.delivery.manifest_objects_max)?;
@@ -802,6 +822,9 @@ impl FeedRunner {
     /// `bulk_dir` served by the engine, and opens one submission over them.
     async fn submit_transformed(&self, bulk: &BulkSubmitter) -> Result<()> {
         loop {
+            if self.halted() {
+                return Ok(());
+            }
             let records = self
                 .db
                 .submittable_records(&self.feed.id, self.feed.delivery.bulk_records_max)?;
@@ -906,6 +929,11 @@ impl FeedRunner {
 
     async fn deliver_due(&self) -> Result<()> {
         loop {
+            // A halted or replaced source stops between batches: what is due stays
+            // for the runner that replaces it.
+            if self.halted() {
+                return Ok(());
+            }
             let items = self
                 .db
                 .due_records(&self.feed.id, self.feed.delivery.batch_size)?;
@@ -948,6 +976,10 @@ impl FeedRunner {
             Err(SendError::Refused(status, _)) if items.len() > 1 => {
                 tracing::warn!(feed = %self.feed.id, status, "batch refused as a whole; sending records one by one");
                 for item in items {
+                    // Halted: the rest stays due, for the runner that replaces this one.
+                    if self.halted() {
+                        break;
+                    }
                     if !Box::pin(self.deliver(std::slice::from_ref(item))).await? {
                         return Ok(false);
                     }
