@@ -11,7 +11,7 @@ DIR/ready.json, waits for the host to create DIR/ack, runs the program and
 translates how the program ended into an exit code. It never writes to
 stdout, which belongs to the program. See docs/contract.md.
 
-Standard library only. Python 3.11 or later.
+Standard library only. Python 3.9 or later.
 """
 
 import errno
@@ -382,8 +382,8 @@ def setup(argv):
         if not os.path.isdir(control):
             raise SetupError("usage", f"control directory does not exist: {control}")
         control = os.path.abspath(control)
-        if sys.version_info < (3, 11):
-            raise SetupError("python_version", "Python 3.11 or later is required")
+        if sys.version_info < (3, 9):
+            raise SetupError("python_version", "Python 3.9 or later is required")
         program = os.path.abspath(program)
         if not os.path.isfile(program) or not os.access(program, os.R_OK):
             raise SetupError("program_missing", f"cannot read the program: {program}")

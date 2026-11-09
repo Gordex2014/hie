@@ -156,7 +156,7 @@ fn python() -> Option<String> {
     candidates.into_iter().find(|p| {
         std::process::Command::new(p)
             .arg("-c")
-            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)")
+            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)")
             .output()
             .is_ok_and(|o| o.status.success())
     })
@@ -169,7 +169,7 @@ fn repo() -> PathBuf {
 #[tokio::test]
 async fn an_ndjson_drop_goes_through_bulk_submit_and_its_receipts_come_back() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
 
@@ -322,7 +322,7 @@ async fn an_ndjson_drop_goes_through_bulk_submit_and_its_receipts_come_back() {
 #[tokio::test]
 async fn a_csv_is_transformed_and_submitted_in_bulk() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let consumer = Consumer {
@@ -471,7 +471,7 @@ async fn a_csv_is_transformed_and_submitted_in_bulk() {
 #[tokio::test]
 async fn a_zipped_export_is_staged_and_submitted() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let consumer = Consumer {

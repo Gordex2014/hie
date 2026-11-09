@@ -42,7 +42,7 @@ fn python() -> Option<String> {
     candidates.into_iter().find(|p| {
         std::process::Command::new(p)
             .arg("-c")
-            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)")
+            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)")
             .output()
             .is_ok_and(|o| o.status.success())
     })
@@ -69,7 +69,7 @@ async fn wait_until(
 #[tokio::test]
 async fn a_source_lives_through_the_api() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let urls: Urls = Arc::default();
@@ -340,7 +340,7 @@ async fn a_source_lives_through_the_api() {
 #[tokio::test]
 async fn transforms_and_monitoring_are_served() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let urls: Urls = Arc::default();
@@ -523,7 +523,7 @@ async fn transforms_and_monitoring_are_served() {
 #[tokio::test]
 async fn a_load_shows_its_failures_grouped_and_retries_them() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let urls: Urls = Arc::default();
@@ -710,7 +710,7 @@ def transform(record, context):
 #[tokio::test]
 async fn transform_tries_are_bounded_and_leave_nothing_behind() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let dir = tempfile::tempdir().unwrap();

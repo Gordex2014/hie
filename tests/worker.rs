@@ -113,7 +113,7 @@ fn python() -> Option<String> {
     candidates.into_iter().find(|p| {
         std::process::Command::new(p)
             .arg("-c")
-            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)")
+            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)")
             .output()
             .is_ok_and(|o| o.status.success())
     })
@@ -238,7 +238,7 @@ macro_rules! need_python {
         match python() {
             Some(p) => Rig::new(p),
             None => {
-                eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+                eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
                 return;
             }
         }
@@ -850,7 +850,7 @@ async fn a_timeout_kills_what_the_program_started() {
 #[test]
 fn the_worker_environment_is_built_from_nothing() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let out = tempfile::NamedTempFile::new().unwrap();
@@ -1039,7 +1039,7 @@ async fn every_record_gets_its_own_reply(t: &Transformer) -> Vec<Value> {
 #[tokio::test]
 async fn a_transform_that_writes_to_fd_1_once_still_gets_every_reply() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let dir = tempfile::tempdir().unwrap();
@@ -1073,7 +1073,7 @@ def transform(record, context):
 #[tokio::test]
 async fn a_transform_whose_child_writes_to_fd_1_every_time_still_gets_every_reply() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let dir = tempfile::tempdir().unwrap();
@@ -1208,7 +1208,7 @@ def transform(record, context):
 #[tokio::test]
 async fn sigterm_stops_the_engine_and_takes_its_workers_with_it() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let dir = tempfile::tempdir().unwrap();

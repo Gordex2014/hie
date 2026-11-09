@@ -67,7 +67,7 @@ class WorkerProtocol(unittest.TestCase):
 
 class Interpreter(unittest.TestCase):
     def test_the_interpreter_is_recent_enough_for_the_launcher(self):
-        self.assertGreaterEqual(sys.version_info, (3, 11))
+        self.assertGreaterEqual(sys.version_info, (3, 9))
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "the memory limit is enforced on Linux")

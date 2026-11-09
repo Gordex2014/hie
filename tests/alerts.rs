@@ -38,7 +38,7 @@ fn python() -> Option<String> {
     candidates.into_iter().find(|p| {
         std::process::Command::new(p)
             .arg("-c")
-            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)")
+            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)")
             .output()
             .is_ok_and(|o| o.status.success())
     })
@@ -161,7 +161,7 @@ fn alert<'a>(alerts: &'a Value, kind: &str) -> Option<&'a Value> {
 #[tokio::test]
 async fn a_source_is_born_with_a_silence_rule_and_rules_are_managed() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let lab = lab(&python).await;
@@ -248,7 +248,7 @@ async fn a_source_is_born_with_a_silence_rule_and_rules_are_managed() {
 #[tokio::test]
 async fn too_many_rejected_rows_fire_once_and_clear_on_a_clean_load() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let lab = lab(&python).await;
@@ -316,7 +316,7 @@ async fn too_many_rejected_rows_fire_once_and_clear_on_a_clean_load() {
 #[tokio::test]
 async fn silence_fires_once_and_clears_when_data_arrives() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let lab = lab(&python).await;

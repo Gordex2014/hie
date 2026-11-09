@@ -84,7 +84,7 @@ fn python() -> Option<String> {
     candidates.into_iter().find(|p| {
         std::process::Command::new(p)
             .arg("-c")
-            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)")
+            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)")
             .output()
             .is_ok_and(|o| o.status.success())
     })
@@ -118,7 +118,7 @@ fn alert_kinds(state: &hie::api::AppState) -> Vec<String> {
 #[tokio::test]
 async fn a_feed_survives_an_outage_bad_rows_and_resends() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let (base, fhir) = fhir_server().await;
@@ -527,7 +527,7 @@ impl Probe {
 #[tokio::test]
 async fn a_record_that_hangs_crashes_or_runs_out_of_memory_is_rejected_once() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     // The memory and file-size limits are enforced on Linux only; elsewhere
@@ -636,7 +636,7 @@ async fn a_record_that_hangs_crashes_or_runs_out_of_memory_is_rejected_once() {
 #[tokio::test]
 async fn a_timed_out_record_is_not_sent_again_when_the_worker_then_cannot_start() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let probe = Probe::new(
@@ -666,7 +666,7 @@ async fn a_timed_out_record_is_not_sent_again_when_the_worker_then_cannot_start(
 #[tokio::test]
 async fn a_transient_record_ends_the_pass_before_the_next_is_sent() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let probe = Probe::new(
@@ -688,7 +688,7 @@ async fn a_transient_record_ends_the_pass_before_the_next_is_sent() {
 #[tokio::test]
 async fn a_source_replaced_mid_record_does_not_resend_the_one_already_decided() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let probe = Probe::new(
@@ -733,7 +733,7 @@ const GATED: &str = "id,mode\n1,gate\n2,ok\n3,ok\n";
 
 async fn gated_probe() -> Option<Probe> {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return None;
     };
     let probe = Probe::new(&python, "  request_seconds: 30\n", false, GATED).await;
@@ -828,7 +828,7 @@ async fn a_transform_saved_mid_record_runs_each_record_once() {
 #[tokio::test]
 async fn a_replacement_aborts_a_runner_that_does_not_stop_within_the_grace() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let probe = Probe::new(&python, "  request_seconds: 30\n", true, "id,mode\n1,ok\n").await;
@@ -867,7 +867,7 @@ async fn a_replacement_aborts_a_runner_that_does_not_stop_within_the_grace() {
 #[tokio::test(flavor = "multi_thread")]
 async fn runners_replaced_in_a_row_never_abort_a_newer_one() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let probe = Probe::new(&python, "  request_seconds: 30\n", false, "id,mode\n0,ok\n").await;
@@ -904,7 +904,7 @@ async fn runners_replaced_in_a_row_never_abort_a_newer_one() {
 #[tokio::test]
 async fn a_halted_runner_delivers_nothing_more() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let probe = Probe::new(
@@ -932,7 +932,7 @@ async fn a_halted_runner_delivers_nothing_more() {
 #[tokio::test]
 async fn deleted_sources_leave_no_runner_slots_behind() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let probe = Probe::new(&python, "  request_seconds: 30\n", true, "id,mode\n").await;
