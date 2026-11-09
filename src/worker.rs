@@ -3,9 +3,11 @@
 //!
 //! The worker runs as `python -I -B -u -X utf8 limits.py --control … -- worker.py
 //! <transform>`, where `limits.py` is the contract's reference launcher, kept
-//! unchanged in `hie_runtime/` and pinned by its hash in `limits.pin`. The
-//! launcher puts the process in its own group and applies the memory, file-size
-//! and open-files limits; this module owns everything else: a fresh run
+//! unchanged in `hie_runtime/` and pinned by its hash in `limits.pin`: the file
+//! is hashed before every start, and the hash the launcher reports is checked
+//! again in its handshake. The launcher puts the process in its own group and
+//! applies the memory, file-size and open-files limits; this module owns
+//! everything else: a fresh run
 //! directory and an environment built from nothing for every process, the
 //! control handshake, the startup and per-request deadlines, bounded output,
 //! killing the whole group, and one report per process.
@@ -180,6 +182,26 @@ pub(crate) struct Launch {
     pub run_root: Option<PathBuf>,
     /// What the logs call this worker.
     pub label: String,
+}
+
+impl Launch {
+    /// The launcher on disk must be the one this engine was built for: its
+    /// SHA-256 is checked against the pin before every start, so a launcher
+    /// that would report the pinned hash without having it never runs.
+    fn check_launcher(&self) -> Result<(), String> {
+        use sha2::Digest;
+        let bytes = std::fs::read(&self.launcher)
+            .map_err(|e| format!("cannot read the launcher {}: {e}", self.launcher.display()))?;
+        let found = hex::encode(sha2::Sha256::digest(&bytes));
+        let pinned = pin().sha256;
+        if found != pinned {
+            return Err(format!(
+                "the launcher {} has SHA-256 {found}, which does not match the pinned {pinned}",
+                self.launcher.display()
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// What became of one request.
@@ -553,11 +575,13 @@ static NOT_ENFORCED_WARNED: AtomicBool = AtomicBool::new(false);
 static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Generation {
-    /// Starts a process and waits until it is ready: the control handshake,
-    /// the pin check, then the worker's own `{"ready": true}`, all within the
+    /// Checks the launcher file against the pin, starts a process and waits
+    /// until it is ready: the control handshake, the launcher's own report of
+    /// its contract and hash, then the worker's `{"ready": true}`, all within the
     /// startup budget. An error is the reason it is unavailable, with the end
     /// of its stderr.
     pub(crate) async fn start(launch: &Launch) -> Result<Generation, String> {
+        launch.check_launcher()?;
         let python = launch.python.clone()?;
         #[cfg(windows)]
         let python = real_interpreter(&python, launch.limits.startup).await?;

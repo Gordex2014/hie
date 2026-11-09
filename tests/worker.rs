@@ -529,53 +529,109 @@ async fn watching_acks<T>(runs: &Path, f: impl std::future::Future<Output = T>) 
     (out, seen.load(std::sync::atomic::Ordering::SeqCst))
 }
 
-#[tokio::test]
-async fn a_launcher_that_does_not_match_the_pin_never_runs_the_program() {
-    let rig = need_python!();
-    let launcher = rig.runtime.join("limits.py");
-    let original = std::fs::read_to_string(&launcher).unwrap();
+/// `limits.py` with one byte changed, and its SHA-256.
+fn one_byte_changed(launcher: &Path) -> (String, String) {
+    let original = std::fs::read_to_string(launcher).unwrap();
     let changed = original.replacen("Reference launcher", "reference launcher", 1);
     assert_eq!(changed.len(), original.len());
-    let changed_sha = {
+    assert_ne!(changed, original);
+    let sha = {
         use sha2::Digest;
         hex::encode(sha2::Sha256::digest(changed.as_bytes()))
     };
-    std::fs::write(&launcher, changed).unwrap();
-    let (logs, _guard) = Logs::capture();
-    let t = rig.transformer("marker", limits());
-    let (result, acked) =
-        watching_acks(&rig.runs, t.transform(&json!({"echo": "a"}), &ctx())).await;
-    let message = format!("{:#}", result.unwrap_err());
-    assert!(
-        message.contains("does not match the pinned")
-            && message.contains(hie::worker::pin().sha256),
-        "{message}"
-    );
-    assert!(!acked, "the host acknowledged a launcher it does not trust");
-    assert!(!rig.state.join("marker").exists(), "the program ran");
-    assert!(rig.started().is_empty());
-    assert!(rig.run_dirs().is_empty());
-    // The report keeps the evidence the refused launcher gave.
-    let reports = logs.lines("transform worker retired");
-    assert_eq!(reports.len(), 1, "{reports:?}");
-    assert!(
-        reports[0].contains(&format!("\"reference_sha256\":\"{changed_sha}\""))
-            && reports[0].contains("\"verdict\":\"unavailable\""),
-        "{}",
-        reports[0]
-    );
-    // Elsewhere the launcher reports what it cannot enforce there.
-    #[cfg(target_os = "linux")]
-    assert!(reports[0].contains("\"not_enforced\":[]"), "{}", reports[0]);
+    (changed, sha)
+}
+
+/// Replaces the rig's interpreter with a shell script that runs `body` and
+/// then `exec`s the real one, keeping its process id.
+#[cfg(unix)]
+fn wrap_interpreter(rig: &mut Rig, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let wrapper = rig.root.join("python-wrapper");
+    let real = resolve(&rig.python);
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n{}\n",
+            body.replace("PYTHON", &format!("\"{real}\""))
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    rig.python = wrapper.to_str().unwrap().to_string();
+}
+
+/// The interpreter's absolute path, as the engine would find it on `PATH`.
+#[cfg(unix)]
+fn resolve(python: &str) -> String {
+    let out = std::process::Command::new(python)
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
 #[tokio::test]
-async fn a_launcher_for_another_contract_is_unavailable() {
-    let rig = need_python!();
+async fn a_launcher_that_does_not_match_the_pin_never_runs_the_program() {
+    #[allow(unused_mut)]
+    let mut rig = need_python!();
     let launcher = rig.runtime.join("limits.py");
-    let original = std::fs::read_to_string(&launcher).unwrap();
+    let (changed, changed_sha) = one_byte_changed(&launcher);
+    std::fs::write(&launcher, changed).unwrap();
+    // Notes every time the interpreter is started.
+    #[cfg(unix)]
+    let invoked = {
+        let invoked = rig.root.join("invoked");
+        wrap_interpreter(
+            &mut rig,
+            &format!(
+                "echo started >> \"{}\"\nexec PYTHON \"$@\"",
+                invoked.display()
+            ),
+        );
+        invoked
+    };
+    let (logs, _guard) = Logs::capture();
+    let t = rig.transformer("marker", limits());
+    for _ in 0..2 {
+        let message = format!(
+            "{:#}",
+            t.transform(&json!({"echo": "a"}), &ctx())
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            message.contains(&format!(
+                "has SHA-256 {changed_sha}, which does not match the pinned {}",
+                hie::worker::pin().sha256
+            )),
+            "{message}"
+        );
+    }
+    // No process was started: the interpreter never ran, so neither did the
+    // launcher nor the program, and there is no process to report.
+    #[cfg(unix)]
+    assert!(!invoked.exists(), "the interpreter was started");
+    assert!(
+        logs.lines("transform worker").is_empty(),
+        "{:?}",
+        logs.lines("")
+    );
+    assert!(!rig.state.join("marker").exists(), "the program ran");
+    assert!(rig.started().is_empty());
+    assert!(rig.run_dirs().is_empty());
+}
+
+/// The file on disk matches the pin, but the interpreter runs another
+/// launcher: the launcher's own report of its contract and hash is checked too.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_launcher_that_reports_another_contract_or_hash_is_unavailable() {
+    let mut rig = need_python!();
+    let original = std::fs::read_to_string(rig.runtime.join("limits.py")).unwrap();
+    let other_contract = rig.root.join("other-contract.py");
     std::fs::write(
-        &launcher,
+        &other_contract,
         original.replacen(
             "CONTRACT = \"limited-process@1\"",
             "CONTRACT = \"limited-process@2\"",
@@ -583,17 +639,42 @@ async fn a_launcher_for_another_contract_is_unavailable() {
         ),
     )
     .unwrap();
-    let t = rig.transformer("marker", limits());
-    let err = t
-        .transform(&json!({"echo": "a"}), &ctx())
-        .await
-        .unwrap_err();
-    assert!(
-        format!("{err:#}")
-            .contains("follows \"limited-process@2\", not the pinned limited-process@1"),
-        "{err:#}"
+    let other_hash = rig.root.join("other-hash.py");
+    let (changed, changed_sha) = one_byte_changed(&rig.runtime.join("limits.py"));
+    std::fs::write(&other_hash, changed).unwrap();
+    let choice = rig.root.join("substitute");
+    // `python -I -B -u -X utf8 <launcher> …`: the sixth argument is swapped.
+    wrap_interpreter(
+        &mut rig,
+        &format!(
+            "a1=$1 a2=$2 a3=$3 a4=$4 a5=$5\nshift 6\nexec PYTHON \"$a1\" \"$a2\" \"$a3\" \"$a4\" \"$a5\" \"$(cat \"{}\")\" \"$@\"",
+            choice.display()
+        ),
     );
-    assert!(!rig.state.join("marker").exists());
+    let t = rig.transformer("marker", limits());
+    for (substitute, expected) in [
+        (
+            &other_contract,
+            "follows \"limited-process@2\", not the pinned limited-process@1".to_string(),
+        ),
+        (
+            &other_hash,
+            format!(
+                "the launcher's hash {changed_sha} does not match the pinned {}",
+                hie::worker::pin().sha256
+            ),
+        ),
+    ] {
+        std::fs::write(&choice, substitute.to_str().unwrap()).unwrap();
+        let (result, acked) =
+            watching_acks(&rig.runs, t.transform(&json!({"echo": "a"}), &ctx())).await;
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains(&expected), "{message}");
+        assert!(!acked, "the host acknowledged a launcher it does not trust");
+    }
+    assert!(!rig.state.join("marker").exists(), "the program ran");
+    assert!(rig.started().is_empty());
+    assert!(rig.run_dirs().is_empty());
 }
 
 #[cfg(target_os = "linux")]
