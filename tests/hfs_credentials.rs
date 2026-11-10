@@ -82,7 +82,7 @@ fn python() -> Option<String> {
     candidates.into_iter().find(|p| {
         std::process::Command::new(p)
             .arg("-c")
-            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)")
+            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)")
             .output()
             .is_ok_and(|o| o.status.success())
     })
@@ -120,7 +120,7 @@ fn make_pending_due(database: &Path, expected: usize) {
 #[tokio::test]
 async fn the_engine_fetches_caches_refreshes_and_drops_its_token() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found (set HIE_TEST_PYTHON)");
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
     };
     let world: Shared = Arc::new(Mutex::new(World {

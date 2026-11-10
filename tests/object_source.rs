@@ -36,7 +36,7 @@ fn python() -> Option<&'static str> {
     ["py", "python3", "python"].into_iter().find(|p| {
         std::process::Command::new(p)
             .arg("-c")
-            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)")
+            .arg("import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)")
             .output()
             .is_ok_and(|o| o.status.success())
     })
@@ -45,7 +45,7 @@ fn python() -> Option<&'static str> {
 #[tokio::test]
 async fn an_ndjson_object_is_delivered_by_id_and_archived() {
     let Some(python) = python() else {
-        eprintln!("skipping: no Python 3.11+ found");
+        eprintln!("skipping: no Python 3.9+ found");
         return;
     };
     let urls: Urls = Arc::default();
