@@ -507,6 +507,7 @@ async fn a_process_that_dies_on_a_record_rejects_it_once() {
 }
 
 /// Watches every run directory's `control/ack` while `f` runs.
+#[cfg(unix)]
 async fn watching_acks<T>(runs: &Path, f: impl std::future::Future<Output = T>) -> (T, bool) {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
