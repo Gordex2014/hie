@@ -7,9 +7,10 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::StreamExt;
 use object_store::ObjectStore;
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::path::Path as ObjectPath;
 use object_store::signer::Signer;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Serialize;
 
 use crate::config::{FeedConfig, RemoteAuth, SourceConfig, glob_match};
@@ -55,66 +56,8 @@ impl Source {
                 min_age: Duration::from_millis(*min_file_age_ms),
                 archive: archive.clone().unwrap_or_else(|| path.join("processed")),
             }),
-            SourceConfig::S3 {
-                bucket,
-                prefix,
-                region,
-                endpoint,
-                pattern,
-                min_file_age_ms,
-                archive_prefix,
-                anonymous,
-                read_only,
-                queue,
-                relist_seconds,
-                ..
-            } => {
-                // Objects of hundreds of megabytes take minutes to fetch.
-                let mut builder = AmazonS3Builder::from_env()
-                    .with_bucket_name(bucket)
-                    .with_client_options(
-                        object_store::ClientOptions::new().with_timeout(Duration::from_secs(1800)),
-                    );
-                if *anonymous {
-                    builder = builder.with_skip_signature(true);
-                }
-                if let Some(region) = region {
-                    builder = builder.with_region(region);
-                }
-                if let Some(endpoint) = endpoint {
-                    builder = builder
-                        .with_endpoint(endpoint)
-                        .with_allow_http(true)
-                        .with_virtual_hosted_style_request(false);
-                }
-                let store = Arc::new(
-                    builder
-                        .build()
-                        .with_context(|| format!("feed {}: S3 source", feed.id))?,
-                );
-                let mut source = ObjectSource::new(
-                    store.clone(),
-                    prefix,
-                    archive_prefix,
-                    pattern,
-                    Duration::from_millis(*min_file_age_ms),
-                )
-                .read_only(*read_only);
-                if let Some(queue) = queue {
-                    let region = SqsQueue::region_of(queue)
-                        .or_else(|| region.clone())
-                        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-                        .or_else(|| std::env::var("AWS_REGION").ok())
-                        .unwrap_or_else(|| "us-east-1".into());
-                    source = source
-                        .with_queue(SqsQueue::new(queue, &region, store.credentials().clone()))
-                        .relist_every(Duration::from_secs(*relist_seconds));
-                }
-                Source::Object(if *anonymous {
-                    source
-                } else {
-                    source.with_signer(store)
-                })
+            SourceConfig::S3 { .. } => {
+                Source::Object(object_source_from(feed, AmazonS3Builder::from_env())?)
             }
             SourceConfig::Mllp { listen, spool, .. } => Source::Mllp(MllpSource {
                 feed_id: feed.id.clone(),
@@ -265,6 +208,185 @@ impl Source {
     }
 }
 
+/// Builds an S3 source on `seed` (the environment in production:
+/// `AmazonS3Builder::from_env()`), so tests can seed inherited values without
+/// touching the process environment.
+pub(crate) fn object_source_from(feed: &FeedConfig, seed: AmazonS3Builder) -> Result<ObjectSource> {
+    let SourceConfig::S3 {
+        bucket,
+        prefix,
+        region,
+        endpoint,
+        pattern,
+        min_file_age_ms,
+        archive_prefix,
+        anonymous,
+        read_only,
+        queue,
+        relist_seconds,
+        ..
+    } = &feed.source
+    else {
+        bail!("feed {}: not an S3 source", feed.id);
+    };
+    // Objects of hundreds of megabytes take minutes to fetch.
+    let mut builder = seed.with_bucket_name(bucket).with_client_options(
+        object_store::ClientOptions::new().with_timeout(Duration::from_secs(1800)),
+    );
+    if *anonymous {
+        builder = builder.with_skip_signature(true);
+    }
+    if let Some(region) = region.as_deref().filter(|r| !r.is_empty()) {
+        builder = builder.with_region(region);
+    }
+    if let Some(endpoint) = endpoint.as_deref().filter(|e| !e.is_empty()) {
+        builder = builder
+            .with_endpoint(endpoint)
+            .with_allow_http(true)
+            .with_virtual_hosted_style_request(false);
+    }
+    // What is in effect once the environment is taken into account. The builder
+    // cannot unset a value, and with an empty one the store and the public URL
+    // would address different hosts: refuse it.
+    let effective_region = builder.get_config_value(&AmazonS3ConfigKey::Region);
+    if effective_region.as_deref() == Some("") {
+        bail!(
+            "feed {}: s3: the region in effect is empty (an empty AWS_REGION or AWS_DEFAULT_REGION?); set it in the source or unset the variable",
+            feed.id
+        );
+    }
+    let effective_endpoint = builder.get_config_value(&AmazonS3ConfigKey::Endpoint);
+    if effective_endpoint.as_deref() == Some("") {
+        bail!(
+            "feed {}: s3: the endpoint in effect is empty (an empty AWS_ENDPOINT?); set it in the source or unset the variable",
+            feed.id
+        );
+    }
+    let virtual_hosted = builder
+        .get_config_value(&AmazonS3ConfigKey::VirtualHostedStyleRequest)
+        .is_some_and(|v| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes" | "y"
+            )
+        });
+    let public = anonymous.then(|| {
+        PublicBucket::new(
+            bucket,
+            effective_region.as_deref(),
+            effective_endpoint.as_deref(),
+            virtual_hosted,
+        )
+    });
+    let store = Arc::new(
+        builder
+            .build()
+            .with_context(|| format!("feed {}: S3 source", feed.id))?,
+    );
+    let mut source = ObjectSource::new(
+        store.clone(),
+        prefix,
+        archive_prefix,
+        pattern,
+        Duration::from_millis(*min_file_age_ms),
+    )
+    .read_only(*read_only);
+    if let Some(queue) = queue {
+        let region = SqsQueue::region_of(queue)
+            .or_else(|| region.clone())
+            .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .unwrap_or_else(|| "us-east-1".into());
+        source = source
+            .with_queue(SqsQueue::new(queue, &region, store.credentials().clone()))
+            .relist_every(Duration::from_secs(*relist_seconds));
+    }
+    Ok(match public {
+        Some(public) => source.with_public_urls(public),
+        None => source.with_signer(store),
+    })
+}
+
+/// A key as the store lists it (raw UTF-8), or one the engine composed, as a
+/// store path, unescaped.
+fn object_path(key: &str) -> Result<ObjectPath> {
+    ObjectPath::parse(key).map_err(|e| {
+        anyhow::Error::new(Unshareable(format!(
+            "{key:?} is not a valid object key: {e}"
+        )))
+    })
+}
+
+/// A store object that can never be handed over as configured. Terminal:
+/// retrying cannot help.
+#[derive(Debug)]
+pub struct Unshareable(pub String);
+
+impl std::fmt::Display for Unshareable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unshareable {}
+
+/// What a key segment keeps unescaped in a URL: RFC 3986's unreserved characters.
+const KEY_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// A bucket anyone may read: where a third party fetches its objects without
+/// credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicBucket {
+    base: String,
+}
+
+impl PublicBucket {
+    /// `region` and `endpoint` are the values in effect (`None` = unset).
+    ///
+    /// Without an endpoint, AWS virtual-hosted style,
+    /// `https://{bucket}.s3.{region}.amazonaws.com`, or path style,
+    /// `https://s3.{region}.amazonaws.com/{bucket}`, for a bucket name with a dot,
+    /// which AWS's wildcard certificate does not cover. The region defaults to
+    /// `us-east-1`.
+    ///
+    /// With an endpoint, `{endpoint}/{bucket}`; or, when `virtual_hosted`, the
+    /// endpoint unchanged (it already names the bucket), as the store client does.
+    pub fn new(
+        bucket: &str,
+        region: Option<&str>,
+        endpoint: Option<&str>,
+        virtual_hosted: bool,
+    ) -> Self {
+        let base = match endpoint {
+            Some(endpoint) if virtual_hosted => endpoint.to_string(),
+            Some(endpoint) => format!("{}/{bucket}", endpoint.trim_end_matches('/')),
+            None => {
+                let region = region.unwrap_or("us-east-1");
+                if bucket.contains('.') {
+                    format!("https://s3.{region}.amazonaws.com/{bucket}")
+                } else {
+                    format!("https://{bucket}.s3.{region}.amazonaws.com")
+                }
+            }
+        };
+        Self { base }
+    }
+
+    /// The object's URL: the key encoded once, segment by segment.
+    pub fn url(&self, key: &ObjectPath) -> String {
+        let key: Vec<String> = key
+            .as_ref()
+            .split('/')
+            .map(|segment| utf8_percent_encode(segment, KEY_SEGMENT).to_string())
+            .collect();
+        format!("{}/{}", self.base, key.join("/"))
+    }
+}
+
 /// An MLLP listener whose messages wait in a spool folder: the listener writes
 /// them, the folder source takes them.
 pub struct MllpSource {
@@ -345,6 +467,8 @@ pub struct ObjectSource {
     store: Arc<dyn ObjectStore>,
     /// Mints pre-signed URLs; set for S3, absent for stores that cannot sign.
     signer: Option<Arc<dyn Signer>>,
+    /// Where anyone reads the objects of a public bucket, which is never signed.
+    public: Option<PublicBucket>,
     prefix: Option<ObjectPath>,
     archive: ObjectPath,
     pattern: String,
@@ -372,6 +496,7 @@ impl ObjectSource {
         Self {
             store,
             signer: None,
+            public: None,
             prefix: (!prefix.is_empty()).then(|| ObjectPath::from(prefix)),
             archive: ObjectPath::from(archive_prefix.trim_matches('/')),
             pattern: pattern.to_string(),
@@ -426,6 +551,10 @@ impl ObjectSource {
         for notice in notices {
             receipts.push(notice.receipt);
             if !self.wants(&notice.key) {
+                continue;
+            }
+            if let Err(e) = object_path(&notice.key) {
+                tracing::warn!("announced object skipped: {e:#}");
                 continue;
             }
             let name = notice
@@ -511,7 +640,7 @@ impl ObjectSource {
     }
 
     async fn fetch(&self, key: &str) -> Result<Incoming> {
-        let path = ObjectPath::from(key);
+        let path = object_path(key)?;
         let bytes = self
             .store
             .get(&path)
@@ -531,9 +660,9 @@ impl ObjectSource {
         if self.read_only {
             return Ok(key.to_string());
         }
-        let to = ObjectPath::from(format!("{}/{archived_name}", self.archive));
+        let to = object_path(&format!("{}/{archived_name}", self.archive))?;
         self.store
-            .rename(&ObjectPath::from(key), &to)
+            .rename(&object_path(key)?, &to)
             .await
             .with_context(|| format!("archiving {key}"))?;
         Ok(to.to_string())
@@ -543,6 +672,12 @@ impl ObjectSource {
 impl ObjectSource {
     pub fn with_signer(mut self, signer: Arc<dyn Signer>) -> Self {
         self.signer = Some(signer);
+        self
+    }
+
+    /// Hands objects over by their public URL: a bucket anyone may read.
+    pub fn with_public_urls(mut self, public: PublicBucket) -> Self {
+        self.public = Some(public);
         self
     }
 
@@ -569,7 +704,7 @@ impl Source {
         }
         let key = format!("{}/{name}", o.submission_prefix(token));
         o.store
-            .put(&ObjectPath::from(key.as_str()), bytes.into())
+            .put(&object_path(&key)?, bytes.into())
             .await
             .with_context(|| format!("writing {key}"))?;
         Ok(Some(key))
@@ -593,7 +728,7 @@ impl Source {
         }
         let key = format!("{}/unpacked/{container}/{name}", o.archive);
         o.store
-            .put(&ObjectPath::from(key.as_str()), bytes.to_vec().into())
+            .put(&object_path(&key)?, bytes.to_vec().into())
             .await
             .with_context(|| format!("writing {key}"))?;
         Ok(Some(key))
@@ -608,7 +743,7 @@ impl Source {
         if o.read_only {
             return Ok(());
         }
-        let prefix = ObjectPath::from(o.submission_prefix(token));
+        let prefix = object_path(&o.submission_prefix(token))?;
         let mut stream = o.store.list(Some(&prefix));
         let mut keys = Vec::new();
         while let Some(meta) = stream.next().await {
@@ -626,23 +761,33 @@ impl Source {
 
 impl Source {
     /// A URL a third party (HFS) can read the object from for `ttl`: a pre-signed
-    /// GET on S3. `None` when the source cannot sign, and the engine serves the
-    /// object itself.
+    /// GET, or the object's public URL in a public bucket.
+    ///
+    /// `None` only for a source with no store; the engine serves its files itself.
+    /// A store object answers a URL in its store, or an error: `Unshareable` when
+    /// no configuration can ever hand it over, any other error when a retry may
+    /// succeed (signing).
     pub async fn share(&self, key: &str, ttl: Duration) -> Result<Option<String>> {
         match self {
             Source::Folder(_) | Source::FhirServer(_) | Source::Database(_) | Source::Mllp(_) => {
                 Ok(None)
             }
-            Source::Object(o) => match &o.signer {
-                None => Ok(None),
-                Some(signer) => {
-                    let url = signer
-                        .signed_url(http::Method::GET, &ObjectPath::from(key), ttl)
-                        .await
-                        .with_context(|| format!("signing a URL for {key}"))?;
-                    Ok(Some(url.to_string()))
+            Source::Object(o) => {
+                let path = object_path(key)?;
+                match (&o.signer, &o.public) {
+                    (Some(signer), _) => {
+                        let url = signer
+                            .signed_url(http::Method::GET, &path, ttl)
+                            .await
+                            .with_context(|| format!("signing a URL for {key}"))?;
+                        Ok(Some(url.to_string()))
+                    }
+                    (None, Some(public)) => Ok(Some(public.url(&path))),
+                    (None, None) => Err(anyhow::Error::new(Unshareable(format!(
+                        "cannot hand {key} over: this store neither signs URLs nor is a public bucket"
+                    )))),
                 }
-            },
+            }
         }
     }
 }
@@ -1057,5 +1202,117 @@ mod tests {
         assert!(waits.list().await.unwrap().is_empty());
         let takes = ObjectSource::new(store, "", "processed", "*", Duration::ZERO);
         assert_eq!(takes.list().await.unwrap(), ["x.csv"]);
+    }
+    fn key(raw: &str) -> ObjectPath {
+        ObjectPath::parse(raw).unwrap()
+    }
+
+    #[test]
+    fn public_urls_on_aws() {
+        let at = |bucket, region, vh| {
+            PublicBucket::new(bucket, region, None, vh).url(&key("in/a.ndjson"))
+        };
+        assert_eq!(
+            at("hfs-test", Some("eu-west-1"), false),
+            "https://hfs-test.s3.eu-west-1.amazonaws.com/in/a.ndjson"
+        );
+        assert_eq!(
+            at("hfs-test", None, false),
+            "https://hfs-test.s3.us-east-1.amazonaws.com/in/a.ndjson"
+        );
+        assert_eq!(
+            at("hfs-test", None, true),
+            "https://hfs-test.s3.us-east-1.amazonaws.com/in/a.ndjson"
+        );
+        // A dotted bucket name is not covered by AWS's wildcard certificate.
+        assert_eq!(
+            at("logs.example", Some("us-east-1"), false),
+            "https://s3.us-east-1.amazonaws.com/logs.example/in/a.ndjson"
+        );
+    }
+
+    #[test]
+    fn public_urls_follow_the_endpoint_style() {
+        let at = |endpoint, vh| {
+            PublicBucket::new("files", Some("us-east-1"), Some(endpoint), vh).url(&key("a.ndjson"))
+        };
+        assert_eq!(
+            at("https://store:9000/", false),
+            "https://store:9000/files/a.ndjson"
+        );
+        assert_eq!(
+            at("https://host/base", false),
+            "https://host/base/files/a.ndjson"
+        );
+        // Virtual-hosted under an endpoint: the endpoint already names the bucket,
+        // and is kept exactly as the store client sends it.
+        assert_eq!(
+            at("https://files.store:9000", true),
+            "https://files.store:9000/a.ndjson"
+        );
+        assert_eq!(
+            at("https://files.store:9000/", true),
+            "https://files.store:9000//a.ndjson"
+        );
+    }
+
+    #[test]
+    fn public_url_keys_are_encoded_once() {
+        let bucket = PublicBucket::new("b", None, Some("https://store"), false);
+        assert_eq!(
+            bucket.url(&key("a b/Obs+1 é 50%~x.ndjson")),
+            "https://store/b/a%20b/Obs%2B1%20%C3%A9%2050%25~x.ndjson"
+        );
+    }
+
+    fn s3_feed(extra: &str) -> FeedConfig {
+        serde_yaml::from_str(&format!(
+            "id: x\nname: X\nsource:\n  type: s3\n  bucket: b\n  anonymous: true\n{extra}format: ndjson\ntransform: t.py\n"
+        ))
+        .unwrap()
+    }
+
+    async fn shared(feed: &FeedConfig, seed: AmazonS3Builder) -> Result<String> {
+        let source = Source::Object(object_source_from(feed, seed)?);
+        Ok(source
+            .share("a.ndjson", Duration::from_secs(60))
+            .await?
+            .expect("a store object has a URL"))
+    }
+
+    #[tokio::test]
+    async fn effective_settings_come_from_the_seed_and_the_source_wins() {
+        use AmazonS3ConfigKey::*;
+        // The source's endpoint wins over an inherited one, and forces path style.
+        let seed = AmazonS3Builder::new()
+            .with_config(Endpoint, "https://inherited:9000")
+            .with_config(VirtualHostedStyleRequest, "true");
+        assert_eq!(
+            shared(&s3_feed("  endpoint: https://store:9000\n"), seed)
+                .await
+                .unwrap(),
+            "https://store:9000/b/a.ndjson"
+        );
+        // An inherited default region is the region in effect.
+        let seed = AmazonS3Builder::new().with_config(DefaultRegion, "eu-west-2");
+        assert_eq!(
+            shared(&s3_feed(""), seed).await.unwrap(),
+            "https://b.s3.eu-west-2.amazonaws.com/a.ndjson"
+        );
+        // An empty inherited region or endpoint cannot be unset: refused.
+        let seed = AmazonS3Builder::new().with_config(Region, "");
+        let err = shared(&s3_feed(""), seed).await.unwrap_err().to_string();
+        assert!(err.contains("the region in effect is empty"), "{err}");
+        let seed = AmazonS3Builder::new().with_config(Endpoint, "");
+        let err = shared(&s3_feed(""), seed).await.unwrap_err().to_string();
+        assert!(err.contains("the endpoint in effect is empty"), "{err}");
+        // The source's own region replaces an empty inherited one.
+        let seed = AmazonS3Builder::new().with_config(Region, "");
+        assert_eq!(
+            shared(&s3_feed("  region: us-east-1\n"), seed)
+                .await
+                .unwrap(),
+            "https://b.s3.us-east-1.amazonaws.com/a.ndjson"
+        );
     }
 }
