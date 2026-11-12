@@ -12,7 +12,7 @@ Available today in the current release. The reasons behind each choice are in [d
 
 **Sources**
 
-- Folder, S3 bucket (including public and read-only buckets, and buckets that announce objects through an SQS queue), another FHIR server, SQL databases (PostgreSQL, MySQL, SQLite, SQL Server), HL7 v2 over MLLP — see [docs/sources.md](docs/sources.md)
+- Folder, S3 bucket (private buckets with stored credentials, public and read-only buckets, and buckets that announce objects through an SQS queue), another FHIR server, SQL databases (PostgreSQL, MySQL, SQLite, SQL Server), HL7 v2 over MLLP — see [docs/sources.md](docs/sources.md)
 - CSV, NDJSON, FHIR Bundle, HL7 v2 and zipped drops of any of them
 
 **Transforms**

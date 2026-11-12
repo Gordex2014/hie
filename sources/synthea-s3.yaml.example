@@ -1,5 +1,6 @@
-# Rename to .yaml to enable. Credentials come from the AWS environment
-# (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION or a profile).
+# Rename to .yaml to enable. The bucket is read with the credential named
+# lab-feeds, stored through POST /api/secrets (an access key id and secret
+# access key); a public bucket says anonymous: true instead.
 id: synthea-s3
 name: Synthea NDJSON on S3
 source:
@@ -7,6 +8,7 @@ source:
   bucket: my-lab-feeds
   prefix: synthea/
   region: us-east-1
+  credential: lab-feeds
   # endpoint: http://localhost:9000   # MinIO or another S3-compatible store
   pattern: "*.ndjson"
   poll_seconds: 30

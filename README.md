@@ -9,7 +9,7 @@ The Helios Integration Engine (HIE) moves healthcare data into [HL7® FHIR®](ht
 - **🧾 Every row accounted for**: each record is stored before its file is acknowledged, and keeps its file, line, outcome and reason; nothing is lost when a server is down, and a bad row is rejected on its own with the line and the reason
 - **🔁 Idempotent delivery**: resources go out by id or by business identifier, so a re-sent file updates instead of duplicating; large loads go through `$bulk-submit` and are settled by receipts
 - **🐍 Transforms in Python**: a function that takes one record and returns resources, with terminology lookups against a FHIR terminology server; run in a local Python worker
-- **📡 Sources that fit what customers have**: folders, S3 buckets (public, read-only, or announced by SQS), SQL databases, HL7 v2 over MLLP, other FHIR servers; zips unpacked as drops
+- **📡 Sources that fit what customers have**: folders, S3 buckets (private buckets with stored credentials, public, read-only, or announced by SQS), SQL databases, HL7 v2 over MLLP, other FHIR servers; zips unpacked as drops
 - **🔔 Operable**: alert rules for silence, missing deliveries, rejected shares and unreachable servers; Prometheus metrics; an API with scopes behind any OIDC provider; several instances on one store
 
 ## What People Build with HIE

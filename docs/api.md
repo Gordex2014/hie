@@ -7,8 +7,8 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | Method and path | Does |
 |---|---|
 | `GET /api/sources` | Every source: definition, state (`waiting`, `receiving`, `late`, `paused`), freshness, record counts, last file, last alert |
-| `POST /api/sources` | Creates a source from its definition (the YAML as JSON); writes `sources/{id}.yaml` and starts it. `409` if it exists, `400` with the reason if invalid |
-| `POST /api/sources/test` | Tests a connection: `{"source": {...}}` or a full definition. Answers `reachable`, `elapsed_ms`, `objects`, `newest`, `newest_at` |
+| `POST /api/sources` | Creates a source from its definition (the YAML as JSON); writes `sources/{id}.yaml` and starts it. `409` if it exists, `400` with the reason if invalid (`code: invalid_definition`, also when the credential it names is missing or unusable) |
+| `POST /api/sources/test` | Tests a connection: `{"source": {...}}` or a full definition. Answers `reachable`, `elapsed_ms`, `objects`, `newest`, `newest_at`. An S3 source with a `credential` is tested with the credential's current revision |
 | `GET /api/sources/{id}` | One source, as above |
 | `PUT /api/sources/{id}` | Replaces the definition and restarts the source |
 | `DELETE /api/sources/{id}` | Stops the source and removes its file; its records and alerts stay |
@@ -30,8 +30,41 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /api/alerts?source=&open=true` | Alerts, newest first, each with its rule, recipients, channels, and when and why it cleared; `open=true` lists only those not cleared |
 | `GET /api/alert-rules?source=` | Every rule; `POST` creates one (`400` names what is wrong with it) |
 | `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove |
+| `GET /api/secrets` | Every stored credential, by name, without its value |
+| `POST /api/secrets` | Stores a credential: `{"name", "kind": "aws", "value": {"access_key_id", "secret_access_key"}}`. `201` |
+| `GET /api/secrets/{id}` | One credential, without its value |
+| `PUT /api/secrets/{id}` | Replaces its value with a new revision: `{"value": {...}}`. Sources use it from their next pass |
+| `DELETE /api/secrets/{id}` | Removes it. `409` with `sources` while a source is registered for it |
 | `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind |
-| `GET /health` | `{"status": "ok", "service": "hie", "version", "uptime_seconds", "started_at", "timestamp"}` |
+| `GET /health` | `{"status": "ok", "service": "hie", "version", "uptime_seconds", "started_at", "timestamp", "secrets"}`; `secrets` is `{"backend": "native"\|"none", "available", "key_id"}`, the key id being a one-way 16-hex fingerprint of the key in use, or `null` |
+
+Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start, or on replace), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), and the codes of the credential routes below.
+
+### Secrets
+
+Connector credentials, which S3 sources name with `credential:` (see [sources](sources.md)). A credential has an id (`sec_` and 16 hex characters), a name, a kind and a current revision. Only `aws` exists: an access key id and a secret access key, held together in each revision, with no session token.
+
+```json
+{"id": "sec_3f9c2a7d1e4b6a80", "name": "lab-bucket", "kind": "aws", "hint": "MPLE",
+ "revision": 1, "created_at": "2026-11-12T10:00:00.000Z", "updated_at": "2026-11-12T10:00:00.000Z",
+ "used_by": ["lab-s3"]}
+```
+
+- **No answer carries a value.** `hint` is the last four characters of the access key id, to tell credentials apart.
+- **Names** are 1 to 64 characters, unique, with no whitespace around them, no control characters, and not starting with `sec_`. A `credential:` starting with `sec_` is an id; anything else is a name.
+- **A `PUT`** makes a new revision; `name` and `kind` stay. A running source uses it from its next pass (or at once with `check-now`). The previous value is no longer returned by the store, but may remain in database files and backups until they are overwritten.
+- **`used_by`** and the `409`'s `sources` list the sources registered for the credential by any engine instance on the store. A source is registered when it is created or replaced with the credential, and released once its runner for another credential (or for none) has ended. `POST /api/sources/test` uses a credential without registering anything, so a credential may be deleted while a Test runs, and the Test then reports that it could not use it.
+- **Bodies** are a JSON object with exactly the members shown; anything else, at any level, is refused with a fixed sentence that never repeats what was sent.
+
+| Status | `code` | When |
+|---|---|---|
+| `400` | `invalid_body` (with `field` when one is at fault) | The body does not parse, has unknown members, misses a field, or breaks a rule (name, kind, value shape) |
+| `404` | `secret_not_found` | No credential with that id |
+| `409` | `name_in_use` | The name is taken |
+| `409` | `secret_in_use` (with `sources`) | A source is registered for the credential |
+| `503` | `secrets_unavailable` | No store: this build has no secret backend, or the store has no usable key (the reason says which) |
+| `503` | `store_busy` (`Retry-After: 1`) | The store's lock was not free |
+| `500` | `internal_error` | The engine failed; its log has the reason |
 
 ## Authentication
 
@@ -50,8 +83,8 @@ What a token may do is decided by its scopes (the `scope`, `scp` or `roles` clai
 
 | Scope | Grants |
 |---|---|
-| `hie/read` | Every `GET`: sources, loads, records, transforms, alerts, rules, monitoring |
-| `hie/manage` | Changing sources, rules, loads and records (`POST`, `PUT`, `DELETE`, pause, resume, retry, reprocess, try), and reading |
+| `hie/read` | Every `GET` except `/api/secrets`: sources, loads, records, transforms, alerts, rules, monitoring |
+| `hie/manage` | Changing sources, rules, loads and records (`POST`, `PUT`, `DELETE`, pause, resume, retry, reprocess, try), and reading; and credentials: every method on `/api/secrets`, reads included |
 | `hie/transforms` | `PUT /api/transforms/{name}`: code the engine then runs; and reading |
 | `hie/*` | Everything |
 
