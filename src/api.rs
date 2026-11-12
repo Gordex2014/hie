@@ -1,3 +1,5 @@
+mod secrets;
+
 use std::sync::Arc;
 
 use crate::db::{Param, params};
@@ -71,6 +73,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/records/{id}", get(get_record))
         .route("/api/records/{id}/reprocess", post(reprocess))
         .route("/api/alerts", get(list_alerts))
+        .route(
+            "/api/secrets",
+            get(secrets::list_secrets).post(secrets::create_secret),
+        )
+        .route(
+            "/api/secrets/{id}",
+            get(secrets::get_secret)
+                .put(secrets::replace_secret)
+                .delete(secrets::delete_secret),
+        )
         .route("/api/alert-rules", get(list_rules).post(create_rule))
         .route(
             "/api/alert-rules/{id}",
@@ -153,34 +165,91 @@ async fn bulk_file(
 
 const DAY_MS: i64 = 86_400_000;
 
-struct ApiError(StatusCode, String);
+/// An error answer: `{"error": <sentence>}`, plus a stable `code` and other
+/// members when set, and any headers it needs.
+struct ApiError {
+    status: StatusCode,
+    error: String,
+    code: Option<&'static str>,
+    extra: Map<String, Value>,
+    headers: Vec<(header::HeaderName, header::HeaderValue)>,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, error: impl Into<String>) -> Self {
+        Self {
+            status,
+            error: error.into(),
+            code: None,
+            extra: Map::new(),
+            headers: Vec::new(),
+        }
+    }
+
+    fn code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
+    }
+
+    fn with(mut self, key: &str, value: impl Into<Value>) -> Self {
+        self.extra.insert(key.to_string(), value.into());
+        self
+    }
+
+    fn header(mut self, name: header::HeaderName, value: &'static str) -> Self {
+        self.headers
+            .push((name, header::HeaderValue::from_static(value)));
+        self
+    }
+
+    /// The store's write lock was not free: the same request may work shortly.
+    fn store_busy() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the store is busy; try again shortly",
+        )
+        .code("store_busy")
+        .header(header::RETRY_AFTER, "1")
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({"error": self.1}))).into_response()
+        let mut body = Map::new();
+        body.insert("error".into(), Value::String(self.error));
+        if let Some(code) = self.code {
+            body.insert("code".into(), Value::String(code.into()));
+        }
+        body.extend(self.extra);
+        let mut response = (self.status, Json(Value::Object(body))).into_response();
+        for (name, value) in self.headers {
+            response.headers_mut().insert(name, value);
+        }
+        response
     }
 }
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
         tracing::error!("API request failed: {e:#}");
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
     }
 }
 
 impl From<ManagerError> for ApiError {
     fn from(e: ManagerError) -> Self {
         match e {
-            ManagerError::Invalid(m) => ApiError(StatusCode::BAD_REQUEST, m),
-            ManagerError::NotFound(m) => ApiError(StatusCode::NOT_FOUND, m),
-            ManagerError::Conflict(m) => ApiError(StatusCode::CONFLICT, m),
-            ManagerError::Busy(m) => ApiError(StatusCode::SERVICE_UNAVAILABLE, m),
-            ManagerError::InvalidDefinition(m) => ApiError(StatusCode::BAD_REQUEST, m),
-            ManagerError::StoreBusy => ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the store is busy; try again shortly".into(),
-            ),
-            ManagerError::NotStarted(m) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, m),
+            ManagerError::Invalid(m) => ApiError::new(StatusCode::BAD_REQUEST, m),
+            ManagerError::InvalidDefinition(m) => {
+                ApiError::new(StatusCode::BAD_REQUEST, m).code("invalid_definition")
+            }
+            ManagerError::NotFound(m) => ApiError::new(StatusCode::NOT_FOUND, m),
+            ManagerError::Conflict(m) => ApiError::new(StatusCode::CONFLICT, m),
+            ManagerError::Busy(m) => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, m).code("busy"),
+            ManagerError::StoreBusy => ApiError::store_busy(),
+            ManagerError::NotStarted(m) => {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, m).code("source_not_started")
+            }
             ManagerError::Internal(e) => e.into(),
         }
     }
@@ -189,7 +258,7 @@ impl From<ManagerError> for ApiError {
 type ApiResult = Result<Json<Value>, ApiError>;
 
 fn not_found(what: &str) -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, format!("{what} not found"))
+    ApiError::new(StatusCode::NOT_FOUND, format!("{what} not found"))
 }
 
 fn iso_ms(ms: i64) -> Option<String> {
@@ -467,9 +536,9 @@ async fn try_transform(
     Json(body): Json<TryBody>,
 ) -> ApiResult {
     if body.records.len() > 100 {
-        return Err(ApiError(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "try at most 100 records at a time".into(),
+            "try at most 100 records at a time",
         ));
     }
     let results = s.manager.try_transform(&name, &body.records).await?;
@@ -734,19 +803,19 @@ async fn list_rules(State(s): State<AppState>, Query(q): Query<AlertQuery>) -> A
 async fn get_rule(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult {
     let rule =
         s.db.rule(id)?
-            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("rule {id} not found")))?;
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("rule {id} not found")))?;
     Ok(Json(json!(rule)))
 }
 
 /// Parses a rule body, checks its shape and that the source it names exists.
 fn parse_rule(s: &AppState, body: Value) -> Result<Rule, ApiError> {
     let rule: Rule = serde_json::from_value(body)
-        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
-    crate::alerts::validate_rule(&rule).map_err(|m| ApiError(StatusCode::BAD_REQUEST, m))?;
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    crate::alerts::validate_rule(&rule).map_err(|m| ApiError::new(StatusCode::BAD_REQUEST, m))?;
     if let Some(source) = &rule.source_id
         && s.manager.source(source).is_none()
     {
-        return Err(ApiError(
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             format!("source {source} not found"),
         ));
@@ -774,7 +843,7 @@ async fn replace_rule(
 ) -> ApiResult {
     let mut rule = parse_rule(&s, body)?;
     if !s.db.update_rule(id, &rule)? {
-        return Err(ApiError(
+        return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             format!("rule {id} not found"),
         ));
@@ -788,7 +857,7 @@ async fn delete_rule(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
     if !s.db.delete_rule(id)? {
-        return Err(ApiError(
+        return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             format!("rule {id} not found"),
         ));
