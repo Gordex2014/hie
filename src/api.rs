@@ -22,6 +22,8 @@ pub struct AppState {
     pub started: Started,
     /// Where the engine writes the NDJSON it serves for transformed submissions.
     pub bulk_dir: std::path::PathBuf,
+    /// Connector credentials, or why there are none.
+    pub secrets: crate::secrets::Secrets,
 }
 
 /// When the process came up, for the uptime that `/health` reports.
@@ -98,6 +100,7 @@ async fn health(State(s): State<AppState>) -> Json<Value> {
         "uptime_seconds": s.started.instant.elapsed().as_secs_f64(),
         "started_at": s.started.at.to_rfc3339(),
         "timestamp": chrono::Utc::now().to_rfc3339(),
+        "secrets": s.secrets.health(),
     }))
 }
 

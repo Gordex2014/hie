@@ -34,9 +34,25 @@ pub struct Config {
     /// What each transform's worker process may use and how long it may take.
     #[serde(default)]
     pub worker: WorkerConfig,
+    /// Where the key that seals connector credentials comes from, when it is
+    /// not in the environment.
+    #[serde(default)]
+    pub secrets: SecretsConfig,
     /// The directory holding `hie.yaml`; relative paths in source files resolve against it.
     #[serde(skip)]
     pub base_dir: PathBuf,
+    /// The configuration file itself, as loaded.
+    #[serde(skip)]
+    pub path: PathBuf,
+}
+
+/// The `secrets:` block. It holds a path, never a key.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsConfig {
+    /// A file holding the secret key (base64 of 32 bytes), relative to the
+    /// directory holding `hie.yaml`; `HIE_SECRET_KEY_FILE` names one too.
+    pub key_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -655,6 +671,10 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
         .with_context(|| format!("checking {}", path.display()))?;
     let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
     config.base_dir = base.clone();
+    config.path = path.to_path_buf();
+    if let Some(key_file) = &config.secrets.key_file {
+        config.secrets.key_file = Some(base.join(key_file));
+    }
     config.database = base.join(&config.database);
     config.sources_dir = base.join(&config.sources_dir);
     config.transforms_dir = base.join(&config.transforms_dir);
