@@ -188,6 +188,17 @@ impl SourceManager {
 
     /// Builds and spawns the runner for a resolved definition, replacing a running one.
     pub fn start(&self, feed: FeedConfig) -> Result<()> {
+        // Files recorded before origins were: decided once, here, before
+        // the runner can hand any of them over. A stored origin never follows
+        // later edits of the definition.
+        self.db.backfill_file_origins(
+            &feed.id,
+            matches!(
+                feed.source,
+                SourceConfig::Folder { .. } | SourceConfig::Mllp { .. }
+            ),
+            &self.bulk_dir,
+        )?;
         let runner = Arc::new(
             FeedRunner::new(
                 feed.clone(),

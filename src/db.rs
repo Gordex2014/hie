@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS alert_rules (
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("files", "source_key", "TEXT"),
     ("files", "archived", "INTEGER NOT NULL DEFAULT 0"),
+    ("files", "origin", "TEXT"),
     ("records", "submission", "TEXT"),
     ("alerts", "rule_id", "INTEGER"),
     ("alerts", "cleared_at", "INTEGER"),
@@ -165,6 +166,8 @@ pub struct SubmittableFile {
     pub file_id: i64,
     pub name: String,
     pub source_key: Option<String>,
+    /// Where the kept file lives: see `Db::insert_file`.
+    pub origin: Option<String>,
     /// The resource type of the file's first pending record (an export holds one type per file).
     pub resource_type: String,
     /// Pending records of the file that no submission holds.
@@ -801,7 +804,16 @@ impl Db {
     }
 
     /// Records a file. `source_key` is kept when the object must stay at its source
-    /// until HFS has fetched it (the `$bulk-submit` path).
+    /// until HFS has fetched it (the `$bulk-submit` path), and `origin` says where
+    /// that kept file lives:
+    /// - `store`: an object in a store, always handed over by its store's URL;
+    /// - `local`: a file of a source that reads from disk (a folder, the MLLP
+    ///   spool), served by the engine and acknowledged by its source;
+    /// - `staged`: an entry the engine unpacked under its bulk directory, served
+    ///   by the engine and removed once settled.
+    ///
+    /// A row without one (written by an earlier version and not backfilled) is
+    /// never served by the engine.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_file(
         &self,
@@ -812,6 +824,7 @@ impl Db {
         status: &str,
         duplicate_of: Option<i64>,
         source_key: Option<&str>,
+        origin: Option<&str>,
     ) -> Result<i64> {
         let now = now_ms();
         let finished_at = if status == "processing" {
@@ -820,20 +833,71 @@ impl Db {
             Some(now)
         };
         self.insert_returning_id(
-            "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at, source_key)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-            &params![feed, name, sha, size, status, duplicate_of, now, finished_at, source_key],
+            "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at, source_key, origin)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &params![feed, name, sha, size, status, duplicate_of, now, finished_at, source_key, origin],
         )
     }
 
-    /// The key and name of a file still waiting at its source (not archived yet).
-    pub fn file_source(&self, file_id: i64) -> Result<Option<(String, String)>> {
+    /// The key, name and origin of a file still waiting at its source (not archived yet).
+    pub fn file_source(&self, file_id: i64) -> Result<Option<(String, String, Option<String>)>> {
         Ok(self
             .query_one(
-                "SELECT source_key, name FROM files WHERE id = $1 AND source_key IS NOT NULL AND archived = 0",
+                "SELECT source_key, name, origin FROM files WHERE id = $1 AND source_key IS NOT NULL AND archived = 0",
                 &params![file_id],
             )?
-            .map(|r| (r.string(0), r.string(1))))
+            .map(|r| (r.string(0), r.string(1), r.opt_string(2))))
+    }
+
+    /// Gives the files of a feed recorded before origins were, and that still name
+    /// where they live, their origin, decided once by `bulk::historical_origin`.
+    /// Archived files are included: a retry hands them over again. Only missing
+    /// origins are filled. Returns how many.
+    pub fn backfill_file_origins(
+        &self,
+        feed: &str,
+        local_source: bool,
+        bulk_dir: &Path,
+    ) -> Result<usize> {
+        self.with(|c| {
+            c.batch("BEGIN")?;
+            let result = (|| {
+                // Only an unpacked entry (`zip!/entry`) can have been staged by the
+                // engine; every other file takes its source's kind.
+                let mut n = c.execute(
+                    "UPDATE files SET origin = $2
+                     WHERE feed_id = $1 AND origin IS NULL AND source_key IS NOT NULL
+                       AND name NOT LIKE '%!/%'",
+                    &params![feed, if local_source { "local" } else { "store" }],
+                )? as usize;
+                let entries = c.query(
+                    "SELECT id, name, source_key FROM files
+                     WHERE feed_id = $1 AND origin IS NULL AND source_key IS NOT NULL",
+                    &params![feed],
+                )?;
+                for r in &entries {
+                    let origin = crate::bulk::historical_origin(
+                        &r.string(1),
+                        &r.string(2),
+                        local_source,
+                        bulk_dir,
+                    );
+                    c.execute(
+                        "UPDATE files SET origin = $2 WHERE id = $1 AND origin IS NULL",
+                        &params![r.i64(0), origin],
+                    )?;
+                }
+                n += entries.len();
+                Ok::<_, anyhow::Error>(n)
+            })();
+            match result {
+                Ok(n) => c.batch("COMMIT").map(|()| n),
+                Err(e) => {
+                    let _ = c.batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
     }
 
     /// The file was moved out of the way; `key` is where it lives now, so a retry
@@ -1149,10 +1213,10 @@ impl Db {
     /// manifest needs them: counted in the store, never listed record by record.
     pub fn submittable_files(&self, feed: &str, limit: usize) -> Result<Vec<SubmittableFile>> {
         let rows = self.query(
-            "SELECT r.file_id, f.name, f.source_key, COUNT(*)
+            "SELECT r.file_id, f.name, f.source_key, COUNT(*), f.origin
              FROM records r JOIN files f ON f.id = r.file_id
              WHERE r.feed_id = $1 AND r.status = 'pending' AND r.submission IS NULL
-             GROUP BY r.file_id, f.name, f.source_key
+             GROUP BY r.file_id, f.name, f.source_key, f.origin
              ORDER BY r.file_id LIMIT $2",
             &params![feed, limit],
         )?;
@@ -1177,6 +1241,7 @@ impl Db {
                 file_id,
                 name: r.string(1),
                 source_key: r.opt_string(2),
+                origin: r.opt_string(4),
                 resource_type,
                 count: r.i64(3) as usize,
             });
@@ -1359,16 +1424,20 @@ impl Db {
             .collect())
     }
 
-    /// The source key of a file, only when that file is part of the submission.
-    pub fn submission_file(&self, token: &str, file_id: i64) -> Result<Option<String>> {
+    /// The source key and origin of a file, only when that file is part of the submission.
+    pub fn submission_file(
+        &self,
+        token: &str,
+        file_id: i64,
+    ) -> Result<Option<(String, Option<String>)>> {
         Ok(self
             .query_one(
-                "SELECT f.source_key FROM files f
+                "SELECT f.source_key, f.origin FROM files f
                  WHERE f.id = $2 AND f.source_key IS NOT NULL
                    AND EXISTS (SELECT 1 FROM records r WHERE r.file_id = f.id AND r.submission = $1)",
                 &params![token, file_id],
             )?
-            .and_then(|r| r.opt_string(0)))
+            .map(|r| (r.string(0), r.opt_string(1))))
     }
 
     // ---- source state, cursors, leases ------------------------------------------

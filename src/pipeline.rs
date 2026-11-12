@@ -333,6 +333,7 @@ impl FeedRunner {
                 "duplicate",
                 Some(original),
                 None,
+                None,
             )?;
             tracing::info!(feed, file = %name, duplicate_of = original, "same content already received; not reprocessed");
             let archived = self
@@ -348,6 +349,10 @@ impl FeedRunner {
 
         // On the bulk path the object stays at its source until HFS has read it.
         let keep = self.bulk.is_some() && !self.bulk_transformed;
+        let origin = match self.source {
+            Source::Object(_) => "store",
+            _ => "local",
+        };
         let file_id = self.db.insert_file(
             feed,
             &name,
@@ -356,6 +361,7 @@ impl FeedRunner {
             "processing",
             None,
             keep.then_some(key.as_str()),
+            keep.then_some(origin),
         )?;
         let readable = self.admit(file_id, &name, &bytes)?;
         if keep && readable {
@@ -398,9 +404,16 @@ impl FeedRunner {
     /// zip is recorded as `unpacked` (so it is not read twice) and archived.
     async fn unpack(&self, key: &str, name: &str, sha: &str, bytes: Vec<u8>) -> Result<()> {
         let feed = &self.feed.id;
-        let container =
-            self.db
-                .insert_file(feed, name, sha, bytes.len() as u64, "unpacked", None, None)?;
+        let container = self.db.insert_file(
+            feed,
+            name,
+            sha,
+            bytes.len() as u64,
+            "unpacked",
+            None,
+            None,
+            None,
+        )?;
         let wanted = match self.feed.format {
             Format::Csv => &["csv"][..],
             Format::Ndjson => &["ndjson", "jsonl"][..],
@@ -462,6 +475,7 @@ impl FeedRunner {
                     "duplicate",
                     Some(original),
                     None,
+                    None,
                 )?;
                 continue;
             }
@@ -470,7 +484,7 @@ impl FeedRunner {
             let staged = if self.bulk.is_some() && !self.bulk_transformed {
                 let base = format!("{}.ndjson", taken + 1);
                 match self.source.put_unpacked(container, &base, &data).await? {
-                    Some(key) => Some(key),
+                    Some(key) => Some((key, "store")),
                     None => {
                         let dir = self.bulk_dir.join("unpacked").join(container.to_string());
                         std::fs::create_dir_all(&dir)
@@ -478,7 +492,7 @@ impl FeedRunner {
                         let local = dir.join(&base);
                         std::fs::write(&local, &data)
                             .with_context(|| format!("writing {}", local.display()))?;
-                        Some(local.to_string_lossy().into_owned())
+                        Some((local.to_string_lossy().into_owned(), "staged"))
                     }
                 }
             } else {
@@ -491,7 +505,8 @@ impl FeedRunner {
                 data.len() as u64,
                 "processing",
                 None,
-                staged.as_deref(),
+                staged.as_ref().map(|(key, _)| key.as_str()),
+                staged.as_ref().map(|(_, origin)| *origin),
             )?;
             self.admit(file_id, &entry_name, &data)?;
             taken += 1;
@@ -626,15 +641,16 @@ impl FeedRunner {
             let mut records = 0usize;
             let mut hashes = Vec::new();
             for file in &files {
-                let url = match &file.source_key {
-                    // An entry the engine keeps itself is served, never signed.
-                    Some(key) if !self.is_staged_locally(key) => {
-                        match self.source.share(key, ttl).await? {
-                            Some(signed) => signed,
-                            None => bulk.file_url(&token, file.file_id),
-                        }
+                let url = match (file.origin.as_deref(), &file.source_key) {
+                    // A file the engine keeps or reads from disk is served by it.
+                    (Some("staged" | "local"), _) | (_, None) => {
+                        bulk.file_url(&token, file.file_id)
                     }
-                    _ => bulk.file_url(&token, file.file_id),
+                    // A store object is always read from its store.
+                    (_, Some(key)) => match self.source.share(key, ttl).await? {
+                        Some(url) => url,
+                        None => bulk.file_url(&token, file.file_id),
+                    },
                 };
                 entries.push((file.resource_type.clone(), url, file.count));
                 file_ids.push(file.file_id);
@@ -900,10 +916,13 @@ impl FeedRunner {
             rows.iter().filter_map(|r| r["file_id"].as_i64()).collect()
         };
         for file_id in file_ids {
-            if let Some((key, name)) = self.db.file_source(file_id)? {
-                let archived = if self.is_staged_locally(&key) {
-                    // An unpacked entry the engine served: nothing to move, it goes.
-                    if let Err(e) = std::fs::remove_file(&key) {
+            if let Some((key, name, origin)) = self.db.file_source(file_id)? {
+                let archived = if origin.as_deref() == Some("staged") {
+                    // An unpacked entry the engine served: nothing to move, it goes,
+                    // but only from inside the bulk directory.
+                    if !bulk::is_within(Path::new(&key), &self.bulk_dir) {
+                        tracing::warn!(feed = %self.feed.id, "{key} is not inside the bulk directory; left in place");
+                    } else if let Err(e) = std::fs::remove_file(&key) {
                         tracing::warn!(feed = %self.feed.id, "cannot remove {key}: {e}");
                     } else if let Some(dir) = Path::new(&key).parent() {
                         // The container's directory goes with its last entry.
@@ -919,12 +938,6 @@ impl FeedRunner {
             }
         }
         Ok(())
-    }
-
-    /// Whether a kept file lives in the engine's own `bulk_dir` rather than at the source.
-    fn is_staged_locally(&self, key: &str) -> bool {
-        let prefix = self.bulk_dir.to_string_lossy();
-        key.starts_with(prefix.as_ref())
     }
 
     async fn deliver_due(&self) -> Result<()> {

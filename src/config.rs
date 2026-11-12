@@ -585,16 +585,18 @@ impl FeedConfig {
 impl Config {
     /// Where the engine writes the NDJSON it serves for transformed submissions:
     /// next to the SQLite file, or under `data/bulk` when the store is PostgreSQL.
+    /// Absolute, so what the engine stages there is recognised wherever it runs.
     pub fn bulk_dir(&self) -> PathBuf {
         let spec = self.database.to_string_lossy();
-        if spec.starts_with("postgres://") || spec.starts_with("postgresql://") {
+        let dir = if spec.starts_with("postgres://") || spec.starts_with("postgresql://") {
             self.base_dir.join("data").join("bulk")
         } else {
             self.database
                 .parent()
                 .map(|p| p.join("bulk"))
                 .unwrap_or_else(|| PathBuf::from("bulk"))
-        }
+        };
+        std::path::absolute(&dir).unwrap_or(dir)
     }
 }
 

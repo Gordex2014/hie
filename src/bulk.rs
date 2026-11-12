@@ -7,11 +7,42 @@
 //! carries.
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use serde_json::{Value, json};
 
 use crate::credentials::Credentials;
 use crate::fhir::{self, SendError};
+
+/// Whether `path` lies inside `dir`, as the filesystem resolves both (symbolic
+/// links and `..` included). A path that cannot be resolved, because it is missing
+/// or unreadable, is not inside. A recorded path is otherwise used exactly as
+/// stored, so reading or removing it reaches the same file.
+pub fn is_within(path: &Path, dir: &Path) -> bool {
+    match (std::fs::canonicalize(path), std::fs::canonicalize(dir)) {
+        (Ok(path), Ok(dir)) => path.starts_with(dir),
+        _ => false,
+    }
+}
+
+/// The origin of a kept file recorded before origins were stored, decided once
+/// at start-up. A store object's name is its basename, so only an entry the
+/// engine unpacked is named `zip!/entry`; with its file under the engine's bulk
+/// directory, it is one the engine staged itself.
+pub fn historical_origin(
+    name: &str,
+    key: &str,
+    local_source: bool,
+    bulk_dir: &Path,
+) -> &'static str {
+    if name.contains("!/") && is_within(Path::new(key), bulk_dir) {
+        "staged"
+    } else if local_source {
+        "local"
+    } else {
+        "store"
+    }
+}
 
 /// What a status poll found.
 #[derive(Debug)]
