@@ -161,3 +161,75 @@ fn an_s3_file_without_credential_or_anonymous_refuses_check_and_run() {
         );
     }
 }
+
+#[cfg(feature = "secrets-native")]
+fn key_text() -> String {
+    use base64::Engine;
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).unwrap();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The two markers of a refusal's suffix, checked against its stable shape:
+/// `(store key <16 hex|none>, this instance's key <16 hex|none|malformed|unavailable|ambiguous|unsafe>)`.
+#[cfg(feature = "secrets-native")]
+fn refusal_markers(stderr: &str) -> (String, String) {
+    let at = stderr
+        .find("(store key ")
+        .unwrap_or_else(|| panic!("no key suffix: {stderr}"));
+    let rest = &stderr[at + "(store key ".len()..];
+    let close = rest.find(')').expect("closed suffix");
+    let (store, instance) = rest[..close]
+        .split_once(", this instance's key ")
+        .expect("both markers");
+    let hex16 = |s: &str| {
+        s.len() == 16
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    assert!(hex16(store) || store == "none", "{stderr}");
+    assert!(
+        hex16(instance)
+            || ["none", "malformed", "unavailable", "ambiguous", "unsafe"].contains(&instance),
+        "{stderr}"
+    );
+    (store.to_string(), instance.to_string())
+}
+
+#[cfg(feature = "secrets-native")]
+#[test]
+fn a_start_with_the_wrong_key_or_an_ambiguous_one_is_refused_before_serving() {
+    let dir = root();
+    let (config, _) = hie::config::load(&dir.path().join("hie.yaml")).unwrap();
+    // Sealed with key A by an earlier start; kept open for the whole test.
+    let a = key_text();
+    let db = std::sync::Arc::new(hie::db::Db::connect(&config.database.to_string_lossy()).unwrap());
+    let sealed = hie::secrets::open(&config, &db, hie::secrets::KeySettings::inline(&a)).unwrap();
+    let store_key = sealed.health()["key_id"].as_str().unwrap().to_string();
+
+    let started = std::time::Instant::now();
+    let out = engine(dir.path(), "run", &[("HIE_SECRET_KEY", &key_text())]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("sealed with another key"), "{stderr}");
+    let (store, instance) = refusal_markers(&stderr);
+    assert_eq!(store, store_key);
+    assert_ne!(store, instance);
+
+    let file = dir.path().join("k.key");
+    std::fs::write(&file, format!("{a}\n")).unwrap();
+    let out = engine(
+        dir.path(),
+        "run",
+        &[
+            ("HIE_SECRET_KEY", &a),
+            ("HIE_SECRET_KEY_FILE", &file.to_string_lossy()),
+        ],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("more than one place"), "{stderr}");
+    assert_eq!(refusal_markers(&stderr), (store_key, "ambiguous".into()));
+    drop(db);
+}
