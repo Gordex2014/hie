@@ -175,6 +175,12 @@ impl From<ManagerError> for ApiError {
             ManagerError::NotFound(m) => ApiError(StatusCode::NOT_FOUND, m),
             ManagerError::Conflict(m) => ApiError(StatusCode::CONFLICT, m),
             ManagerError::Busy(m) => ApiError(StatusCode::SERVICE_UNAVAILABLE, m),
+            ManagerError::InvalidDefinition(m) => ApiError(StatusCode::BAD_REQUEST, m),
+            ManagerError::StoreBusy => ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the store is busy; try again shortly".into(),
+            ),
+            ManagerError::NotStarted(m) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, m),
             ManagerError::Internal(e) => e.into(),
         }
     }
@@ -277,7 +283,7 @@ async fn create_source(
     Json(body): Json<Value>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let by = principal.map(|axum::Extension(p)| p.subject().to_string());
-    let feed = s.manager.create(&body, by.as_deref())?;
+    let feed = s.manager.create(&body, by.as_deref()).await?;
     Ok((StatusCode::CREATED, Json(source_status(&s, &feed)?)))
 }
 
@@ -286,7 +292,7 @@ async fn replace_source(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> ApiResult {
-    let feed = s.manager.replace(&id, &body)?;
+    let feed = s.manager.replace(&id, &body).await?;
     Ok(Json(source_status(&s, &feed)?))
 }
 
@@ -294,7 +300,7 @@ async fn delete_source(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    s.manager.delete(&id)?;
+    s.manager.delete(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -440,7 +446,7 @@ async fn put_transform(
     Path(name): Path<String>,
     Json(body): Json<TransformBody>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let existed = s.manager.save_transform(&name, &body.code)?;
+    let existed = s.manager.save_transform(&name, &body.code).await?;
     let status = if existed {
         StatusCode::OK
     } else {

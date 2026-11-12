@@ -7,14 +7,19 @@
 #[allow(unused_macros)]
 macro_rules! pause_point {
     (await $owner:expr, $name:literal) => {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "secrets-native"))]
         $owner.pause_at($name).await;
     };
     ($owner:expr, $name:literal) => {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "secrets-native"))]
         $owner.pause_at($name);
     };
 }
+
+/// What a test runs at an async `pause_point!`, to hold the task there.
+#[cfg(all(test, feature = "secrets-native"))]
+pub(crate) type AsyncPause =
+    std::sync::Arc<dyn Fn(&'static str) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 pub mod alerts;
 pub mod api;
@@ -110,7 +115,31 @@ pub fn build_with(
         db.clone(),
         config.alerts.webhook_url.clone(),
     ));
-    let manager = manager::SourceManager::new(config, runtime_dir, db.clone(), fhir, alerts);
+    // Source files this build could not load: each stays visible as an alert.
+    for skipped in &config.skipped {
+        if db
+            .open_alert(&skipped.source_id, "definition", None)?
+            .is_none()
+        {
+            alerts.raise(
+                Some(&skipped.source_id),
+                "definition",
+                &format!(
+                    "{}: {}; the file is skipped",
+                    skipped.file.display(),
+                    skipped.reason
+                ),
+            )?;
+        }
+    }
+    let manager = manager::SourceManager::new(
+        config,
+        runtime_dir,
+        db.clone(),
+        fhir,
+        alerts,
+        secrets.clone(),
+    );
     manager.start_all(feeds)?;
     Ok((
         manager.clone(),

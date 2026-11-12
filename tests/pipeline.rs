@@ -707,7 +707,7 @@ async fn a_source_replaced_mid_record_does_not_resend_the_one_already_decided() 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     // Record 1 timed out and is decided; record 2 is in flight.
-    probe.manager.delete("probe").unwrap();
+    probe.manager.delete("probe").await.unwrap();
     probe.manager.start(probe.feed.clone()).unwrap();
     while probe.rows()["3"].0 != "sent" {
         assert!(
@@ -921,7 +921,7 @@ async fn a_halted_runner_delivers_nothing_more() {
     assert!(requests > 0);
     probe.fhir.lock().unwrap().down = false;
     let runner = probe.manager.runner("probe").unwrap();
-    probe.manager.delete("probe").unwrap();
+    probe.manager.delete("probe").await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await; // past the 10 ms backoff
     runner.tick().await.unwrap();
     assert_eq!(probe.fhir.lock().unwrap().requests, requests);
@@ -941,11 +941,11 @@ async fn deleted_sources_leave_no_runner_slots_behind() {
     for id in &ids {
         let mut body = definition.clone();
         body["id"] = json!(id);
-        probe.manager.create(&body, None).unwrap();
+        probe.manager.create(&body, None).await.unwrap();
     }
     assert_eq!(probe.manager.runner_slots(), 11);
     for id in &ids {
-        probe.manager.delete(id).unwrap();
+        probe.manager.delete(id).await.unwrap();
     }
     let started = std::time::Instant::now();
     while probe.manager.runner_slots() != probe.manager.sources().len() {

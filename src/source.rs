@@ -6,17 +6,19 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::StreamExt;
-use object_store::ObjectStore;
-use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, AwsCredentialProvider};
 use object_store::path::Path as ObjectPath;
 use object_store::signer::Signer;
+use object_store::{CredentialProvider, ObjectStore};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use secrecy::ExposeSecret;
 use serde::Serialize;
 
 use crate::config::{FeedConfig, RemoteAuth, SourceConfig, glob_match};
 use crate::credentials::{CredentialSettings, Credentials, TokenSource};
 use crate::database::DatabaseSource;
 use crate::db::Db;
+use crate::secrets::Revealed;
 use crate::sqs::SqsQueue;
 
 /// Notices taken from a queue in one pass.
@@ -42,7 +44,15 @@ pub enum Source {
 }
 
 impl Source {
+    /// The source a definition describes. An S3 source that names a credential
+    /// is built without it: it cannot sign until `from_config_with` gives it one.
     pub fn from_config(feed: &FeedConfig) -> Result<Self> {
+        Self::from_config_with(feed, None)
+    }
+
+    /// The source a definition describes, an S3 source signing with `credential`
+    /// (the current revision of the one its definition names).
+    pub fn from_config_with(feed: &FeedConfig, credential: Option<&Revealed>) -> Result<Self> {
         Ok(match &feed.source {
             SourceConfig::Folder {
                 path,
@@ -56,9 +66,11 @@ impl Source {
                 min_age: Duration::from_millis(*min_file_age_ms),
                 archive: archive.clone().unwrap_or_else(|| path.join("processed")),
             }),
-            SourceConfig::S3 { .. } => {
-                Source::Object(object_source_from(feed, AmazonS3Builder::from_env())?)
-            }
+            SourceConfig::S3 { .. } => Source::Object(object_source_from(
+                feed,
+                routing_env(|name| std::env::var(name).ok()),
+                credential,
+            )?),
             SourceConfig::Mllp { listen, spool, .. } => Source::Mllp(MllpSource {
                 feed_id: feed.id.clone(),
                 listen: listen.clone(),
@@ -208,10 +220,133 @@ impl Source {
     }
 }
 
-/// Builds an S3 source on `seed` (the environment in production:
-/// `AmazonS3Builder::from_env()`), so tests can seed inherited values without
-/// touching the process environment.
-pub(crate) fn object_source_from(feed: &FeedConfig, seed: AmazonS3Builder) -> Result<ObjectSource> {
+/// The AWS variables an S3 source still inherits when it does not set its own
+/// region or endpoint: where the bucket is, never how to sign. `DefaultRegion`
+/// only fills a region nothing else set, and `AWS_ENDPOINT_URL` wins over
+/// `AWS_ENDPOINT`.
+const ROUTING_ENV: &[(&str, AmazonS3ConfigKey)] = &[
+    ("AWS_REGION", AmazonS3ConfigKey::Region),
+    ("AWS_DEFAULT_REGION", AmazonS3ConfigKey::DefaultRegion),
+    ("AWS_ENDPOINT_URL", AmazonS3ConfigKey::Endpoint),
+    ("AWS_ENDPOINT", AmazonS3ConfigKey::Endpoint),
+    (
+        "AWS_VIRTUAL_HOSTED_STYLE_REQUEST",
+        AmazonS3ConfigKey::VirtualHostedStyleRequest,
+    ),
+];
+
+/// A builder with the routing variables `var` gives (the process environment in
+/// production), and nothing else: no credentials, tokens, profiles or metadata
+/// endpoints. An empty value counts as unset.
+pub(crate) fn routing_env(var: impl Fn(&str) -> Option<String>) -> AmazonS3Builder {
+    let mut builder = AmazonS3Builder::new();
+    let mut applied: Vec<AmazonS3ConfigKey> = Vec::new();
+    for (name, key) in ROUTING_ENV {
+        if applied.contains(key) {
+            continue;
+        }
+        if let Some(value) = var(name).filter(|v| !v.trim().is_empty()) {
+            builder = builder.with_config(*key, value);
+            applied.push(*key);
+        }
+    }
+    builder
+}
+
+/// Signs with one revision of a stored credential.
+struct RevisionCredentials {
+    credential: Arc<AwsCredential>,
+    /// The credential's name and revision, for debug output.
+    label: String,
+}
+
+impl std::fmt::Debug for RevisionCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RevisionCredentials({}, ..)", self.label)
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialProvider for RevisionCredentials {
+    type Credential = AwsCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<AwsCredential>> {
+        Ok(self.credential.clone())
+    }
+}
+
+/// Never signs: an anonymous source, or a credential not loaded yet.
+#[derive(Debug)]
+struct NoCredentials(&'static str);
+
+#[async_trait::async_trait]
+impl CredentialProvider for NoCredentials {
+    type Credential = AwsCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<AwsCredential>> {
+        Err(object_store::Error::Generic {
+            store: "S3",
+            source: self.0.into(),
+        })
+    }
+}
+
+/// The provider an S3 source signs with: always set, so the client never falls
+/// back to credentials from the environment, a profile or instance metadata.
+fn s3_credentials(
+    feed: &FeedConfig,
+    credential: Option<&Revealed>,
+) -> Result<AwsCredentialProvider> {
+    let SourceConfig::S3 {
+        anonymous,
+        credential: named,
+        ..
+    } = &feed.source
+    else {
+        bail!("feed {}: not an S3 source", feed.id);
+    };
+    if *anonymous {
+        return Ok(Arc::new(NoCredentials("an anonymous source is not signed")));
+    }
+    if named.is_none() {
+        bail!(
+            "feed {}: s3: say how to reach the bucket: credential: <name or id> of a credential stored through /api/secrets, or anonymous: true for a public bucket",
+            feed.id
+        );
+    }
+    let Some(revealed) = credential else {
+        return Ok(Arc::new(NoCredentials("the credential is not loaded yet")));
+    };
+    let field = |name: &str| {
+        revealed
+            .value
+            .field(name)
+            .map(|v| v.expose_secret().to_string())
+            .with_context(|| {
+                format!(
+                    "feed {}: credential {} has no {name}",
+                    feed.id, revealed.meta.name
+                )
+            })
+    };
+    Ok(Arc::new(RevisionCredentials {
+        credential: Arc::new(AwsCredential {
+            key_id: field("access_key_id")?,
+            secret_key: field("secret_access_key")?,
+            token: None,
+        }),
+        label: format!("{} rev {}", revealed.meta.name, revealed.meta.revision),
+    }))
+}
+
+/// Builds an S3 source on `seed` (the routing environment in production:
+/// `routing_env`), so tests can seed inherited values without touching the
+/// process environment, signing with `credential` when the source names one.
+pub(crate) fn object_source_from(
+    feed: &FeedConfig,
+    seed: AmazonS3Builder,
+    credential: Option<&Revealed>,
+) -> Result<ObjectSource> {
     let SourceConfig::S3 {
         bucket,
         prefix,
@@ -229,10 +364,14 @@ pub(crate) fn object_source_from(feed: &FeedConfig, seed: AmazonS3Builder) -> Re
     else {
         bail!("feed {}: not an S3 source", feed.id);
     };
+    let provider = s3_credentials(feed, credential)?;
     // Objects of hundreds of megabytes take minutes to fetch.
-    let mut builder = seed.with_bucket_name(bucket).with_client_options(
-        object_store::ClientOptions::new().with_timeout(Duration::from_secs(1800)),
-    );
+    let mut builder = seed
+        .with_bucket_name(bucket)
+        .with_credentials(provider.clone())
+        .with_client_options(
+            object_store::ClientOptions::new().with_timeout(Duration::from_secs(1800)),
+        );
     if *anonymous {
         builder = builder.with_skip_signature(true);
     }
@@ -292,13 +431,13 @@ pub(crate) fn object_source_from(feed: &FeedConfig, seed: AmazonS3Builder) -> Re
     )
     .read_only(*read_only);
     if let Some(queue) = queue {
+        // The queue URL's region, else the bucket's in effect (the source's, then
+        // the routing environment's).
         let region = SqsQueue::region_of(queue)
-            .or_else(|| region.clone())
-            .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-            .or_else(|| std::env::var("AWS_REGION").ok())
+            .or(effective_region)
             .unwrap_or_else(|| "us-east-1".into());
         source = source
-            .with_queue(SqsQueue::new(queue, &region, store.credentials().clone()))
+            .with_queue(SqsQueue::new(queue, &region, provider))
             .relist_every(Duration::from_secs(*relist_seconds));
     }
     Ok(match public {
@@ -1151,6 +1290,9 @@ fn later(a: &str, b: &str) -> bool {
 }
 
 #[cfg(test)]
+mod routing_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use object_store::PutPayload;
@@ -1273,7 +1415,7 @@ mod tests {
     }
 
     async fn shared(feed: &FeedConfig, seed: AmazonS3Builder) -> Result<String> {
-        let source = Source::Object(object_source_from(feed, seed)?);
+        let source = Source::Object(object_source_from(feed, seed, None)?);
         Ok(source
             .share("a.ndjson", Duration::from_secs(60))
             .await?

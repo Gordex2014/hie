@@ -44,7 +44,38 @@ pub struct Config {
     /// The configuration file itself, as loaded.
     #[serde(skip)]
     pub path: PathBuf,
+    /// Source files left out at load because this build cannot run them.
+    #[serde(skip)]
+    pub skipped: Vec<SkippedSource>,
 }
+
+/// A source file `load` left out, and why: it names a credential and this
+/// build has no secret store.
+#[derive(Debug, Clone)]
+pub struct SkippedSource {
+    pub file: PathBuf,
+    pub source_id: String,
+    pub reason: String,
+}
+
+/// A source that names a credential, in a build without a secret store.
+#[derive(Debug, Clone)]
+pub struct NeedsSecretBackend {
+    pub source: String,
+    pub credential: String,
+}
+
+impl std::fmt::Display for NeedsSecretBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "source {}: credential {:?} needs a secret store, and this build has none (built without the secrets-native feature)",
+            self.source, self.credential
+        )
+    }
+}
+
+impl std::error::Error for NeedsSecretBackend {}
 
 /// The `secrets:` block. It holds a path, never a key.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -152,8 +183,8 @@ pub enum SourceConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         archive: Option<PathBuf>,
     },
-    /// An S3 bucket. Credentials come from the usual AWS environment
-    /// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, profiles).
+    /// An S3 bucket, read with the stored credential `credential` names, or
+    /// unsigned when `anonymous`.
     S3 {
         bucket: String,
         #[serde(default)]
@@ -174,6 +205,10 @@ pub enum SourceConfig {
         /// A public bucket: no credentials, requests are not signed.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         anonymous: bool,
+        /// The stored credential (`/api/secrets`) the bucket and its queue are
+        /// read with, by name or id; always its current revision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential: Option<String>,
         /// Someone else's bucket: nothing is moved or written there. Objects the
         /// engine has already taken are recognised by content and left alone.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -443,8 +478,17 @@ impl SourceConfig {
         }
     }
 
+    /// The stored credential an S3 source is read with, as its definition names it.
+    pub fn credential(&self) -> Option<&str> {
+        match self {
+            SourceConfig::S3 { credential, .. } => credential.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Checks what the type itself cannot: a FHIR server source needs at least one
-    /// resource type, sane paging, and a URL that looks like one.
+    /// resource type, sane paging, and a URL that looks like one; an S3 source
+    /// says how it reaches its bucket.
     pub fn check(&self) -> Result<()> {
         if let SourceConfig::FhirServer {
             url,
@@ -505,6 +549,25 @@ impl SourceConfig {
             bail!("mllp: listen must be an address such as 0.0.0.0:2575, not {listen:?}");
         }
         if let SourceConfig::S3 {
+            anonymous,
+            credential,
+            ..
+        } = self
+        {
+            match (anonymous, credential) {
+                (true, Some(_)) => bail!(
+                    "s3: anonymous and credential do not go together: a public bucket is read without credentials"
+                ),
+                (false, None) => bail!(
+                    "s3: say how to reach the bucket: credential: <name or id> of a credential stored through /api/secrets, or anonymous: true for a public bucket. AWS_* credentials from the environment are no longer read"
+                ),
+                (_, Some(c)) if c.trim().is_empty() || c.chars().count() > 64 => bail!(
+                    "s3: credential must be the name (1 to 64 characters) or the id of a stored credential"
+                ),
+                _ => {}
+            }
+        }
+        if let SourceConfig::S3 {
             queue: Some(queue),
             anonymous,
             relist_seconds,
@@ -561,6 +624,13 @@ impl FeedConfig {
         self.source
             .check()
             .with_context(|| format!("source {}", self.id))?;
+        #[cfg(not(feature = "secrets-native"))]
+        if let Some(credential) = self.source.credential() {
+            return Err(anyhow::Error::new(NeedsSecretBackend {
+                source: self.id.clone(),
+                credential: credential.to_string(),
+            }));
+        }
         // What a server, a query or an MLLP sender hands over has its own shape,
         // whatever the file says; and there is no object for $bulk-submit to fetch.
         let fixed = match self.source {
@@ -682,24 +752,72 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
         .with_context(|| format!("creating {}", config.sources_dir.display()))?;
 
     let mut feeds = Vec::new();
-    let mut entries: Vec<_> = std::fs::read_dir(&config.sources_dir)
-        .with_context(|| format!("reading {}", config.sources_dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("yaml" | "yml")))
-        .collect();
-    entries.sort();
     let mut ids = HashSet::new();
-    for feed_path in entries {
+    for feed_path in source_files(&config.sources_dir)? {
         let text = std::fs::read_to_string(&feed_path)?;
         let mut feed: FeedConfig = serde_yaml::from_str(&text)
             .with_context(|| format!("parsing {}", feed_path.display()))?;
-        feed.resolve(&base)?;
+        if let Err(e) = feed
+            .resolve(&base)
+            .with_context(|| format!("loading {}", feed_path.display()))
+        {
+            // A build without a secret store still starts: it leaves out what
+            // it cannot run, and says so.
+            if let Some(needs) = e.downcast_ref::<NeedsSecretBackend>() {
+                tracing::error!(
+                    "{}: {needs}; the file is skipped and the engine starts without it",
+                    feed_path.display()
+                );
+                config.skipped.push(SkippedSource {
+                    file: feed_path.clone(),
+                    source_id: needs.source.clone(),
+                    reason: needs.to_string(),
+                });
+                continue;
+            }
+            return Err(e);
+        }
         if !ids.insert(feed.id.clone()) {
             bail!("duplicate source id {}", feed.id);
         }
         feeds.push(feed);
     }
     Ok((config, feeds))
+}
+
+/// The source files in `dir`, in the order `load` reads them: every `*.yaml`
+/// and `*.yml`, whatever its name (a source's id is in its body).
+pub fn source_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("yaml" | "yml")))
+        .collect();
+    entries.sort();
+    Ok(entries)
+}
+
+/// The definition of source `id` as `load` would find it in `dir`, resolved
+/// against `base`: the one file whose body has that id, whatever the file is
+/// called. `None` when no file has it; an error, as at load, when a file does
+/// not parse or two files have it.
+pub fn find_source(dir: &Path, base: &Path, id: &str) -> Result<Option<FeedConfig>> {
+    let mut found = None;
+    for path in source_files(dir)? {
+        let text = std::fs::read_to_string(&path)?;
+        let mut feed: FeedConfig =
+            serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        if feed.id != id {
+            continue;
+        }
+        if found.is_some() {
+            bail!("duplicate source id {id}");
+        }
+        feed.resolve(base)
+            .with_context(|| format!("loading {}", path.display()))?;
+        found = Some(feed);
+    }
+    Ok(found)
 }
 
 /// Parses `90s`, `30m`, `24h` or `7d`.
@@ -856,5 +974,100 @@ mod tests {
                 "{yaml}: {err}"
             );
         }
+    }
+
+    fn s3(extra: &str) -> SourceConfig {
+        serde_yaml::from_str(&format!("type: s3\nbucket: lab\n{extra}")).unwrap()
+    }
+
+    fn check_error(source: SourceConfig) -> String {
+        format!("{:#}", source.check().unwrap_err())
+    }
+
+    #[test]
+    fn an_s3_source_says_how_it_reaches_its_bucket() {
+        assert!(check_error(s3("")).contains("say how to reach the bucket"));
+        assert!(
+            check_error(s3("anonymous: true\ncredential: lab\n")).contains("do not go together")
+        );
+        for bad in ["\"  \"", &"x".repeat(65)] {
+            assert!(
+                check_error(s3(&format!("credential: {bad}\n")))
+                    .contains("credential must be the name"),
+                "{bad}"
+            );
+        }
+        assert!(s3("anonymous: true\n").check().is_ok());
+        assert!(s3("credential: lab\n").check().is_ok());
+        assert!(s3("credential: sec_0123456789abcdef\n").check().is_ok());
+        // A queue is read with credentials: with a credential, not anonymously.
+        let queue = "queue: https://sqs.eu-west-1.amazonaws.com/1/q\n";
+        assert!(s3(&format!("credential: lab\n{queue}")).check().is_ok());
+        assert!(
+            check_error(s3(&format!("anonymous: true\n{queue}"))).contains("anonymous and queue")
+        );
+        assert_eq!(s3("credential: lab\n").credential(), Some("lab"));
+        let yaml = serde_yaml::to_string(&s3("credential: lab\n")).unwrap();
+        assert!(yaml.contains("credential: lab"), "{yaml}");
+        assert!(
+            !serde_yaml::to_string(&s3("anonymous: true\n"))
+                .unwrap()
+                .contains("credential")
+        );
+    }
+
+    fn root_with(source_files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.py"), "def transform(r, c): return r\n").unwrap();
+        std::fs::write(dir.path().join("hie.yaml"), "fhir_base_url: http://hfs\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("sources")).unwrap();
+        for (name, text) in source_files {
+            std::fs::write(dir.path().join("sources").join(name), text).unwrap();
+        }
+        dir
+    }
+
+    const LEGACY_S3: &str =
+        "id: legacy\nname: L\nsource:\n  type: s3\n  bucket: b\nformat: ndjson\ntransform: t.py\n";
+    const CREDENTIAL_S3: &str = "id: private\nname: P\nsource:\n  type: s3\n  bucket: b\n  credential: lab\nformat: ndjson\ntransform: t.py\n";
+    const FOLDER: &str =
+        "id: inbox\nname: I\nsource:\n  type: folder\n  path: inbox\ntransform: t.py\n";
+
+    #[test]
+    fn a_legacy_s3_file_refuses_the_load_naming_the_file() {
+        let dir = root_with(&[("legacy.yaml", LEGACY_S3)]);
+        let err = format!("{:#}", load(&dir.path().join("hie.yaml")).unwrap_err());
+        assert!(
+            err.contains("legacy.yaml") && err.contains("source legacy"),
+            "{err}"
+        );
+        assert!(err.contains("say how to reach the bucket"), "{err}");
+    }
+
+    #[cfg(feature = "secrets-native")]
+    #[test]
+    fn a_credential_file_loads_with_a_secret_store() {
+        let dir = root_with(&[("private.yaml", CREDENTIAL_S3), ("inbox.yaml", FOLDER)]);
+        let (config, feeds) = load(&dir.path().join("hie.yaml")).unwrap();
+        assert_eq!(feeds.len(), 2);
+        assert!(config.skipped.is_empty());
+    }
+
+    #[cfg(not(feature = "secrets-native"))]
+    #[test]
+    fn a_credential_file_is_skipped_without_a_secret_store() {
+        let dir = root_with(&[("private.yaml", CREDENTIAL_S3), ("inbox.yaml", FOLDER)]);
+        let (config, feeds) = load(&dir.path().join("hie.yaml")).unwrap();
+        assert_eq!(
+            feeds.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            ["inbox"]
+        );
+        assert_eq!(config.skipped.len(), 1);
+        assert_eq!(config.skipped[0].source_id, "private");
+        assert!(config.skipped[0].file.ends_with("private.yaml"));
+        assert!(config.skipped[0].reason.contains("needs a secret store"));
+        // Anything else still refuses the load.
+        let dir = root_with(&[("private.yaml", CREDENTIAL_S3), ("legacy.yaml", LEGACY_S3)]);
+        assert!(load(&dir.path().join("hie.yaml")).is_err());
     }
 }

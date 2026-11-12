@@ -17,6 +17,7 @@ use crate::config::{Config, FeedConfig, SourceConfig};
 use crate::db::{Db, Rule};
 use crate::fhir::FhirClient;
 use crate::pipeline::{FeedRunner, RunnerControl};
+use crate::secrets::{SecretError, SecretKind, Secrets};
 use crate::source::{Probe, Source};
 use crate::transform::{Outcome, Transformer, check_resource};
 use crate::worker::WorkerLimits;
@@ -32,11 +33,34 @@ const HANDOVER_SLACK: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub enum ManagerError {
     Invalid(String),
+    /// A source definition that cannot run as submitted: its shape, its paths,
+    /// or the credential it names.
+    InvalidDefinition(String),
     NotFound(String),
     Conflict(String),
     /// Too much running already; the same request may succeed later.
     Busy(String),
+    /// The store's write lock was not free; the same request may succeed later.
+    StoreBusy,
+    /// The definition was saved, but its source did not start.
+    NotStarted(String),
     Internal(anyhow::Error),
+}
+
+impl ManagerError {
+    /// A secret store error met while checking or registering a credential.
+    fn from_secret(source: &str, reference: &str, e: SecretError) -> Self {
+        match e {
+            SecretError::Unavailable(reason) => ManagerError::InvalidDefinition(format!(
+                "source {source}: credential {reference}: {reason}"
+            )),
+            SecretError::NotFound => ManagerError::InvalidDefinition(format!(
+                "source {source}: no credential named {reference}; store it first with POST /api/secrets"
+            )),
+            SecretError::Busy => ManagerError::StoreBusy,
+            other => ManagerError::Internal(anyhow::Error::new(other)),
+        }
+    }
 }
 
 impl From<anyhow::Error> for ManagerError {
@@ -107,11 +131,26 @@ pub struct SourceManager {
     db: Arc<Db>,
     fhir: Arc<FhirClient>,
     alerts: Arc<Alerter>,
+    /// Connector credentials, or why there are none.
+    secrets: Secrets,
     sources: Mutex<BTreeMap<String, Managed>>,
     /// Per source id, in the order they were started, the runner tasks that may
     /// still run, deleted sources included. Locked only inside `sources`.
     runners: Mutex<HashMap<String, Vec<RunnerTask>>>,
     handover_grace_ms: AtomicU64,
+    /// Per source id, held across a change of the source: checking its
+    /// credential, registering it, publishing the definition, starting it, and
+    /// cleaning up the registrations it no longer needs.
+    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// What a test runs at the manager's and its runners' pause points.
+    #[cfg(all(test, feature = "secrets-native"))]
+    pause: Mutex<Option<crate::AsyncPause>>,
+    /// Makes the next start after a definition is published fail, for tests.
+    #[cfg(all(test, feature = "secrets-native"))]
+    fail_next_start: std::sync::atomic::AtomicBool,
+    /// Makes the next definition write fail, for tests.
+    #[cfg(all(test, feature = "secrets-native"))]
+    fail_next_write: std::sync::atomic::AtomicBool,
 }
 
 impl SourceManager {
@@ -121,6 +160,7 @@ impl SourceManager {
         db: Arc<Db>,
         fhir: Arc<FhirClient>,
         alerts: Arc<Alerter>,
+        secrets: Secrets,
     ) -> Arc<Self> {
         Arc::new(Self {
             python: config.python.clone(),
@@ -137,8 +177,16 @@ impl SourceManager {
             db,
             fhir,
             alerts,
+            secrets,
             sources: Mutex::new(BTreeMap::new()),
             runners: Mutex::new(HashMap::new()),
+            locks: Mutex::new(HashMap::new()),
+            #[cfg(all(test, feature = "secrets-native"))]
+            pause: Mutex::new(None),
+            #[cfg(all(test, feature = "secrets-native"))]
+            fail_next_start: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(test, feature = "secrets-native"))]
+            fail_next_write: std::sync::atomic::AtomicBool::new(false),
             handover_grace_ms: AtomicU64::new(
                 (config
                     .worker
@@ -186,8 +234,31 @@ impl SourceManager {
         });
     }
 
+    /// The lock a change of source `id` holds.
+    fn source_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .expect("manager mutex")
+            .entry(id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    #[cfg(all(test, feature = "secrets-native"))]
+    pub(crate) fn on_pause(&self, hook: crate::AsyncPause) {
+        *self.pause.lock().expect("pause mutex") = Some(hook);
+    }
+
+    #[cfg(all(test, feature = "secrets-native"))]
+    async fn pause_at(&self, name: &'static str) {
+        let hook = self.pause.lock().expect("pause mutex").clone();
+        if let Some(hook) = hook {
+            hook(name).await;
+        }
+    }
+
     /// Builds and spawns the runner for a resolved definition, replacing a running one.
-    pub fn start(&self, feed: FeedConfig) -> Result<()> {
+    pub fn start(self: &Arc<Self>, feed: FeedConfig) -> Result<()> {
         // Files recorded before origins were: decided once, here, before
         // the runner can hand any of them over. A stored origin never follows
         // later edits of the definition.
@@ -199,21 +270,23 @@ impl SourceManager {
             ),
             &self.bulk_dir,
         )?;
-        let runner = Arc::new(
-            FeedRunner::new(
-                feed.clone(),
-                self.db.clone(),
-                self.fhir.clone(),
-                self.alerts.clone(),
-                &self.python,
-                &self.runtime_dir,
-                &self.fhir_base_url,
-                &self.public_url,
-            )?
-            .with_bulk_dir(&self.bulk_dir)
-            .with_terminology(self.terminology_url.as_deref())
-            .with_worker_limits(self.worker_limits.clone()),
-        );
+        let runner = FeedRunner::new(
+            feed.clone(),
+            self.db.clone(),
+            self.fhir.clone(),
+            self.alerts.clone(),
+            &self.python,
+            &self.runtime_dir,
+            &self.fhir_base_url,
+            &self.public_url,
+        )?
+        .with_bulk_dir(&self.bulk_dir)
+        .with_terminology(self.terminology_url.as_deref())
+        .with_worker_limits(self.worker_limits.clone())
+        .with_secrets(self.secrets.clone());
+        #[cfg(all(test, feature = "secrets-native"))]
+        let runner = runner.with_pause(self.pause.lock().expect("pause mutex").clone());
+        let runner = Arc::new(runner);
         let control = Arc::new(RunnerControl::default());
         let id = feed.id.clone();
         let grace = Duration::from_millis(self.handover_grace_ms.load(Ordering::Relaxed));
@@ -237,9 +310,15 @@ impl SourceManager {
         // aborted after `grace`. Spawned here, so the order is the order of `start`.
         let predecessors = tasks.clone();
         let (done, ended) = tokio::sync::watch::channel(());
+        let manager = Arc::downgrade(self);
         let task = tokio::spawn(async move {
             let _done = done;
             hand_over(&id, predecessors, grace).await;
+            // Every earlier runner has ended: the registrations the current
+            // definition does not need can go.
+            if let Some(manager) = manager.upgrade() {
+                manager.cleanup_refs(&id).await;
+            }
             runner.run(control).await;
         });
         tasks.push(RunnerTask {
@@ -254,7 +333,9 @@ impl SourceManager {
         managed.control.poke.notify_one();
     }
 
-    pub fn start_all(&self, feeds: Vec<FeedConfig>) -> Result<()> {
+    pub fn start_all(self: &Arc<Self>, feeds: Vec<FeedConfig>) -> Result<()> {
+        // Before any runner: what an earlier run of this instance left behind.
+        self.reconcile_refs(&feeds);
         for feed in feeds {
             self.ensure_default_rule(&feed, None)?;
             self.start(feed)?;
@@ -307,33 +388,169 @@ impl SourceManager {
     /// returns both the form to write (as submitted) and the resolved form to run.
     fn parse(&self, body: &Value) -> Result<(FeedConfig, FeedConfig), ManagerError> {
         let submitted: FeedConfig = serde_json::from_value(body.clone())
-            .map_err(|e| ManagerError::Invalid(e.to_string()))?;
+            .map_err(|e| ManagerError::InvalidDefinition(e.to_string()))?;
         let mut resolved = submitted.clone();
         resolved
             .resolve(&self.base_dir)
-            .map_err(|e| ManagerError::Invalid(format!("{e:#}")))?;
-        Source::from_config(&resolved).map_err(|e| ManagerError::Invalid(format!("{e:#}")))?;
+            .map_err(|e| ManagerError::InvalidDefinition(format!("{e:#}")))?;
+        Source::from_config(&resolved)
+            .map_err(|e| ManagerError::InvalidDefinition(format!("{e:#}")))?;
         Ok((submitted, resolved))
     }
 
-    fn write(&self, submitted: &FeedConfig) -> Result<()> {
-        std::fs::create_dir_all(&self.sources_dir)?;
-        let path = self.file_for(&submitted.id);
-        std::fs::write(&path, submitted.to_yaml()?)
-            .with_context(|| format!("writing {}", path.display()))
+    /// The id of the stored credential a definition names, after checking it
+    /// exists and fits an S3 source; `None` when it names none.
+    async fn credential_of(&self, feed: &FeedConfig) -> Result<Option<String>, ManagerError> {
+        let Some(reference) = feed.source.credential() else {
+            return Ok(None);
+        };
+        let store = match self.secrets.store() {
+            Ok(store) => store,
+            Err(_) => {
+                self.secrets.recheck_once().await;
+                let e = self.secrets.store().err().unwrap_or(SecretError::NotFound);
+                return Err(ManagerError::from_secret(&feed.id, reference, e));
+            }
+        };
+        let meta = store
+            .find(reference)
+            .await
+            .map_err(|e| ManagerError::from_secret(&feed.id, reference, e))?
+            .ok_or_else(|| ManagerError::from_secret(&feed.id, reference, SecretError::NotFound))?;
+        match meta.kind {
+            SecretKind::Aws => Ok(Some(meta.id)),
+        }
     }
 
-    pub fn create(&self, body: &Value, by: Option<&str>) -> Result<FeedConfig, ManagerError> {
+    /// Registers source `id`, as this instance, for the credential `secret_id`:
+    /// `true` when this call made the registration, `false` when it existed.
+    fn hold(&self, feed: &FeedConfig, secret_id: &str) -> Result<bool, ManagerError> {
+        #[cfg(feature = "secrets-native")]
+        {
+            self.db
+                .secret_hold(secret_id, &feed.id, self.secrets.owner())
+                .map_err(|e| {
+                    ManagerError::from_secret(
+                        &feed.id,
+                        feed.source.credential().unwrap_or(secret_id),
+                        e,
+                    )
+                })
+        }
+        #[cfg(not(feature = "secrets-native"))]
+        {
+            let _ = (feed, secret_id);
+            Ok(false)
+        }
+    }
+
+    /// Takes back the registration a change made, when the change then failed
+    /// before publishing its definition. Any registration that existed before
+    /// the change stays: an earlier runner may still be using it, and only the
+    /// cleanup after its handover, or the next start, may release it.
+    fn take_back(&self, id: &str, secret: Option<&str>, made: bool) {
+        #[cfg(feature = "secrets-native")]
+        if let (Some(secret), true) = (secret, made)
+            && let Err(e) = self.db.secret_unhold(secret, id, self.secrets.owner())
+        {
+            tracing::warn!(feed = %id, "a registration stays until the next start: {e}");
+        }
+        #[cfg(not(feature = "secrets-native"))]
+        let _ = (id, secret, made);
+    }
+
+    /// Removes this instance's registrations of source `id`, except `keep`.
+    #[cfg(feature = "secrets-native")]
+    fn release(&self, id: &str, keep: Option<&str>) -> Result<(), SecretError> {
+        self.db.secret_release(id, self.secrets.owner(), keep)
+    }
+
+    /// The default rule and the runner of a definition that was just published:
+    /// a failure here leaves the definition saved and the registrations kept.
+    fn start_published(
+        self: &Arc<Self>,
+        feed: &FeedConfig,
+        by: Option<&str>,
+    ) -> Result<(), ManagerError> {
+        #[cfg(all(test, feature = "secrets-native"))]
+        if self
+            .fail_next_start
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ManagerError::NotStarted(
+                "the definition was saved, but the source could not be started: a test made the start fail; it starts with this definition at the next start, or on replace".into(),
+            ));
+        }
+        self.ensure_default_rule(feed, by)
+            .and_then(|()| self.start(feed.clone()))
+            .map_err(|e| {
+                tracing::error!(feed = %feed.id, "the definition was saved, but the source did not start: {e:#}");
+                ManagerError::NotStarted(format!(
+                    "the definition was saved, but the source could not be started: {e:#}; it starts with this definition at the next start, or on replace"
+                ))
+            })
+    }
+
+    /// Publishes the definition all at once: written to a temporary file of its
+    /// own, then renamed over the source's file, so a failed write leaves the
+    /// previous definition in place. `config::load` reads only `*.yaml` and
+    /// `*.yml`, never the temporary file.
+    fn write(&self, submitted: &FeedConfig) -> Result<()> {
+        use std::io::Write;
+        #[cfg(all(test, feature = "secrets-native"))]
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("writing {}: a test made the write fail", submitted.id);
+        }
+        std::fs::create_dir_all(&self.sources_dir)?;
+        let path = self.file_for(&submitted.id);
+        let yaml = submitted.to_yaml()?;
+        let temp = self.sources_dir.join(format!(
+            ".{}.yaml.{:08x}.tmp",
+            submitted.id,
+            rand::random::<u32>()
+        ));
+        let written = std::fs::File::create_new(&temp).and_then(|mut file| {
+            file.write_all(yaml.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temp, &path)
+        });
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        written.with_context(|| format!("writing {}", path.display()))
+    }
+
+    pub async fn create(
+        self: &Arc<Self>,
+        body: &Value,
+        by: Option<&str>,
+    ) -> Result<FeedConfig, ManagerError> {
         let (submitted, resolved) = self.parse(body)?;
+        let lock = self.source_lock(&submitted.id);
+        let _changing = lock.lock().await;
         if self.source(&submitted.id).is_some() || self.file_for(&submitted.id).exists() {
             return Err(ManagerError::Conflict(format!(
                 "source {} already exists",
                 submitted.id
             )));
         }
-        self.write(&submitted)?;
-        self.ensure_default_rule(&submitted, by)?;
-        self.start(resolved.clone())?;
+        let secret = self.credential_of(&resolved).await?;
+        pause_point!(await self, "manager:after-find");
+        // Nothing is published and nothing released when this fails.
+        let made = match &secret {
+            Some(secret) => self.hold(&resolved, secret)?,
+            None => false,
+        };
+        pause_point!(await self, "manager:after-hold");
+        if let Err(e) = self.write(&submitted) {
+            self.take_back(&submitted.id, secret.as_deref(), made);
+            return Err(e.into());
+        }
+        pause_point!(await self, "manager:after-publish");
+        self.start_published(&resolved, by)?;
         Ok(resolved)
     }
 
@@ -359,7 +576,11 @@ impl SourceManager {
         self.db.insert_rule(&rule).map(drop)
     }
 
-    pub fn replace(&self, id: &str, body: &Value) -> Result<FeedConfig, ManagerError> {
+    pub async fn replace(
+        self: &Arc<Self>,
+        id: &str,
+        body: &Value,
+    ) -> Result<FeedConfig, ManagerError> {
         if self.source(id).is_none() {
             return Err(ManagerError::NotFound(format!("source {id} not found")));
         }
@@ -370,18 +591,48 @@ impl SourceManager {
                 submitted.id
             )));
         }
-        self.write(&submitted)?;
-        self.start(resolved.clone())?;
+        let lock = self.source_lock(id);
+        let _changing = lock.lock().await;
+        let secret = self.credential_of(&resolved).await?;
+        pause_point!(await self, "manager:after-find");
+        // The old registrations and definition stay untouched when this fails.
+        let made = match &secret {
+            Some(secret) => self.hold(&resolved, secret)?,
+            None => false,
+        };
+        pause_point!(await self, "manager:after-hold");
+        if let Err(e) = self.write(&submitted) {
+            self.take_back(id, secret.as_deref(), made);
+            return Err(e.into());
+        }
+        pause_point!(await self, "manager:after-publish");
+        // The old credential's registration goes once the new runner has taken
+        // over (`cleanup_refs`).
+        self.start_published(&resolved, None)?;
         Ok(resolved)
     }
 
+    /// The definition of `id` as its file holds it, resolved, found as `load`
+    /// finds it (any `*.yaml` or `*.yml` whose body has that id): what the source
+    /// runs once a start succeeds, which may differ from the running one after
+    /// a start that failed. `None` once the file is gone.
+    fn published(&self, id: &str) -> Result<Option<FeedConfig>> {
+        crate::config::find_source(&self.sources_dir, &self.base_dir, id)
+            .with_context(|| format!("reading the definition of {id}"))
+    }
+
     /// Stops the source and removes its definition. Its records and alerts stay.
-    pub fn delete(&self, id: &str) -> Result<(), ManagerError> {
-        let removed = {
+    /// Its registrations go once its runner has ended.
+    pub async fn delete(self: &Arc<Self>, id: &str) -> Result<(), ManagerError> {
+        let lock = self.source_lock(id);
+        let _changing = lock.lock().await;
+        let (removed, halted) = {
             let mut sources = self.sources.lock().expect("manager mutex");
             let removed = sources.remove(id);
-            Self::reap(&mut self.runners.lock().expect("manager mutex"), &sources);
-            removed
+            let mut runners = self.runners.lock().expect("manager mutex");
+            Self::reap(&mut runners, &sources);
+            let halted = runners.get(id).cloned().unwrap_or_default();
+            (removed, halted)
         };
         let Some(managed) = removed else {
             return Err(ManagerError::NotFound(format!("source {id} not found")));
@@ -391,7 +642,122 @@ impl SourceManager {
         if path.exists() {
             std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         }
+        let manager = Arc::downgrade(self);
+        let grace = Duration::from_millis(self.handover_grace_ms.load(Ordering::Relaxed));
+        let id = id.to_string();
+        tokio::spawn(async move {
+            hand_over(&id, halted, grace).await;
+            if let Some(manager) = manager.upgrade() {
+                manager.cleanup_refs(&id).await;
+            }
+        });
         Ok(())
+    }
+
+    /// Removes this instance's registrations of source `id` that its current
+    /// definition does not need: all of them once it is deleted. Runs only when
+    /// no earlier runner of the source is left, so nothing still signs with a
+    /// credential it releases. While the published definition and the running
+    /// one name different credentials (a start that failed after publishing),
+    /// nothing is released: both stay until a start of the published one
+    /// succeeds. Retried a few times; what is left is cleaned at the next start.
+    async fn cleanup_refs(&self, id: &str) {
+        #[cfg(feature = "secrets-native")]
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+            }
+            let lock = self.source_lock(id);
+            let _changing = lock.lock().await;
+            pause_point!(await self, "manager:cleanup:before");
+            let running = self.source(id);
+            let published = match self.published(id) {
+                Ok(published) => published,
+                Err(e) => {
+                    tracing::warn!(feed = %id, "credential registrations kept: {e:#}");
+                    return;
+                }
+            };
+            if running.as_ref().map(|f| f.source.credential())
+                != published.as_ref().map(|f| f.source.credential())
+            {
+                tracing::info!(feed = %id, "credential registrations kept until the saved definition starts");
+                return;
+            }
+            let keep = match running {
+                None => None,
+                Some(feed) => match feed.source.credential() {
+                    None => None,
+                    Some(reference) => match self.db.secret_id_for(reference) {
+                        Ok(keep) => keep,
+                        Err(e) => {
+                            tracing::warn!(feed = %id, "cleaning up credential registrations: {e}");
+                            continue;
+                        }
+                    },
+                },
+            };
+            match self.release(id, keep.as_deref()) {
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::warn!(feed = %id, "cleaning up credential registrations: {e}")
+                }
+            }
+        }
+        #[cfg(not(feature = "secrets-native"))]
+        let _ = id;
+    }
+
+    /// At start, before any runner: makes this instance's registrations match the
+    /// definitions it loaded, as a crash may have left them (a registration
+    /// without a published file, a file removed without its cleanup, a replace
+    /// whose old registration was not released yet). Other instances' rows are
+    /// never touched; a failure leaves a row, which only keeps a secret.
+    fn reconcile_refs(&self, feeds: &[FeedConfig]) {
+        #[cfg(feature = "secrets-native")]
+        {
+            let owner = self.secrets.owner();
+            if owner.is_empty() {
+                return;
+            }
+            let loaded: std::collections::HashSet<&str> =
+                feeds.iter().map(|f| f.id.as_str()).collect();
+            for feed in feeds {
+                let keep = match feed.source.credential() {
+                    None => None,
+                    Some(reference) => match self.db.secret_id_for(reference) {
+                        Ok(keep) => keep,
+                        Err(e) => {
+                            tracing::warn!(feed = %feed.id, "reconciling credential registrations: {e}");
+                            continue;
+                        }
+                    },
+                };
+                if let Some(secret) = &keep
+                    && let Err(e) = self.db.secret_hold(secret, &feed.id, owner)
+                {
+                    tracing::warn!(feed = %feed.id, "reconciling credential registrations: {e}");
+                    continue;
+                }
+                if let Err(e) = self.db.secret_release(&feed.id, owner, keep.as_deref()) {
+                    tracing::warn!(feed = %feed.id, "reconciling credential registrations: {e}");
+                }
+            }
+            match self.db.secret_holds_of(owner) {
+                Ok(holds) => {
+                    for (source, _) in holds {
+                        if !loaded.contains(source.as_str())
+                            && let Err(e) = self.db.secret_release(&source, owner, None)
+                        {
+                            tracing::warn!(feed = %source, "reconciling credential registrations: {e}");
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("reconciling credential registrations: {e}"),
+            }
+        }
+        #[cfg(not(feature = "secrets-native"))]
+        let _ = feeds;
     }
 
     pub fn pause(&self, id: &str, by: Option<&str>) -> Result<(), ManagerError> {
@@ -428,8 +794,11 @@ impl SourceManager {
     pub async fn test(&self, body: &Value) -> Result<Probe, ManagerError> {
         let source_value = body.get("source").unwrap_or(body);
         let mut source: SourceConfig = serde_json::from_value(source_value.clone())
-            .map_err(|e| ManagerError::Invalid(e.to_string()))?;
+            .map_err(|e| ManagerError::InvalidDefinition(e.to_string()))?;
         source.resolve(&self.base_dir);
+        source
+            .check()
+            .map_err(|e| ManagerError::InvalidDefinition(format!("source test: {e:#}")))?;
         let feed = FeedConfig {
             id: "test".into(),
             name: "test".into(),
@@ -440,8 +809,29 @@ impl SourceManager {
             expect_every_text: None,
             expect_every: None,
         };
-        let source =
-            Source::from_config(&feed).map_err(|e| ManagerError::Invalid(format!("{e:#}")))?;
+        // The credential's current revision, revealed for this probe only: a
+        // test registers nothing.
+        let revealed = match feed.source.credential() {
+            None => None,
+            Some(reference) => {
+                let store = match self.secrets.store() {
+                    Ok(store) => store,
+                    Err(_) => {
+                        self.secrets.recheck_once().await;
+                        let e = self.secrets.store().err().unwrap_or(SecretError::NotFound);
+                        return Err(ManagerError::from_secret("test", reference, e));
+                    }
+                };
+                Some(
+                    store
+                        .reveal(reference)
+                        .await
+                        .map_err(|e| ManagerError::from_secret("test", reference, e))?,
+                )
+            }
+        };
+        let source = Source::from_config_with(&feed, revealed.as_ref())
+            .map_err(|e| ManagerError::InvalidDefinition(format!("{e:#}")))?;
         match source.probe().await {
             Ok(probe) => Ok(probe),
             Err(e) => Ok(Probe {
@@ -527,16 +917,34 @@ impl SourceManager {
 
     /// Writes the transform's code and restarts the sources that use it, so their
     /// Python workers load the new version.
-    pub fn save_transform(&self, name: &str, code: &str) -> Result<bool, ManagerError> {
+    ///
+    /// Each source restarts under its own lock with the definition its file
+    /// holds, so a definition saved by a change whose start failed is the one
+    /// that runs, not the older one still running.
+    pub async fn save_transform(
+        self: &Arc<Self>,
+        name: &str,
+        code: &str,
+    ) -> Result<bool, ManagerError> {
         let path = self.transform_path(name)?;
         std::fs::create_dir_all(&self.transforms_dir).map_err(anyhow::Error::from)?;
         let existed = path.exists();
         std::fs::write(&path, code).with_context(|| format!("writing {}", path.display()))?;
         let canonical = path.canonicalize().unwrap_or(path);
-        for feed in self.sources() {
-            if feed.transform.canonicalize().ok().as_ref() == Some(&canonical) {
-                self.start(feed)?;
+        for running in self.sources() {
+            if running.transform.canonicalize().ok().as_ref() != Some(&canonical) {
+                continue;
             }
+            let lock = self.source_lock(&running.id);
+            let _changing = lock.lock().await;
+            if self.source(&running.id).is_none() {
+                continue; // deleted meanwhile
+            }
+            let feed = match self.published(&running.id)? {
+                Some(feed) => feed,
+                None => continue,
+            };
+            self.start(feed)?;
         }
         Ok(existed)
     }
@@ -597,3 +1005,6 @@ impl SourceManager {
         Ok(out)
     }
 }
+
+#[cfg(all(test, feature = "secrets-native"))]
+mod reference_tests;

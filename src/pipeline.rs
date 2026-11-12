@@ -14,6 +14,7 @@ use crate::config::{DeliveryMethod, FeedConfig, Format, parse_duration};
 use crate::db::{Db, Rule, WorkItem, now_ms};
 use crate::fhir::{self, DeliveryKey, EntryResult, FhirClient, SendError};
 use crate::reader;
+use crate::secrets::Secrets;
 use crate::source::{Incoming, Source, Unshareable};
 use crate::transform::{self, Outcome, Transformer};
 use crate::worker::WorkerLimits;
@@ -35,7 +36,19 @@ pub struct RunnerControl {
 /// HFS outage never loses data, and every row keeps its object name and line number.
 pub struct FeedRunner {
     pub feed: FeedConfig,
-    source: Source,
+    /// The source as built from the definition, rebuilt when the current
+    /// revision of its credential changes.
+    source: std::sync::RwLock<Arc<Source>>,
+    /// Where the source's credential comes from; `None` for runners over a
+    /// given source, which never rebuild it.
+    secrets: Option<Secrets>,
+    /// The credential (id, revision) the source signs with, once loaded.
+    loaded: std::sync::Mutex<Option<(String, u32)>>,
+    /// Whether this runner raised a `credential` alert that is still open.
+    credential_alert: AtomicBool,
+    /// What a test runs at this runner's pause points.
+    #[cfg(all(test, feature = "secrets-native"))]
+    pause: Option<crate::AsyncPause>,
     db: Arc<Db>,
     fhir: Arc<FhirClient>,
     bulk: Option<BulkSubmitter>,
@@ -123,7 +136,12 @@ impl FeedRunner {
         });
         Self {
             feed,
-            source,
+            source: std::sync::RwLock::new(Arc::new(source)),
+            secrets: None,
+            loaded: std::sync::Mutex::new(None),
+            credential_alert: AtomicBool::new(false),
+            #[cfg(all(test, feature = "secrets-native"))]
+            pause: None,
             db,
             fhir,
             bulk,
@@ -138,8 +156,30 @@ impl FeedRunner {
         }
     }
 
-    pub fn source(&self) -> &Source {
-        &self.source
+    /// The source this pass reads: the one built from the definition, or the
+    /// rebuild for the credential's current revision.
+    pub fn source(&self) -> Arc<Source> {
+        self.source.read().expect("source lock").clone()
+    }
+
+    /// Reads the credential the definition names from `secrets`, rebuilding the
+    /// source whenever its current revision changes.
+    pub fn with_secrets(mut self, secrets: Secrets) -> Self {
+        self.secrets = Some(secrets);
+        self
+    }
+
+    #[cfg(all(test, feature = "secrets-native"))]
+    pub(crate) fn with_pause(mut self, pause: Option<crate::AsyncPause>) -> Self {
+        self.pause = pause;
+        self
+    }
+
+    #[cfg(all(test, feature = "secrets-native"))]
+    async fn pause_at(&self, name: &'static str) {
+        if let Some(pause) = &self.pause {
+            pause(name).await;
+        }
     }
 
     /// When this runner started: the reference for silence until data arrives.
@@ -199,7 +239,7 @@ impl FeedRunner {
             tracing::debug!(feed = %self.feed.id, "held by another instance; standing by");
             return Ok(false);
         }
-        if let Err(e) = self.source.start().await {
+        if let Err(e) = self.source().start().await {
             tracing::error!(feed = %self.feed.id, "{e:#}");
             self.alerts.raise(
                 Some(&self.feed.id),
@@ -208,9 +248,138 @@ impl FeedRunner {
             )?;
         }
         if !self.db.is_paused(&self.feed.id)? {
+            self.ensure_credential().await;
             self.tick().await?;
         }
         Ok(true)
+    }
+
+    /// Whether the source can read its store: it names no credential, or it is
+    /// a given source, or the credential's current revision is loaded.
+    fn credential_ready(&self) -> bool {
+        self.secrets.is_none()
+            || self.feed.source.credential().is_none()
+            || self.loaded.lock().expect("loaded lock").is_some()
+    }
+
+    /// Loads the current revision of the credential the definition names when it
+    /// is not the one in use: registers the source for it first (so it cannot be
+    /// deleted while used), then rebuilds the source with it. On any problem the
+    /// source keeps what it had, a `credential` alert is open, and the next pass
+    /// tries again; once loaded, the alert is cleared.
+    pub(crate) async fn ensure_credential(&self) {
+        let Some(secrets) = &self.secrets else {
+            return;
+        };
+        let Some(reference) = self.feed.source.credential() else {
+            return;
+        };
+        let store = match secrets.store() {
+            Ok(store) => store,
+            Err(e) => {
+                secrets.recheck_once().await;
+                let reason = secrets
+                    .store()
+                    .err()
+                    .map_or_else(|| e.to_string(), |e| e.to_string());
+                self.credential_problem(reference, &reason);
+                return;
+            }
+        };
+        let meta = match store.find(reference).await {
+            Ok(Some(meta)) => meta,
+            Ok(None) => {
+                // Gone: nothing may sign with it any more.
+                if self.loaded.lock().expect("loaded lock").take().is_some()
+                    && let Ok(source) = Source::from_config(&self.feed)
+                {
+                    *self.source.write().expect("source lock") =
+                        Arc::new(source.with_db(self.db.clone()));
+                }
+                self.credential_problem(
+                    reference,
+                    "does not exist; store it with POST /api/secrets",
+                );
+                return;
+            }
+            Err(e) => {
+                self.credential_problem(reference, &e.to_string());
+                return;
+            }
+        };
+        let current = (meta.id.clone(), meta.revision);
+        if self.loaded.lock().expect("loaded lock").as_ref() == Some(&current) {
+            if self.credential_alert.swap(false, Ordering::AcqRel)
+                && let Err(e) =
+                    self.alerts
+                        .clear_open(&self.feed.id, "credential", None, "credential loaded")
+            {
+                tracing::error!(feed = %self.feed.id, "{e:#}");
+            }
+            return;
+        }
+        pause_point!(await self, "runner:credential:before-hold");
+        #[cfg(feature = "secrets-native")]
+        if let Err(e) = self
+            .db
+            .secret_hold(&meta.id, &self.feed.id, secrets.owner())
+        {
+            // The source keeps what it had; nothing is released.
+            self.credential_problem(reference, &e.to_string());
+            return;
+        }
+        let revealed = match store.reveal(&meta.id).await {
+            Ok(revealed) => revealed,
+            Err(e) => {
+                self.credential_problem(reference, &e.to_string());
+                return;
+            }
+        };
+        let source = match Source::from_config_with(&self.feed, Some(&revealed)) {
+            Ok(source) => source.with_db(self.db.clone()),
+            Err(e) => {
+                self.credential_problem(reference, &format!("{e:#}"));
+                return;
+            }
+        };
+        *self.source.write().expect("source lock") = Arc::new(source);
+        *self.loaded.lock().expect("loaded lock") =
+            Some((revealed.meta.id.clone(), revealed.meta.revision));
+        tracing::info!(
+            feed = %self.feed.id,
+            credential = %revealed.meta.name,
+            revision = revealed.meta.revision,
+            "using the credential's current revision"
+        );
+        self.credential_alert.store(false, Ordering::Release);
+        if let Err(e) =
+            self.alerts
+                .clear_open(&self.feed.id, "credential", None, "credential loaded")
+        {
+            tracing::error!(feed = %self.feed.id, "{e:#}");
+        }
+    }
+
+    /// Logs why the credential cannot be used, and opens a `credential` alert
+    /// unless one is open for the source.
+    fn credential_problem(&self, reference: &str, message: &str) {
+        let message = format!("{}: credential {reference}: {message}", self.feed.name);
+        tracing::error!(feed = %self.feed.id, "{message}");
+        let open = match self.db.open_alert(&self.feed.id, "credential", None) {
+            Ok(open) => open.is_some(),
+            Err(e) => {
+                tracing::error!(feed = %self.feed.id, "{e:#}");
+                return;
+            }
+        };
+        if !open
+            && let Err(e) = self
+                .alerts
+                .raise(Some(&self.feed.id), "credential", &message)
+        {
+            tracing::error!(feed = %self.feed.id, "{e:#}");
+        }
+        self.credential_alert.store(true, Ordering::Release);
     }
 
     /// The feed's loop: a pass every poll interval, or sooner when poked; nothing
@@ -240,9 +409,13 @@ impl FeedRunner {
     /// One pass of the whole pipeline. Each step picks up whatever the previous
     /// passes left, so a step that fails is simply retried on the next pass.
     pub async fn tick(&self) -> Result<()> {
+        // Without its credential loaded, a source cannot read its store: nothing
+        // is listed and nothing is handed over this pass, but what is open is
+        // still polled and settled.
+        let ready = self.credential_ready();
         // A source that cannot be read this pass must not hold back what is
         // already in the store: the rest of the pass runs, the scan is retried next.
-        if let Err(e) = self.scan().await {
+        if ready && let Err(e) = self.scan().await {
             tracing::error!(feed = %self.feed.id, "scan failed, will retry next pass: {e:#}");
         }
         if self.bulk.is_some() {
@@ -253,7 +426,7 @@ impl FeedRunner {
             }
             // A submission that cannot be opened this pass must not hold back the
             // ones already open: they are polled anyway.
-            if let Err(e) = self.submit_pending().await {
+            if ready && let Err(e) = self.submit_pending().await {
                 let reason = bulk::safe_reason(&format!("{e:#}"));
                 tracing::error!(feed = %self.feed.id, "opening submissions failed, will retry next pass: {reason}");
             }
@@ -267,14 +440,15 @@ impl FeedRunner {
     }
 
     async fn scan(&self) -> Result<()> {
-        let read_only = self.source.is_read_only();
-        for (key, name, size) in self.source.list_meta().await? {
+        let source = self.source();
+        let read_only = source.is_read_only();
+        for (key, name, size) in source.list_meta().await? {
             // Someone else's bucket keeps what we took: known by name and size,
             // it is not downloaded again just to recognise its hash.
             if read_only && size > 0 && self.db.has_file(&self.feed.id, &name, size)? {
                 continue;
             }
-            let incoming = match self.source.fetch(&key).await {
+            let incoming = match source.fetch(&key).await {
                 Ok(incoming) => incoming,
                 // Announced, then gone before this pass reached it: nothing to take.
                 Err(e) if is_not_found(&e) => {
@@ -287,7 +461,7 @@ impl FeedRunner {
         }
         // Notifications are acknowledged only once what they announced is in the
         // store: a pass that failed before this leaves them to be delivered again.
-        self.source.settle_notifications().await?;
+        source.settle_notifications().await?;
         Ok(())
     }
 
@@ -322,7 +496,7 @@ impl FeedRunner {
         let sha = reader::sha256_hex(&bytes);
 
         if let Some(original) = self.db.find_file_by_hash(feed, &sha)? {
-            if self.source.is_read_only() {
+            if self.source().is_read_only() {
                 // Someone else's bucket: the object stays, and was already taken.
                 return Ok(());
             }
@@ -342,7 +516,7 @@ impl FeedRunner {
             )?;
             tracing::info!(feed, file = %name, duplicate_of = original, "same content already received; not reprocessed");
             let archived = self
-                .source
+                .source()
                 .acknowledge(&key, &format!("{id}-{name}"))
                 .await?;
             return self.db.mark_file_archived(id, &archived);
@@ -354,9 +528,10 @@ impl FeedRunner {
 
         // On the bulk path the object stays at its source until HFS has read it.
         let keep = self.bulk.is_some() && !self.bulk_transformed;
-        let origin = match self.source {
-            Source::Object(_) => "store",
-            _ => "local",
+        let origin = if matches!(*self.source(), Source::Object(_)) {
+            "store"
+        } else {
+            "local"
         };
         let file_id = self.db.insert_file(
             feed,
@@ -373,7 +548,7 @@ impl FeedRunner {
             return Ok(());
         }
         let archived = self
-            .source
+            .source()
             .acknowledge(&key, &format!("{file_id}-{name}"))
             .await?;
         self.db.mark_file_archived(file_id, &archived)
@@ -456,7 +631,7 @@ impl FeedRunner {
                         &format!("{}: cannot open {name}: {e:#}", self.feed.name),
                     )?;
                     let archived = self
-                        .source
+                        .source()
                         .acknowledge(key, &format!("{container}-{name}"))
                         .await?;
                     return self.db.mark_file_archived(container, &archived);
@@ -488,7 +663,7 @@ impl FeedRunner {
             // entry is staged where HFS can fetch it and kept until the receipts.
             let staged = if self.bulk.is_some() && !self.bulk_transformed {
                 let base = format!("{}.ndjson", taken + 1);
-                match self.source.put_unpacked(container, &base, &data).await? {
+                match self.source().put_unpacked(container, &base, &data).await? {
                     Some(key) => Some((key, "store")),
                     None => {
                         let dir = self.bulk_dir.join("unpacked").join(container.to_string());
@@ -518,7 +693,7 @@ impl FeedRunner {
         }
         tracing::info!(feed, file = %name, entries = taken, "unpacked");
         let archived = self
-            .source
+            .source()
             .acknowledge(key, &format!("{container}-{name}"))
             .await?;
         self.db.mark_file_archived(container, &archived)
@@ -653,7 +828,7 @@ impl FeedRunner {
                     }
                     // A store object is always read from its store, never served by
                     // the engine, even when the source no longer reads from one.
-                    (_, Some(key)) => match self.source.share(key, ttl).await.and_then(|url| {
+                    (_, Some(key)) => match self.source().share(key, ttl).await.and_then(|url| {
                         url.ok_or_else(|| {
                             anyhow::Error::new(Unshareable(format!(
                                 "cannot hand {key} over: the source no longer reads from a store"
@@ -862,7 +1037,7 @@ impl FeedRunner {
         {
             tracing::warn!(feed = %self.feed.id, "cannot remove {}: {e}", dir.display());
         }
-        if let Err(e) = self.source.remove_submission_files(token).await {
+        if let Err(e) = self.source().remove_submission_files(token).await {
             tracing::warn!(feed = %self.feed.id, "cannot remove submission files at the source: {e:#}");
         }
     }
@@ -902,11 +1077,11 @@ impl FeedRunner {
                 let n = n as i64 + 1;
                 let name = format!("{n}.ndjson");
                 let shared = match self
-                    .source
+                    .source()
                     .put_submission_file(&token, &name, bytes.clone())
                     .await?
                 {
-                    Some(key) => self.source.share(&key, ttl).await?,
+                    Some(key) => self.source().share(&key, ttl).await?,
                     None => None,
                 };
                 let url = match shared {
@@ -964,7 +1139,7 @@ impl FeedRunner {
                     }
                     format!("removed {key}")
                 } else {
-                    self.source
+                    self.source()
                         .acknowledge(&key, &format!("{file_id}-{name}"))
                         .await?
                 };
@@ -1294,4 +1469,174 @@ fn is_not_found(e: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
     })
+}
+
+#[cfg(all(test, feature = "secrets-native"))]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::secrets::{self, KeySettings, NewSecret, SecretKind, SecretValue};
+
+    fn value(key_id: &str) -> SecretValue {
+        SecretValue::new(
+            SecretKind::Aws,
+            [
+                ("access_key_id".to_string(), key_id.to_string().into()),
+                (
+                    "secret_access_key".to_string(),
+                    "generated-secret".to_string().into(),
+                ),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Holds a task at `name` until the test lets it go.
+    fn pause_at(name: &'static str) -> (crate::AsyncPause, Arc<Notify>, Arc<Notify>) {
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let once = Arc::new(AtomicBool::new(false));
+        let (r, l) = (reached.clone(), release.clone());
+        let hook: crate::AsyncPause = Arc::new(move |at| {
+            let (r, l, once) = (r.clone(), l.clone(), once.clone());
+            Box::pin(async move {
+                if at == name && !once.swap(true, Ordering::SeqCst) {
+                    r.notify_one();
+                    l.notified().await;
+                }
+            })
+        });
+        (hook, reached, release)
+    }
+
+    async fn signed_with(runner: &FeedRunner) -> String {
+        let url = runner
+            .source()
+            .share("a.ndjson", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        let at = url.find("X-Amz-Credential=").unwrap() + "X-Amz-Credential=".len();
+        url[at..].split("%2F").next().unwrap().to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_credential_is_registered_before_use_and_a_failed_registration_keeps_the_old_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("hie.yaml"),
+            "fhir_base_url: http://127.0.0.1:9\ndatabase: data/hie.db\n",
+        )
+        .unwrap();
+        let (config, _) = crate::config::load(&dir.path().join("hie.yaml")).unwrap();
+        let db = Arc::new(Db::open(&config.database).unwrap());
+        let key = {
+            let k = crate::crypto::MasterKey::generate().unwrap();
+            String::from_utf8(k.to_line()[..44].to_vec()).unwrap()
+        };
+        let secrets = secrets::open(&config, &db, KeySettings::inline(&key)).unwrap();
+        let store = secrets.store().unwrap().clone();
+        let id = store
+            .create(NewSecret {
+                name: "lab".into(),
+                kind: SecretKind::Aws,
+                value: value("AKIDFIRST"),
+            })
+            .await
+            .unwrap()
+            .id;
+        let feed: FeedConfig = serde_yaml::from_str(
+            "id: s\nname: S\nsource:\n  type: s3\n  bucket: b\n  region: us-east-1\n  endpoint: http://127.0.0.1:9\n  credential: lab\nformat: ndjson\ntransform: t.py\n",
+        )
+        .unwrap();
+        let alerts = Arc::new(Alerter::new(db.clone(), None));
+        let (hook, reached, release) = pause_at("runner:credential:before-hold");
+        let runner = Arc::new(
+            FeedRunner::new(
+                feed,
+                db.clone(),
+                Arc::new(FhirClient::with_credentials("http://127.0.0.1:9", None)),
+                alerts,
+                "python3",
+                dir.path(),
+                "http://127.0.0.1:9",
+                "http://127.0.0.1:9",
+            )
+            .unwrap()
+            .with_secrets(secrets.clone())
+            .with_pause(Some(hook)),
+        );
+        let owner = secrets.owner().to_string();
+
+        // The registration comes before the credential is used.
+        assert!(!runner.credential_ready());
+        let loading = tokio::spawn({
+            let runner = runner.clone();
+            async move { runner.ensure_credential().await }
+        });
+        reached.notified().await;
+        assert!(db.secret_holds_of(&owner).unwrap().is_empty());
+        assert!(!runner.credential_ready());
+        release.notify_one();
+        loading.await.unwrap();
+        assert_eq!(
+            db.secret_holds_of(&owner).unwrap(),
+            [("s".to_string(), id.clone())]
+        );
+        assert!(runner.credential_ready());
+        assert_eq!(signed_with(&runner).await, "AKIDFIRST");
+
+        // A new revision whose registration cannot be taken (the lock wait runs
+        // out): the old client stays, no row is removed, a credential alert opens.
+        store.replace(&id, value("AKIDSECOND")).await.unwrap();
+        let other = Arc::new(Db::open(&config.database).unwrap());
+        let held = Arc::new(std::sync::Barrier::new(2));
+        let go = Arc::new(std::sync::Barrier::new(2));
+        {
+            let (held, go) = (held.clone(), go.clone());
+            other.on_pause(Arc::new(move |at| {
+                if at == "ref:hold:after-lock" {
+                    held.wait();
+                    go.wait();
+                }
+            }));
+        }
+        let blocker = {
+            let (other, id) = (other.clone(), id.clone());
+            std::thread::spawn(move || other.secret_hold(&id, "t", "another-instance"))
+        };
+        held.wait();
+        if db.is_postgres() {
+            db.query_json("SET lock_timeout = '50ms'", Vec::new())
+                .unwrap();
+        } else {
+            db.set_busy_timeout(Duration::from_millis(50));
+        }
+        runner.ensure_credential().await;
+        assert_eq!(signed_with(&runner).await, "AKIDFIRST");
+        assert_eq!(
+            db.secret_holds_of(&owner).unwrap(),
+            [("s".to_string(), id.clone())]
+        );
+        // On SQLite the same write lock keeps the alert from being stored; on
+        // PostgreSQL only the secret's row is locked.
+        if db.is_postgres() {
+            assert!(db.open_alert("s", "credential", None).unwrap().is_some());
+        }
+        assert!(runner.credential_alert.load(Ordering::Acquire));
+        go.wait();
+        blocker.join().unwrap().unwrap();
+        if db.is_postgres() {
+            db.query_json("SET lock_timeout = 0", Vec::new()).unwrap();
+        } else {
+            db.set_busy_timeout(Duration::from_secs(5));
+        }
+
+        // Next pass: the new revision is used, and the alert is cleared.
+        runner.ensure_credential().await;
+        assert_eq!(signed_with(&runner).await, "AKIDSECOND");
+        assert!(db.open_alert("s", "credential", None).unwrap().is_none());
+        drop(other);
+    }
 }
