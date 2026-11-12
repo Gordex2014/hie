@@ -24,6 +24,33 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+/// Libraries that log the values bound to SQL statements (record data, status
+/// URLs, tokens) at DEBUG and TRACE. They never log below INFO.
+pub const PARAMETER_LOGGERS: &[&str] = &["tokio_postgres"];
+
+/// The process's log filter: `spec` as `HIE_LOG` gives it (`info` when it is unset
+/// or invalid), and, whatever it says, nothing below INFO from the libraries in
+/// `PARAMETER_LOGGERS`.
+pub fn log_filter<S>(spec: Option<&str>) -> impl tracing_subscriber::layer::Filter<S> + use<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    use tracing_subscriber::filter::{EnvFilter, FilterExt, filter_fn};
+    let wanted = spec
+        .and_then(|s| EnvFilter::try_new(s).ok())
+        .unwrap_or_else(|| EnvFilter::new("info"));
+    wanted.and(filter_fn(|meta| {
+        *meta.level() <= tracing::Level::INFO
+            || !PARAMETER_LOGGERS.iter().any(|library| {
+                meta.target() == *library
+                    || meta
+                        .target()
+                        .strip_prefix(library)
+                        .is_some_and(|rest| rest.starts_with("::"))
+            })
+    }))
+}
+
 /// Opens the store and the HFS client, starts every configured source, and returns
 /// the manager (which owns the runners) and the API state.
 pub fn build(

@@ -1440,6 +1440,16 @@ impl Db {
             .map(|r| (r.string(0), r.opt_string(1))))
     }
 
+    /// Rejects a file's pending records that no submission holds: the file cannot
+    /// be handed over at all. Returns how many.
+    pub fn reject_unsubmitted(&self, file_id: i64, kind: &str, error: &str) -> Result<usize> {
+        Ok(self.execute(
+            "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, updated_at = $4
+             WHERE file_id = $1 AND status = 'pending' AND submission IS NULL",
+            &params![file_id, kind, error, now_ms()],
+        )? as usize)
+    }
+
     // ---- source state, cursors, leases ------------------------------------------
 
     /// Pauses or resumes a source. Paused is an operational state kept here, not

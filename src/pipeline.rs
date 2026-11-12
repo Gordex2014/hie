@@ -14,7 +14,7 @@ use crate::config::{DeliveryMethod, FeedConfig, Format, parse_duration};
 use crate::db::{Db, Rule, WorkItem, now_ms};
 use crate::fhir::{self, DeliveryKey, EntryResult, FhirClient, SendError};
 use crate::reader;
-use crate::source::{Incoming, Source};
+use crate::source::{Incoming, Source, Unshareable};
 use crate::transform::{self, Outcome, Transformer};
 use crate::worker::WorkerLimits;
 use tokio::sync::Notify;
@@ -251,7 +251,12 @@ impl FeedRunner {
             } else {
                 self.preflight_received()?;
             }
-            self.submit_pending().await?;
+            // A submission that cannot be opened this pass must not hold back the
+            // ones already open: they are polled anyway.
+            if let Err(e) = self.submit_pending().await {
+                let reason = bulk::safe_reason(&format!("{e:#}"));
+                tracing::error!(feed = %self.feed.id, "opening submissions failed, will retry next pass: {reason}");
+            }
             self.poll_submissions().await?;
         } else {
             self.transform_and_deliver().await?;
@@ -646,16 +651,43 @@ impl FeedRunner {
                     (Some("staged" | "local"), _) | (_, None) => {
                         bulk.file_url(&token, file.file_id)
                     }
-                    // A store object is always read from its store.
-                    (_, Some(key)) => match self.source.share(key, ttl).await? {
-                        Some(url) => url,
-                        None => bulk.file_url(&token, file.file_id),
+                    // A store object is always read from its store, never served by
+                    // the engine, even when the source no longer reads from one.
+                    (_, Some(key)) => match self.source.share(key, ttl).await.and_then(|url| {
+                        url.ok_or_else(|| {
+                            anyhow::Error::new(Unshareable(format!(
+                                "cannot hand {key} over: the source no longer reads from a store"
+                            )))
+                        })
+                    }) {
+                        Ok(url) => url,
+                        Err(e) if e.downcast_ref::<Unshareable>().is_some() => {
+                            // No retry can help: the file's records are settled.
+                            let reason = bulk::safe_reason(&format!(
+                                "cannot be handed over to the FHIR server: {e:#}"
+                            ));
+                            tracing::error!(feed = %self.feed.id, file = %file.name, "{reason}");
+                            if self
+                                .db
+                                .reject_unsubmitted(file.file_id, "server", &reason)?
+                                == 0
+                            {
+                                return Err(e);
+                            }
+                            continue;
+                        }
+                        // Signing may succeed later: the records stay pending, and
+                        // nothing of this submission was written yet.
+                        Err(e) => return Err(e),
                     },
                 };
                 entries.push((file.resource_type.clone(), url, file.count));
                 file_ids.push(file.file_id);
                 records += file.count;
                 hashes.push(file.name.clone());
+            }
+            if entries.is_empty() {
+                continue;
             }
             let hash_refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
             let submission_id = bulk::submission_id(&self.feed.id, &hash_refs);
@@ -733,7 +765,8 @@ impl FeedRunner {
                     }
                 }
                 Err(SendError::Refused(status, body)) => {
-                    let reason = format!("HTTP {status}: {}", fhir::outcome_text(&body));
+                    let reason =
+                        bulk::safe_reason(&format!("HTTP {status}: {}", fhir::outcome_text(&body)));
                     tracing::warn!(feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
                     for (record_id, _, _) in self.db.submitted_records(&sub.token)? {
                         self.db
@@ -750,6 +783,7 @@ impl FeedRunner {
                     self.archive_submission(&sub.token).await?;
                 }
                 Err(SendError::Transient(reason)) => {
+                    let reason = bulk::safe_reason(&reason);
                     let attempts = sub.attempts + 1;
                     let d = &self.feed.delivery;
                     let backoff = d

@@ -147,6 +147,7 @@ impl TokenSource {
             .form(&form)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("cannot reach the token endpoint")?;
         let status = response.status();
         if !status.is_success() {
@@ -160,6 +161,7 @@ impl TokenSource {
         let body: TokenResponse = response
             .json()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("token endpoint answered without an access_token")?;
         tracing::debug!(
             client = %self.settings.client_id,
