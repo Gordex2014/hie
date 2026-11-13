@@ -7,11 +7,85 @@
 //! carries.
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use serde_json::{Value, json};
 
 use crate::credentials::Credentials;
 use crate::fhir::{self, SendError};
+
+/// Whether `path` lies inside `dir`, as the filesystem resolves both (symbolic
+/// links and `..` included). A path that cannot be resolved, because it is missing
+/// or unreadable, is not inside. A recorded path is otherwise used exactly as
+/// stored, so reading or removing it reaches the same file.
+pub fn is_within(path: &Path, dir: &Path) -> bool {
+    match (std::fs::canonicalize(path), std::fs::canonicalize(dir)) {
+        (Ok(path), Ok(dir)) => path.starts_with(dir),
+        _ => false,
+    }
+}
+
+/// The origin of a kept file recorded before origins were stored, decided once
+/// at start-up. A store object's name is its basename, so only an entry the
+/// engine unpacked is named `zip!/entry`; with its file under the engine's bulk
+/// directory, it is one the engine staged itself.
+pub fn historical_origin(
+    name: &str,
+    key: &str,
+    local_source: bool,
+    bulk_dir: &Path,
+) -> &'static str {
+    if name.contains("!/") && is_within(Path::new(key), bulk_dir) {
+        "staged"
+    } else if local_source {
+        "local"
+    } else {
+        "store"
+    }
+}
+
+/// A bulk failure reason as it may be logged, alerted or stored. Every URL in it
+/// (`http://` or `https://`, in any case, up to whitespace, a quote or a bracket)
+/// becomes its origin followed by `/…`: its path, query, fragment and user
+/// information may carry signatures and tokens. The rest of the reason, the
+/// operation, the HTTP status and the error, is kept.
+pub fn safe_reason(reason: &str) -> String {
+    let lower = reason.to_ascii_lowercase();
+    let mut out = String::with_capacity(reason.len());
+    let mut at = 0;
+    while let Some(start) = ["http://", "https://"]
+        .iter()
+        .filter_map(|scheme| lower[at..].find(scheme).map(|n| at + n))
+        .min()
+    {
+        out.push_str(&reason[at..start]);
+        let end = reason[start..]
+            .find(|c: char| {
+                c.is_whitespace()
+                    || matches!(
+                        c,
+                        '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+                    )
+            })
+            .map_or(reason.len(), |n| start + n);
+        out.push_str(&origin_of(&reason[start..end]));
+        at = end;
+    }
+    out.push_str(&reason[at..]);
+    out
+}
+
+/// `scheme://host[:port]/…` of a URL, or `<URL>` when it has no host.
+fn origin_of(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(parsed) => match (parsed.host_str(), parsed.port()) {
+            (Some(host), Some(port)) => format!("{}://{host}:{port}/…", parsed.scheme()),
+            (Some(host), None) => format!("{}://{host}/…", parsed.scheme()),
+            (None, _) => "<URL>".into(),
+        },
+        Err(_) => "<URL>".into(),
+    }
+}
 
 /// What a status poll found.
 #[derive(Debug)]
@@ -100,7 +174,13 @@ impl BulkSubmitter {
             .await?
             .send()
             .await
-            .map_err(|e| SendError::Transient(format!("cannot reach {}: {e}", self.fhir_base)))
+            .map_err(|e| {
+                SendError::Transient(format!(
+                    "cannot reach {}: {}",
+                    self.fhir_base,
+                    e.without_url()
+                ))
+            })
     }
 
     async fn get(&self, url: &str, accept: &str) -> Result<reqwest::Response, SendError> {
@@ -109,7 +189,7 @@ impl BulkSubmitter {
             .await?
             .send()
             .await
-            .map_err(|e| SendError::Transient(format!("fetching {url}: {e}")))
+            .map_err(|e| SendError::Transient(format!("fetching {}: {}", url, e.without_url())))
     }
 
     async fn classify(&self, response: reqwest::Response) -> Result<reqwest::Response, SendError> {
@@ -183,17 +263,19 @@ impl BulkSubmitter {
                     return Err(fhir::refused_token(status, &self.credentials).await);
                 }
                 status @ (500..=599) => {
-                    return Err(SendError::Transient(format!("HTTP {status} polling {url}")));
+                    return Err(SendError::Transient(format!(
+                        "HTTP {status} polling {}",
+                        url
+                    )));
                 }
                 status => {
                     let body: Value = response.json().await.unwrap_or(Value::Null);
                     return Err(SendError::Refused(status, body));
                 }
             }
-            let manifest: Value = response
-                .json()
-                .await
-                .map_err(|e| SendError::Transient(format!("status manifest at {url}: {e}")))?;
+            let manifest: Value = response.json().await.map_err(|e| {
+                SendError::Transient(format!("status manifest at {}: {}", url, e.without_url()))
+            })?;
             for entry in manifest["output"].as_array().into_iter().flatten() {
                 if let Some(file_url) = entry["url"].as_str() {
                     for line in self.lines(file_url).await? {
@@ -226,10 +308,10 @@ impl BulkSubmitter {
             .get(url, "application/fhir+ndjson, application/x-ndjson, */*")
             .await?
             .error_for_status()
-            .map_err(|e| SendError::Transient(format!("fetching {url}: {e}")))?
+            .map_err(|e| SendError::Transient(format!("fetching {}: {}", url, e.without_url())))?
             .text()
             .await
-            .map_err(|e| SendError::Transient(format!("reading {url}: {e}")))?;
+            .map_err(|e| SendError::Transient(format!("reading {}: {}", url, e.without_url())))?;
         Ok(text
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -272,6 +354,39 @@ mod tests {
         );
         assert_ne!(submission_id("lab", &["a"]), submission_id("other", &["a"]));
         assert!(submission_id("lab", &[]).starts_with("hie-"));
+    }
+
+    #[test]
+    fn failure_reasons_keep_only_the_origin_of_each_url() {
+        assert_eq!(
+            safe_reason(
+                "HTTP 500 polling https://user:pw@b.s3.amazonaws.com/k/a.ndjson?X-Amz-Signature=s#f"
+            ),
+            "HTTP 500 polling https://b.s3.amazonaws.com/…"
+        );
+        // Any case; a comma inside the query does not end the URL; a path that
+        // carries a credential (padding, an encoded slash) goes with the path.
+        assert_eq!(
+            safe_reason("failed HTTPS://h/status?sig=CANARY-UPPERCASE"),
+            "failed https://h/…"
+        );
+        assert_eq!(
+            safe_reason("fetching https://h/status?sig=abc,CANARY-COMMA-TAIL: 503"),
+            "fetching https://h/… 503"
+        );
+        assert_eq!(
+            safe_reason("reading http://h:8080/t/CANARY-PATH==/x%2FCANARY-ENC/r (timed out)"),
+            "reading http://h:8080/… (timed out)"
+        );
+        // Quotes and brackets end a URL; the rest of the reason stays.
+        assert_eq!(
+            safe_reason(r#"HTTP 400: could not fetch "https://h/o?t=x" [see https://h2/d?k=y]"#),
+            r#"HTTP 400: could not fetch "https://h/…" [see https://h2/…]"#
+        );
+        assert_eq!(
+            safe_reason("no URL here, HTTP 503"),
+            "no URL here, HTTP 503"
+        );
     }
 
     #[test]

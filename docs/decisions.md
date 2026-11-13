@@ -236,7 +236,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 ## 21. `$bulk-submit` points HFS at the source objects, and receipts map by `Type/id`
 
-**Chosen:** On `delivery.method: bulk_submit` the engine does not rewrite files. It stores the rows, runs a pre-flight in Rust instead of the transform (`resourceType` and `id` present), and serves a manifest whose entries are pre-signed URLs of the S3 objects, or the engine's own file URLs for a folder. The kick-off closes the submission (`submissionStatus: completed`); the engine polls `$bulk-submit-status`, reads the receipt files, marks a record `sent` when a `{"reference": "Type/id"}` for it appears and `rejected` otherwise, then archives the objects. One submission per drop, a `submissionId` derived from the files, `409` from HFS treated as "already held".
+**Chosen:** On `delivery.method: bulk_submit` the engine does not rewrite files. It stores the rows, runs a pre-flight in Rust instead of the transform (`resourceType` and `id` present), and serves a manifest whose entries are pre-signed URLs of the S3 objects, or the engine's own file URLs for a folder. The kick-off closes the submission (`submissionStatus: completed`); the engine polls `$bulk-submit-status`, reads the receipt files, marks a record `sent` when a `{"reference": "Type/id"}` for it appears and `rejected` otherwise, then archives the objects. One submission per drop, a `submissionId` derived from the files, `409` from HFS treated as "already held". A public bucket (`anonymous: true`) is handed over by its objects' public URLs: virtual-hosted on AWS, but path style for a bucket name with a dot, which AWS's wildcard certificate does not cover. Each kept file records where it lives (`files.origin`: a store, a local source, or an entry the engine staged), and only what the engine holds is served from its file route; rows from earlier versions get their origin once at start-up.
 
 **Why:**
 - It is the picture agreed in discussion #1 for an NDJSON export in a bucket: HFS does the ingestion, the engine keeps the history and the dispositions.
@@ -247,6 +247,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 - A resource without an `id` cannot go this way; the pre-flight rejects it and says so. (Decision 29 adds the `transformed` path, where the engine derives one.)
 - A line HFS refuses that the pre-flight did not predict is rejected with "no receipt", plus HFS's first error text, without a certain attribution.
 - The engine's `public_url` must be reachable from HFS, and the folder-file route must stay open (unguessable token in the path).
+- A public URL for a dotted bucket name uses a different host form from the engine's own reads; both name the same bucket and key. The stored origin is decided when a file is taken (or once, at the upgrade) and does not follow later edits of the source's definition.
 
 ## 22. Alert rules are data, and an alert clears itself
 

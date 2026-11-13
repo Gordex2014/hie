@@ -81,8 +81,9 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
-        // What HFS fetches during a $bulk-submit: the manifest, and the objects of
-        // sources that cannot sign URLs. The token in the path is unguessable.
+        // What HFS fetches during a $bulk-submit: the manifest, and the files the
+        // engine holds itself (written, read from disk or unpacked by it). A store
+        // object is never served here. The token in the path is unguessable.
         .route("/bulk/{token}/manifest.json", get(bulk_manifest))
         .route("/bulk/{token}/files/{file_id}", get(bulk_file))
         .merge(api)
@@ -111,18 +112,39 @@ async fn bulk_file(
     State(s): State<AppState>,
     Path((token, file_id)): Path<(String, i64)>,
 ) -> Result<Response, ApiError> {
-    // A file the engine wrote for a transformed submission, or else the source
-    // file as it arrived (the source_objects path on a folder).
+    tracing::debug!(file_id, "bulk file request");
+    let submission =
+        s.db.submission(&token)?
+            .ok_or_else(|| not_found("submission"))?;
+    // A file the engine wrote for a transformed submission, or else a kept file
+    // the engine itself holds: one its source reads from disk, or an entry it
+    // unpacked. Where a file lives is what was recorded when it was taken, never
+    // a guess from its key.
     let engine_file = s.bulk_dir.join(&token).join(format!("{file_id}.ndjson"));
-    let path = if engine_file.is_file() && s.db.submission(&token)?.is_some() {
-        engine_file.to_string_lossy().into_owned()
+    let path = if engine_file.is_file() {
+        engine_file
     } else {
-        s.db.submission_file(&token, file_id)?
-            .ok_or_else(|| not_found("file"))?
+        let (key, origin) =
+            s.db.submission_file(&token, file_id)?
+                .ok_or_else(|| not_found("file"))?;
+        let path = std::path::PathBuf::from(&key);
+        let served = match origin.as_deref() {
+            Some("local") => true,
+            // Staged entries live in the engine's bulk directory, nowhere else.
+            Some("staged") => crate::bulk::is_within(&path, &s.bulk_dir),
+            // A store object, or a file of unknown origin: read from its store.
+            _ => false,
+        };
+        if !served {
+            tracing::warn!(feed = %submission.feed_id, file_id, "refused: a store object is fetched from its store, never from the engine");
+            return Err(not_found("file"));
+        }
+        path
     };
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|_| not_found("file"))?;
+    tracing::debug!(feed = %submission.feed_id, file_id, "bulk file served");
     Ok(([(header::CONTENT_TYPE, "application/fhir+ndjson")], bytes).into_response())
 }
 

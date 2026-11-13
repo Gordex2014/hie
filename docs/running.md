@@ -64,7 +64,7 @@ To build the image yourself: `docker build -t hie .`
 |---|---|---|
 | `HIE_CONFIG` | `hie.yaml` | Engine configuration file |
 | `HIE_RUNTIME_DIR` | `hie_runtime` next to the config | Location of the Python worker |
-| `HIE_LOG` | `info` | Log filter (`debug`, `hie=debug`, ...) |
+| `HIE_LOG` | `info` | Log filter (`debug`, `hie=debug`, ...). Whatever it says, `tokio_postgres` never logs below `info`: at `debug` and `trace` it would log the values bound to every statement (record data, status URLs, tokens) |
 | `HIE_DATABASE_URL` | | The store, overriding `database:` in `hie.yaml`: a `postgres://user:password@host/db` URL. Set it here so the password is not in the file |
 | `HIE_INSTANCE_ID` | host, pid and a random tail | This instance's name in the leases, when several share one store |
 | `HIE_TERMINOLOGY_SERVER` | `terminology_url` in `hie.yaml` | The HTS transforms may ask through `lookup` and `translate` |

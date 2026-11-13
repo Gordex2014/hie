@@ -250,3 +250,84 @@ async fn a_queue_announces_objects_between_listings() {
     assert_eq!(urls.lock().unwrap().len(), 3);
     assert_eq!(db.feed_counts("export").unwrap()["files"], 3);
 }
+
+/// A notice for a key that is not an object path (an empty segment) is consumed
+/// without effect: the valid objects of the pass are still taken.
+#[tokio::test]
+async fn an_announced_key_that_is_not_an_object_path_is_skipped() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found");
+        return;
+    };
+    let queue: Shared = Arc::default();
+    let sqs_base = serve(
+        Router::new()
+            .route("/queue/drops", post(sqs))
+            .with_state(queue.clone()),
+    )
+    .await;
+    let urls: Arc<Mutex<Vec<String>>> = Arc::default();
+    let fhir = serve(
+        Router::new()
+            .route("/", post(batch))
+            .with_state(urls.clone()),
+    )
+    .await;
+
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let feed: hie::config::FeedConfig = serde_yaml::from_str(&format!(
+        "id: export\nname: Export\nsource:\n  type: s3\n  bucket: unused\nformat: ndjson\ntransform: {}\n",
+        repo.join("transforms/fhir_passthrough.py").display().to_string().replace('\\', "/")
+    ))
+    .unwrap();
+    let store = Arc::new(InMemory::new());
+    let credentials = Arc::new(StaticCredentialProvider::new(AwsCredential {
+        key_id: "AKIATEST".into(),
+        secret_key: "secret".into(),
+        token: None,
+    }));
+    let source = Source::Object(
+        ObjectSource::new(
+            store.clone(),
+            "drops",
+            "drops/processed",
+            "*.ndjson",
+            Duration::ZERO,
+        )
+        .with_queue(SqsQueue::new(
+            &format!("{sqs_base}/queue/drops"),
+            "us-east-1",
+            credentials,
+        ))
+        .relist_every(Duration::from_secs(3600)),
+    );
+    let db = Arc::new(Db::in_memory().unwrap());
+    let runner = FeedRunner::with_source(
+        feed,
+        source,
+        db.clone(),
+        Arc::new(FhirClient::new(&fhir)),
+        Arc::new(Alerter::new(db.clone(), None)),
+        python,
+        &repo.join("hie_runtime"),
+        &fhir,
+        "http://127.0.0.1:0",
+    );
+    // The first pass lists the (empty) bucket; the next ones read the queue.
+    runner.tick().await.unwrap();
+
+    put(&store, "drops/c.ndjson", "c").await;
+    {
+        let mut q = queue.lock().unwrap();
+        q.waiting
+            .push(("m-bad".into(), event("drops//b.ndjson", 40)));
+        q.waiting.push(("m-c".into(), event("drops/c.ndjson", 40)));
+    }
+    runner.tick().await.unwrap();
+    assert_eq!(*urls.lock().unwrap(), ["Patient/c"]);
+    let q = queue.lock().unwrap();
+    let mut deleted = q.deleted.clone();
+    deleted.sort();
+    assert_eq!(deleted, ["m-bad", "m-c"]);
+    assert!(q.in_flight.is_empty());
+}

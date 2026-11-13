@@ -1041,6 +1041,7 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "object_store",
+ "percent-encoding",
  "postgres",
  "rand 0.8.8",
  "reqwest",

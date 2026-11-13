@@ -27,12 +27,16 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("HIE_LOG")
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    {
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_filter(hie::log_filter(std::env::var("HIE_LOG").ok().as_deref())),
+            )
+            .init();
+    }
     let cli = Cli::parse();
     // The `runtime:` backend is gone: an operator who still points transforms at
     // the remote runtime service must not have them run here unnoticed.
