@@ -53,10 +53,22 @@ If HFS runs on the host instead, drop `--network`, use `fhir_base_url: http://ho
 |---|---|
 | `/hie/hie.yaml` | the engine configuration (required, see above) |
 | `/hie/inbox` | the folders the example folder sources watch; processed files move to `processed/` |
-| `/hie/data` | the SQLite store: records, delivery state, alerts. Without it, history is lost with the container |
+| `/hie/data` | the SQLite store: records, delivery state, alerts, stored credentials, and the secret key that seals them (`hie-secrets.key`) unless one is given (see [Credentials and the secret key](#credentials-and-the-secret-key)). Without it, history is lost with the container |
 | `/hie/sources`, `/hie/transforms` | optional: your own sources and transforms, and anything created through the API, kept across upgrades |
 
-Other commands: `docker run --rm ghcr.io/heliossoftware/hie:latest --version`, and `... check` with the same mounts to validate the config and sources. The container runs as root, so files it writes to the mounts are owned by root. Pass the `HIE_AUTH_*` variables (see [Authentication](api.md#authentication)) and AWS credentials with `-e`.
+Other commands: `docker run --rm ghcr.io/heliossoftware/hie:latest --version`, and `... check` with the same mounts to validate the config and sources. The container runs as root, so files it writes to the mounts are owned by root. Pass the `HIE_AUTH_*` variables (see [Authentication](api.md#authentication)) with `-e`. S3 credentials are not passed to the container: they are stored through `/api/secrets` and named by each source. To keep the secret key off the data volume, mount a file holding it read-only and name it: `-v $PWD/hie_secret_key:/run/secrets/hie_secret_key:ro -e HIE_SECRET_KEY_FILE=/run/secrets/hie_secret_key`. With Docker Compose, a `secrets:` entry does the same:
+
+```yaml
+services:
+  hie:
+    image: ghcr.io/heliossoftware/hie:latest
+    environment:
+      HIE_SECRET_KEY_FILE: /run/secrets/hie_secret_key
+    secrets: [hie_secret_key]
+secrets:
+  hie_secret_key:
+    file: ./hie_secret_key
+```
 
 To build the image yourself: `docker build -t hie .`
 
@@ -66,10 +78,12 @@ To build the image yourself: `docker build -t hie .`
 | `HIE_RUNTIME_DIR` | `hie_runtime` next to the config | Location of the Python worker |
 | `HIE_LOG` | `info` | Log filter (`debug`, `hie=debug`, ...). Whatever it says, `tokio_postgres` never logs below `info`: at `debug` and `trace` it would log the values bound to every statement (record data, status URLs, tokens) |
 | `HIE_DATABASE_URL` | | The store, overriding `database:` in `hie.yaml`: a `postgres://user:password@host/db` URL. Set it here so the password is not in the file |
-| `HIE_INSTANCE_ID` | host, pid and a random tail | This instance's name in the leases, when several share one store |
+| `HIE_INSTANCE_ID` | host, pid and a random tail | This instance's name in the leases, when several share one store; also the owner of its credential registrations (otherwise an id kept in `sources/.hie-instance-id`) |
 | `HIE_TERMINOLOGY_SERVER` | `terminology_url` in `hie.yaml` | The HTS transforms may ask through `lookup` and `translate` |
 | `HIE_TERMINOLOGY_TOKEN` | | A bearer token for that HTS, when it requires one |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` | | Credentials for S3 sources, as for any AWS tool (profiles work too) |
+| `HIE_SECRET_KEY` | | The secret key that seals stored credentials: 32 random bytes in base64, e.g. from `openssl rand -base64 32`. See [Credentials and the secret key](#credentials-and-the-secret-key) |
+| `HIE_SECRET_KEY_FILE` | | A file holding that key, absolute or relative to the working directory; `secrets.key_file` in `hie.yaml` names one relative to `hie.yaml` |
+| `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_ENDPOINT_URL` (or `AWS_ENDPOINT`), `AWS_VIRTUAL_HOSTED_STYLE_REQUEST` | | Where an S3 source's bucket is, when the source sets no `region` or `endpoint`. AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, profiles, web identity, container or instance credentials) are **not read**: S3 sources and their queues sign with the stored credential their definition names, and a start with any of them set says so in its log |
 
 ### The transform worker
 
@@ -85,6 +99,37 @@ worker:
 ```
 
 Every value must be at least 1. A transform that imports a heavy library may need a larger `memory_mib`. A reply line is at most 32 MiB. Each worker process gets a fresh run directory under the system temporary directory, deleted when it ends.
+
+### Credentials and the secret key
+
+S3 sources sign with credentials stored in the engine (`/api/secrets`, see [Secrets](api.md#secrets)), sealed in its database with XChaCha20-Poly1305 under a key derived from one **secret key**. Only metadata is ever answered; values never leave the engine except to sign requests.
+
+The secret key comes from exactly one place:
+- `HIE_SECRET_KEY`: the key itself, base64 of 32 bytes (43 or 44 characters, either alphabet, whitespace around it ignored);
+- `HIE_SECRET_KEY_FILE`, or `secrets.key_file` in `hie.yaml`: a file holding it. Both may name the same file. The file may be a symbolic link with any owner and mode, as Kubernetes and Docker secret mounts are; protect it yourself. It must be a regular file;
+- with none of them and a SQLite file store, `hie-secrets.key` next to the database (`data/hie-secrets.key`), created at the first start with mode `0600`, owner-only. It must stay a regular file owned by the engine's user that no one else can read, and is never replaced.
+
+The key next to the database sits on the same volume: a copy of that volume, or a backup of it, holds both the credentials and their key. The engine says so in its log. Keep a copy of the key elsewhere, and prefer `HIE_SECRET_KEY` or `HIE_SECRET_KEY_FILE` to keep it off that volume. A PostgreSQL or in-memory store has no place for a key file and needs one of the variables; every instance on a shared store uses the same key.
+
+The first start with a key **seals** the store: it writes a key check. Every later start proves its key against it, and is refused, before serving, when the store is sealed and the key is missing, wrong or malformed. The refusal ends with both key ids (one-way fingerprints; `/health` shows the one in use):
+
+```
+... (store key 3f9c2a7d1e4b6a80, this instance's key 91b0c3d4e5f60718)
+```
+
+The second id may also be `none`, `malformed`, `unavailable`, `ambiguous` or `unsafe`. The engine never makes a new key for a sealed store and never falls back to anything else. Two cases are refused even before the first credential: a key set in more than one place (`HIE_SECRET_KEY` with a key file, or two different key files), and an automatic key file that is a symbolic link, not a regular file, someone else's, or readable by others.
+
+A store that is not sealed yet and has no usable key (PostgreSQL without a key, or a malformed `HIE_SECRET_KEY`) still starts: `/api/secrets` answers `503` with the reason, and sources that name a credential raise a `credential` alert. The engine reads its key only at start: once the key is fixed, restart it.
+
+There is no key rotation. A lost key loses the credentials: delete the rows of `secrets`, `secret_keys` and `secret_refs`, start with a new key, and store the credentials again. A replaced value is no longer returned, but may remain in the SQLite WAL and free pages, PostgreSQL's dead rows until vacuum, and backups, all sealed under the same key.
+
+A source's **registration** for its credential is what makes `DELETE /api/secrets/{id}` answer `409`. Each instance owns its registrations: its `HIE_INSTANCE_ID`, or an id kept in `sources/.hie-instance-id`, made at the first start. Instances that share one sources directory must each set `HIE_INSTANCE_ID`. Changing an instance's id leaves its old registrations behind; restore the id, or remove them with `DELETE FROM secret_refs WHERE instance_id = '<old id>'`. At start, each instance makes its registrations match the definitions it loaded.
+
+If two instances make their first start at the same time and one seals the store with its key while the other creates the automatic key file, the second is refused, and its refusal names the key file it created: that file unlocks nothing; remove it, then start with the store's key. The engine never removes a key file itself.
+
+If the engine stops while it creates the automatic key file, a `data/.hie-secrets.key.*.tmp` copy of the key may remain; delete it while no engine is starting.
+
+A build without the `secrets-native` feature has no secret store: it skips source files that name a credential, with an error and a `definition` alert naming each file, and starts with the rest (`hie check` prints what it skipped). `secrets-aws`, a store on AWS Secrets Manager, is reserved but not built.
 
 ### The store, and more than one instance
 

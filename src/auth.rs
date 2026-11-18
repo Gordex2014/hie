@@ -110,9 +110,10 @@ pub async fn require_bearer(
     }
 }
 
-/// Reading anything.
+/// Reading anything but connector credentials.
 pub const SCOPE_READ: &str = "hie/read";
 /// Changing sources, rules, loads and records: everything that is not code.
+/// Also every request on connector credentials, reads included.
 pub const SCOPE_MANAGE: &str = "hie/manage";
 /// Saving a transform: code the engine then runs.
 pub const SCOPE_TRANSFORMS: &str = "hie/transforms";
@@ -122,6 +123,11 @@ pub const SCOPE_ALL: &str = "hie/*";
 /// The scope a request needs: its method and path decide, so a token that may
 /// read cannot change anything, and one that may change sources cannot write code.
 pub fn required_scope(method: &str, path: &str) -> &'static str {
+    // Credentials are managed, not read: listing them names what the engine
+    // can reach.
+    if path == "/api/secrets" || path.starts_with("/api/secrets/") {
+        return SCOPE_MANAGE;
+    }
     if matches!(method, "GET" | "HEAD" | "OPTIONS") {
         return SCOPE_READ;
     }
@@ -182,6 +188,18 @@ mod tests {
         );
         assert_eq!(required_scope("GET", "/api/transforms/x"), SCOPE_READ);
         assert_eq!(required_scope("PUT", "/api/transforms/x"), SCOPE_TRANSFORMS);
+    }
+
+    #[test]
+    fn every_request_on_credentials_needs_the_manage_scope() {
+        for method in ["GET", "HEAD", "OPTIONS", "POST", "PUT", "DELETE"] {
+            assert_eq!(required_scope(method, "/api/secrets"), SCOPE_MANAGE);
+            assert_eq!(
+                required_scope(method, "/api/secrets/sec_0123456789abcdef"),
+                SCOPE_MANAGE
+            );
+        }
+        assert_eq!(required_scope("GET", "/api/secretsx"), SCOPE_READ);
     }
 
     #[test]

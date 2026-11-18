@@ -3,6 +3,9 @@
 //! (`postgres://...`, for more than one instance or more than one machine).
 //! Placeholders are `$1`, `$2`, ...; SQLite gets them as `?1`, `?2`.
 
+#[cfg(feature = "secrets-native")]
+pub mod secrets;
+
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -632,6 +635,36 @@ pub struct Db {
     postgres: bool,
     /// A schema created for one test run on PostgreSQL, dropped with the store.
     test_schema: Option<String>,
+    /// What a test runs at a named point (`pause_point!`), to hold a thread there.
+    #[cfg(all(test, feature = "secrets-native"))]
+    pause: Mutex<Option<PauseHook>>,
+}
+
+/// What a test runs at a `pause_point!` of the store.
+#[cfg(all(test, feature = "secrets-native"))]
+pub(crate) type PauseHook = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
+
+/// Whether an error is a lock wait that ran out: SQLite's busy or locked after
+/// `busy_timeout`, or PostgreSQL's serialization failure, deadlock or lock
+/// not available. The same call may succeed later.
+pub fn is_busy(e: &anyhow::Error) -> bool {
+    use postgres::error::SqlState;
+    e.chain().any(|cause| {
+        if let Some(e) = cause.downcast_ref::<rusqlite::Error>() {
+            return matches!(
+                e.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            );
+        }
+        if let Some(e) = cause.downcast_ref::<postgres::Error>() {
+            return e.code().is_some_and(|code| {
+                *code == SqlState::T_R_SERIALIZATION_FAILURE
+                    || *code == SqlState::T_R_DEADLOCK_DETECTED
+                    || *code == SqlState::LOCK_NOT_AVAILABLE
+            });
+        }
+        false
+    })
 }
 
 impl Db {
@@ -696,6 +729,8 @@ impl Db {
             conn: Mutex::new(Conn::Sqlite(conn)),
             postgres: false,
             test_schema: None,
+            #[cfg(all(test, feature = "secrets-native"))]
+            pause: Mutex::new(None),
         })
     }
 
@@ -734,7 +769,31 @@ impl Db {
             conn: Mutex::new(Conn::Postgres(client)),
             postgres: true,
             test_schema,
+            #[cfg(all(test, feature = "secrets-native"))]
+            pause: Mutex::new(None),
         })
+    }
+
+    /// How long a SQLite statement waits for another connection's write lock
+    /// before it fails as busy (5 s by default). PostgreSQL waits on its locks.
+    pub fn set_busy_timeout(&self, wait: std::time::Duration) {
+        if let Conn::Sqlite(c) = &mut *self.conn.lock().expect("database mutex poisoned") {
+            let _ = c.busy_timeout(wait);
+        }
+    }
+
+    /// Runs `hook` at every `pause_point!` this store reaches.
+    #[cfg(all(test, feature = "secrets-native"))]
+    pub(crate) fn on_pause(&self, hook: PauseHook) {
+        *self.pause.lock().expect("pause mutex") = Some(hook);
+    }
+
+    #[cfg(all(test, feature = "secrets-native"))]
+    pub(crate) fn pause_at(&self, name: &'static str) {
+        let hook = self.pause.lock().expect("pause mutex").clone();
+        if let Some(hook) = hook {
+            hook(name);
+        }
     }
 
     fn with<T>(&self, f: impl FnOnce(&mut Conn) -> Result<T>) -> Result<T> {

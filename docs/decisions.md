@@ -382,13 +382,13 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 
 ## 33. A bucket may announce objects through an SQS queue
 
-**Chosen:** An S3 source may name a `queue`: the SQS queue the bucket's `s3:ObjectCreated:*` notifications go to, directly or through SNS. With one, a pass receives the queue's messages, takes the announced objects that are under the prefix and match the pattern, and deletes the messages once the objects are in the store. The bucket is still listed in full at start and every `relist_seconds` (an hour by default). The queue is read with the source's own AWS credentials, signed with the SigV4 signer the S3 client already carries; no AWS SDK is added.
+**Chosen:** An S3 source may name a `queue`: the SQS queue the bucket's `s3:ObjectCreated:*` notifications go to, directly or through SNS. With one, a pass receives the queue's messages, takes the announced objects that are under the prefix and match the pattern, and deletes the messages once the objects are in the store. The bucket is still listed in full at start and every `relist_seconds` (an hour by default). The queue is read with the source's own credential (since decision 37, the stored credential its definition names), signed with SigV4 like the S3 client; no AWS SDK is added.
 
 **Why:**
 - Listing a bucket of many objects every few seconds is slow and costs a request per thousand keys; a queue delivers only what is new, at once.
 - Messages are deleted after the pass, not when received, so a crash or a failed fetch leaves them to be delivered again after the visibility timeout; a duplicate delivery is harmless because the store recognises the object by its hash.
 - The periodic listing is the safety net for a lost or malformed event, which S3's at-least-once delivery does not rule out.
-- Signing the SQS calls with the credential provider from `object_store` keeps one way of holding AWS credentials and avoids the AWS SDK's weight for two API calls (`ReceiveMessage`, `DeleteMessageBatch`).
+- Signing the SQS calls with the same credential provider as the bucket keeps one way of holding AWS credentials and avoids the AWS SDK's weight for two API calls (`ReceiveMessage`, `DeleteMessageBatch`).
 
 **Cost / not yet:** an anonymous source cannot have a queue; FIFO queues and message attributes are not handled; the queue must be the bucket's own notification target (the engine does not subscribe or configure anything); MinIO cannot feed a real queue, so the lab runs this only against the stand-in.
 
@@ -419,6 +419,24 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - Python 3.9 is the floor. The contract sets 3.9 as the launcher's own floor and leaves the interpreter to the host; nothing in the launcher needs more, and a higher floor would stop transforms on machines that run HIE today (Ubuntu 22.04 ships 3.10, others 3.9). The Docker image's Debian bookworm ships 3.11.
 
 **Cost / not yet:** limits are per process, not per transform with its children, and nothing bounds the number of processes; the network stays open and the filesystem readable and writable with the engine's rights; CPU time is deliberately unlimited, because it accumulates over a long-lived worker and would end a healthy one, so the per-record deadline is what stops a spinning transform; a process that leaves its group survives the kill; on macOS and Windows only the deadline, the group kill and the bounded output are guaranteed. A transform's in-memory state (caches) is lost whenever its process is replaced. Machines with only Python 3.8 or older need a newer interpreter for `python:` before any transform runs.
+
+## 37. Connector credentials in an encrypted store inside the engine
+
+**Chosen:** S3 sources (and their queues) sign with credentials stored in the engine, never with AWS credentials from its environment. A credential is stored through `/api/secrets` (kind `aws`: an access key id and a secret access key), has a current revision, and is named by a source's `credential:`; a source with neither `credential` nor `anonymous: true` is refused. The engine answers metadata only, never a value. The native backend (`secrets-native`, on by default) keeps each credential's current revision in the engine's own database, sealed with XChaCha20-Poly1305 under a key derived with HKDF-SHA256 from one master key, with a fresh random nonce per seal and associated data that binds the store, the secret's id, name, kind and revision, the algorithm and the key id. The master key comes from `HIE_SECRET_KEY`, a key file, or, for a SQLite store, a key file the engine creates next to the database. The first start with a key writes a key check; a later start with a sealed store and a missing, wrong or malformed key is refused before serving, naming both key ids. A running source loads a new revision on its next pass. Each engine instance registers the sources it runs for their credentials, so a credential used by any instance on the store cannot be deleted.
+
+**Why:**
+- Credentials in the process environment are one set for every source, cannot be changed without a restart, and are readable by anything that can read the environment. Stored per credential, each source reaches only its bucket, and a rotation needs no restart.
+- In the engine's own store, they need no external secret manager for a single-host install, and work the same on SQLite and PostgreSQL. The trait keeps room for an external backend (`secrets-aws` is reserved).
+- An AEAD with associated data detects a value moved to another row, renamed, or rolled to another revision; XChaCha20's 24-byte nonces can be random without a counter.
+- Refusing to start on a sealed store without its key, rather than starting with credentials unusable, makes a lost or wrong key visible at once; the engine never makes a new key for a sealed store.
+- Registering before use, under the secret's row lock, makes "deleted while used" impossible across instances, and a manager-owned cleanup after the old runner has ended releases nothing still in use.
+
+**Cost / not yet:**
+- Two settings are refused even before the store is sealed: a key set in more than one place, and an automatic key file that is a link, not a regular file, someone else's or readable by others. Explicit key files are taken with any owner and mode, so secret mounts work; protecting them is the operator's.
+- By default the SQLite key sits on the same volume as the database, so a copy of that volume holds both; the engine warns. There is no key rotation and no envelope encryption: a lost key loses the credentials.
+- A replaced value remains in database files (SQLite WAL and free pages, PostgreSQL dead rows) and backups until overwritten, under the same key. A whole row rolled back to an older revision still opens: nothing outside the row counts revisions.
+- Plaintext copies outside the engine's wiped types: the S3 client's own credential strings for the client's lifetime, HTTP and JSON parser buffers. HMAC pad blocks and HKDF temporaries made once at start are not wiped.
+- Registrations belong to an instance (`HIE_INSTANCE_ID`, or an id kept in the sources directory). After a failure they err on keeping: a start that fails after a definition was published keeps both credentials registered until the next start or replace, a cleanup that keeps failing leaves a row until the next start, and a changed instance id leaves its old rows behind. Each only makes a delete answer `409`. A crash while the key file is created can leave a temporary copy of the key next to it.
 
 ## Not in the prototype
 

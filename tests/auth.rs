@@ -265,8 +265,33 @@ async fn scopes_decide_what_a_token_may_do() {
     assert_eq!(r.status(), 403);
     assert_eq!(r.json::<Value>().await.unwrap()["required"], "hie/manage");
 
+    // Credentials are not for readers, not even to list them.
+    for path in ["/api/secrets", "/api/secrets/sec_0123456789abcdef"] {
+        let r = http
+            .get(format!("{api}{path}"))
+            .bearer_auth(&reader)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "{path}");
+        assert_eq!(r.json::<Value>().await.unwrap()["required"], "hie/manage");
+    }
+
     // Manage: sources and rules, but no code.
     let manager = mint("hie/manage");
+    assert_eq!(
+        http.get(format!("{api}/api/secrets"))
+            .bearer_auth(&manager)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        if cfg!(feature = "secrets-native") {
+            200
+        } else {
+            503
+        }
+    );
     assert_eq!(
         http.post(format!("{api}/api/sources"))
             .bearer_auth(&manager)

@@ -1,6 +1,7 @@
 //! `hie check` refuses to start while `HIE_RUNTIME_URL` or a `runtime:` key in
 //! `hie.yaml` still points transforms at the remote runtime service, which the
-//! engine no longer talks to.
+//! engine no longer talks to; and both `check` and `run` refuse an S3 source
+//! that does not say how it reaches its bucket.
 
 use std::process::{Command, Output};
 
@@ -81,4 +82,154 @@ fn check_fails_while_hie_runtime_url_is_not_utf8() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// `hie <command>` on `dir/hie.yaml`, without any inherited key or store
+/// variable, waiting at most a minute for it to exit.
+fn engine(dir: &std::path::Path, command: &str, env: &[(&str, &str)]) -> Output {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_hie"));
+    c.arg("--config")
+        .arg(dir.join("hie.yaml"))
+        .arg(command)
+        .env_remove("HIE_CONFIG")
+        .env_remove("HIE_RUNTIME_URL")
+        .env_remove("HIE_DATABASE_URL")
+        .env_remove("HIE_SECRET_KEY")
+        .env_remove("HIE_SECRET_KEY_FILE")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    let mut child = c.spawn().unwrap();
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(60) {
+            let _ = child.kill();
+            panic!("hie {command} did not exit");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child.wait_with_output().unwrap()
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A root with `hie.yaml` (on a free port) and a transform.
+fn root() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("hie.yaml"),
+        format!(
+            "fhir_base_url: http://127.0.0.1:1/fhir\ndatabase: data/hie.db\nlisten: 127.0.0.1:{}\n",
+            free_port()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("t.py"),
+        "def transform(r, c):\n    return []\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("sources")).unwrap();
+    dir
+}
+
+#[test]
+fn an_s3_file_without_credential_or_anonymous_refuses_check_and_run() {
+    let dir = root();
+    std::fs::write(
+        dir.path().join("sources/synthea-s3.yaml"),
+        "id: synthea-s3\nname: Synthea\nsource:\n  type: s3\n  bucket: b\nformat: ndjson\ntransform: t.py\n",
+    )
+    .unwrap();
+    for command in ["check", "run"] {
+        let out = engine(dir.path(), command, &[("AWS_ACCESS_KEY_ID", "AKIDFROMENV")]);
+        assert!(!out.status.success(), "hie {command} started");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("synthea-s3.yaml")
+                && stderr.contains("source synthea-s3")
+                && stderr.contains("say how to reach the bucket"),
+            "{command}: {stderr}"
+        );
+    }
+}
+
+#[cfg(feature = "secrets-native")]
+fn key_text() -> String {
+    use base64::Engine;
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).unwrap();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The two markers of a refusal's suffix, checked against its stable shape:
+/// `(store key <16 hex|none>, this instance's key <16 hex|none|malformed|unavailable|ambiguous|unsafe>)`.
+#[cfg(feature = "secrets-native")]
+fn refusal_markers(stderr: &str) -> (String, String) {
+    let at = stderr
+        .find("(store key ")
+        .unwrap_or_else(|| panic!("no key suffix: {stderr}"));
+    let rest = &stderr[at + "(store key ".len()..];
+    let close = rest.find(')').expect("closed suffix");
+    let (store, instance) = rest[..close]
+        .split_once(", this instance's key ")
+        .expect("both markers");
+    let hex16 = |s: &str| {
+        s.len() == 16
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    assert!(hex16(store) || store == "none", "{stderr}");
+    assert!(
+        hex16(instance)
+            || ["none", "malformed", "unavailable", "ambiguous", "unsafe"].contains(&instance),
+        "{stderr}"
+    );
+    (store.to_string(), instance.to_string())
+}
+
+#[cfg(feature = "secrets-native")]
+#[test]
+fn a_start_with_the_wrong_key_or_an_ambiguous_one_is_refused_before_serving() {
+    let dir = root();
+    let (config, _) = hie::config::load(&dir.path().join("hie.yaml")).unwrap();
+    // Sealed with key A by an earlier start; kept open for the whole test.
+    let a = key_text();
+    let db = std::sync::Arc::new(hie::db::Db::connect(&config.database.to_string_lossy()).unwrap());
+    let sealed = hie::secrets::open(&config, &db, hie::secrets::KeySettings::inline(&a)).unwrap();
+    let store_key = sealed.health()["key_id"].as_str().unwrap().to_string();
+
+    let started = std::time::Instant::now();
+    let out = engine(dir.path(), "run", &[("HIE_SECRET_KEY", &key_text())]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("sealed with another key"), "{stderr}");
+    let (store, instance) = refusal_markers(&stderr);
+    assert_eq!(store, store_key);
+    assert_ne!(store, instance);
+
+    let file = dir.path().join("k.key");
+    std::fs::write(&file, format!("{a}\n")).unwrap();
+    let out = engine(
+        dir.path(),
+        "run",
+        &[
+            ("HIE_SECRET_KEY", &a),
+            ("HIE_SECRET_KEY_FILE", &file.to_string_lossy()),
+        ],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("more than one place"), "{stderr}");
+    assert_eq!(refusal_markers(&stderr), (store_key, "ambiguous".into()));
+    drop(db);
 }

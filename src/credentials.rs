@@ -13,12 +13,25 @@ use crate::fhir::SendError;
 /// `None` when the engine calls HFS anonymously, as the public sandbox does.
 pub type Credentials = Option<Arc<TokenSource>>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CredentialSettings {
     pub token_url: String,
     pub client_id: String,
     pub client_secret: String,
     pub scope: Option<String>,
+}
+
+/// Everything but the client secret, which a debug print or a log line must
+/// never carry.
+impl std::fmt::Debug for CredentialSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialSettings")
+            .field("token_url", &self.token_url)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 impl CredentialSettings {
@@ -172,5 +185,23 @@ impl TokenSource {
             token: body.access_token,
             expires_at: Instant::now() + Duration::from_secs(body.expires_in),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_leaves_the_client_secret_out() {
+        let settings = CredentialSettings {
+            token_url: "https://idp/token".into(),
+            client_id: "hie".into(),
+            client_secret: "CANARY-0b6c2f4e-client-secret".into(),
+            scope: Some("system/*.cruds".into()),
+        };
+        let printed = format!("{settings:?} {settings:#?}");
+        assert!(!printed.contains("CANARY"), "{printed}");
+        assert!(printed.contains("https://idp/token") && printed.contains("hie"));
     }
 }

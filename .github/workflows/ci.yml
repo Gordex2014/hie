@@ -23,10 +23,16 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
+      - name: Lint without a secret backend
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
       - name: Transform tests
         run: python3 -m unittest tests/test_lab_results.py tests/test_hl7.py tests/test_terminology.py tests/test_worker.py
       - name: Engine tests
         run: cargo test
+        env:
+          HIE_TEST_PYTHON: python3
+      - name: Engine tests without a secret backend
+        run: cargo test --no-default-features --lib --test secrets --test no_backend_startup --test check --test s3_credentials
         env:
           HIE_TEST_PYTHON: python3
 

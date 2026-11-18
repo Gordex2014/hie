@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
             "HIE_RUNTIME_URL is no longer supported: transforms run in the local worker; unset it"
         );
     }
+    warn_about_aws_credentials();
     let (mut config, feeds) = hie::config::load(&cli.config)?;
     // The store may be a PostgreSQL URL with a password: it comes from the
     // environment, never from the file.
@@ -85,6 +86,9 @@ async fn main() -> Result<()> {
                 f.transform.display()
             );
         }
+        for skipped in &config.skipped {
+            println!("skipped {}: {}", skipped.file.display(), skipped.reason);
+        }
         return Ok(());
     }
 
@@ -116,7 +120,14 @@ async fn main() -> Result<()> {
             None
         }
     };
-    let (_manager, state) = hie::build(&config, feeds, &runtime_dir, auth, credentials)?;
+    let (_manager, state) = hie::build_with(
+        &config,
+        feeds,
+        &runtime_dir,
+        auth,
+        credentials,
+        hie::secrets::KeySettings::load(),
+    )?;
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;
@@ -130,6 +141,32 @@ async fn main() -> Result<()> {
         signal = stop.recv() => tracing::info!("{signal}: stopping"),
     }
     Ok(())
+}
+
+/// S3 sources and their queues sign only with stored credentials: AWS credential
+/// variables left in the environment are named (never their values) so an
+/// operator knows they no longer do anything.
+fn warn_about_aws_credentials() {
+    const IGNORED: &[&str] = &[
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    ];
+    let set: Vec<&str> = IGNORED
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect();
+    if !set.is_empty() {
+        tracing::warn!(
+            "{} set but no longer read: S3 sources and their queues use the credential their definition names. AWS_REGION, AWS_DEFAULT_REGION, AWS_ENDPOINT(_URL) and AWS_VIRTUAL_HOSTED_STYLE_REQUEST are still read when a source does not set region or endpoint",
+            set.join(", ")
+        );
+    }
 }
 
 /// Ctrl-C, and SIGTERM where there is one. Each stream registers its handler
