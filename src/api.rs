@@ -202,6 +202,12 @@ impl ApiError {
         self
     }
 
+    /// There is no secret store: `sentence` is a cause's fixed sentence, never
+    /// the detail, which may name host paths and OS errors.
+    fn secrets_unavailable(sentence: String) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, sentence).code("secrets_unavailable")
+    }
+
     /// The store's write lock was not free: the same request may work shortly.
     fn store_busy() -> Self {
         Self::new(
@@ -247,6 +253,7 @@ impl From<ManagerError> for ApiError {
             ManagerError::Conflict(m) => ApiError::new(StatusCode::CONFLICT, m),
             ManagerError::Busy(m) => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, m).code("busy"),
             ManagerError::StoreBusy => ApiError::store_busy(),
+            ManagerError::SecretsUnavailable(m) => ApiError::secrets_unavailable(m),
             ManagerError::NotStarted(m) => {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, m).code("source_not_started")
             }

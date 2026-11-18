@@ -24,6 +24,14 @@ async fn refusing_bucket() -> String {
 
 /// An engine with no sources and a SQLite store; the API's base URL.
 async fn engine() -> (String, hie::api::AppState, tempfile::TempDir) {
+    engine_with(|_| hie::secrets::KeySettings::none()).await
+}
+
+/// `engine`, with the key inputs `keys` makes from the engine's directory,
+/// which it may also seed (with source files, say) before the engine loads.
+async fn engine_with(
+    keys: impl FnOnce(&std::path::Path) -> hie::secrets::KeySettings,
+) -> (String, hie::api::AppState, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("transforms")).unwrap();
@@ -37,9 +45,17 @@ async fn engine() -> (String, hie::api::AppState, tempfile::TempDir) {
         "fhir_base_url: http://127.0.0.1:9/fhir\ndatabase: data/hie.db\n",
     )
     .unwrap();
+    let keys = keys(root);
     let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
-    let (_manager, state) =
-        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let (_manager, state) = hie::build_with(
+        &config,
+        feeds,
+        &repo().join("hie_runtime"),
+        None,
+        None,
+        keys,
+    )
+    .unwrap();
     let api = serve(hie::api::router(state.clone())).await;
     (api, state, dir)
 }
@@ -398,6 +414,99 @@ mod native {
         );
         blocker.execute_batch("ROLLBACK").unwrap();
     }
+
+    #[tokio::test]
+    async fn a_store_without_a_usable_key_answers_503_without_paths() {
+        // A key file that cannot be read: the engine starts without a store,
+        // with a source file that names a credential.
+        let bucket = refusing_bucket().await;
+        let kept = s3_source("kept", &bucket, json!({"credential": "lab"}));
+        let (api, state, dir) = engine_with(|root| {
+            std::fs::create_dir_all(root.join("sources")).unwrap();
+            std::fs::write(root.join("sources/kept.yaml"), kept.to_string()).unwrap();
+            hie::secrets::KeySettings::file(root.join("missing").join("hie.key"))
+        })
+        .await;
+        let root = dir.path().display().to_string();
+        let detail = state.secrets.unavailable_detail().unwrap();
+        assert!(detail.contains(&root), "the log keeps the path: {detail}");
+        let http = reqwest::Client::new();
+        let credential = s3_source("drops", &bucket, json!({"credential": "lab"}));
+        for r in [
+            http.get(format!("{api}/api/secrets")).send().await.unwrap(),
+            // Creating or replacing a source that names a credential: the same
+            // 503, not a 400, since the same request works once the key is fixed.
+            http.post(format!("{api}/api/sources"))
+                .json(&credential)
+                .send()
+                .await
+                .unwrap(),
+            http.put(format!("{api}/api/sources/kept"))
+                .json(&kept)
+                .send()
+                .await
+                .unwrap(),
+            http.post(format!("{api}/api/sources/test"))
+                .json(&json!({"source": credential["source"]}))
+                .send()
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(r.status(), 503);
+            let text = r.text().await.unwrap();
+            assert!(!text.contains(&root) && !text.contains("hie.key"), "{text}");
+            let answer: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(answer["code"], "secrets_unavailable");
+            assert!(
+                answer["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("the secret key is malformed, cannot be read"),
+                "{answer}"
+            );
+        }
+        // Nothing was saved for the refused source.
+        let r = http
+            .get(format!("{api}/api/sources/drops"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
+
+        // The source loaded at start raises a `credential` alert, with the
+        // same sentence and no path.
+        // One bound over the whole poll, requests included.
+        let poll = async {
+            loop {
+                let alerts: Value = http
+                    .get(format!("{api}/api/alerts?source=kept&open=true"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if let Some(alert) = alerts["alerts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|a| a["kind"] == "credential")
+                {
+                    break alert.clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+        let alert = tokio::time::timeout(std::time::Duration::from_secs(30), poll)
+            .await
+            .expect("no credential alert within 30 s");
+        let text = alert.to_string();
+        assert!(!text.contains(&root) && !text.contains("hie.key"), "{text}");
+        assert!(
+            text.contains("the secret key is malformed, cannot be read"),
+            "{text}"
+        );
+    }
 }
 
 #[cfg(not(feature = "secrets-native"))]
@@ -458,6 +567,23 @@ mod no_backend {
                 .as_str()
                 .unwrap()
                 .contains("needs a secret store")
+        );
+
+        // The connection test reaches the store, which this build does not have.
+        let r = http
+            .post(format!("{api}/api/sources/test"))
+            .json(&json!({"source": s3_source("drops", &bucket, json!({"credential": "lab"}))["source"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 503);
+        let answer: Value = r.json().await.unwrap();
+        assert_eq!(answer["code"], "secrets_unavailable");
+        assert!(
+            answer["error"]
+                .as_str()
+                .unwrap()
+                .contains("no secret backend")
         );
 
         let r = http

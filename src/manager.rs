@@ -42,6 +42,9 @@ pub enum ManagerError {
     Busy(String),
     /// The store's write lock was not free; the same request may succeed later.
     StoreBusy,
+    /// The source names a credential and there is no secret store: the cause's
+    /// sentence only. The same request may succeed once the key is fixed.
+    SecretsUnavailable(String),
     /// The definition was saved, but its source did not start.
     NotStarted(String),
     Internal(anyhow::Error),
@@ -51,8 +54,9 @@ impl ManagerError {
     /// A secret store error met while checking or registering a credential.
     fn from_secret(source: &str, reference: &str, e: SecretError) -> Self {
         match e {
-            SecretError::Unavailable(reason) => ManagerError::InvalidDefinition(format!(
-                "source {source}: credential {reference}: {reason}"
+            SecretError::Unavailable(cause) => ManagerError::SecretsUnavailable(format!(
+                "source {source}: credential {reference}: {}",
+                cause.sentence()
             )),
             SecretError::NotFound => ManagerError::InvalidDefinition(format!(
                 "source {source}: no credential named {reference}; store it first with POST /api/secrets"
@@ -478,7 +482,7 @@ impl SourceManager {
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             return Err(ManagerError::NotStarted(
-                "the definition was saved, but the source could not be started: a test made the start fail; it starts with this definition at the next start, or on replace".into(),
+                "the definition was saved, but the source could not be started: a test made the start fail; it starts with this definition at the next start of the engine".into(),
             ));
         }
         self.ensure_default_rule(feed, by)
@@ -486,7 +490,7 @@ impl SourceManager {
             .map_err(|e| {
                 tracing::error!(feed = %feed.id, "the definition was saved, but the source did not start: {e:#}");
                 ManagerError::NotStarted(format!(
-                    "the definition was saved, but the source could not be started: {e:#}; it starts with this definition at the next start, or on replace"
+                    "the definition was saved, but the source could not be started: {e:#}; it starts with this definition at the next start of the engine"
                 ))
             })
     }
