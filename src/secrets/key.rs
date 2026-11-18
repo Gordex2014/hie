@@ -6,7 +6,9 @@
 //! `hie-secrets.key` next to the database, created the first time. The first
 //! instance to seal the store writes a key check; every later start proves its
 //! key against it. A sealed store without its key refuses to start, and the
-//! engine never makes a new key for one.
+//! engine never makes a new key for one. A store that is not sealed and has no
+//! usable key, or whose key file could not be created, starts without
+//! credentials.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -16,7 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use zeroize::Zeroizing;
 
 use super::native::NativeStore;
-use super::{EnvKey, KeySettings, Secrets};
+use super::{Cause, EnvKey, KeySettings, Secrets};
 use crate::config::Config;
 use crate::crypto::{self, ALGORITHM, CHECK_PLAINTEXT, MasterKey, Sealer};
 use crate::db::Db;
@@ -185,6 +187,17 @@ fn sealed_refusal(input: &Input, store: &str) -> String {
 /// Opens the store's secrets: the state machine of the key inputs and the key
 /// check. An error refuses the start.
 pub(crate) fn open(config: &Config, db: &Arc<Db>, keys: KeySettings) -> Result<Secrets> {
+    open_with(config, db, keys, || Ok(()))
+}
+
+/// `open`, with `before_link` run just before the automatic key file is linked
+/// into place, so a test can make that step fail.
+fn open_with(
+    config: &Config,
+    db: &Arc<Db>,
+    keys: KeySettings,
+    before_link: impl FnOnce() -> std::io::Result<()>,
+) -> Result<Secrets> {
     let owner = owner_id(std::env::var("HIE_INSTANCE_ID").ok(), &config.sources_dir);
     let spec = config.database.to_string_lossy().into_owned();
     db.secret_tables()?;
@@ -269,7 +282,54 @@ pub(crate) fn open(config: &Config, db: &Arc<Db>, keys: KeySettings) -> Result<S
     match input {
         Input::Usable(k, origin) => init(db, &k, &origin, false, owner),
         Input::Absent { auto: Some(path) } => {
-            let (k, created) = create_auto_key(&path, || Ok(()))?;
+            let (k, created) = match create_auto_key(&path, before_link) {
+                Ok(made) => made,
+                Err(AutoKeyError::Refused(e)) => return Err(e),
+                // A volume without hard links, or a directory the engine
+                // cannot write: no key, but nothing to refuse either.
+                Err(AutoKeyError::Io(e)) => {
+                    // Another instance may have sealed the store meanwhile:
+                    // then this instance has no key for it, which is refused.
+                    if let Some(row) = db.secret_check_row()? {
+                        bail!(sealed_refusal(
+                            &Input::Absent {
+                                auto: Some(path.clone())
+                            },
+                            &row.key_id
+                        ));
+                    }
+                    // Something may have appeared at the path meanwhile: only
+                    // a path that is still empty starts without a key.
+                    if std::fs::symlink_metadata(&path).is_ok() {
+                        match read_auto(&path) {
+                            Input::Absent { .. } => {}
+                            Input::Unsafe(path, why) => bail!(unsafe_text(&path, &why, "none")),
+                            other @ (Input::Malformed(_) | Input::Unreadable(..)) => {
+                                bail!(unusable_text(&other, false, "none"))
+                            }
+                            Input::Usable(..) => bail!(
+                                "secret store: {} appeared while this instance was creating it; restart the engine {}",
+                                path.display(),
+                                ids("none", "none")
+                            ),
+                        }
+                    }
+                    let reason = format!(
+                        "secret store: {} does not exist and could not be created ({e:#}); let the engine write to that directory, or set HIE_SECRET_KEY or HIE_SECRET_KEY_FILE, then restart",
+                        path.display()
+                    );
+                    tracing::error!(
+                        "secret store unavailable: {reason}; /api/secrets answers 503 and sources cannot use credentials"
+                    );
+                    return Ok(unavailable(
+                        Cause::KeyFileNotCreated,
+                        reason,
+                        db,
+                        inputs,
+                        owner,
+                    ));
+                }
+            };
             if created {
                 tracing::warn!(
                     "created the secret key {}: it unlocks every stored credential and sits on the same volume as the database, so a copy of that volume holds both; keep a copy elsewhere, or set HIE_SECRET_KEY or HIE_SECRET_KEY_FILE to keep the key off this volume",
@@ -301,31 +361,33 @@ pub(crate) fn open(config: &Config, db: &Arc<Db>, keys: KeySettings) -> Result<S
             tracing::warn!(
                 "secret store unavailable: {reason}; /api/secrets answers 503 and sources cannot use credentials"
             );
-            Ok(Secrets::unavailable_with_recheck(
-                reason,
-                Recheck {
-                    db: db.clone(),
-                    inputs,
-                },
-                owner,
-            ))
+            Ok(unavailable(Cause::NoKey, reason, db, inputs, owner))
         }
         unusable @ (Input::Malformed(_) | Input::Unreadable(..)) => {
             let reason = unusable_text(&unusable, false, "none");
             tracing::error!(
                 "secret store unavailable: {reason}; /api/secrets answers 503 and sources cannot use credentials"
             );
-            Ok(Secrets::unavailable_with_recheck(
-                reason,
-                Recheck {
-                    db: db.clone(),
-                    inputs,
-                },
-                owner,
-            ))
+            Ok(unavailable(Cause::KeyUnusable, reason, db, inputs, owner))
         }
         Input::Unsafe(..) => unreachable!("refused above"),
     }
+}
+
+/// No store for `cause`, `reason` being its detail; rechecked once later.
+fn unavailable(
+    cause: Cause,
+    reason: String,
+    db: &Arc<Db>,
+    inputs: Inputs,
+    owner: String,
+) -> Secrets {
+    let recheck = Recheck {
+        db: db.clone(),
+        inputs,
+        start: cause,
+    };
+    Secrets::unavailable_with_recheck(cause, reason, recheck, owner)
 }
 
 /// Seals the store with `key` unless another instance sealed it first, then
@@ -421,34 +483,72 @@ fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// What a store without a usable key re-reads once, so the reason it gives is
-/// current. It never seals the store and never makes it available.
+/// What a store without a usable key re-reads once, so the cause it gives is
+/// current. It only reads: it never creates a key file, never seals the store
+/// and never makes it available.
 pub struct Recheck {
     db: Arc<Db>,
     inputs: Inputs,
+    /// The cause at start.
+    start: Cause,
 }
 
 impl Recheck {
-    /// The reason now.
-    pub(crate) fn run(self) -> String {
+    /// The cause now, and its detail for the log.
+    pub(crate) fn run(self) -> (Cause, String) {
         let row = match self.db.secret_check_row() {
             Ok(row) => row,
-            Err(e) => return format!("secret store: the key check cannot be read: {e:#}"),
+            Err(e) => {
+                return (
+                    Cause::CheckUnreadable,
+                    format!("secret store: the key check cannot be read: {e:#}"),
+                );
+            }
         };
         let input = self.inputs.classify();
         match (row, input) {
-            (Some(row), Input::Usable(k, _)) => format!(
-                "secret store: the store was sealed after this engine started; restart it with the store's key to use credentials {}",
-                ids(&row.key_id, k.sealer().key_id())
+            (Some(row), Input::Usable(k, _)) => (
+                Cause::Changed,
+                format!(
+                    "secret store: the store was sealed after this engine started; restart it with the store's key to use credentials {}",
+                    ids(&row.key_id, k.sealer().key_id())
+                ),
             ),
-            (Some(row), other) => sealed_refusal(&other, &row.key_id),
-            (None, Input::Usable(_, origin)) => format!(
-                "secret store: {} became usable after this engine started; restart it to use credentials",
-                origin.describe()
+            (Some(row), other) => (Cause::Changed, sealed_refusal(&other, &row.key_id)),
+            (None, Input::Usable(_, origin)) => (
+                Cause::Changed,
+                format!(
+                    "secret store: {} became usable after this engine started; restart it to use credentials",
+                    origin.describe()
+                ),
             ),
-            (None, Input::Unsafe(path, why)) => unsafe_text(&path, &why, "none"),
-            (None, Input::Absent { .. }) => self.inputs.no_key_reason().to_string(),
-            (None, unusable) => unusable_text(&unusable, false, "none"),
+            (None, Input::Unsafe(path, why)) => {
+                (Cause::KeyUnusable, unsafe_text(&path, &why, "none"))
+            }
+            // Only a SQLite file store has a place for the key file.
+            (None, Input::Absent { auto: Some(path) })
+                if self.start == Cause::KeyFileNotCreated =>
+            {
+                (
+                    Cause::KeyFileNotCreated,
+                    format!(
+                        "secret store: {} still does not exist; the engine creates it only at start: let it write to that directory, or set HIE_SECRET_KEY or HIE_SECRET_KEY_FILE, then restart",
+                        path.display()
+                    ),
+                )
+            }
+            // It was there at start, unusable, and has been removed since.
+            (None, Input::Absent { auto: Some(path) }) => (
+                Cause::Changed,
+                format!(
+                    "secret store: {} was removed after this engine started; restart it to create a new key file, or set HIE_SECRET_KEY or HIE_SECRET_KEY_FILE",
+                    path.display()
+                ),
+            ),
+            (None, Input::Absent { auto: None }) => {
+                (Cause::NoKey, self.inputs.no_key_reason().to_string())
+            }
+            (None, unusable) => (Cause::KeyUnusable, unusable_text(&unusable, false, "none")),
         }
     }
 }
@@ -543,7 +643,17 @@ fn read_auto(path: &Path) -> Input {
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
                 return unsafe_because("it is a symbolic link".into());
             }
-            Err(e) => return Input::Unreadable(origin, io_reason(&e)),
+            // Something open refuses, a socket for instance: what is there
+            // decides whether it is unsafe or only unreadable.
+            Err(e) => {
+                return match std::fs::symlink_metadata(path) {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        unsafe_because("it is a symbolic link".into())
+                    }
+                    Ok(m) if !m.is_file() => unsafe_because("it is not a regular file".into()),
+                    _ => Input::Unreadable(origin, io_reason(&e)),
+                };
+            }
         }
     };
     #[cfg(not(unix))]
@@ -603,6 +713,27 @@ impl Drop for OwnTemp {
     }
 }
 
+/// Why the automatic key file gave no key.
+#[derive(Debug)]
+enum AutoKeyError {
+    /// Writing the file or linking it into place failed: the store starts
+    /// without a key.
+    Io(anyhow::Error),
+    /// Anything else, a file in place that must not be used among them: a
+    /// refusal to start.
+    Refused(anyhow::Error),
+}
+
+impl From<anyhow::Error> for AutoKeyError {
+    fn from(e: anyhow::Error) -> Self {
+        AutoKeyError::Refused(e)
+    }
+}
+
+fn io_failure(e: std::io::Error, doing: &str, path: &Path) -> AutoKeyError {
+    AutoKeyError::Io(anyhow::Error::new(e).context(format!("{doing} {}", path.display())))
+}
+
 /// Creates the automatic key file: a new key written to a temporary file of
 /// this process, owner-only, then linked into place without replacing one that
 /// exists; the file in place is the key, whoever made it. The temporary file is
@@ -611,9 +742,9 @@ impl Drop for OwnTemp {
 fn create_auto_key(
     path: &Path,
     before_link: impl FnOnce() -> std::io::Result<()>,
-) -> Result<(MasterKey, bool)> {
+) -> Result<(MasterKey, bool), AutoKeyError> {
     let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| io_failure(e, "creating", dir))?;
     let mut tail = [0u8; 8];
     getrandom::fill(&mut tail).map_err(|e| anyhow!("no random bytes for a file name: {e}"))?;
     let temp = dir.join(format!(".{AUTO_KEY_FILE}.{}.tmp", hex::encode(tail)));
@@ -631,32 +762,51 @@ fn create_auto_key(
         }
         let mut file = options
             .open(&temp)
-            .with_context(|| format!("creating {}", temp.display()))?;
+            .map_err(|e| io_failure(e, "creating", &temp))?;
         let _own = OwnTemp(temp.clone());
         use std::io::Write;
         file.write_all(&key.to_line()[..])
             .and_then(|()| file.sync_all())
-            .with_context(|| format!("writing {}", temp.display()))?;
-        before_link().with_context(|| format!("writing {}", temp.display()))?;
-        created = match std::fs::hard_link(&temp, path) {
+            .and_then(|()| before_link())
+            .map_err(|e| io_failure(e, "writing", &temp))?;
+        created = match link(&temp, path) {
             Ok(()) => true,
-            // Another instance made it first: its file is the key.
+            // Another instance made it first: its file is the key. Never
+            // replaced (no rename): two first starts must agree on one key.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-            Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+            Err(e) => return Err(io_failure(e, "creating", path)),
         };
     }
     sync_dir(dir);
+    let refused = |m: String| Err(AutoKeyError::Refused(anyhow!(m)));
     match read_auto(path) {
         Input::Usable(k, _) => Ok((k, created)),
-        Input::Unsafe(path, why) => bail!(unsafe_text(&path, &why, "none")),
+        Input::Unsafe(path, why) => refused(unsafe_text(&path, &why, "none")),
         other @ (Input::Malformed(_) | Input::Unreadable(..)) => {
-            bail!(unusable_text(&other, false, "none"))
+            refused(unusable_text(&other, false, "none"))
         }
-        Input::Absent { .. } => bail!(
+        Input::Absent { .. } => refused(format!(
             "secret store: {} is gone right after it was created",
             path.display()
-        ),
+        )),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test: the next link of the automatic key file on this thread
+    /// fails with it.
+    static FAIL_LINK: std::cell::Cell<Option<std::io::Error>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Links the automatic key file into place, never replacing a file there.
+fn link(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(e) = FAIL_LINK.take() {
+        return Err(e);
+    }
+    std::fs::hard_link(from, to)
 }
 
 fn sync_dir(dir: &Path) {

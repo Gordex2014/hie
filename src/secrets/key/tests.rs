@@ -73,10 +73,18 @@ fn refusal(result: Result<Secrets>) -> String {
     }
 }
 
+/// The detail of why there is no store, as logged.
 fn reason(secrets: &Secrets) -> String {
+    assert!(secrets.store().is_err(), "expected no store");
+    secrets.unavailable_detail().unwrap()
+}
+
+/// The cause of there being no store, as answered.
+fn cause(secrets: &Secrets) -> crate::secrets::Cause {
     match secrets.store() {
         Ok(_) => panic!("expected no store"),
-        Err(e) => e.to_string(),
+        Err(crate::secrets::SecretError::Unavailable(cause)) => cause,
+        Err(e) => panic!("unexpected {e}"),
     }
 }
 
@@ -367,6 +375,168 @@ fn a_creator_removes_its_own_temporary_file_on_every_path() {
     );
 }
 
+/// A `before_link` that removes the creator's temporary file, so the link
+/// itself fails, as it does on a volume without hard links.
+fn remove_own_temp(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&format!(".{AUTO_KEY_FILE}.")) && name.ends_with(".tmp") {
+            std::fs::remove_file(dir.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_key_file_that_cannot_be_linked_starts_without_credentials() {
+    // The link fails: the engine starts without a store instead of refusing,
+    // and leaves nothing behind.
+    let dir = tempfile::tempdir().unwrap();
+    let c = config(dir.path(), "");
+    let db = db_for(&c);
+    let dir_of_key = auto_path(&c).parent().unwrap().to_path_buf();
+    let s = open_with(&c, &db, KeySettings::none(), || {
+        remove_own_temp(&dir_of_key)
+    })
+    .unwrap();
+    assert_eq!(cause(&s), crate::secrets::Cause::KeyFileNotCreated);
+    assert_eq!(s.health()["available"], false);
+    let r = reason(&s);
+    let path = auto_path(&c).display().to_string();
+    assert!(
+        r.contains(&format!("creating {path}")) && r.contains("os error"),
+        "{r}"
+    );
+    // What is answered names neither the path nor the error.
+    let answered = s.store().err().unwrap().to_string();
+    assert!(
+        !answered.contains(&path) && !answered.contains("os error"),
+        "{answered}"
+    );
+    assert!(!auto_path(&c).exists());
+    assert!(
+        leftovers(&dir_of_key).iter().all(|n| !n.ends_with(".tmp")),
+        "{:?}",
+        leftovers(&dir_of_key)
+    );
+
+    // The recheck only reads: it creates no file and keeps the cause.
+    s.recheck_once().await;
+    assert_eq!(cause(&s), crate::secrets::Cause::KeyFileNotCreated);
+    assert!(
+        reason(&s).contains("still does not exist"),
+        "{}",
+        reason(&s)
+    );
+    assert!(!auto_path(&c).exists());
+
+    // The next start that can create it seals the store with it.
+    let s = open(&c, &db, KeySettings::none()).unwrap();
+    assert!(s.store().is_ok());
+    assert!(auto_path(&c).exists());
+}
+
+#[test]
+fn a_key_file_that_cannot_be_linked_is_refused_once_another_key_sealed_the_store() {
+    // Another instance seals the store while this start fails to link its key
+    // file: this instance has no key for a sealed store, which is refused.
+    let dir = tempfile::tempdir().unwrap();
+    let c = config(dir.path(), "");
+    let db = db_for(&c);
+    let dir_of_key = auto_path(&c).parent().unwrap().to_path_buf();
+    let other = key_text();
+    let sealed = {
+        let (c, other) = (c.clone(), other.clone());
+        move || {
+            seal(&c, &db_for(&c), &other);
+            remove_own_temp(&dir_of_key)
+        }
+    };
+    let m = refusal(open_with(&c, &db, KeySettings::none(), sealed));
+    assert!(
+        m.contains("the store is sealed and this instance has no key"),
+        "{m}"
+    );
+    assert_eq!(markers(&m), (key_id_of(&other), "none".into()));
+    assert!(!auto_path(&c).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_failure_is_refused_when_something_appeared_at_the_key_path() {
+    // The link fails while a symbolic link appears at the path: the start is
+    // refused as for any unsafe key file, not degraded, and the temporary
+    // file is removed.
+    let dir = tempfile::tempdir().unwrap();
+    let c = config(dir.path(), "");
+    let db = db_for(&c);
+    let auto = auto_path(&c);
+    let elsewhere = dir.path().join("elsewhere.key");
+    std::fs::write(&elsewhere, format!("{}\n", key_text())).unwrap();
+    let hook = {
+        let (auto, elsewhere) = (auto.clone(), elsewhere.clone());
+        move || {
+            std::os::unix::fs::symlink(&elsewhere, &auto)?;
+            FAIL_LINK.set(Some(std::io::Error::other("no hard links here")));
+            Ok(())
+        }
+    };
+    let m = refusal(open_with(&c, &db, KeySettings::none(), hook));
+    assert!(
+        m.contains("is not safe to use as the key: it is a symbolic link"),
+        "{m}"
+    );
+    assert!(FAIL_LINK.take().is_none(), "the injected failure was used");
+    let dir_of_key = auto.parent().unwrap();
+    assert!(
+        leftovers(dir_of_key).iter().all(|n| !n.ends_with(".tmp")),
+        "{:?}",
+        leftovers(dir_of_key)
+    );
+    assert!(
+        std::fs::symlink_metadata(&auto)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(db.secret_check_row().unwrap().is_none(), "nothing sealed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_socket_at_the_key_path_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = config(dir.path(), "");
+    let db = db_for(&c);
+    let _socket = std::os::unix::net::UnixListener::bind(auto_path(&c)).unwrap();
+    let m = refusal(open(&c, &db, KeySettings::none()));
+    assert!(m.contains("it is not a regular file"), "{m}");
+    assert_eq!(markers(&m), ("none".into(), "unsafe".into()));
+}
+
+#[tokio::test]
+async fn a_key_file_removed_after_start_asks_for_a_restart() {
+    // A malformed key file at start, removed since: the recheck does not say
+    // the engine failed to create it.
+    let dir = tempfile::tempdir().unwrap();
+    let c = config(dir.path(), "");
+    let db = db_for(&c);
+    std::fs::write(auto_path(&c), "not-a-key\n").unwrap();
+    #[cfg(unix)]
+    chmod(&auto_path(&c), 0o600);
+    let s = open(&c, &db, KeySettings::none()).unwrap();
+    assert_eq!(cause(&s), crate::secrets::Cause::KeyUnusable);
+    std::fs::remove_file(auto_path(&c)).unwrap();
+    s.recheck_once().await;
+    assert_eq!(cause(&s), crate::secrets::Cause::Changed);
+    assert!(
+        reason(&s).contains("was removed after this engine started"),
+        "{}",
+        reason(&s)
+    );
+    assert!(!auto_path(&c).exists());
+}
+
 #[test]
 fn a_creator_paused_before_its_link_takes_the_winners_key() {
     let dir = tempfile::tempdir().unwrap();
@@ -443,6 +613,7 @@ async fn the_recheck_refreshes_the_reason_once_and_never_opens_the_store() {
     let r = reason(&s);
     assert!(r.contains("sealed, but HIE_SECRET_KEY is not a key"), "{r}");
     assert_eq!(markers(&r), (store, "malformed".into()));
+    assert_eq!(cause(&s), crate::secrets::Cause::Changed);
 
     // A key file that appears after start: the reason says so; still no store.
     let dir = tempfile::tempdir().unwrap();
@@ -589,7 +760,7 @@ fn a_key_file_made_while_another_key_sealed_the_store_is_named_and_kept() {
         opening
             .join()
             .unwrap()
-            .map(|()| Secrets::unavailable("unused")),
+            .map(|()| Secrets::unavailable(crate::secrets::Cause::NoKey, "unused")),
     );
     assert!(m.contains("sealed with another key"), "{m}");
     let path = auto_path(&c).display().to_string();

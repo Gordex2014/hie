@@ -7,10 +7,10 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | Method and path | Does |
 |---|---|
 | `GET /api/sources` | Every source: definition, state (`waiting`, `receiving`, `late`, `paused`), freshness, record counts, last file, last alert |
-| `POST /api/sources` | Creates a source from its definition (the YAML as JSON); writes `sources/{id}.yaml` and starts it. `409` if it exists, `400` with the reason if invalid (`code: invalid_definition`, also when the credential it names is missing or unusable) |
-| `POST /api/sources/test` | Tests a connection: `{"source": {...}}` or a full definition. Answers `reachable`, `elapsed_ms`, `objects`, `newest`, `newest_at`. An S3 source with a `credential` is tested with the credential's current revision |
+| `POST /api/sources` | Creates a source from its definition (the YAML as JSON); writes `sources/{id}.yaml` and starts it. `409` if it exists, `400` with the reason if invalid (`code: invalid_definition`, also when the credential it names does not exist, and in a build without a secret backend, where no retry can help). When it names a credential and the store has no usable key: `503 secrets_unavailable`, and the same request works once the key is fixed and the engine restarted |
+| `POST /api/sources/test` | Tests a connection: `{"source": {...}}` or a full definition. Answers `reachable`, `elapsed_ms`, `objects`, `newest`, `newest_at`. An S3 source with a `credential` is tested with the credential's current revision; with no secret store, whether the key is missing or unusable or the build has no secret backend, it answers `503 secrets_unavailable` |
 | `GET /api/sources/{id}` | One source, as above |
-| `PUT /api/sources/{id}` | Replaces the definition and restarts the source |
+| `PUT /api/sources/{id}` | Replaces the definition and restarts the source. A definition is refused as `POST` refuses it: `400 invalid_definition` (in a build without a secret backend too, when it names a credential), or `503 secrets_unavailable` when it names a credential and the store has no usable key |
 | `DELETE /api/sources/{id}` | Stops the source and removes its file; its records and alerts stay |
 | `POST /api/sources/{id}/pause` | Stops polling and delivery until resumed; body `{"by": "..."}` is kept with the time |
 | `POST /api/sources/{id}/resume` | Resumes and passes at once |
@@ -38,7 +38,7 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind |
 | `GET /health` | `{"status": "ok", "service": "hie", "version", "uptime_seconds", "started_at", "timestamp", "secrets"}`; `secrets` is `{"backend": "native"\|"none", "available", "key_id"}`, the key id being a one-way 16-hex fingerprint of the key in use, or `null` |
 
-Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start, or on replace), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), and the codes of the credential routes below.
+Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), and the codes of the credential routes below.
 
 ### Secrets
 
@@ -62,7 +62,7 @@ Connector credentials, which S3 sources name with `credential:` (see [sources](s
 | `404` | `secret_not_found` | No credential with that id |
 | `409` | `name_in_use` | The name is taken |
 | `409` | `secret_in_use` (with `sources`) | A source is registered for the credential |
-| `503` | `secrets_unavailable` | No store: this build has no secret backend, or the store has no usable key (the reason says which) |
+| `503` | `secrets_unavailable` | No store: this build has no secret backend, the store has no key, the key is malformed, cannot be read or is not safe to use, or the key file could not be created. `error` is a fixed sentence for the cause, with no path or system error; the engine log says why. When the key is at fault, the same request works once it is fixed and the engine restarted |
 | `503` | `store_busy` (`Retry-After: 1`) | The store's lock was not free |
 | `500` | `internal_error` | The engine failed; its log has the reason |
 

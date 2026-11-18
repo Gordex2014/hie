@@ -5,7 +5,7 @@
 //! `credential:` and always uses the current revision. The store behind the
 //! `SecretStore` trait is the native one (`secrets-native`): values sealed in the
 //! engine's own database under a key of this instance. Without a backend the
-//! engine starts, and every use of a credential is refused with the reason.
+//! engine starts, and every use of a credential is refused with the cause.
 
 #[cfg(feature = "secrets-native")]
 pub mod key;
@@ -135,8 +135,9 @@ pub struct NewSecret {
 
 #[derive(Debug)]
 pub enum SecretError {
-    /// No backend, or no usable key for a store that is not sealed yet.
-    Unavailable(String),
+    /// No backend, or no usable key for a store that is not sealed yet. Only
+    /// the cause travels: the detail, with its paths and OS errors, is logged.
+    Unavailable(Cause),
     NotFound,
     NameInUse,
     /// The sources registered for the secret, deduplicated and sorted.
@@ -157,7 +158,7 @@ pub enum SecretError {
 impl std::fmt::Display for SecretError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SecretError::Unavailable(reason) => f.write_str(reason),
+            SecretError::Unavailable(cause) => f.write_str(cause.sentence()),
             SecretError::NotFound => f.write_str("no such credential"),
             SecretError::NameInUse => f.write_str("a credential with this name already exists"),
             SecretError::InUse(sources) => {
@@ -224,7 +225,49 @@ pub fn is_id(reference: &str) -> bool {
     reference.starts_with("sec_")
 }
 
-/// The secret store as the engine holds it: available, or not with the reason.
+/// Why there is no store, as answers and alerts give it: one fixed sentence per
+/// cause, with no path, OS error or key id. The detail goes to the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+    /// This build has no secret backend.
+    NoBackend,
+    /// No key is given, and none can be made for this store.
+    NoKey,
+    /// The key given is malformed, cannot be read, or is not safe to use.
+    KeyUnusable,
+    /// The key file next to the database could not be created at start.
+    KeyFileNotCreated,
+    /// The store or the key changed after start: a restart decides.
+    Changed,
+    /// The store's key check could not be read.
+    CheckUnreadable,
+}
+
+impl Cause {
+    /// The sentence answered and alerted for this cause.
+    pub fn sentence(self) -> &'static str {
+        match self {
+            Cause::NoBackend => NO_BACKEND,
+            Cause::NoKey => {
+                "the secret store has no key: set HIE_SECRET_KEY, HIE_SECRET_KEY_FILE or secrets.key_file, then restart the engine; its log has the detail"
+            }
+            Cause::KeyUnusable => {
+                "the secret key is malformed, cannot be read, or is not safe to use; the engine log has the detail"
+            }
+            Cause::KeyFileNotCreated => {
+                "the engine could not create its secret key file at start; the engine log has the detail"
+            }
+            Cause::Changed => {
+                "the secret store or its key changed after the engine started; restart the engine; its log says what changed"
+            }
+            Cause::CheckUnreadable => {
+                "the secret store's key check cannot be read; the engine log has the detail"
+            }
+        }
+    }
+}
+
+/// The secret store as the engine holds it: available, or not with the cause.
 #[derive(Clone)]
 pub struct Secrets {
     state: Arc<State>,
@@ -238,7 +281,8 @@ enum State {
         key_id: String,
     },
     Unavailable {
-        reason: Mutex<Arc<str>>,
+        /// The cause, answered, and the detail, logged only.
+        reason: Mutex<(Cause, Arc<str>)>,
         /// What the one-shot recheck needs; `None` without a backend.
         #[cfg(feature = "secrets-native")]
         recheck: Option<Mutex<Option<key::Recheck>>>,
@@ -246,11 +290,11 @@ enum State {
 }
 
 impl Secrets {
-    /// No store, for `reason`.
-    pub fn unavailable(reason: impl Into<Arc<str>>) -> Self {
+    /// No store, for `cause`; `detail` is for the log only.
+    pub fn unavailable(cause: Cause, detail: impl Into<Arc<str>>) -> Self {
         Self {
             state: Arc::new(State::Unavailable {
-                reason: Mutex::new(reason.into()),
+                reason: Mutex::new((cause, detail.into())),
                 #[cfg(feature = "secrets-native")]
                 recheck: None,
             }),
@@ -268,26 +312,38 @@ impl Secrets {
 
     #[cfg(feature = "secrets-native")]
     pub(crate) fn unavailable_with_recheck(
-        reason: String,
+        cause: Cause,
+        detail: String,
         recheck: key::Recheck,
         owner: String,
     ) -> Self {
         Self {
             state: Arc::new(State::Unavailable {
-                reason: Mutex::new(reason.into()),
+                reason: Mutex::new((cause, detail.into())),
                 recheck: Some(Mutex::new(Some(recheck))),
             }),
             owner: owner.into(),
         }
     }
 
-    /// The store, or why there is none.
+    /// The store, or the cause of there being none.
     pub fn store(&self) -> Result<&Arc<dyn SecretStore>, SecretError> {
         match &*self.state {
             State::Available { store, .. } => Ok(store),
             State::Unavailable { reason, .. } => Err(SecretError::Unavailable(
-                reason.lock().expect("secrets mutex").to_string(),
+                reason.lock().expect("secrets mutex").0,
             )),
+        }
+    }
+
+    /// Why there is no store, as logged: paths and OS errors included.
+    /// `None` when the store is available.
+    pub fn unavailable_detail(&self) -> Option<String> {
+        match &*self.state {
+            State::Available { .. } => None,
+            State::Unavailable { reason, .. } => {
+                Some(reason.lock().expect("secrets mutex").1.to_string())
+            }
         }
     }
 
@@ -297,9 +353,9 @@ impl Secrets {
     }
 
     /// Without a store, re-reads the key inputs and the store's key check once
-    /// per process, so the reason given is current: a key file mounted after
-    /// start, or a store sealed by another instance since. It never makes the
-    /// store available; that takes a restart.
+    /// per process, so the cause given is current: a key file mounted after
+    /// start, or a store sealed by another instance since. It never creates a
+    /// key file and never makes the store available; that takes a restart.
     pub async fn recheck_once(&self) {
         #[cfg(feature = "secrets-native")]
         if let State::Unavailable {
@@ -309,9 +365,9 @@ impl Secrets {
         {
             let mut pending = recheck.lock().expect("secrets mutex");
             if let Some(recheck) = pending.take() {
-                let refreshed = recheck.run();
-                tracing::warn!("secret store still unavailable: {refreshed}");
-                *reason.lock().expect("secrets mutex") = refreshed.into();
+                let (cause, detail) = recheck.run();
+                tracing::warn!("secret store still unavailable: {detail}");
+                *reason.lock().expect("secrets mutex") = (cause, detail.into());
             }
         }
     }
@@ -446,7 +502,7 @@ pub fn open(config: &Config, db: &Arc<Db>, keys: KeySettings) -> anyhow::Result<
             );
         }
         tracing::warn!("secret store unavailable: {NO_BACKEND}");
-        Ok(Secrets::unavailable(NO_BACKEND))
+        Ok(Secrets::unavailable(Cause::NoBackend, NO_BACKEND))
     }
 }
 

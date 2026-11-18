@@ -154,10 +154,12 @@ async fn an_unsealed_store_with_a_malformed_key_starts_without_credentials() {
     let s = secrets::open(&c, &db(&c), KeySettings::inline("not-a-key")).unwrap();
     assert_eq!(s.health()["available"], false);
     assert_eq!(s.health()["backend"], "native");
-    let Err(SecretError::Unavailable(reason)) = s.store() else {
+    let Err(SecretError::Unavailable(cause)) = s.store() else {
         panic!("expected no store");
     };
-    assert!(reason.contains("HIE_SECRET_KEY is not a key"), "{reason}");
+    assert_eq!(cause, secrets::Cause::KeyUnusable);
+    let detail = s.unavailable_detail().unwrap();
+    assert!(detail.contains("HIE_SECRET_KEY is not a key"), "{detail}");
 }
 
 #[tokio::test]

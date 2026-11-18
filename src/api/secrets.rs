@@ -73,10 +73,13 @@ fn invalid_body(sentence: &str) -> ApiError {
 }
 
 /// The answer for a store error. Store and integrity errors are logged and
-/// answered without their detail.
+/// answered without their detail; a missing store is answered with its cause's
+/// fixed sentence, its detail being in the log since start.
 fn answer(e: SecretError) -> ApiError {
     match e {
-        SecretError::Unavailable(reason) => unavailable(reason),
+        SecretError::Unavailable(cause) => {
+            ApiError::secrets_unavailable(cause.sentence().to_string())
+        }
         SecretError::NotFound => {
             ApiError::new(StatusCode::NOT_FOUND, "credential not found").code("secret_not_found")
         }
@@ -106,12 +109,8 @@ fn answer(e: SecretError) -> ApiError {
     }
 }
 
-fn unavailable(reason: String) -> ApiError {
-    ApiError::new(StatusCode::SERVICE_UNAVAILABLE, reason).code("secrets_unavailable")
-}
-
 /// The store, or the 503 that says why there is none (rechecked once per
-/// process, so the reason is current).
+/// process, so the cause is current).
 async fn store(s: &AppState) -> Result<Arc<dyn SecretStore>, ApiError> {
     if let Ok(store) = s.secrets.store() {
         return Ok(store.clone());
