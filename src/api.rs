@@ -510,6 +510,7 @@ fn daily_stats(
     let (today_since, today_until) = local.bounds(local.len() - 1);
     let last = &by_day[local.len() - 1];
     let today_json = json!({
+        "day": last["day"],
         "files": last["files"],
         "records": count(db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2 AND f.received_at < $3", params![id, today_since, today_until])?,
         "sent": last["sent"],
@@ -1053,7 +1054,7 @@ mod tests {
         let stats = daily_stats(&db, "lab", &ny, 2, utc("2026-11-21T04:00:00Z")).unwrap();
         assert_eq!(
             stats["today"],
-            json!({"files": 2, "records": 2, "sent": 1, "rejected": 1, "pending": 0})
+            json!({"day": "2026-11-20", "files": 2, "records": 2, "sent": 1, "rejected": 1, "pending": 0})
         );
         assert_eq!(
             stats["by_day"][0],

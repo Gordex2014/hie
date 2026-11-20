@@ -96,14 +96,14 @@ impl Alerter {
         // Yesterday's deadline, pushed onto today's start, is checked first and
         // against its own day: a file of today must not hide that yesterday's
         // never came. Once per day: not when an alert of the rule was still open
-        // at that deadline or raised since.
-        if let Some((day, from, to)) = check.due.filter(|(day, ..)| *day != check.today.0)
+        // at that deadline or raised since. An alert raised here is left for the
+        // next pass to clear, so that it is never cleared before it is sent.
+        if let Some((day, from, to)) = check.pushed
             && !self.db.received_between(feed, from, to)?
             && !self
                 .db
                 .rule_alert_alive_since(feed, "missing", rule.id, to)?
-        {
-            self.fire_once(
+            && self.fire_once(
                 feed,
                 "missing",
                 rule,
@@ -112,7 +112,9 @@ impl Alerter {
                     rule.threshold,
                     zone.name()
                 ),
-            )?;
+            )?
+        {
+            return Ok(());
         }
         if self
             .db
@@ -124,7 +126,7 @@ impl Alerter {
                 Some(rule.id),
                 &format!("{feed_name}: the file arrived"),
             )?;
-        } else if check.due.is_some_and(|(day, ..)| day == check.today.0) {
+        } else if check.due {
             self.fire_once(
                 feed,
                 "missing",
@@ -234,34 +236,31 @@ pub fn validate_rule(rule: &Rule) -> Result<(), String> {
 pub struct MissingBy {
     /// Today and its `[start, end)` in epoch ms: a file received in it clears the alert.
     pub today: (NaiveDate, i64, i64),
-    /// The day whose deadline has passed, with its bounds, if any: nothing
-    /// received in it fires the alert. Usually today, after its deadline. It is
-    /// yesterday in the first moments of a day when yesterday's deadline fell in a
-    /// DST gap that ran into midnight, so that it resolved to today's start.
-    pub due: Option<(NaiveDate, i64, i64)>,
+    /// Today's deadline has passed: nothing received today fires the alert.
+    pub due: bool,
+    /// Yesterday and its bounds, when its deadline fell in a gap that ran into
+    /// midnight and so resolved to today's start: nothing received yesterday
+    /// fires the alert for it, whatever today brings.
+    pub pushed: Option<(NaiveDate, i64, i64)>,
 }
 
 /// Where a deadline of `due_minute` (minutes after local midnight) stands at
-/// `now` in `zone`. A deadline skipped by a DST change is the change itself; a
-/// repeated one is its first occurrence.
+/// `now` in `zone`. A deadline skipped by a change of offset is the change
+/// itself; a repeated one is its first occurrence.
 pub fn missing_by(zone: &Zone, due_minute: u32, now: DateTime<Utc>) -> MissingBy {
     let time = NaiveTime::from_hms_opt(due_minute / 60, due_minute % 60, 0).expect("a time of day");
     let (today, start, end) = zone.today_bounds(now);
-    let deadline = zone.instant(today, time);
-    let due = if now >= deadline {
-        Some((today, start, end))
-    } else {
-        today.pred_opt().and_then(|yesterday| {
-            let deadline = zone.instant(yesterday, time);
-            let from = zone.day_start(yesterday).timestamp_millis();
-            // A date the zone skipped altogether has no instant to miss a file in.
-            (deadline.timestamp_millis() >= start && now >= deadline && from < start)
-                .then_some((yesterday, from, start))
-        })
-    };
+    let pushed = today.pred_opt().and_then(|yesterday| {
+        let deadline = zone.instant(yesterday, time);
+        let from = zone.day_start(yesterday).timestamp_millis();
+        // A date the zone skipped altogether has no instant to miss a file in.
+        (deadline.timestamp_millis() >= start && now >= deadline && from < start)
+            .then_some((yesterday, from, start))
+    });
     MissingBy {
         today: (today, start, end),
-        due,
+        due: now >= zone.instant(today, time),
+        pushed,
     }
 }
 
@@ -348,37 +347,32 @@ mod tests {
                 ms("2026-11-21T00:00:00Z")
             )
         );
-        assert_eq!(before.due, None);
+        assert!(!before.due);
+        assert_eq!(before.pushed, None);
         let after = missing_by(&z, 6 * 60, utc("2026-11-20T06:00:00Z"));
-        assert_eq!(after.due, Some(after.today));
+        assert!(after.due);
+        assert_eq!(after.today, before.today);
     }
-
     #[test]
     fn missing_by_in_a_zone_across_both_dst_changes() {
         let ny = zone("America/New_York");
         // 06:00 on a normal day: 11:00Z in winter.
-        assert_eq!(
-            missing_by(&ny, 6 * 60, utc("2026-01-15T10:59:59Z")).due,
-            None
-        );
-        assert!(
-            missing_by(&ny, 6 * 60, utc("2026-01-15T11:00:00Z"))
-                .due
-                .is_some()
-        );
+        assert!(!missing_by(&ny, 6 * 60, utc("2026-01-15T10:59:59Z")).due);
+        assert!(missing_by(&ny, 6 * 60, utc("2026-01-15T11:00:00Z")).due);
         // 02:30 does not exist on 2026-03-08: due at the change, 03:00 EDT (07:00Z).
-        assert_eq!(missing_by(&ny, 150, utc("2026-03-08T06:59:59Z")).due, None);
+        assert!(!missing_by(&ny, 150, utc("2026-03-08T06:59:59Z")).due);
         let spring = missing_by(&ny, 150, utc("2026-03-08T07:00:00Z"));
+        assert!(spring.due);
         assert_eq!(
-            spring.due,
-            Some((
+            spring.today,
+            (
                 date("2026-03-08"),
                 ms("2026-03-08T05:00:00Z"),
                 ms("2026-03-09T04:00:00Z")
-            ))
+            )
         );
         // 01:30 happens twice on 2026-11-01: due at the first (05:30Z), in a 25-hour day.
-        assert_eq!(missing_by(&ny, 90, utc("2026-11-01T05:29:59Z")).due, None);
+        assert!(!missing_by(&ny, 90, utc("2026-11-01T05:29:59Z")).due);
         let fall = missing_by(&ny, 90, utc("2026-11-01T05:30:00Z"));
         assert_eq!(
             fall.today,
@@ -388,12 +382,12 @@ mod tests {
                 ms("2026-11-02T05:00:00Z")
             )
         );
-        assert!(fall.due.is_some());
+        assert!(fall.due);
+        assert_eq!(fall.pushed, None);
         // At 23:30 local the UTC date is already the next one: still the local day.
         let late = missing_by(&ny, 6 * 60, utc("2026-01-16T04:30:00Z"));
         assert_eq!(late.today.0, date("2026-01-15"));
     }
-
     #[test]
     fn a_deadline_pushed_to_the_next_midnight_is_due_as_that_day_begins() {
         // Nuuk, 2026-03-28: 23:00 to 24:00 does not exist, so 23:30 is the change,
@@ -410,19 +404,23 @@ mod tests {
             deadline - chrono::Duration::milliseconds(1),
         );
         assert_eq!(just_before.today.0, date("2026-03-28"));
-        assert_eq!(just_before.due, None);
+        assert!(!just_before.due);
+        assert_eq!(just_before.pushed, None);
         let at = missing_by(&nuuk, 23 * 60 + 30, deadline);
         assert_eq!(at.today.0, date("2026-03-29"));
-        assert_eq!(
-            at.due,
-            Some((
-                date("2026-03-28"),
-                nuuk.day_start(date("2026-03-28")).timestamp_millis(),
-                deadline.timestamp_millis()
-            ))
-        );
+        assert!(!at.due);
+        let pushed = Some((
+            date("2026-03-28"),
+            nuuk.day_start(date("2026-03-28")).timestamp_millis(),
+            deadline.timestamp_millis(),
+        ));
+        assert_eq!(at.pushed, pushed);
+        // A pass late on the 29th, after the 29th's own deadline, still sees the 28th's.
+        let late = missing_by(&nuuk, 23 * 60 + 30, utc("2026-03-30T00:45:00Z"));
+        assert_eq!(late.today.0, date("2026-03-29"));
+        assert!(late.due);
+        assert_eq!(late.pushed, pushed);
     }
-
     /// The store-backed check with a fixed clock: what fires and what clears.
     struct Lab {
         db: Arc<Db>,
@@ -572,13 +570,21 @@ mod tests {
             .day_start(date("2026-03-29"));
         let at =
             |offset_minutes: i64| (start + chrono::Duration::minutes(offset_minutes)).to_rfc3339();
+        let missed =
+            "Lab: nothing arrived on 2026-03-28 and the file was expected by 23:30 America/Nuuk";
         // Nothing on the 28th, and the 29th's file already in at the first check:
-        // the 28th's alert is raised and cleared at once, then never raised again.
+        // the 28th's alert is raised, cleared on the next pass, never raised again.
         let lab = Lab::new("23:30", Some("America/Nuuk"));
         lab.receive(&at(1));
-        assert_eq!(lab.check(&at(2)), None);
-        assert_eq!(lab.alerts(), 1);
+        assert_eq!(lab.check(&at(2)).as_deref(), Some(missed));
         assert_eq!(lab.check(&at(3)), None);
+        assert_eq!(lab.check(&at(4)), None);
+        assert_eq!(lab.alerts(), 1);
+        // The same when the first pass of the 29th comes after its own deadline.
+        let lab = Lab::new("23:30", Some("America/Nuuk"));
+        lab.receive(&at(60));
+        assert_eq!(lab.check(&at(24 * 60 - 15)).as_deref(), Some(missed));
+        assert_eq!(lab.check(&at(24 * 60 - 14)), None);
         assert_eq!(lab.alerts(), 1);
         // An alert of the rule still open at the deadline (the 27th's) covers the
         // 28th too: cleared by the 29th's file, nothing more is raised.
@@ -590,8 +596,24 @@ mod tests {
         assert_eq!(lab.check(&at(2)), None);
         assert_eq!(lab.check(&at(3)), None);
         assert_eq!(lab.alerts(), 1);
+        // One cleared before the deadline does not.
+        let lab = Lab::new("23:30", Some("America/Nuuk"));
+        lab.alerter
+            .fire_once("lab", "missing", &lab.rule, "the 27th")
+            .unwrap();
+        lab.db
+            .execute_for_test(
+                "UPDATE alerts SET created_at = $1, cleared_at = $2",
+                &crate::db::params![
+                    start.timestamp_millis() - 30 * 3_600_000,
+                    start.timestamp_millis() - 20 * 3_600_000
+                ],
+            )
+            .unwrap();
+        lab.receive(&at(1));
+        assert_eq!(lab.check(&at(2)).as_deref(), Some(missed));
+        assert_eq!(lab.alerts(), 2);
     }
-
     #[test]
     fn a_skipped_date_misses_no_deadline() {
         // Apia skipped 2011-12-30: its 06:00 resolves to the start of the 31st.
@@ -599,7 +621,7 @@ mod tests {
         let start = apia.day_start(date("2011-12-31"));
         let check = missing_by(&apia, 6 * 60, start);
         assert_eq!(check.today.0, date("2011-12-31"));
-        assert_eq!(check.due, None);
+        assert_eq!(check.pushed, None);
     }
 
     #[test]

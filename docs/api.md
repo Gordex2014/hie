@@ -18,7 +18,7 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /api/sources/{id}/loads` (also `/files`) | Every load: the file, its method, records read, sent, rejected, in progress, how long it took, where it is archived |
 | `GET /api/loads/{id}` | One load with its **failures grouped by reason**: kind, reason, count, first line, and up to three sample rows each |
 | `POST /api/loads/{id}/retry` | Puts the load's rejected rows back at the start, all of them or those with one reason (`{"reason": "..."}`); the source passes at once |
-| `GET /api/sources/{id}/stats?days=14&tz=Europe/Madrid` | What a source's page draws: today (files, records, sent, rejected, pending) and one row per day, oldest first, today last. Days are local days in `tz` (UTC without it), and the answer's `tz` names the zone they were counted in: see [Days and time zones](#days-and-time-zones) |
+| `GET /api/sources/{id}/stats?days=14&tz=Europe/Madrid` | What a source's page draws: today (its `day`, files, records, sent, rejected, pending) and one row per `day`, oldest first, today last. Days are local days in `tz` (UTC without it), and the answer's `tz` names the zone they were counted in: see [Days and time zones](#days-and-time-zones) |
 | `GET /api/transforms` | Every transform file: name, path, size, modified, and the sources that use it |
 | `GET /api/transforms/{name}` | The transform's code |
 | `PUT /api/transforms/{name}` | Saves the code (`{"code": "..."}`); the sources using it restart their Python worker. `201` when new |
@@ -44,7 +44,7 @@ Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apar
 
 Daily figures are counted in UTC unless the request names a zone with `tz`, an IANA name such as `Europe/Madrid` or `America/New_York` (matched without regard to case; a `+` is sent as `%2B`, as in `Etc/GMT%2B5`). The answer's `tz` names the zone used, as the database spells it, and is `UTC` when none was asked for; a client that wants its own zone's days checks it before labelling them. A name that is not a zone answers `400` `{"error": "tz must be an IANA time zone name, such as Europe/Madrid or UTC", "code": "invalid_query", "field": "tz"}`; a `tz` given twice is refused before that, with a plain-text `400`.
 
-- A day runs from local midnight to the next local midnight. When a change to or from daylight saving time skips midnight, the day starts at the change, the first valid moment after it; when it repeats midnight, the day starts at the first one.
+- A day runs from local midnight to the next local midnight. When a change of offset (such as the start of daylight saving time) skips midnight, the day starts at the change, the first valid moment after it; when one repeats midnight, the day starts at the first one.
 - So a day with a change lasts as long as it did on the clock (23 or 25 hours in most zones, 23½ on Lord Howe Island), and a date the zone skipped altogether is a day with nothing in it.
 - Zone rules come from the IANA database built into the engine, the same on every instance and never the host's; a release brings newer rules.
 

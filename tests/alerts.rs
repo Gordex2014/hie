@@ -420,19 +420,33 @@ async fn missing_by_rules_take_a_time_zone_and_fire_in_it() {
 
     // 00:00 has always passed, in any zone: both rules are due at once. The
     // zone is kept as the database spells it; no zone reads back as null (UTC).
+    // Of two zones 8½ hours apart, the one not near its midnight, so that the
+    // file dropped below is today's when it is checked.
+    let now = chrono::Utc::now();
+    let (asked, zone) = [
+        ("pacific/kiritimati", "Pacific/Kiritimati"),
+        ("asia/kolkata", "Asia/Kolkata"),
+    ]
+    .into_iter()
+    .find(|(_, name)| {
+        let (_, start, end) = hie::zone::Zone::parse(name).unwrap().today_bounds(now);
+        let at = now.timestamp_millis();
+        at - start > 3_600_000 && end - at > 3_600_000
+    })
+    .unwrap();
     let created = lab
         .post(
             "/api/alert-rules",
-            json!({"source_id": "lab-results", "condition": "missing_by", "threshold": "00:00", "tz": "pacific/kiritimati"}),
+            json!({"source_id": "lab-results", "condition": "missing_by", "threshold": "00:00", "tz": asked}),
         )
         .await;
     assert_eq!(created.status(), 201);
     let zoned: Value = created.json().await.unwrap();
-    assert_eq!(zoned["tz"], "Pacific/Kiritimati");
+    assert_eq!(zoned["tz"], zone);
     let zoned = zoned["id"].as_i64().unwrap();
     assert_eq!(
         lab.get(&format!("/api/alert-rules/{zoned}")).await["tz"],
-        "Pacific/Kiritimati"
+        zone
     );
     let created = lab
         .post(
@@ -456,7 +470,7 @@ async fn missing_by_rules_take_a_time_zone_and_fire_in_it() {
     );
     assert_eq!(
         alert_of(&alerts, zoned).unwrap()["message"],
-        "Lab results: nothing has arrived today and the file was expected by 00:00 Pacific/Kiritimati"
+        format!("Lab results: nothing has arrived today and the file was expected by 00:00 {zone}")
     );
 
     // A file now is today's in every zone: both clear.
@@ -495,31 +509,43 @@ async fn stats_count_local_days_and_echo_the_zone() {
         return;
     };
     let lab = lab(&python).await;
+    let received_after = chrono::Utc::now();
     lab.drop_file("labs.csv").await;
-    // The last day is the zone's today (or the next one, if the request
-    // straddled a local midnight), and the file just received is in it.
+    // The file is in the day it was received in, in each zone, and the last day
+    // is that zone's today; both may move on by one if a local midnight passes
+    // during the test.
     for (query, zone) in [
         ("days=3", "UTC"),
         ("days=3&tz=pacific/kiritimati", "Pacific/Kiritimati"),
         ("days=3&tz=Pacific/Pago_Pago", "Pacific/Pago_Pago"),
         ("days=3&tz=Etc/GMT%2B5", "Etc/GMT+5"),
     ] {
-        let z = hie::zone::Zone::parse(zone).unwrap();
-        let before = z.today(chrono::Utc::now()).to_string();
         let stats = lab
             .wait_until(&format!("/api/sources/lab-results/stats?{query}"), |s| {
-                s["by_day"][2]["files"] == 1
+                s["by_day"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|d| d["files"] == 1)
             })
             .await;
-        let after = z.today(chrono::Utc::now()).to_string();
-        assert_eq!(stats["tz"], zone, "{query}");
-        assert_eq!(stats["by_day"].as_array().unwrap().len(), 3);
-        let last = stats["by_day"][2]["day"].as_str().unwrap().to_string();
-        assert!(
-            last == before || last == after,
-            "{query}: {last}, {before}..{after}"
+        let z = hie::zone::Zone::parse(zone).unwrap();
+        let (earliest, latest) = (
+            z.today(received_after).to_string(),
+            z.today(chrono::Utc::now()).to_string(),
         );
-        assert_eq!(stats["today"]["files"], 1, "{query}: {stats}");
+        let within = |day: &Value| {
+            let day = day.as_str().unwrap();
+            earliest.as_str() <= day && day <= latest.as_str()
+        };
+        assert_eq!(stats["tz"], zone, "{query}");
+        let days = stats["by_day"].as_array().unwrap();
+        assert_eq!(days.len(), 3);
+        let with_file = days.iter().find(|d| d["files"] == 1).unwrap();
+        assert!(within(&with_file["day"]), "{query}: {stats}");
+        assert!(within(&days[2]["day"]), "{query}: {stats}");
+        assert_eq!(stats["today"]["day"], days[2]["day"], "{query}");
+        assert_eq!(stats["today"]["files"], days[2]["files"], "{query}");
     }
     // Kiritimati (+14) and Pago Pago (-11) are a day and more apart.
     let east = lab

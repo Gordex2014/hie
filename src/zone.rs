@@ -1,9 +1,10 @@
 //! Calendar days and times of day in an IANA time zone, UTC by default.
 //!
-//! A local time that does not exist (skipped by a DST change) stands for the
-//! first valid instant after it, which is the change itself; one that happens
-//! twice stands for its first occurrence. A day is `[local midnight, next local
-//! midnight)` by that rule, so a day with a change lasts 23 or 25 hours, and a
+//! A local time that does not exist (skipped by a change of offset, such as
+//! daylight saving time) stands for the first valid instant after it, which is
+//! the change itself; one that happens twice stands for its first occurrence. A
+//! day is `[local midnight, next local midnight)` by that rule, so it lasts as
+//! long as it did on the clock (23 or 25 hours across most DST changes), and a
 //! date a zone skipped entirely is an empty day.
 //!
 //! Zone rules come from the copy of the IANA database built into the engine
