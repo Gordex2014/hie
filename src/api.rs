@@ -425,9 +425,19 @@ async fn test_source(State(s): State<AppState>, Json(body): Json<Value>) -> ApiR
 #[derive(Deserialize)]
 struct StatsQuery {
     days: Option<i64>,
+    /// The IANA time zone the days are counted in; UTC when absent.
+    tz: Option<String>,
 }
 
-/// What a source's page draws: today's numbers and one row per day for the last N days.
+/// A query parameter that cannot be used: a fixed sentence and the parameter.
+fn invalid_query(field: &'static str, error: &'static str) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, error)
+        .code("invalid_query")
+        .with("field", field)
+}
+
+/// What a source's page draws: today's numbers and one row per day for the last
+/// N days, days being local days in `tz` (UTC by default), which is echoed.
 async fn source_stats(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -436,68 +446,79 @@ async fn source_stats(
     s.manager
         .source(&id)
         .ok_or_else(|| not_found(&format!("source {id}")))?;
-    let days = q.days.unwrap_or(14).clamp(1, 366);
-    let today = chrono::Utc::now().date_naive();
-    let first = today - chrono::Days::new(days as u64 - 1);
-    let since = first
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
-        .timestamp_millis();
+    let zone = match q.tz.as_deref() {
+        None => crate::zone::Zone::utc(),
+        Some(name) => crate::zone::Zone::parse(name).map_err(|e| invalid_query("tz", e))?,
+    };
+    let days = q.days.unwrap_or(14).clamp(1, 366) as u32;
+    Ok(Json(daily_stats(
+        &s.db,
+        &id,
+        &zone,
+        days,
+        chrono::Utc::now(),
+    )?))
+}
 
-    let mut by_day: Map<String, Value> = (0..days)
+/// A source's figures by local day in `zone`, the last of the `days` being the
+/// one `now` falls in.
+fn daily_stats(
+    db: &Db,
+    id: &str,
+    zone: &crate::zone::Zone,
+    days: u32,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Value> {
+    let local = crate::zone::Days::ending_today(zone, now, days);
+    let (since, until) = local.span();
+    let mut by_day: Vec<Value> = (0..local.len())
         .map(|i| {
-            let day = (first + chrono::Days::new(i as u64)).to_string();
-            (day, json!({"files": 0, "sent": 0, "rejected": 0}))
+            let day = local.date(i as i64).expect("a day of the window");
+            json!({"day": day.to_string(), "files": 0, "sent": 0, "rejected": 0})
         })
         .collect();
-    for row in s.db.query_json(
+    let by_index = |row: &Value| -> Option<usize> {
+        row["day"]
+            .as_i64()
+            .and_then(|i| usize::try_from(i).ok())
+            .filter(|i| *i < local.len())
+    };
+    for row in db.query_json(
         &format!(
             "SELECT {} AS day, COUNT(*) AS n FROM files
-             WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2 GROUP BY 1",
-            s.db.day("received_at")
+             WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2 AND received_at < $3 GROUP BY 1",
+            local.sql_index("received_at")
         ),
-        params![id, since],
+        params![id, since, until],
     )? {
-        if let Some(entry) = row["day"].as_str().and_then(|d| by_day.get_mut(d)) {
-            entry["files"] = row["n"].clone();
+        if let Some(i) = by_index(&row) {
+            by_day[i]["files"] = row["n"].clone();
         }
     }
-    for row in s.db.query_json(
+    for row in db.query_json(
         &format!(
             "SELECT {} AS day, status, COUNT(*) AS n FROM records
-             WHERE feed_id = $1 AND status IN ('sent', 'rejected') AND updated_at >= $2 GROUP BY 1, status",
-            s.db.day("updated_at")
+             WHERE feed_id = $1 AND status IN ('sent', 'rejected') AND updated_at >= $2 AND updated_at < $3 GROUP BY 1, status",
+            local.sql_index("updated_at")
         ),
-        params![id, since],
+        params![id, since, until],
     )? {
-        if let (Some(entry), Some(status)) = (
-            row["day"].as_str().and_then(|d| by_day.get_mut(d)),
-            row["status"].as_str(),
-        ) {
-            entry[status] = row["n"].clone();
+        if let (Some(i), Some(status)) = (by_index(&row), row["status"].as_str()) {
+            by_day[i][status] = row["n"].clone();
         }
     }
-    let rows: Vec<Value> = by_day
-        .into_iter()
-        .map(|(day, v)| json!({"day": day, "files": v["files"], "sent": v["sent"], "rejected": v["rejected"]}))
-        .collect();
-
-    let today_since = today
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
-        .timestamp_millis();
+    let (today_since, today_until) = local.bounds(local.len() - 1);
+    let last = &by_day[local.len() - 1];
     let today_json = json!({
-        "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2", params![id, today_since])?,
-        "records": count(&s.db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2", params![id, today_since])?,
-        "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status = 'sent' AND updated_at >= $2", params![id, today_since])?,
-        "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status = 'rejected' AND updated_at >= $2", params![id, today_since])?,
-        "pending": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status IN ('received', 'pending')", params![id])?,
+        "files": last["files"],
+        "records": count(db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2 AND f.received_at < $3", params![id, today_since, today_until])?,
+        "sent": last["sent"],
+        "rejected": last["rejected"],
+        "pending": count(db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status IN ('received', 'pending')", params![id])?,
     });
-    Ok(Json(
-        json!({"source": id, "days": days, "today": today_json, "by_day": rows}),
-    ))
+    Ok(
+        json!({"source": id, "days": days, "tz": zone.name(), "today": today_json, "by_day": by_day}),
+    )
 }
 
 async fn list_transforms(State(s): State<AppState>) -> ApiResult {
@@ -816,9 +837,17 @@ async fn get_rule(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult {
 
 /// Parses a rule body, checks its shape and that the source it names exists.
 fn parse_rule(s: &AppState, body: Value) -> Result<Rule, ApiError> {
-    let rule: Rule = serde_json::from_value(body)
+    let mut rule: Rule = serde_json::from_value(body)
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
     crate::alerts::validate_rule(&rule).map_err(|m| ApiError::new(StatusCode::BAD_REQUEST, m))?;
+    // A zone is kept as the database spells it (`europe/madrid` is `Europe/Madrid`).
+    if let Some(zone) = rule
+        .tz
+        .as_deref()
+        .and_then(|tz| crate::zone::Zone::parse(tz).ok())
+    {
+        rule.tz = Some(zone.name().to_string());
+    }
     if let Some(source) = &rule.source_id
         && s.manager.source(source).is_none()
     {
@@ -916,4 +945,142 @@ async fn metrics(State(s): State<AppState>) -> Result<Response, ApiError> {
         ));
     }
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zone::{Zone, utc};
+
+    /// A store with one file and one record per instant: the file received and
+    /// the record `status` at that instant.
+    fn store(rows: &[(&str, &str)]) -> Db {
+        let db = Db::in_memory().unwrap();
+        for (i, (at, status)) in rows.iter().enumerate() {
+            let ms = utc(at).timestamp_millis();
+            let file = db
+                .insert_file("lab", at, &format!("sha-{i}"), 1, "done", None, None, None)
+                .unwrap();
+            db.insert_records(file, "lab", &[(1, json!({}), None)])
+                .unwrap();
+            db.execute_for_test(
+                "UPDATE files SET received_at = $2 WHERE id = $1",
+                &params![file, ms],
+            )
+            .unwrap();
+            db.execute_for_test(
+                "UPDATE records SET status = $2, updated_at = $3 WHERE file_id = $1",
+                &params![file, *status, ms],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    fn day<'a>(stats: &'a Value, date: &str) -> &'a Value {
+        stats["by_day"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["day"] == date)
+            .unwrap_or_else(|| panic!("no {date} in {stats}"))
+    }
+
+    #[test]
+    fn days_are_local_days_across_both_dst_changes() {
+        let db = store(&[
+            // 2026-03-08 in New York (23 hours): 05:00Z to 04:00Z the next day.
+            ("2026-03-08T04:59:59.999Z", "sent"),     // the 7th
+            ("2026-03-08T05:00:00Z", "sent"),         // the 8th
+            ("2026-03-09T03:59:59.999Z", "rejected"), // the 8th
+            ("2026-03-09T04:00:00Z", "sent"),         // the 9th
+            // 2026-11-01 in New York (25 hours): 04:00Z to 05:00Z the next day.
+            ("2026-11-01T03:59:59.999Z", "sent"), // 10-31
+            ("2026-11-01T04:00:00Z", "sent"),     // 11-01
+            ("2026-11-02T04:30:00Z", "rejected"), // 11-01, its 25th hour
+            ("2026-11-02T05:00:00Z", "sent"),     // 11-02
+        ]);
+        let ny = Zone::parse("America/New_York").unwrap();
+        let now = utc("2026-11-02T12:00:00Z");
+        let stats = daily_stats(&db, "lab", &ny, 366, now).unwrap();
+        assert_eq!(stats["tz"], "America/New_York");
+        assert_eq!(stats["by_day"].as_array().unwrap().len(), 366);
+        assert_eq!(stats["by_day"][365]["day"], "2026-11-02");
+        for (date, files, sent, rejected) in [
+            ("2026-03-07", 1, 1, 0),
+            ("2026-03-08", 2, 1, 1),
+            ("2026-03-09", 1, 1, 0),
+            ("2026-10-31", 1, 1, 0),
+            ("2026-11-01", 2, 1, 1),
+            ("2026-11-02", 1, 1, 0),
+        ] {
+            let d = day(&stats, date);
+            assert_eq!(
+                (
+                    d["files"].as_i64(),
+                    d["sent"].as_i64(),
+                    d["rejected"].as_i64()
+                ),
+                (Some(files), Some(sent), Some(rejected)),
+                "{date}"
+            );
+        }
+        assert_eq!(stats["today"]["files"], 1);
+        assert_eq!(stats["today"]["records"], 1);
+
+        // The same rows by UTC day.
+        let stats = daily_stats(&db, "lab", &Zone::utc(), 366, now).unwrap();
+        assert_eq!(stats["tz"], "UTC");
+        for (date, files) in [
+            ("2026-03-08", 2),
+            ("2026-03-09", 2),
+            ("2026-11-01", 2),
+            ("2026-11-02", 2),
+        ] {
+            assert_eq!(day(&stats, date)["files"], files, "{date}");
+        }
+    }
+
+    #[test]
+    fn today_ends_at_the_next_local_midnight() {
+        let db = store(&[
+            ("2026-11-20T04:59:59.999Z", "sent"),     // the 19th in New York
+            ("2026-11-20T05:00:00Z", "sent"),         // the 20th
+            ("2026-11-21T04:59:59.999Z", "rejected"), // the 20th
+            ("2026-11-21T05:00:00Z", "rejected"),     // the 21st: tomorrow, not counted
+        ]);
+        let ny = Zone::parse("America/New_York").unwrap();
+        let stats = daily_stats(&db, "lab", &ny, 2, utc("2026-11-21T04:00:00Z")).unwrap();
+        assert_eq!(
+            stats["today"],
+            json!({"files": 2, "records": 2, "sent": 1, "rejected": 1, "pending": 0})
+        );
+        assert_eq!(
+            stats["by_day"][0],
+            json!({"day": "2026-11-19", "files": 1, "sent": 1, "rejected": 0})
+        );
+        assert_eq!(
+            stats["by_day"][1],
+            json!({"day": "2026-11-20", "files": 2, "sent": 1, "rejected": 1})
+        );
+        // Today's figures are the last day's.
+        assert_eq!(stats["today"]["files"], stats["by_day"][1]["files"]);
+    }
+
+    #[test]
+    fn a_zone_without_dst_and_the_default() {
+        let db = store(&[
+            ("2026-11-19T18:29:59.999Z", "sent"),
+            ("2026-11-19T18:30:00Z", "sent"),
+        ]);
+        let kolkata = Zone::parse("Asia/Kolkata").unwrap();
+        let stats = daily_stats(&db, "lab", &kolkata, 2, utc("2026-11-20T06:00:00Z")).unwrap();
+        assert_eq!(stats["by_day"][0]["files"], 1);
+        assert_eq!(stats["by_day"][1]["files"], 1);
+        let stats =
+            daily_stats(&db, "lab", &Zone::default(), 2, utc("2026-11-20T06:00:00Z")).unwrap();
+        assert_eq!(stats["tz"], "UTC");
+        assert_eq!(stats["by_day"][0]["files"], 2);
+        assert_eq!(stats["today"]["files"], 0);
+    }
 }

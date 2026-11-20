@@ -41,6 +41,7 @@ pub mod source;
 pub mod sqs;
 pub mod transform;
 pub mod worker;
+pub mod zone;
 
 use std::path::Path;
 use std::sync::Arc;

@@ -18,17 +18,17 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /api/sources/{id}/loads` (also `/files`) | Every load: the file, its method, records read, sent, rejected, in progress, how long it took, where it is archived |
 | `GET /api/loads/{id}` | One load with its **failures grouped by reason**: kind, reason, count, first line, and up to three sample rows each |
 | `POST /api/loads/{id}/retry` | Puts the load's rejected rows back at the start, all of them or those with one reason (`{"reason": "..."}`); the source passes at once |
-| `GET /api/sources/{id}/stats?days=14` | What a source's page draws: today (files, records, sent, rejected, pending) and one row per day |
+| `GET /api/sources/{id}/stats?days=14&tz=Europe/Madrid` | What a source's page draws: today (files, records, sent, rejected, pending) and one row per day, oldest first, today last. Days are local days in `tz` (UTC without it), and the answer's `tz` names the zone they were counted in: see [Days and time zones](#days-and-time-zones) |
 | `GET /api/transforms` | Every transform file: name, path, size, modified, and the sources that use it |
 | `GET /api/transforms/{name}` | The transform's code |
 | `PUT /api/transforms/{name}` | Saves the code (`{"code": "..."}`); the sources using it restart their Python worker. `201` when new |
 | `POST /api/transforms/{name}/try` | Runs the transform on `{"records": [...]}` (up to 100) without loading: per record, the resources it became or the rejection reason. At most four tries run at once; `503` when one cannot start within 10 s |
-| `GET /api/monitoring/status` | What the monitoring page opens on: `needs_you` (late, paused, or rejecting sources with the reason), `last_24h` (files, sent, rejected, alerts), every source |
+| `GET /api/monitoring/status` | What the monitoring page opens on: `needs_you` (late, paused, or rejecting sources with the reason), `last_24h` (files, sent, rejected, alerts), every source. Its figures cover the last 24 hours, not calendar days, so it takes no `tz` |
 | `GET /api/records?source=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
 | `GET /api/records/{id}` | One record: file, line, original and corrected row, resources sent, HFS response |
 | `POST /api/records/{id}/reprocess` | Runs a record again; body `{"raw": {...}}` replaces the row and keeps the original |
 | `GET /api/alerts?source=&open=true` | Alerts, newest first, each with its rule, recipients, channels, and when and why it cleared; `open=true` lists only those not cleared |
-| `GET /api/alert-rules?source=` | Every rule; `POST` creates one (`400` names what is wrong with it) |
+| `GET /api/alert-rules?source=` | Every rule; `POST` creates one (`400` names what is wrong with it). A `missing_by` rule may name a `tz` (see [sources](sources.md#alerts-and-rules)) |
 | `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove |
 | `GET /api/secrets` | Every stored credential, by name, without its value |
 | `POST /api/secrets` | Stores a credential: `{"name", "kind": "aws", "value": {"access_key_id", "secret_access_key"}}`. `201` |
@@ -38,7 +38,15 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind |
 | `GET /health` | `{"status": "ok", "service": "hie", "version", "uptime_seconds", "started_at", "timestamp", "secrets"}`; `secrets` is `{"backend": "native"\|"none", "available", "key_id"}`, the key id being a one-way 16-hex fingerprint of the key in use, or `null` |
 
-Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), and the codes of the credential routes below.
+Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), `invalid_query` (`400` with `field`: a query parameter that cannot be used, such as an unknown `tz`; the sentence never repeats what was sent), and the codes of the credential routes below.
+
+### Days and time zones
+
+Daily figures are counted in UTC unless the request names a zone with `tz`, an IANA name such as `Europe/Madrid` or `America/New_York` (matched without regard to case; a `+` is sent as `%2B`, as in `Etc/GMT%2B5`). The answer's `tz` names the zone used, as the database spells it, and is `UTC` when none was asked for; a client that wants its own zone's days checks it before labelling them. A name that is not a zone answers `400` `{"error": "tz must be an IANA time zone name, such as Europe/Madrid or UTC", "code": "invalid_query", "field": "tz"}`; a `tz` given twice is refused before that, with a plain-text `400`.
+
+- A day runs from local midnight to the next local midnight. When a change to or from daylight saving time skips midnight, the day starts at the change, the first valid moment after it; when it repeats midnight, the day starts at the first one.
+- So a day with a change lasts 23 or 25 hours, as it did on the clock, and a date the zone skipped altogether is a day with nothing in it.
+- Zone rules come from the IANA database built into the engine, the same on every instance and never the host's; a release brings newer rules.
 
 ### Secrets
 

@@ -1,6 +1,7 @@
-//! Alert rules end to end: the rule a source is born with, the CRUD, and the two
-//! rule kinds a test can provoke quickly — too many rejected rows, and silence —
-//! each firing once and clearing itself.
+//! Alert rules end to end: the rule a source is born with, the CRUD, and the
+//! rule kinds a test can provoke quickly — too many rejected rows, silence, and a
+//! file missing by midnight (in UTC and in a zone) — each firing once and
+//! clearing itself.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -361,4 +362,157 @@ async fn silence_fires_once_and_clears_when_data_arrives() {
         alert(&alerts, "silence").unwrap()["cleared_reason"],
         "Lab results: data arrived"
     );
+}
+
+/// The alert a rule raised, by rule id.
+fn alert_of(alerts: &Value, rule: i64) -> Option<&Value> {
+    alerts["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["rule_id"] == rule)
+}
+
+#[tokio::test]
+async fn missing_by_rules_take_a_time_zone_and_fire_in_it() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let lab = lab(&python).await;
+
+    // Refusals: a zone that does not exist, and a zone on a rule without a time of day.
+    for (body, reason) in [
+        (
+            json!({"condition": "missing_by", "threshold": "06:00", "tz": "Mars/Base"}),
+            "tz must be an IANA time zone name, such as Europe/Madrid or UTC",
+        ),
+        (
+            json!({"condition": "missing_by", "threshold": "06:00", "tz": "Etc/Unknown"}),
+            "tz must be an IANA time zone name, such as Europe/Madrid or UTC",
+        ),
+        (
+            json!({"condition": "silence", "threshold": "2h", "tz": "Europe/Madrid"}),
+            "tz applies only to missing_by rules",
+        ),
+    ] {
+        let r = lab.post("/api/alert-rules", body).await;
+        assert_eq!(r.status(), 400);
+        assert_eq!(r.json::<Value>().await.unwrap()["error"], reason);
+    }
+
+    // 00:00 has always passed, in any zone: both rules are due at once. The
+    // zone is kept as the database spells it; no zone reads back as null (UTC).
+    let created = lab
+        .post(
+            "/api/alert-rules",
+            json!({"source_id": "lab-results", "condition": "missing_by", "threshold": "00:00", "tz": "pacific/kiritimati"}),
+        )
+        .await;
+    assert_eq!(created.status(), 201);
+    let zoned: Value = created.json().await.unwrap();
+    assert_eq!(zoned["tz"], "Pacific/Kiritimati");
+    let zoned = zoned["id"].as_i64().unwrap();
+    assert_eq!(
+        lab.get(&format!("/api/alert-rules/{zoned}")).await["tz"],
+        "Pacific/Kiritimati"
+    );
+    let created = lab
+        .post(
+            "/api/alert-rules",
+            json!({"source_id": "lab-results", "condition": "missing_by", "threshold": "00:00"}),
+        )
+        .await;
+    assert_eq!(created.status(), 201);
+    let plain: Value = created.json().await.unwrap();
+    assert_eq!(plain["tz"], Value::Null);
+    let plain = plain["id"].as_i64().unwrap();
+
+    let alerts = lab
+        .wait_for("both missing_by alerts", |a| {
+            alert_of(a, zoned).is_some() && alert_of(a, plain).is_some()
+        })
+        .await;
+    assert_eq!(
+        alert_of(&alerts, plain).unwrap()["message"],
+        "Lab results: nothing has arrived today and the file was expected by 00:00 UTC"
+    );
+    assert_eq!(
+        alert_of(&alerts, zoned).unwrap()["message"],
+        "Lab results: nothing has arrived today and the file was expected by 00:00 Pacific/Kiritimati"
+    );
+
+    // A file now is today's in every zone: both clear.
+    lab.drop_file("labs.csv").await;
+    let alerts = lab
+        .wait_for("both missing_by alerts to clear", |a| {
+            [zoned, plain]
+                .iter()
+                .all(|id| alert_of(a, *id).is_some_and(|x| !x["cleared_at"].is_null()))
+        })
+        .await;
+    assert_eq!(
+        alert_of(&alerts, zoned).unwrap()["cleared_reason"],
+        "Lab results: the file arrived"
+    );
+
+    // Replacing the rule without a zone puts it back on UTC.
+    let r = lab
+        .http
+        .put(format!("{}/api/alert-rules/{zoned}", lab.api))
+        .json(&json!({"source_id": "lab-results", "condition": "missing_by", "threshold": "06:00"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        lab.get(&format!("/api/alert-rules/{zoned}")).await["tz"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn stats_count_local_days_and_echo_the_zone() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let lab = lab(&python).await;
+    let stats = lab.get("/api/sources/lab-results/stats?days=3").await;
+    assert_eq!(stats["tz"], "UTC");
+    assert_eq!(stats["by_day"].as_array().unwrap().len(), 3);
+    let today = chrono::Utc::now().date_naive().to_string();
+    let last = stats["by_day"][2]["day"].as_str().unwrap().to_string();
+    // Unless the test straddles midnight, the last day is the UTC date.
+    assert!(last <= today, "{last} vs {today}");
+
+    let stats = lab
+        .get("/api/sources/lab-results/stats?days=2&tz=asia/kathmandu")
+        .await;
+    assert_eq!(stats["tz"], "Asia/Kathmandu");
+    assert_eq!(stats["by_day"].as_array().unwrap().len(), 2);
+    // `+` is sent as %2B.
+    let stats = lab
+        .get("/api/sources/lab-results/stats?tz=Etc/GMT%2B5")
+        .await;
+    assert_eq!(stats["tz"], "Etc/GMT+5");
+
+    for zone in ["Mars/Base", "", "Etc/Unknown"] {
+        let r = lab
+            .http
+            .get(format!("{}/api/sources/lab-results/stats", lab.api))
+            .query(&[("tz", zone)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{zone:?}");
+        assert_eq!(
+            r.json::<Value>().await.unwrap(),
+            json!({
+                "error": "tz must be an IANA time zone name, such as Europe/Madrid or UTC",
+                "code": "invalid_query",
+                "field": "tz"
+            })
+        );
+    }
 }

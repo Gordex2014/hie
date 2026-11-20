@@ -34,6 +34,8 @@ getrandom = { version = "0.4", optional = true }
 helios-auth = "0.2"
 hex = "0.4.3"
 hkdf = { version = "0.13", optional = true }
+# Time zones, from the IANA database built into the engine (jiff-tzdb), never the host's.
+jiff = { version = "1.0.1", default-features = false, features = ["std", "tzdb-bundle-always"] }
 # Only to wipe HMAC state: hkdf already depends on it.
 hmac = { version = "0.13", default-features = false, features = ["zeroize"], optional = true }
 http = "1"

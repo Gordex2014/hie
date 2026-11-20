@@ -78,8 +78,10 @@ Alerts are governed by **rules**: data, created and edited over the API, each na
 | Condition | Threshold | Fires when | Clears when |
 |-----------|-----------|------------|-------------|
 | `silence` | a duration, `2h` | nothing has arrived for longer than that | data arrives |
-| `missing_by` | a time of day in UTC, `06:00` | that time passes and nothing arrived today | the file arrives |
+| `missing_by` | a time of day, `06:00`, in the rule's `tz` (UTC without one) | that time passes and nothing arrived today | the file arrives |
 | `rejected_share` | a percentage, `10%` | a load has more than that share of rows rejected | a later load is within the limit |
 | `unreachable` | a number of attempts, `5` | delivery to HFS has failed that many times in a row | delivery succeeds |
+
+A `missing_by` rule may carry `tz`, an IANA time zone name, so that both its time and "today" are the zone's: `{"source_id": "lab-results", "condition": "missing_by", "threshold": "06:00", "tz": "Europe/Madrid"}`. The name is kept as the database spells it, and a rule without one (or with `"tz": null`) stays in UTC. Only `missing_by` takes a zone; a name that is not a zone, or a zone on another condition, is refused with `400`. Today runs from local midnight to the next. A time skipped by a change to daylight saving time is due at the change, the first valid moment after it; a time that happens twice is due at its first occurrence. When that pushes a deadline to the next midnight, the alert fires as the next day begins, for the day before, if nothing arrived that day.
 
 A condition raises **one** alert per rule and source, open until it clears itself; the alert keeps its rule, who was notified, the channels, and the clearing time and reason. `app` alerts are what the UI lists; `webhook` posts them to `alerts.webhook_url` (the `text` field is the shape Slack and Teams accept); `email` is accepted and recorded, with no mail sink wired yet. A source with no `rejected_share` rule alerts on every load that rejects rows, and one with no `unreachable` rule alerts after `delivery.alert_after_attempts`.
