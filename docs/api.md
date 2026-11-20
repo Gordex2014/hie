@@ -27,7 +27,7 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /api/records?source=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
 | `GET /api/records/{id}` | One record: file, line, original and corrected row, resources sent, HFS response |
 | `POST /api/records/{id}/reprocess` | Runs a record again; body `{"raw": {...}}` replaces the row and keeps the original |
-| `GET /api/alerts?source=&open=true` | Alerts, newest first, each with its rule, recipients, channels, and when and why it cleared; `open=true` lists only those not cleared |
+| `GET /api/alerts?source=&open=true` | Alerts, newest first, each with its rule, recipients, channels, when and why it cleared, and `webhook`: the delivery of its latest webhook event (`event`, `event_id`, `state`, `attempts`, `last_error`, `last_status`, `delivered_at`; null for alerts from before events were recorded); `open=true` lists only those not cleared. Also `webhook: {configured, signed}`, this instance's webhook settings. See [the alert webhook](sources.md#the-alert-webhook) |
 | `GET /api/alert-rules?source=` | Every rule; `POST` creates one (`400` names what is wrong with it) |
 | `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove |
 | `GET /api/secrets` | Every stored credential, by name, without its value |

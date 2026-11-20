@@ -108,6 +108,24 @@ CREATE TABLE IF NOT EXISTS alert_rules (
   created_by TEXT,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS alert_webhooks (
+  id INTEGER PRIMARY KEY,
+  event_id TEXT NOT NULL UNIQUE,
+  alert_id INTEGER NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
+  event TEXT NOT NULL,
+  destination TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  state TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  last_status INTEGER,
+  delivered_at INTEGER,
+  created_at INTEGER NOT NULL,
+  UNIQUE (alert_id, event)
+);
+CREATE INDEX IF NOT EXISTS alert_webhooks_due ON alert_webhooks(state, destination, next_attempt_at);
+CREATE INDEX IF NOT EXISTS alert_webhooks_alert ON alert_webhooks(alert_id, id);
 ";
 
 /// Columns added after a store was first created; each is added when missing.
@@ -205,6 +223,52 @@ pub struct Lease {
     pub owner: String,
     pub until: i64,
 }
+
+/// An alert as stored, with its times as the API formats them, for the webhook
+/// event written with it.
+#[derive(Debug, Clone)]
+pub struct AlertRow {
+    pub id: i64,
+    pub feed_id: Option<String>,
+    pub kind: String,
+    pub message: String,
+    pub rule_id: Option<i64>,
+    pub notify: Vec<String>,
+    /// The rule's channels when it fired; `None` for an alert without a rule.
+    pub channels: Option<Vec<String>>,
+    pub created_at: String,
+    pub cleared_at: Option<String>,
+    pub cleared_reason: Option<String>,
+}
+
+/// The webhook event written in the same transaction as an alert's change.
+#[derive(Debug, Clone)]
+pub struct NewWebhook {
+    pub event_id: String,
+    pub event: &'static str,
+    /// Which webhook URL the event is for (a fingerprint, never the URL), or
+    /// `""` when nothing is to be sent.
+    pub destination: String,
+    pub payload: String,
+    pub state: &'static str,
+}
+
+/// A webhook attempt this instance claimed: `attempt` fences its outcome.
+#[derive(Debug, Clone)]
+pub struct WebhookClaim {
+    pub event_id: String,
+    pub alert_id: i64,
+    pub event: String,
+    pub attempt: u32,
+    pub payload: String,
+}
+
+/// A `cleared` event waits while the `fired` event of its alert for the same
+/// destination is still pending. Written against the unaliased table.
+const WEBHOOK_UNBLOCKED: &str = "NOT (alert_webhooks.event = 'cleared' AND EXISTS (
+    SELECT 1 FROM alert_webhooks f
+    WHERE f.alert_id = alert_webhooks.alert_id AND f.event = 'fired'
+      AND f.state = 'pending' AND f.destination = alert_webhooks.destination))";
 
 /// Rows per multi-row statement: well under both engines' parameter limits.
 const INSERT_ROWS_PER_STATEMENT: usize = 200;
@@ -1621,26 +1685,87 @@ impl Db {
 
     // ---- alerts ----------------------------------------------------------------
 
+    /// The columns `AlertRow` is read from, as a `RETURNING` or `SELECT` list.
+    fn alert_columns(&self) -> String {
+        format!(
+            "id, feed_id, kind, message, rule_id, notify, channels, {} AS created_at, {} AS cleared_at, cleared_reason",
+            self.iso("created_at"),
+            self.iso("cleared_at")
+        )
+    }
+
+    fn alert_row(r: &Row) -> AlertRow {
+        let list = |i: usize| -> Option<Vec<String>> {
+            r.json(i).and_then(|v| serde_json::from_value(v).ok())
+        };
+        AlertRow {
+            id: r.i64(0),
+            feed_id: r.opt_string(1),
+            kind: r.string(2),
+            message: r.string(3),
+            rule_id: r.opt_i64(4),
+            notify: list(5).unwrap_or_default(),
+            channels: list(6),
+            created_at: r.string(7),
+            cleared_at: r.opt_string(8),
+            cleared_reason: r.opt_string(9),
+        }
+    }
+
+    fn insert_webhook(c: &mut Conn, alert_id: i64, w: &NewWebhook, now: i64) -> Result<()> {
+        c.execute(
+            "INSERT INTO alert_webhooks (event_id, alert_id, event, destination, payload, state, attempts, next_attempt_at, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $7)",
+            &params![w.event_id, alert_id, w.event, w.destination, w.payload, w.state, now],
+        )
+        .map(drop)
+    }
+
+    /// Records an alert and, in the same transaction, the webhook event `webhook`
+    /// builds from the stored row.
     pub fn insert_alert(
         &self,
         feed: Option<&str>,
         kind: &str,
         message: &str,
         rule: Option<&Rule>,
-    ) -> Result<i64> {
-        self.insert_returning_id(
-            "INSERT INTO alerts (feed_id, kind, message, created_at, rule_id, notify, channels)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            &params![
-                feed,
-                kind,
-                message,
-                now_ms(),
-                rule.map(|r| r.id),
-                rule.map(|r| serde_json::to_string(&r.notify).unwrap_or_default()),
-                rule.map(|r| serde_json::to_string(&r.channels).unwrap_or_default()),
-            ],
-        )
+        now: i64,
+        webhook: impl FnOnce(&AlertRow) -> NewWebhook,
+    ) -> Result<AlertRow> {
+        let columns = self.alert_columns();
+        self.with(|c| {
+            c.batch("BEGIN")?;
+            let result = (|| {
+                let row = c
+                    .query(
+                        &format!(
+                            "INSERT INTO alerts (feed_id, kind, message, created_at, rule_id, notify, channels)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {columns}"
+                        ),
+                        &params![
+                            feed,
+                            kind,
+                            message,
+                            now,
+                            rule.map(|r| r.id),
+                            rule.map(|r| serde_json::to_string(&r.notify).unwrap_or_default()),
+                            rule.map(|r| serde_json::to_string(&r.channels).unwrap_or_default()),
+                        ],
+                    )?
+                    .first()
+                    .map(Self::alert_row)
+                    .context("INSERT returned no alert")?;
+                Self::insert_webhook(c, row.id, &webhook(&row), now)?;
+                Ok::<_, anyhow::Error>(row)
+            })();
+            match result {
+                Ok(row) => c.batch("COMMIT").map(|()| row),
+                Err(e) => {
+                    let _ = c.batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
     }
 
     /// The open alert (not cleared) of this kind for a source and rule, if any.
@@ -1660,12 +1785,172 @@ impl Db {
             .map(|r| (r.i64(0), r.i64(1))))
     }
 
-    pub fn clear_alert(&self, id: i64, reason: &str) -> Result<()> {
+    /// Clears an open alert and, in the same transaction, records the webhook
+    /// event `webhook` builds from the cleared row. `None` when the alert was
+    /// already cleared (by another instance, say): then nothing is written.
+    pub fn clear_alert(
+        &self,
+        id: i64,
+        reason: &str,
+        now: i64,
+        webhook: impl FnOnce(&AlertRow) -> NewWebhook,
+    ) -> Result<Option<AlertRow>> {
+        let columns = self.alert_columns();
+        self.with(|c| {
+            c.batch("BEGIN")?;
+            let result = (|| {
+                let Some(row) = c
+                    .query(
+                        &format!(
+                            "UPDATE alerts SET cleared_at = $2, cleared_reason = $3
+                             WHERE id = $1 AND cleared_at IS NULL RETURNING {columns}"
+                        ),
+                        &params![id, now, reason],
+                    )?
+                    .first()
+                    .map(Self::alert_row)
+                else {
+                    return Ok(None);
+                };
+                Self::insert_webhook(c, row.id, &webhook(&row), now)?;
+                Ok::<_, anyhow::Error>(Some(row))
+            })();
+            match result {
+                Ok(row) => c.batch("COMMIT").map(|()| row),
+                Err(e) => {
+                    let _ = c.batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    // ---- alert webhook deliveries --------------------------------------------
+
+    /// Ends the rows whose last allowed attempt was claimed and never recorded
+    /// (the process died during it): `failed`, never sent again. Returns how many.
+    pub fn webhook_expire_exhausted(&self, now: i64, max_attempts: u32) -> Result<u64> {
         self.execute(
-            "UPDATE alerts SET cleared_at = $2, cleared_reason = $3 WHERE id = $1 AND cleared_at IS NULL",
-            &params![id, now_ms(), reason],
+            "UPDATE alert_webhooks SET state = 'failed', last_error = $1, last_status = NULL
+             WHERE state = 'pending' AND attempts >= $2 AND next_attempt_at <= $3",
+            &params![
+                "no outcome recorded for the last attempt",
+                max_attempts,
+                now
+            ],
         )
-        .map(drop)
+    }
+
+    /// The events for `destination` that may be attempted now, oldest first.
+    pub fn webhook_due(
+        &self,
+        destination: &str,
+        now: i64,
+        max_attempts: u32,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .query(
+                &format!(
+                    "SELECT event_id FROM alert_webhooks
+                     WHERE state = 'pending' AND destination = $1 AND next_attempt_at <= $2
+                       AND attempts < $3 AND {WEBHOOK_UNBLOCKED}
+                     ORDER BY id LIMIT $4"
+                ),
+                &params![destination, now, max_attempts, limit],
+            )?
+            .iter()
+            .map(|r| r.string(0))
+            .collect())
+    }
+
+    /// When the next event for `destination` falls due (or a claim on one runs
+    /// out), counting only events the ordering rule does not hold back.
+    pub fn webhook_next_due(&self, destination: &str) -> Result<Option<i64>> {
+        Ok(self
+            .query_one(
+                &format!(
+                    "SELECT MIN(next_attempt_at) FROM alert_webhooks
+                     WHERE state = 'pending' AND destination = $1 AND {WEBHOOK_UNBLOCKED}"
+                ),
+                &params![destination],
+            )?
+            .and_then(|r| r.opt_i64(0)))
+    }
+
+    /// Claims the next attempt of an event until `lease_until`: one statement,
+    /// so of several instances on the store only one gets it. `None` when the
+    /// event is not due (any more), is held back, or belongs to another
+    /// destination.
+    pub fn webhook_claim(
+        &self,
+        event_id: &str,
+        destination: &str,
+        now: i64,
+        lease_until: i64,
+        max_attempts: u32,
+    ) -> Result<Option<WebhookClaim>> {
+        Ok(self
+            .query_one(
+                &format!(
+                    "UPDATE alert_webhooks SET attempts = attempts + 1, next_attempt_at = $3
+                     WHERE event_id = $1 AND destination = $2 AND state = 'pending'
+                       AND next_attempt_at <= $4 AND attempts < $5 AND {WEBHOOK_UNBLOCKED}
+                     RETURNING event_id, alert_id, event, attempts, payload"
+                ),
+                &params![event_id, destination, lease_until, now, max_attempts],
+            )?
+            .map(|r| WebhookClaim {
+                event_id: r.string(0),
+                alert_id: r.i64(1),
+                event: r.string(2),
+                attempt: r.i64(3) as u32,
+                payload: r.string(4),
+            }))
+    }
+
+    /// Records that a claimed attempt was delivered. `false` when the claim is
+    /// no longer this attempt's (it ran out and was taken again, or the alert
+    /// was removed): nothing changes.
+    pub fn webhook_delivered(
+        &self,
+        event_id: &str,
+        attempt: u32,
+        status: u16,
+        now: i64,
+    ) -> Result<bool> {
+        Ok(self.execute(
+            "UPDATE alert_webhooks SET state = 'delivered', delivered_at = $3, last_status = $4
+             WHERE event_id = $1 AND state = 'pending' AND attempts = $2",
+            &params![event_id, attempt, now, status as i64],
+        )? > 0)
+    }
+
+    /// Records a failed claimed attempt, with the receiver's HTTP status when
+    /// it answered: due again at `retry_at`, or `failed` for good when there is
+    /// none. Fenced like `webhook_delivered`.
+    pub fn webhook_attempt_failed(
+        &self,
+        event_id: &str,
+        attempt: u32,
+        error: &str,
+        status: Option<u16>,
+        retry_at: Option<i64>,
+    ) -> Result<bool> {
+        let status = status.map(i64::from);
+        let n = match retry_at {
+            Some(at) => self.execute(
+                "UPDATE alert_webhooks SET last_error = $3, last_status = $4, next_attempt_at = $5
+                 WHERE event_id = $1 AND state = 'pending' AND attempts = $2",
+                &params![event_id, attempt, error, status, at],
+            )?,
+            None => self.execute(
+                "UPDATE alert_webhooks SET state = 'failed', last_error = $3, last_status = $4
+                 WHERE event_id = $1 AND state = 'pending' AND attempts = $2",
+                &params![event_id, attempt, error, status],
+            )?,
+        };
+        Ok(n > 0)
     }
 
     // ---- alert rules -------------------------------------------------------
@@ -1846,6 +2131,223 @@ fn redact(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- alert webhook events: the store's side, with time passed in -------
+
+    fn hook(event_id: &str, event: &'static str, destination: &str) -> NewWebhook {
+        NewWebhook {
+            event_id: event_id.into(),
+            event,
+            destination: destination.into(),
+            payload: format!("{{\"event_id\":\"{event_id}\"}}"),
+            state: "pending",
+        }
+    }
+
+    /// Two handles on one store, as two engine instances have.
+    fn two_handles() -> (tempfile::TempDir, Db, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hie.db");
+        let (a, b) = (Db::open(&path).unwrap(), Db::open(&path).unwrap());
+        (dir, a, b)
+    }
+
+    fn fire(db: &Db, event_id: &str, destination: &str) -> i64 {
+        db.insert_alert(Some("src"), "silence", "quiet", None, 1_000, |_| {
+            hook(event_id, "fired", destination)
+        })
+        .unwrap()
+        .id
+    }
+
+    fn state(db: &Db, event_id: &str) -> (String, i64, Option<String>) {
+        let r = db
+            .query_one(
+                "SELECT state, attempts, last_error FROM alert_webhooks WHERE event_id = $1",
+                &params![event_id],
+            )
+            .unwrap()
+            .unwrap();
+        (r.string(0), r.i64(1), r.opt_string(2))
+    }
+
+    #[test]
+    fn one_instance_wins_a_claim() {
+        let (_dir, a, b) = two_handles();
+        fire(&a, "e1", "d");
+        let first = a.webhook_claim("e1", "d", 2_000, 62_000, 6).unwrap();
+        let second = b.webhook_claim("e1", "d", 2_000, 62_000, 6).unwrap();
+        assert_eq!(first.as_ref().map(|c| c.attempt), Some(1));
+        assert!(second.is_none());
+        assert!(b.webhook_due("d", 2_000, 6, 10).unwrap().is_empty());
+        // Another destination's sender never takes it.
+        assert!(
+            b.webhook_claim("e1", "other", 70_000, 130_000, 6)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_late_outcome_after_the_claim_ran_out_changes_nothing() {
+        let (_dir, a, b) = two_handles();
+        fire(&a, "e1", "d");
+        let stale = a
+            .webhook_claim("e1", "d", 2_000, 62_000, 6)
+            .unwrap()
+            .unwrap();
+        // The lease runs out; the other instance takes the next attempt and delivers.
+        let fresh = b
+            .webhook_claim("e1", "d", 63_000, 123_000, 6)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.attempt, 2);
+        assert!(
+            b.webhook_delivered("e1", fresh.attempt, 200, 64_000)
+                .unwrap()
+        );
+        assert!(
+            !a.webhook_attempt_failed("e1", stale.attempt, "timeout", None, Some(70_000))
+                .unwrap()
+        );
+        assert_eq!(state(&a, "e1").0, "delivered");
+    }
+
+    #[test]
+    fn a_late_outcome_never_touches_a_replacement_event() {
+        let (_dir, a, _b) = two_handles();
+        let alert = fire(&a, "old", "d");
+        let stale = a
+            .webhook_claim("old", "d", 2_000, 62_000, 6)
+            .unwrap()
+            .unwrap();
+        a.execute("DELETE FROM alerts WHERE id = $1", &params![alert])
+            .unwrap();
+        assert!(state_missing(&a, "old"), "the event goes with its alert");
+        fire(&a, "new", "d");
+        let fresh = a
+            .webhook_claim("new", "d", 3_000, 63_000, 6)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.attempt, stale.attempt);
+        assert!(
+            !a.webhook_delivered("old", stale.attempt, 200, 4_000)
+                .unwrap()
+        );
+        assert_eq!(state(&a, "new").0, "pending");
+    }
+
+    fn state_missing(db: &Db, event_id: &str) -> bool {
+        db.query_one(
+            "SELECT 1 FROM alert_webhooks WHERE event_id = $1",
+            &params![event_id],
+        )
+        .unwrap()
+        .is_none()
+    }
+
+    #[test]
+    fn a_last_attempt_with_no_outcome_ends_failed_and_frees_the_clear() {
+        let (_dir, a, _b) = two_handles();
+        let alert = fire(&a, "f", "d");
+        let mut now = 2_000;
+        for attempt in 1..=5 {
+            let c = a
+                .webhook_claim("f", "d", now, now + 60_000, 6)
+                .unwrap()
+                .unwrap();
+            assert_eq!(c.attempt, attempt);
+            a.webhook_attempt_failed(
+                "f",
+                attempt,
+                "HTTP 500 Internal Server Error",
+                Some(500),
+                Some(now + 1),
+            )
+            .unwrap();
+            now += 10;
+        }
+        a.clear_alert(alert, "back", now, |_| hook("c", "cleared", "d"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            a.webhook_due("d", now, 6, 10).unwrap(),
+            ["f"],
+            "the clear waits"
+        );
+        // The sixth attempt is claimed and the process dies before recording it.
+        a.webhook_claim("f", "d", now, now + 60_000, 6)
+            .unwrap()
+            .unwrap();
+        assert!(a.webhook_due("d", now + 61_000, 6, 10).unwrap().is_empty());
+        assert_eq!(a.webhook_expire_exhausted(now + 61_000, 6).unwrap(), 1);
+        let (st, attempts, error) = state(&a, "f");
+        assert_eq!((st.as_str(), attempts), ("failed", 6));
+        assert_eq!(
+            error.as_deref(),
+            Some("no outcome recorded for the last attempt")
+        );
+        assert!(
+            a.webhook_claim("f", "d", now + 62_000, now + 122_000, 6)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(a.webhook_due("d", now + 62_000, 6, 10).unwrap(), ["c"]);
+    }
+
+    #[test]
+    fn a_clear_waits_only_for_its_fire_at_the_same_destination() {
+        let (_dir, a, _b) = two_handles();
+        let one = fire(&a, "f1", "d");
+        a.clear_alert(one, "back", 2_000, |_| hook("c1", "cleared", "d"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            a.webhook_claim("c1", "d", 3_000, 63_000, 6)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            a.webhook_next_due("d").unwrap(),
+            Some(1_000),
+            "only the fire counts"
+        );
+        // Fired for an earlier URL, parked; cleared for the current one: not held back.
+        let two = fire(&a, "f2", "old");
+        a.clear_alert(two, "back", 2_000, |_| hook("c2", "cleared", "new"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.webhook_due("new", 3_000, 6, 10).unwrap(), ["c2"]);
+    }
+
+    #[test]
+    fn an_alert_clears_once_and_rolls_back_whole() {
+        let (_dir, a, b) = two_handles();
+        let id = fire(&a, "f", "");
+        let cleared = a
+            .clear_alert(id, "back", 2_000, |row| {
+                assert_eq!(row.cleared_reason.as_deref(), Some("back"));
+                assert!(row.cleared_at.is_some());
+                hook("c", "cleared", "")
+            })
+            .unwrap();
+        assert!(cleared.is_some());
+        assert!(
+            b.clear_alert(id, "again", 3_000, |_| hook("c2", "cleared", ""))
+                .unwrap()
+                .is_none()
+        );
+        assert!(state_missing(&a, "c2"));
+        // An event that cannot be written (its id is taken) leaves no alert behind.
+        let before = a.query("SELECT id FROM alerts", &[]).unwrap().len();
+        assert!(
+            a.insert_alert(Some("src"), "silence", "quiet", None, 4_000, |_| hook(
+                "f", "fired", ""
+            ))
+            .is_err()
+        );
+        assert_eq!(a.query("SELECT id FROM alerts", &[]).unwrap().len(), before);
+    }
 
     #[test]
     fn params_take_the_usual_values() {

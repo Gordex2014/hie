@@ -26,6 +26,8 @@ pub struct AppState {
     pub bulk_dir: std::path::PathBuf,
     /// Connector credentials, or why there are none.
     pub secrets: crate::secrets::Secrets,
+    /// Alerts and their webhook: whether one is configured, and for which URL.
+    pub alerts: Arc<crate::alerts::Alerter>,
 }
 
 /// When the process came up, for the uptime that `/health` reports.
@@ -764,32 +766,79 @@ struct AlertQuery {
 }
 
 async fn list_alerts(State(s): State<AppState>, Query(q): Query<AlertQuery>) -> ApiResult {
+    // Each alert with its latest webhook event, read in the same statement. A
+    // pending event written for another URL than this instance's is `parked`.
     let rows = s.db.query_json(
         &format!(
-            "SELECT id, feed_id AS source_id, kind, message, rule_id, notify, channels,
-                    {} AS created_at, {} AS cleared_at, cleared_reason
+            "SELECT alerts.id, alerts.feed_id AS source_id, alerts.kind, alerts.message, alerts.rule_id,
+                    alerts.notify, alerts.channels,
+                    {} AS created_at, {} AS cleared_at, alerts.cleared_reason,
+                    w.event AS webhook_event, w.event_id AS webhook_event_id,
+                    CASE WHEN w.state = 'pending' AND w.destination <> CAST($4 AS TEXT) THEN 'parked' ELSE w.state END AS webhook_state,
+                    w.attempts AS webhook_attempts, w.last_error AS webhook_last_error,
+                    w.last_status AS webhook_last_status,
+                    {} AS webhook_delivered_at
              FROM alerts
-             WHERE (CAST($1 AS TEXT) IS NULL OR feed_id = CAST($1 AS TEXT)) AND (CAST($3 AS BIGINT) = 0 OR cleared_at IS NULL)
-             ORDER BY id DESC LIMIT $2",
-            s.db.iso("created_at"),
-            s.db.iso("cleared_at")
+             LEFT JOIN alert_webhooks w
+               ON w.id = (SELECT MAX(x.id) FROM alert_webhooks x WHERE x.alert_id = alerts.id)
+             WHERE (CAST($1 AS TEXT) IS NULL OR alerts.feed_id = CAST($1 AS TEXT))
+               AND (CAST($3 AS BIGINT) = 0 OR alerts.cleared_at IS NULL)
+             ORDER BY alerts.id DESC LIMIT $2",
+            s.db.iso("alerts.created_at"),
+            s.db.iso("alerts.cleared_at"),
+            s.db.iso("w.delivered_at")
         ),
-        params![q.source, q.limit.unwrap_or(100), q.open.unwrap_or(false)],
+        params![
+            q.source,
+            q.limit.unwrap_or(100),
+            q.open.unwrap_or(false),
+            s.alerts.destination()
+        ],
     )?;
-    let rows: Vec<Value> = rows
-        .into_iter()
-        .map(|mut row| {
-            for key in ["notify", "channels"] {
-                if let Some(Value::String(text)) = row.get(key) {
-                    let parsed =
-                        serde_json::from_str::<Value>(text).unwrap_or(Value::Array(vec![]));
-                    row[key] = parsed;
-                }
-            }
-            row
-        })
-        .collect();
-    Ok(Json(json!({"alerts": rows})))
+    let rows: Vec<Value> = rows.into_iter().map(alert_json).collect();
+    let (configured, signed) = s.alerts.webhook_status();
+    Ok(Json(json!({
+        "alerts": rows,
+        "webhook": {"configured": configured, "signed": signed},
+    })))
+}
+
+/// An alert row as the API answers it: the stored lists parsed, and the
+/// `webhook_*` columns folded into `webhook` (`null` for an alert recorded
+/// before events were).
+fn alert_json(mut row: Value) -> Value {
+    for key in ["notify", "channels"] {
+        if let Some(Value::String(text)) = row.get(key) {
+            let parsed = serde_json::from_str::<Value>(text).unwrap_or(Value::Array(vec![]));
+            row[key] = parsed;
+        }
+    }
+    let Some(obj) = row.as_object_mut() else {
+        return row;
+    };
+    let mut webhook = serde_json::Map::new();
+    for key in [
+        "event",
+        "event_id",
+        "state",
+        "attempts",
+        "last_error",
+        "last_status",
+        "delivered_at",
+    ] {
+        let value = obj.remove(&format!("webhook_{key}")).unwrap_or(Value::Null);
+        webhook.insert(key.to_string(), value);
+    }
+    let recorded = !webhook["event_id"].is_null();
+    obj.insert(
+        "webhook".into(),
+        if recorded {
+            Value::Object(webhook)
+        } else {
+            Value::Null
+        },
+    );
+    row
 }
 
 // ---- Alert rules --------------------------------------------------------------

@@ -82,4 +82,35 @@ Alerts are governed by **rules**: data, created and edited over the API, each na
 | `rejected_share` | a percentage, `10%` | a load has more than that share of rows rejected | a later load is within the limit |
 | `unreachable` | a number of attempts, `5` | delivery to HFS has failed that many times in a row | delivery succeeds |
 
-A condition raises **one** alert per rule and source, open until it clears itself; the alert keeps its rule, who was notified, the channels, and the clearing time and reason. `app` alerts are what the UI lists; `webhook` posts them to `alerts.webhook_url` (the `text` field is the shape Slack and Teams accept); `email` is accepted and recorded, with no mail sink wired yet. A source with no `rejected_share` rule alerts on every load that rejects rows, and one with no `unreachable` rule alerts after `delivery.alert_after_attempts`.
+A condition raises **one** alert per rule and source, open until it clears itself; the alert keeps its rule, who was notified, the channels, and the clearing time and reason. `app` alerts are what the UI lists; `webhook` sends the alert's two events, when it fires and when it clears, to `alerts.webhook_url` (below); `email` is accepted and recorded, with no mail sink wired yet. Alerts without a rule (an unreadable file, a skipped definition, a credential that cannot be loaded) go to the webhook too. A source with no `rejected_share` rule alerts on every load that rejects rows, and one with no `unreachable` rule alerts after `delivery.alert_after_attempts`.
+
+#### The alert webhook
+
+Each change of an alert is one **event**, `fired` or `cleared`, written in the same transaction as the alert itself, so neither is lost to a crash. The engine posts it to `alerts.webhook_url` as JSON:
+
+```json
+{
+  "event_id": "5b0e5a8e-3c1f-4b7a-9a43-0f6f1d1c2e77",
+  "event": "cleared",
+  "alert": {
+    "id": 12, "rule_id": 3, "kind": "rejected_share",
+    "message": "Lab results: 83.3% of the rows in messy.csv failed, more than the 10% allowed (5 of 6)",
+    "notify": ["ops@example.org"],
+    "created_at": "2026-11-20T10:00:00.000Z",
+    "cleared_at": "2026-11-20T10:05:00.000Z",
+    "cleared_reason": "Lab results: labs.csv loaded with 0.0% failed, within the limit"
+  },
+  "source": {"id": "lab-results", "name": "Lab results"},
+  "text": "[HIE] cleared: Lab results: labs.csv loaded with 0.0% failed, within the limit"
+}
+```
+
+- `alert` is the alert as `GET /api/alerts` lists it, with the same time strings; a `fired` event has `cleared_at` and `cleared_reason` null. `notify` is `[]` for an alert without a rule. `source.name` is null when the engine does not know it; `source` is null for an alert about no source. `text` is the field Slack and Teams incoming webhooks display.
+- Headers: `Content-Type: application/json`, `X-HIE-Event-Id` and `X-HIE-Event` (the body's `event_id` and `event`), and, when `alerts.webhook_secret` is set, `X-HIE-Signature: sha256=<hex>`: the HMAC-SHA256 of the **raw body** under the secret, lowercase hex. A receiver verifies it over the bytes it received, before parsing, with a constant-time comparison, and trusts the body, not the other headers. Without a secret the events are unsigned. Use HTTPS: the signature proves who sent an event, not that nobody read it.
+- **Retries:** any answer but a 2xx, a timeout (10 s; 3 s to connect) or a connection failure is a failed attempt. The engine tries again up to five times, waiting `alerts.webhook_backoff_ms` (10 000 by default) and doubling each time: 10 s, 20 s, 40 s, 80 s, 160 s. Redirects are not followed: a 3xx is a failed attempt. Every attempt sends the same bytes with the same `event_id`.
+- **De-duplication:** a receiver may get an event more than once (its 2xx was lost to a timeout, or an instance stopped before storing the outcome). It keeps the `event_id`s it has seen, answers a repeated one with a 2xx and does nothing else. `event_id` identifies one event and its retries, not a condition: a source whose lease lapsed in the middle of a pass can raise a second alert, with its own events, for the same condition.
+- **Order:** a `cleared` event waits until its alert's `fired` event has been delivered or given up on. Still, a receiver may get a `cleared` for an alert it has not seen (fired before this engine version, while no URL was set, or whose `fired` failed), and a late `fired` after its `cleared` (a retry of an attempt that timed out): a late `fired` does not reopen a cleared alert. Match the two events of one alert by `alert.id` together with `alert.created_at`: on SQLite an id can come back once older alerts are removed.
+- **One URL per event:** an event is sent only to the URL configured when it was written. After the URL changes, events still waiting for the earlier one stay `pending` (the API shows them `parked`) and go out if that URL comes back; a start without a URL leaves them waiting too. Rotating the secret signs waiting events with the new one. Every instance on one store must have the same `alerts:` settings: any of them may send any waiting event, from oldest to newest, one at a time.
+- **Delivery state:** `GET /api/alerts` answers `webhook: {configured, signed}` for this instance's settings, and each alert's `webhook`: its latest event (`event`, `event_id`), its `state`, `attempts`, `last_error`, `last_status` (the HTTP status of the last answer, null when there was none) and `delivered_at`. `state` is `pending` (being sent, or waiting for a retry), `parked`, `delivered`, `failed` (five retries spent), `not_requested` (the rule's channels leave out `webhook`) or `not_configured` (no URL was set when the event happened). `webhook` is null for alerts recorded before events were. `last_error` is a fixed sentence (`HTTP 503 Service Unavailable`, `timeout`, `connection failed`, `request failed`, `no outcome recorded for the last attempt`): never the URL or what the receiver answered. A monitor that tracks delivery re-reads the alerts it still cares about (open ones, or ones not yet `delivered`): the state changes after the alert is listed.
+- The webhook URL and secret never reach the log, the store or an answer; the store keeps a fingerprint of the URL to tell destinations apart. At `debug` and `trace`, the HTTP client logs the receiver's host and port when it connects.
+- The body before this version was `{text, feed, kind, alert_id, notify}` (and `cleared: true` on a clear), and a clear was posted even for a rule without the `webhook` channel. Receivers reading anything but `text` need the new fields.
