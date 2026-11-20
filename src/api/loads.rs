@@ -70,8 +70,9 @@ impl Ask {
             }
         };
         let source = q.source.filter(|t| !t.is_empty());
-        // Any id a load may carry is accepted, but no control character, which
-        // a PostgreSQL text value cannot even hold.
+        // Any id a load may carry is accepted. Source ids have no control
+        // characters, and PostgreSQL text cannot hold a NUL: refuse them rather
+        // than fail the statement.
         if source
             .as_deref()
             .is_some_and(|id| id.chars().any(char::is_control))
