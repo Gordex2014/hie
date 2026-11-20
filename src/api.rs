@@ -608,6 +608,7 @@ const LOAD_COLUMNS: &str = "f.id, f.feed_id AS source_id, f.source_name, f.name,
                     COUNT(r.id) AS records,
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'sent' THEN 1 ELSE 0 END), 0) AS BIGINT) AS sent,
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT) AS rejected,
+                    CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' AND COALESCE(r.error_kind, '') <> 'filtered' THEN 1 ELSE 0 END), 0) AS BIGINT) AS failing,
                     CAST(COALESCE(SUM(CASE WHEN r.status IN ('received', 'pending', 'submitted') THEN 1 ELSE 0 END), 0) AS BIGINT) AS in_progress,
                     CASE WHEN f.finished_at IS NULL THEN NULL ELSE f.finished_at - f.received_at END AS took_ms";
 
@@ -648,9 +649,14 @@ fn load_rows(
                     .unwrap_or(Value::Null)
             })
             .clone();
-        // Failing now: some of its rows are rejected, or the file could not be read.
-        row["failed"] =
-            Value::Bool(row["status"] == "unreadable" || row["rejected"].as_i64().unwrap_or(0) > 0);
+        // Failing now: the file could not be read, or some of its rows are
+        // rejected for a reason other than their transform filtering them out.
+        let failing = row
+            .as_object_mut()
+            .and_then(|r| r.remove("failing"))
+            .and_then(|n| n.as_i64())
+            .unwrap_or(0);
+        row["failed"] = Value::Bool(row["status"] == "unreadable" || failing > 0);
     }
     Ok(rows)
 }

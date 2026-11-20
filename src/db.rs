@@ -55,8 +55,8 @@ CREATE TABLE IF NOT EXISTS records (
 CREATE INDEX IF NOT EXISTS records_feed_status ON records(feed_id, status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS records_feed_status_id ON records(feed_id, status, id);
 CREATE INDEX IF NOT EXISTS records_file ON records(file_id);
-CREATE INDEX IF NOT EXISTS records_rejected_file ON records(file_id) WHERE status = 'rejected';
-CREATE INDEX IF NOT EXISTS records_rejected_feed_file ON records(feed_id, file_id) WHERE status = 'rejected';
+CREATE INDEX IF NOT EXISTS records_failing_file ON records(file_id) WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered';
+CREATE INDEX IF NOT EXISTS records_failing_feed_file ON records(feed_id, file_id) WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered';
 CREATE TABLE IF NOT EXISTS alerts (
   id INTEGER PRIMARY KEY,
   feed_id TEXT,

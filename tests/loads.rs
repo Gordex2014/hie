@@ -361,6 +361,65 @@ async fn loads_are_filtered_by_source_status_and_failing_now() {
     );
 }
 
+/// A row its transform filtered out on purpose is rejected, but it is not a failure.
+#[tokio::test]
+async fn rows_filtered_out_on_purpose_do_not_fail_a_load() {
+    let e = engine().await;
+    let filter = |file: i64, line: i64| {
+        let id = e.record(file, line);
+        e.db.mark_rejected(id, "filtered", "transform returned no resources", None)
+            .unwrap();
+    };
+    // Done: one row sent, one filtered out.
+    let kept = e.load("zeta", "kept.csv", 2, &[]);
+    e.send(kept, 1);
+    filter(kept, 2);
+    // Done: one row filtered out, one rejected for its data.
+    let mixed = e.load("zeta", "mixed.csv", 2, &[]);
+    filter(mixed, 1);
+    e.reject(mixed, 2, "value 'high' is not a number");
+    e.db.finish_files("zeta").unwrap();
+    // In progress, only filtered out so far.
+    let early = e.load("zeta", "early.csv", 2, &[]);
+    filter(early, 1);
+
+    for limit in [1, 50] {
+        assert_eq!(
+            e.walk(&format!("status=failed&source=zeta&limit={limit}"))
+                .await,
+            [mixed],
+            "limit {limit}"
+        );
+    }
+    let page = e.page("source=zeta").await;
+    let load = |id: i64| {
+        page["loads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    // `rejected` still counts every rejected row; `failed` leaves the filtered ones out.
+    for (id, rejected, failed) in [(early, 1, false), (mixed, 2, true), (kept, 1, false)] {
+        let l = load(id);
+        assert_eq!(
+            (&l["rejected"], &l["failed"]),
+            (&json!(rejected), &json!(failed)),
+            "load {id}"
+        );
+        assert!(l.get("failing").is_none());
+    }
+    // Retrying the data rejection leaves only a filtered row: no longer failing.
+    assert_eq!(
+        e.db.reprocess_rejected(mixed, Some("value 'high' is not a number"))
+            .unwrap(),
+        1
+    );
+    assert_eq!(e.walk("status=failed&source=zeta").await, Vec::<i64>::new());
+}
+
 #[tokio::test]
 async fn a_walk_holds_while_loads_arrive_and_change() {
     let e = engine().await;

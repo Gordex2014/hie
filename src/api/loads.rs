@@ -34,7 +34,8 @@ pub(super) struct LoadQuery {
 enum Keep {
     All,
     Status(String),
-    /// Unreadable, or with at least one rejected row now.
+    /// Unreadable, or with at least one row rejected now for a reason other
+    /// than its transform filtering it out.
     Failed,
 }
 
@@ -118,16 +119,17 @@ impl Ask {
                        ORDER BY id DESC LIMIT CAST({take} AS BIGINT))"
                 )
             }
-            // The loads with a rejected row, newest first, take one seek each on
-            // the index of rejected rows, so a load with many of them is not read
-            // row by row on the way to the next one. The literal status is what
-            // lets both engines use that partial index. A record's `feed_id` is
-            // its load's, as it is stored with it.
+            // The loads with a failing row (rejected, and not filtered out on
+            // purpose), newest first, take one seek each on the index of those
+            // rows, so a load with many of them is not read row by row on the way
+            // to the next one. The condition is written as the index's is, which
+            // is what lets both engines use that partial index. A record's
+            // `feed_id` is its load's, as it is stored with it.
             Keep::Failed => format!(
                 "WITH RECURSIVE rejected(id, n) AS (
-                   SELECT (SELECT MAX(file_id) FROM records WHERE status = 'rejected'{of_source} AND file_id <= CAST({below} AS BIGINT)), 1
+                   SELECT (SELECT MAX(file_id) FROM records WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'{of_source} AND file_id <= CAST({below} AS BIGINT)), 1
                    UNION ALL
-                   SELECT (SELECT MAX(file_id) FROM records WHERE status = 'rejected'{of_source} AND file_id < rejected.id), rejected.n + 1
+                   SELECT (SELECT MAX(file_id) FROM records WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'{of_source} AND file_id < rejected.id), rejected.n + 1
                    FROM rejected WHERE rejected.id IS NOT NULL AND rejected.n < CAST({take} AS BIGINT)
                  ), candidates(id) AS (
                    SELECT id FROM (
@@ -310,11 +312,11 @@ mod tests {
         );
         uses(
             &[("status", "failed")],
-            &["records_rejected_file", "files_status_id"],
+            &["records_failing_file", "files_status_id"],
         );
         uses(
             &[("source", "lab"), ("status", "failed")],
-            &["records_rejected_feed_file", "files_feed_status_id"],
+            &["records_failing_feed_file", "files_feed_status_id"],
         );
     }
 }
