@@ -860,9 +860,19 @@ fn event_query(raw: Option<&str>) -> Result<crate::db::EventQuery, ApiError> {
             )
         })?;
         // Events are stored to the millisecond: a finer instant starts at the
-        // next one, so nothing before it is listed.
-        let rounded_up = at.timestamp_subsec_nanos() % 1_000_000 != 0;
-        q.since = Some(at.timestamp_millis() + i64::from(rounded_up));
+        // next one, so nothing before it is listed. The digits are read from the
+        // text, which may give more than a parser keeps.
+        let finer = since
+            .split_once('.')
+            .map(|(_, fraction)| {
+                fraction
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .skip(3)
+                    .any(|d| d != '0')
+            })
+            .unwrap_or(false);
+        q.since = Some(at.timestamp_millis() + i64::from(finer));
     }
     if let Some(cursor) = given.remove("cursor") {
         let id = cursor

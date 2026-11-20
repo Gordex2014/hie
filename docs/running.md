@@ -111,6 +111,8 @@ retention:
 
 Older events and alerts are purged at start and every hour after, in chunks of 5,000 rows. The alerts the engine still tracks stay whatever their age: open alerts of an enabled rule, and open `credential` and `definition` alerts (see [Alerts and retention](api.md#alerts-and-retention)). An open alert of a rule whose source was deleted while it was open stays until the rule is deleted. Records, loads and submissions are not purged: `history` covers what the engine logs about them, not the data. Instances sharing one store each purge with their own setting, so the shortest one applies. A value outside 1d to 3650d, or a key other than `history`, is refused at start and by `hie check`.
 
+The first start after the upgrade that brings the event log builds new indexes on `records` (one on SQLite, two on PostgreSQL), which blocks writes to `records` while it runs: on a large store, plan for it. Instances starting together on one PostgreSQL schema build it in turn.
+
 ### Credentials and the secret key
 
 S3 sources sign with credentials stored in the engine (`/api/secrets`, see [Secrets](api.md#secrets)), sealed in its database with XChaCha20-Poly1305 under a key derived from one **secret key**. Only metadata is ever answered; values never leave the engine except to sign requests.

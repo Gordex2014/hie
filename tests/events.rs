@@ -769,7 +769,8 @@ fn echoed(manifest_url: &str) -> String {
     format!(
         "could not fetch {path} (also tried https://[::1]:8443/b/a.ndjson?X-Amz-Signature=CANARY-V6 \
          and https://h.test/a(CANARY-PAREN)/b?sig=CANARY-SIG); receipts at \
-         /receipts/1?X-Amz-Signature=CANARY-RELATIVE"
+         /receipts/1?X-Amz-Signature=CANARY-RELATIVE, receipts?X-Amz-Signature=CANARY-QUERY \
+         and ?sig=CANARY-BARE"
     )
 }
 
@@ -968,6 +969,8 @@ async fn a_refused_submission_rejects_its_records_and_keeps_what_was_echoed_out(
         assert!(
             diagnostics.contains("/bulk/<token>/manifest.json")
                 && diagnostics.contains("/receipts/1?…")
+                && diagnostics.contains("receipts?…")
+                && diagnostics.contains(" ?…")
                 && diagnostics.contains("https://[::1]:8443/…")
                 && diagnostics.contains("https://h.test/…"),
             "{diagnostics}"
@@ -1242,6 +1245,15 @@ async fn events_are_paged_in_order_and_a_cursor_only_moves_forward() {
     // before it.
     let (_, page) = get_json(&format!("{api}/api/events?since=2027-01-15T08:00:03.0001Z")).await;
     assert_eq!(ids(&page), &from[1..]);
+    let (_, page) = get_json(&format!(
+        "{api}/api/events?since=2027-01-15T08:00:03.0000000001Z"
+    ))
+    .await;
+    assert_eq!(
+        ids(&page),
+        &from[1..],
+        "digits past the nanosecond count too"
+    );
     let (_, page) = get_json(&format!("{api}/api/events?since=2027-01-15T08:00:03.000Z")).await;
     assert_eq!(ids(&page), from);
     let (_, page) = get_json(&format!("{api}/api/events?since=2030-01-01T00:00:00Z")).await;
@@ -1804,6 +1816,12 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
         hie::db::params![old, cleared_recent],
     )
     .unwrap();
+    // The rules were there before their alerts.
+    db.query_json(
+        "UPDATE alert_rules SET created_at = CAST($1 AS BIGINT)",
+        hie::db::params![old - day],
+    )
+    .unwrap();
 
     // Events: more than one chunk of them old, one recent.
     load(&db, "s", "big", 5_001, 0);
@@ -1922,6 +1940,71 @@ async fn stop_engine(running: Running) {
         store.upgrade().is_none()
     })
     .await;
+}
+
+#[test]
+fn an_open_alert_is_not_kept_by_a_rule_made_after_it() {
+    let db = Db::in_memory().unwrap();
+    let day = 86_400_000i64;
+    let now = hie::db::now_ms();
+    let first = Rule {
+        id: db.insert_rule(&rule("s", true)).unwrap(),
+        ..rule("s", true)
+    };
+    let open = db
+        .insert_alert(Some("s"), "silence", "m", Some(&first))
+        .unwrap();
+    let newest = db.insert_alert(Some("s"), "delivery", "m", None).unwrap();
+    db.query_json(
+        "UPDATE alerts SET created_at = CAST($1 AS BIGINT)",
+        hie::db::params![now - 40 * day],
+    )
+    .unwrap();
+    // The rule goes; a new one is made, with the same id on SQLite.
+    db.delete_rule(first.id).unwrap();
+    let second = db.insert_rule(&rule("s", true)).unwrap();
+    if !db.is_postgres() {
+        assert_eq!(second, first.id);
+    }
+    let purged = hie::retention::purge(&db, now - 30 * day).unwrap();
+    assert_eq!(purged.alerts, 1);
+    assert_eq!(alert_ids(&db), [newest]);
+    assert!(!alert_ids(&db).contains(&open));
+}
+
+#[test]
+fn an_older_poll_answer_cannot_move_a_submission() {
+    let db = Db::in_memory().unwrap();
+    let file = load(&db, "s", "a", 0, 1);
+    db.mark_passthrough(&[(record_id(&db, "s", 1), 0)]).unwrap();
+    assert!(
+        db.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
+            .unwrap()
+    );
+    // A poll failed once: the submission is at attempt 1.
+    assert!(db.submission_attempt_failed("t", 0, 0, "HTTP 503").unwrap());
+    // Answers to requests made at attempt 0 change nothing.
+    assert!(!db.submission_attempt_failed("t", 0, 0, "HTTP 503").unwrap());
+    assert!(
+        !db.progress_submission("t", Some(0), "running", None, 0, 0, None)
+            .unwrap()
+    );
+    let row = db
+        .query_json("SELECT status, attempts, failures FROM submissions", [])
+        .unwrap();
+    assert_eq!(
+        row[0],
+        json!({"status": "kickoff", "attempts": 1, "failures": 1})
+    );
+    let failed = events(&db)
+        .iter()
+        .filter(|e| e["kind"] == "submission.attempt_failed")
+        .count();
+    assert_eq!(failed, 1);
+    assert!(
+        db.progress_submission("t", Some(1), "running", None, 0, 0, None)
+            .unwrap()
+    );
 }
 
 #[tokio::test]

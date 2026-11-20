@@ -983,10 +983,14 @@ impl FeedRunner {
                     },
                 },
             };
+            // Each write below holds only while the submission still has the
+            // attempt count read before the request: an older runner's answer
+            // changes nothing.
             match step {
                 Ok(None) => {
-                    self.db.update_submission(
+                    self.db.progress_submission(
                         &sub.token,
+                        Some(sub.attempts),
                         &sub.status,
                         None,
                         sub.attempts,
@@ -999,8 +1003,15 @@ impl FeedRunner {
                     self.recovered()?;
                 }
                 Ok(Some((status, url))) => {
-                    self.db
-                        .update_submission(&sub.token, status, url.as_deref(), 0, 0, None)?;
+                    self.db.progress_submission(
+                        &sub.token,
+                        Some(sub.attempts),
+                        status,
+                        url.as_deref(),
+                        0,
+                        0,
+                        None,
+                    )?;
                 }
                 Err(SendError::Refused(status, body)) => {
                     // What the server said may echo signed URLs or the engine's
@@ -1026,13 +1037,14 @@ impl FeedRunner {
                         .initial_backoff_ms
                         .saturating_mul(1u64 << (attempts - 1).min(20))
                         .min(d.max_backoff_ms);
-                    self.db.submission_attempt_failed(
+                    if self.db.submission_attempt_failed(
                         &sub.token,
-                        attempts,
+                        sub.attempts,
                         now_ms() + backoff as i64,
                         &reason,
-                    )?;
-                    self.outage(attempts, &reason)?;
+                    )? {
+                        self.outage(attempts, &reason)?;
+                    }
                 }
             }
         }
@@ -1376,8 +1388,14 @@ impl FeedRunner {
         }
     }
 
+    /// Finishes each file that looks finished, one at a time, and weighs its
+    /// alerts right after it is stored: a later file that fails to finish never
+    /// leaves an earlier one without them.
     fn finish(&self) -> Result<()> {
-        for f in self.db.finish_files(&self.feed.id)? {
+        for candidate in self.db.finish_candidates(&self.feed.id)? {
+            let Some(f) = self.db.finish_file(&self.feed.id, candidate)? else {
+                continue;
+            };
             tracing::info!(feed = %self.feed.id, file = %f.name, total = f.total, sent = f.sent, rejected = f.rejected, "file done");
             // The rules say whether a few rejected rows are worth an alert; without
             // one, every rejection is.

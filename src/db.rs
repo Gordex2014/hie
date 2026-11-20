@@ -156,8 +156,12 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
 
 /// Indexes made after the added columns, since they may name one.
 const ADDED_INDEXES: &str = "
-CREATE INDEX IF NOT EXISTS records_file_id ON records(file_id, id);
 CREATE INDEX IF NOT EXISTS records_submission_id ON records(submission, id);
+";
+
+/// On PostgreSQL only: on SQLite `records_file` already orders by id, the rowid.
+const ADDED_INDEXES_POSTGRES: &str = "
+CREATE INDEX IF NOT EXISTS records_file_id ON records(file_id, id);
 ";
 
 /// A rule in words: "nothing arrives for 2 hours", "more than 1% of a load's rows
@@ -1109,21 +1113,33 @@ impl Db {
                 test_schema = None;
             }
         }
-        // A sequence never gives an id twice, as SQLite's AUTOINCREMENT does not.
-        let ddl = SCHEMA
-            .replace(" AUTOINCREMENT", "")
-            .replace("INTEGER PRIMARY KEY", "BIGSERIAL PRIMARY KEY")
-            .replace("INTEGER", "BIGINT");
+        // Instances starting together on one schema build it in turn: two
+        // `CREATE INDEX IF NOT EXISTS` at once may both try to build it.
         client
-            .batch(&ddl)
-            .context("creating the schema in PostgreSQL")?;
-        for (table, column, kind) in ADDED_COLUMNS {
-            client.batch(&format!(
-                "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {}",
-                kind.replace("INTEGER", "BIGINT")
-            ))?;
-        }
-        client.batch(ADDED_INDEXES)?;
+            .batch("SELECT pg_advisory_lock(hashtext('hie.schema'), hashtext(current_schema()))")?;
+        let built = (|| {
+            // A sequence never gives an id twice, as SQLite's AUTOINCREMENT does not.
+            let ddl = SCHEMA
+                .replace(" AUTOINCREMENT", "")
+                .replace("INTEGER PRIMARY KEY", "BIGSERIAL PRIMARY KEY")
+                .replace("INTEGER", "BIGINT");
+            client
+                .batch(&ddl)
+                .context("creating the schema in PostgreSQL")?;
+            for (table, column, kind) in ADDED_COLUMNS {
+                client.batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {}",
+                    kind.replace("INTEGER", "BIGINT")
+                ))?;
+            }
+            client.batch(ADDED_INDEXES)?;
+            client.batch(ADDED_INDEXES_POSTGRES)?;
+            Ok::<_, anyhow::Error>(())
+        })();
+        let unlocked = client
+            .batch("SELECT pg_advisory_unlock(hashtext('hie.schema'), hashtext(current_schema()))");
+        built?;
+        unlocked?;
         Ok(Self {
             conn: Mutex::new(Conn::Postgres(client)),
             postgres: true,
@@ -1597,21 +1613,37 @@ impl Db {
     }
 
     /// Marks files whose records have all reached `sent` or `rejected` as done and
-    /// returns them, each with `load.finished`. Each file is finished in a
-    /// transaction of its own: its row is locked, then moved to `done` only if no
-    /// record is in progress, read after the lock; the counts are read after that.
-    /// A Retry that put records back first is seen; one that comes after waits.
+    /// returns them: `finish_candidates`, then `finish_file` for each.
     pub fn finish_files(&self, feed: &str) -> Result<Vec<FinishedFile>> {
-        let candidates = self.query(
+        let mut done = Vec::new();
+        for candidate in self.finish_candidates(feed)? {
+            done.extend(self.finish_file(feed, candidate)?);
+        }
+        Ok(done)
+    }
+
+    /// The files of a feed that look finished: every record sent or rejected.
+    pub fn finish_candidates(&self, feed: &str) -> Result<Vec<i64>> {
+        Ok(self
+            .query(
             "SELECT f.id FROM files f
              WHERE f.feed_id = $1 AND f.status IN ('processing', 'unpacked')
                AND NOT EXISTS (SELECT 1 FROM records r WHERE r.file_id = f.id AND r.status IN ('received', 'pending', 'submitted'))
              ORDER BY f.id",
-            &params![feed],
-        )?;
-        let mut done = Vec::new();
-        for candidate in candidates.iter().map(|r| r.i64(0)) {
-            let finished = self.transaction(|tx| {
+                &params![feed],
+            )?
+            .iter()
+            .map(|r| r.i64(0))
+            .collect())
+    }
+
+    /// Finishes one file, with `load.finished`, in a transaction of its own: its
+    /// row is locked, then moved to `done` only if no record is in progress, read
+    /// after the lock; the counts are read after that. A Retry that put records
+    /// back first is seen; one that comes after waits. `None` when the file is
+    /// not finished.
+    pub fn finish_file(&self, feed: &str, candidate: i64) -> Result<Option<FinishedFile>> {
+        self.transaction(|tx| {
                 let lock = format!(
                     "SELECT name, status, rejected_reported FROM files
                      WHERE id = $1 AND status IN ('processing', 'unpacked'){}",
@@ -1666,10 +1698,7 @@ impl Db {
                     newly_rejected: rejected - file.i64(2),
                     first_rejection,
                 }))
-            })?;
-            done.extend(finished);
-        }
-        Ok(done)
+            })
     }
 
     // ---- records -----------------------------------------------------------
@@ -2155,11 +2184,39 @@ impl Db {
         next_attempt_at: i64,
         error: Option<&str>,
     ) -> Result<()> {
-        self.execute(
+        self.progress_submission(
+            token,
+            None,
+            status,
+            status_url,
+            attempts,
+            next_attempt_at,
+            error,
+        )
+        .map(drop)
+    }
+
+    /// `update_submission`, only while the submission still has the attempt
+    /// count `captured` read before its request: the answer to an older request
+    /// (a runner that held the source before a lease lapsed) changes nothing.
+    /// Returns whether it changed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn progress_submission(
+        &self,
+        token: &str,
+        captured: Option<u32>,
+        status: &str,
+        status_url: Option<&str>,
+        attempts: u32,
+        next_attempt_at: i64,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self.execute(
             "UPDATE submissions SET status = $2,
                     status_url = COALESCE(CAST($3 AS TEXT), status_url),
                     attempts = $4, next_attempt_at = $5, error = $6, updated_at = $7
-             WHERE token = $1 AND status IN ('kickoff', 'running')",
+             WHERE token = $1 AND status IN ('kickoff', 'running')
+               AND (CAST($8 AS BIGINT) IS NULL OR attempts = CAST($8 AS BIGINT))",
             &params![
                 token,
                 status,
@@ -2167,37 +2224,41 @@ impl Db {
                 attempts,
                 next_attempt_at,
                 error,
-                now_ms()
+                now_ms(),
+                captured
             ],
-        )
-        .map(drop)
+        )? > 0)
     }
 
     /// A kick-off or status poll failed for a reason that may pass: the next
     /// attempt is due at `next_attempt_at`, with `submission.attempt_failed`.
-    /// `reason` is already scrubbed of URLs and the token.
+    /// `reason` is already scrubbed of URLs and the token. Only while the
+    /// submission still has the attempt count `captured` read before the
+    /// request; returns whether it changed.
     pub fn submission_attempt_failed(
         &self,
         token: &str,
-        attempts: u32,
+        captured: u32,
         next_attempt_at: i64,
         reason: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let attempts = captured + 1;
         self.transaction(|tx| {
             let Some(r) = tx.query_one(
                 "UPDATE submissions SET attempts = $2, next_attempt_at = $3, error = $4, failures = failures + 1, updated_at = $5
-                 WHERE token = $1 AND status IN ('kickoff', 'running')
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $6
                  RETURNING feed_id, submission_id",
-                &params![token, attempts, next_attempt_at, reason, now_ms()],
+                &params![token, attempts, next_attempt_at, reason, now_ms(), captured],
             )?
             else {
-                return Ok(());
+                return Ok(false);
             };
             tx.insert_events(&[Event::new("submission.attempt_failed", &r.string(0))
                 .attempt(attempts as i64)
                 .reason(reason)
                 .detail(json!({"submission": r.string(1), "run": crate::bulk::run_key(token),
-                               "next_attempt_at": iso_ms(next_attempt_at)}))])
+                               "next_attempt_at": iso_ms(next_attempt_at)}))])?;
+            Ok(true)
         })
     }
 
@@ -2739,7 +2800,8 @@ impl Db {
     /// Removes up to `limit` alerts older than `cutoff_ms` (since they cleared, or
     /// since they were raised while open) in one transaction, and adds what went
     /// to the purged tallies `/metrics` counts. Kept at any age: open alerts of a
-    /// rule that exists and is enabled, open `credential` and `definition`
+    /// rule that exists, is enabled and is older than the alert (a SQLite rule id
+    /// may be given again after a rule is deleted), open `credential` and `definition`
     /// alerts, and the alert with the highest id, so no alert id is ever given
     /// again. Returns how many went.
     pub fn purge_alerts(&self, cutoff_ms: i64, limit: usize) -> Result<usize> {
@@ -2752,7 +2814,9 @@ impl Db {
                      AND {a}.id < (SELECT MAX(id) FROM alerts)
                      AND NOT ({a}.cleared_at IS NULL AND (
                            {a}.kind IN ('credential', 'definition')
-                           OR EXISTS (SELECT 1 FROM alert_rules r WHERE r.id = {a}.rule_id AND r.enabled = 1)))"
+                           OR EXISTS (SELECT 1 FROM alert_rules r
+                                      WHERE r.id = {a}.rule_id AND r.enabled = 1
+                                        AND r.created_at <= {a}.created_at)))"
                 )
             };
             let gone = tx.query(

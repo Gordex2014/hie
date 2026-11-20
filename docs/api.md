@@ -86,13 +86,13 @@ Submission events (the bulk path) carry `detail.submission`, the id the FHIR ser
 
 Nothing else is an event: a Try, a worker that cannot start (no record is involved; the log says why), changes to sources, the transform step itself, archiving a file, and alerts (which have their own list).
 
-- Deliveries in a period are `record.delivered` and `record.recovered` together (they never both describe one delivery), or the `record` family.
+- Deliveries in a period are `kind=record.delivered,record.recovered` (the two never describe the same delivery). The `record` family also holds rejections, put-backs and failed attempts.
 - An attempt is a delivery attempt that ended, for this record, in a delivery, a rejection or a failure that may pass. A batch the server refused as a whole is sent again record by record, and that whole refusal is not counted as an attempt.
 - A load finishes again after a Retry or a reprocess put some of its records back: there is one `load.finished` each time.
 - An outcome worked out for a record that a person put back meanwhile (a Retry or a reprocess while it was being transformed or sent) changes nothing and writes no event; the record goes through again.
 - On a store upgraded from an earlier version, a submission that was partly settled before the upgrade counts in `submission.settled` only the records settled after it.
 
-**Text.** A `reason` is the engine's own text for the fact (the stored error), with every URL cut to its origin followed by `/…` (a signed URL's path and query never appear), and at most 500 characters. A request target the engine names in a failure (a status, manifest or receipt URL, absolute or relative) is only ever its origin, or `<URL>`. A relative target that a server's answer echoes keeps its path and loses its query (`/receipts/1?…`). On the bulk path the submission's token is replaced by `<token>` wherever it would appear, in the records' stored errors and answers too. No event carries a submission's token, its status URL or a server's full answer.
+**Text.** A `reason` is the engine's own text for the fact (the stored error), with every URL cut to its origin followed by `/…` (a signed URL's path and query never appear), and at most 500 characters. A request target the engine names in a failure (a status, manifest or receipt URL, absolute or relative) is only ever its origin, or `<URL>`. Any other word (up to whitespace, a quote, `<` or `>`) that has a `?` followed later in the word by `=` keeps what comes before the `?` and loses the rest, so a relative target a server echoes, such as `/receipts/1?X-Amz-Signature=…`, becomes `/receipts/1?…`. On the bulk path the submission's token is replaced by `<token>` wherever it would appear, in the records' stored errors and answers too. No event carries a submission's token, its status URL or a server's full answer.
 
 **Reading.** `GET /api/events` lists events oldest first, by `id`:
 
@@ -115,7 +115,7 @@ A poller pages with `cursor`: the first request may give `since`, and each next 
 ### Alerts and retention
 
 Stored alerts follow `retention.history` too. An alert is purged that long after it cleared, or after it was raised if it is still open, except:
-- open alerts of a rule that exists and is enabled;
+- open alerts of a rule that exists, is enabled and was created before the alert (on SQLite a deleted rule's id may be given to a new rule);
 - open `credential` and `definition` alerts, which the engine clears itself;
 - the alert with the highest id.
 

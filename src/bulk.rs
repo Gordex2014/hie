@@ -49,8 +49,9 @@ pub fn historical_origin(
 /// becomes its origin followed by `/…`: its path, query, fragment and user
 /// information may carry signatures and tokens. Brackets and parentheses are
 /// part of a URL, so a bracketed IPv6 host or a path with parentheses goes with
-/// it. A relative target with a query (a path such as `/receipts/1?sig=…`, as a
-/// server may echo one) keeps its path and loses its query: `/receipts/1?…`.
+/// it. Any other word with a query, a `?` followed later in the word by `=`
+/// (a relative target such as `/receipts/1?sig=…`, as a server may echo one),
+/// loses what follows the `?`: `/receipts/1?…`.
 /// The rest of the reason, the operation, the HTTP status and the error, is
 /// kept.
 pub fn safe_reason(reason: &str) -> String {
@@ -73,15 +74,15 @@ pub fn safe_reason(reason: &str) -> String {
     cut_relative_queries(&out)
 }
 
-/// Every word (up to whitespace, a quote, `<` or `>`) where a `/` comes before
-/// a `?` loses what follows the `?`.
+/// Every word (up to whitespace, a quote, `<` or `>`) that has a `?` followed
+/// later in the word by `=` loses what follows that `?`.
 fn cut_relative_queries(text: &str) -> String {
     let stop = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>');
     let mut out = String::with_capacity(text.len());
     let mut word = String::new();
     let flush = |word: &mut String, out: &mut String| {
-        match (word.find('/'), word.find('?')) {
-            (Some(slash), Some(query)) if slash < query => {
+        match word.find('?') {
+            Some(query) if word[query..].contains('=') => {
                 out.push_str(&word[..query]);
                 out.push_str("?…");
             }
@@ -484,7 +485,15 @@ mod tests {
             safe_reason(r#"cannot read "/receipts/1?X-Amz-Signature=CANARY" (or ./r?sig=x): 404"#),
             r#"cannot read "/receipts/1?…" (or ./r?… 404"#
         );
-        assert_eq!(safe_reason("is it done? yes"), "is it done? yes");
+        assert_eq!(
+            safe_reason("receipts.ndjson?X-Amz-Signature=CANARY and manifest.json?sig=CANARY"),
+            "receipts.ndjson?… and manifest.json?…"
+        );
+        assert_eq!(safe_reason("token ?sig=CANARY"), "token ?…");
+        // A question is not a query.
+        for text in ["Was it A/B?", "and/or?", "mg/dL?", "is it done? yes"] {
+            assert_eq!(safe_reason(text), text);
+        }
     }
 
     #[test]

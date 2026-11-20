@@ -87,7 +87,8 @@ async fn status(State(base): State<String>, Path(which): Path<String>) -> Respon
                     nor https://[2001:db8::1]:9000/b/a.ndjson?X-Amz-Signature=CANARY-REFUSED-V6 \
                     nor https://b.test/a(CANARY-REFUSED-PAREN)/b?sig=CANARY-REFUSED-SIG; \
                     manifest /bulk/hie-canary-refused/manifest.json; \
-                    receipts /receipts/1?X-Amz-Signature=CANARY-REFUSED-RELATIVE"}]})),
+                    receipts /receipts/1?X-Amz-Signature=CANARY-REFUSED-RELATIVE, \
+                    receipts?X-Amz-Signature=CANARY-REFUSED-QUERY and ?sig=CANARY-REFUSED-BARE"}]})),
         )
             .into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
