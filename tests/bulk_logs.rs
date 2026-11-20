@@ -67,8 +67,9 @@ fn repo() -> PathBuf {
 }
 
 /// A FHIR server's status endpoints: `poll` in progress, `done` with receipts
-/// that cannot be fetched, `refused` with a diagnostic naming a signed URL, and
-/// anything else failing.
+/// that cannot be fetched, `refused` with a diagnostic naming signed URLs (one on
+/// a bracketed IPv6 host, one with parentheses in its path) and echoing the
+/// engine's own path with the submission's token, and anything else failing.
 async fn status(State(base): State<String>, Path(which): Path<String>) -> Response {
     match which.as_str() {
         "poll" => StatusCode::ACCEPTED.into_response(),
@@ -79,7 +80,10 @@ async fn status(State(base): State<String>, Path(which): Path<String>) -> Respon
         "refused" => (
             StatusCode::BAD_REQUEST,
             Json(json!({"resourceType": "OperationOutcome", "issue": [{"severity": "error", "code": "processing",
-                "diagnostics": "could not fetch https://b.s3.amazonaws.com/a.ndjson?X-Amz-Signature=CANARY-REFUSED-SIGNATURE&X-Amz-Security-Token=CANARY-REFUSED-TOKEN"}]})),
+                "diagnostics": "could not fetch https://b.s3.amazonaws.com/a.ndjson?X-Amz-Signature=CANARY-REFUSED-SIGNATURE&X-Amz-Security-Token=CANARY-REFUSED-TOKEN \
+                    nor https://[2001:db8::1]:9000/b/a.ndjson?X-Amz-Signature=CANARY-REFUSED-V6 \
+                    nor https://b.test/a(CANARY-REFUSED-PAREN)/b?sig=CANARY-REFUSED-SIG; \
+                    manifest /bulk/hie-canary-refused/manifest.json"}]})),
         )
             .into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -177,10 +181,16 @@ fn submission(db: &hie::db::Db, which: &str, status: Option<&str>) {
         .unwrap()[0]["id"]
         .as_i64()
         .unwrap();
-    db.mark_passthrough(&[record]).unwrap();
+    db.mark_passthrough(&[(record, 0)]).unwrap();
     let token = format!("hie-canary-{which}");
-    db.create_submission_for_files(&token, "drops", &token, &json!({"output": []}), &[file])
-        .unwrap();
+    db.create_submission_for_files(
+        &token,
+        "drops",
+        &format!("sub-{which}"),
+        &json!({"output": []}),
+        &[file],
+    )
+    .unwrap();
     if let Some(status) = status {
         db.update_submission(&token, "running", Some(status), 0, 0, None)
             .unwrap();
@@ -202,6 +212,18 @@ fn stored(db: &hie::db::Db) -> (String, String, String) {
         column("SELECT error FROM records", "error"),
         column("SELECT message FROM alerts", "message"),
     )
+}
+
+/// The event log as text, and its kinds.
+fn logged_events(db: &hie::db::Db) -> (String, Vec<String>) {
+    let rows = db
+        .query_json("SELECT kind, reason, detail FROM events ORDER BY id", [])
+        .unwrap();
+    let kinds = rows
+        .iter()
+        .map(|r| r["kind"].as_str().unwrap().to_string())
+        .collect();
+    (serde_json::to_string(&rows).unwrap(), kinds)
 }
 
 /// A failing status poll, and receipts that cannot be fetched.
@@ -229,7 +251,17 @@ async fn a_failing_poll_never_puts_credentials_in_logs_or_alerts() {
             && submissions.contains("fetching"),
         "{submissions}\n{alerts}"
     );
-    for text in [&logs, &submissions, &alerts] {
+    // Both failed attempts are in the event log, without their URLs' secrets.
+    let (events, kinds) = logged_events(&db);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| *k == "submission.attempt_failed")
+            .count(),
+        2,
+        "{kinds:?}"
+    );
+    for text in [&logs, &submissions, &alerts, &events] {
         assert!(!text.contains("CANARY-STATUS"), "{text}");
         assert!(!text.contains("CANARY-RECEIPT"), "{text}");
     }
@@ -249,12 +281,31 @@ async fn a_refusal_that_echoes_a_signed_url_keeps_it_out_of_logs_and_records() {
     let (submissions, records, alerts) = stored(&db);
     assert!(logs.contains("refused: HTTP 400"), "{logs}");
     assert!(
-        submissions.contains("HTTP 400") && submissions.contains("https://b.s3.amazonaws.com/…"),
+        submissions.contains("HTTP 400")
+            && submissions.contains("https://b.s3.amazonaws.com/…")
+            && submissions.contains("https://[2001:db8::1]:9000/…")
+            && submissions.contains("/bulk/<token>/manifest.json"),
         "{submissions}"
     );
     assert!(records.contains("HTTP 400"), "{records}");
-    for text in [&logs, &submissions, &records, &alerts] {
+    // The server's answer kept on the record, scrubbed the same way.
+    let responses = db
+        .query_json("SELECT response FROM records", [])
+        .unwrap()
+        .iter()
+        .map(|r| r["response"].to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(responses.contains("OperationOutcome"), "{responses}");
+    let (events, kinds) = logged_events(&db);
+    assert!(
+        kinds.contains(&"submission.refused".to_string())
+            && kinds.contains(&"record.rejected".to_string()),
+        "{kinds:?}"
+    );
+    for text in [&logs, &submissions, &records, &alerts, &responses, &events] {
         assert!(!text.contains("CANARY-REFUSED"), "{text}");
+        assert!(!text.contains("bulk/hie-canary-refused"), "{text}");
     }
 }
 

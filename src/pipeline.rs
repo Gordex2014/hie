@@ -11,7 +11,7 @@ use chrono::Timelike;
 use crate::alerts::{Alerter, parse_clock};
 use crate::bulk::{self, BulkSubmitter, Poll};
 use crate::config::{DeliveryMethod, FeedConfig, Format, parse_duration};
-use crate::db::{Db, Rule, WorkItem, now_ms};
+use crate::db::{Db, Delivery, NewFile, Rule, WorkItem, now_ms};
 use crate::fhir::{self, DeliveryKey, EntryResult, FhirClient, SendError};
 use crate::reader;
 use crate::secrets::Secrets;
@@ -504,16 +504,9 @@ impl FeedRunner {
                 // The same object, still waiting for HFS to fetch it: leave it alone.
                 return Ok(());
             }
-            let id = self.db.insert_file(
-                feed,
-                &name,
-                &sha,
-                bytes.len() as u64,
-                "duplicate",
-                Some(original),
-                None,
-                None,
-            )?;
+            let id = self
+                .db
+                .insert_duplicate(feed, &name, &sha, bytes.len() as u64, original)?;
             tracing::info!(feed, file = %name, duplicate_of = original, "same content already received; not reprocessed");
             let archived = self
                 .source()
@@ -533,17 +526,17 @@ impl FeedRunner {
         } else {
             "local"
         };
-        let file_id = self.db.insert_file(
-            feed,
-            &name,
-            &sha,
-            bytes.len() as u64,
-            "processing",
-            None,
-            keep.then_some(key.as_str()),
-            keep.then_some(origin),
+        let (file_id, readable) = self.admit(
+            &NewFile {
+                feed,
+                name: &name,
+                sha: &sha,
+                size: bytes.len() as u64,
+                source_key: keep.then_some(key.as_str()),
+                origin: keep.then_some(origin),
+            },
+            &bytes,
         )?;
-        let readable = self.admit(file_id, &name, &bytes)?;
         if keep && readable {
             return Ok(());
         }
@@ -554,27 +547,29 @@ impl FeedRunner {
         self.db.mark_file_archived(file_id, &archived)
     }
 
-    /// Reads a file's records into the store; `false` when the file could not be read.
-    fn admit(&self, file_id: i64, name: &str, bytes: &[u8]) -> Result<bool> {
+    /// Records a file and reads its records into the store, in one transaction
+    /// (`Db::admit_file`). Returns its id, and `false` when it could not be read.
+    fn admit(&self, file: &NewFile, bytes: &[u8]) -> Result<(i64, bool)> {
         let feed = &self.feed.id;
+        let name = file.name;
         match reader::read(self.feed.format, bytes) {
             Ok(records) => {
                 let rows: Vec<_> = records
                     .into_iter()
                     .map(|r| (r.line, r.raw, r.parse_error))
                     .collect();
-                self.db.insert_records(file_id, feed, &rows)?;
+                let file_id = self.db.admit_file(file, Ok(&rows))?;
                 tracing::info!(feed, file = %name, records = rows.len(), "received");
-                Ok(true)
+                Ok((file_id, true))
             }
             Err(e) => {
-                self.db.fail_file(file_id, &format!("{e:#}"))?;
+                let file_id = self.db.admit_file(file, Err(&format!("{e:#}")))?;
                 self.alerts.raise(
                     Some(feed),
                     "unreadable_file",
                     &format!("{}: cannot read {name}: {e:#}", self.feed.name),
                 )?;
-                Ok(false)
+                Ok((file_id, false))
             }
         }
     }
@@ -584,16 +579,9 @@ impl FeedRunner {
     /// zip is recorded as `unpacked` (so it is not read twice) and archived.
     async fn unpack(&self, key: &str, name: &str, sha: &str, bytes: Vec<u8>) -> Result<()> {
         let feed = &self.feed.id;
-        let container = self.db.insert_file(
-            feed,
-            name,
-            sha,
-            bytes.len() as u64,
-            "unpacked",
-            None,
-            None,
-            None,
-        )?;
+        let container = self
+            .db
+            .insert_container(feed, name, sha, bytes.len() as u64)?;
         let wanted = match self.feed.format {
             Format::Csv => &["csv"][..],
             Format::Ndjson => &["ndjson", "jsonl"][..],
@@ -647,15 +635,12 @@ impl FeedRunner {
             let entry_name = format!("{name}!/{path}");
             let entry_sha = reader::sha256_hex(&data);
             if let Some(original) = self.db.find_file_by_hash(feed, &entry_sha)? {
-                self.db.insert_file(
+                self.db.insert_duplicate(
                     feed,
                     &entry_name,
                     &entry_sha,
                     data.len() as u64,
-                    "duplicate",
-                    Some(original),
-                    None,
-                    None,
+                    original,
                 )?;
                 continue;
             }
@@ -678,17 +663,19 @@ impl FeedRunner {
             } else {
                 None
             };
-            let file_id = self.db.insert_file(
-                feed,
-                &entry_name,
-                &entry_sha,
-                data.len() as u64,
-                "processing",
-                None,
-                staged.as_ref().map(|(key, _)| key.as_str()),
-                staged.as_ref().map(|(_, origin)| *origin),
+            // Each entry is admitted in a transaction of its own; one that fails
+            // part way leaves the container recognised by its hash next time.
+            self.admit(
+                &NewFile {
+                    feed,
+                    name: &entry_name,
+                    sha: &entry_sha,
+                    size: data.len() as u64,
+                    source_key: staged.as_ref().map(|(key, _)| key.as_str()),
+                    origin: staged.as_ref().map(|(_, origin)| *origin),
+                },
+                &data,
             )?;
-            self.admit(file_id, &entry_name, &data)?;
             taken += 1;
         }
         tracing::info!(feed, file = %name, entries = taken, "unpacked");
@@ -722,22 +709,25 @@ impl FeedRunner {
                         return Ok(());
                     }
                 };
+                // Each outcome changes the record only while it is still at the
+                // revision it was selected at; a person may have put it back since.
                 match outcome {
                     Outcome::Transient(message) => {
                         // Not the row's fault: leave it and the rest for the next pass.
                         tracing::warn!(feed = %self.feed.id, line = item.line, "transform cannot finish now, will retry: {message}");
+                        self.db.transform_deferred(item, &message)?;
                         return Ok(());
                     }
                     Outcome::Rejected { kind, message } => {
-                        self.db.mark_rejected(item.id, &kind, &message, None)?
+                        self.db.reject_item(item, "received", &kind, &message)?;
                     }
                     Outcome::Resources(resources) if resources.is_empty() => {
-                        self.db.mark_rejected(
-                            item.id,
+                        self.db.reject_item(
+                            item,
+                            "received",
                             "filtered",
                             "transform returned no resources",
-                            None,
-                        )?
+                        )?;
                     }
                     Outcome::Resources(mut resources) => {
                         // On the transformed bulk path a resource must carry an id:
@@ -754,10 +744,12 @@ impl FeedRunner {
                                 .collect::<Result<Vec<_>, _>>()
                         };
                         match checked {
-                            Ok(_) => self
-                                .db
-                                .mark_transformed(item.id, &Value::Array(resources))?,
-                            Err(msg) => self.db.mark_rejected(item.id, "validation", &msg, None)?,
+                            Ok(_) => {
+                                self.db.mark_transformed(item, &Value::Array(resources))?;
+                            }
+                            Err(msg) => {
+                                self.db.reject_item(item, "received", "validation", &msg)?;
+                            }
                         }
                     }
                 }
@@ -780,14 +772,20 @@ impl FeedRunner {
             let mut good = Vec::with_capacity(items.len());
             for item in &items {
                 match transform::check_resource(&item.raw) {
-                    Ok(DeliveryKey::Id { .. }) => good.push(item.id),
-                    Ok(DeliveryKey::Identifier { resource_type, .. }) => self.db.mark_rejected(
-                        item.id,
-                        "validation",
-                        &format!("{resource_type} has no id; $bulk-submit stores resources by id"),
-                        None,
-                    )?,
-                    Err(msg) => self.db.mark_rejected(item.id, "validation", &msg, None)?,
+                    Ok(DeliveryKey::Id { .. }) => good.push((item.id, item.revision)),
+                    Ok(DeliveryKey::Identifier { resource_type, .. }) => {
+                        self.db.reject_item(
+                            item,
+                            "received",
+                            "validation",
+                            &format!(
+                                "{resource_type} has no id; $bulk-submit stores resources by id"
+                            ),
+                        )?;
+                    }
+                    Err(msg) => {
+                        self.db.reject_item(item, "received", "validation", &msg)?;
+                    }
                 }
             }
             self.db.mark_passthrough(&good)?;
@@ -932,46 +930,43 @@ impl FeedRunner {
                         None,
                     )?;
                 }
+                Ok(Some(("done", _))) => {
+                    self.db.settle_submission(&sub.token)?;
+                    self.recovered()?;
+                }
                 Ok(Some((status, url))) => {
                     self.db
                         .update_submission(&sub.token, status, url.as_deref(), 0, 0, None)?;
-                    if status == "done" {
-                        self.recovered()?;
-                    }
                 }
                 Err(SendError::Refused(status, body)) => {
-                    let reason =
-                        bulk::safe_reason(&format!("HTTP {status}: {}", fhir::outcome_text(&body)));
-                    tracing::warn!(feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
-                    for (record_id, _, _) in self.db.submitted_records(&sub.token)? {
-                        self.db
-                            .mark_rejected(record_id, "server", &reason, Some(&body))?;
-                    }
-                    self.db.update_submission(
+                    // What the server said may echo signed URLs or the engine's
+                    // own paths: scrubbed before it is logged or stored.
+                    let reason = bulk::scrub(
+                        &format!("HTTP {status}: {}", fhir::outcome_text(&body)),
                         &sub.token,
-                        "failed",
-                        None,
-                        sub.attempts,
-                        0,
-                        Some(&reason),
+                    );
+                    tracing::warn!(feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
+                    self.db.reject_submission(
+                        &sub.token,
+                        "server",
+                        &reason,
+                        &bulk::scrub_value(&body, &sub.token),
                     )?;
                     self.archive_submission(&sub.token).await?;
                 }
                 Err(SendError::Transient(reason)) => {
-                    let reason = bulk::safe_reason(&reason);
+                    let reason = bulk::scrub(&reason, &sub.token);
                     let attempts = sub.attempts + 1;
                     let d = &self.feed.delivery;
                     let backoff = d
                         .initial_backoff_ms
                         .saturating_mul(1u64 << (attempts - 1).min(20))
                         .min(d.max_backoff_ms);
-                    self.db.update_submission(
+                    self.db.submission_attempt_failed(
                         &sub.token,
-                        &sub.status,
-                        None,
                         attempts,
                         now_ms() + backoff as i64,
-                        Some(&reason),
+                        &reason,
                     )?;
                     self.outage(attempts, &reason)?;
                 }
@@ -992,6 +987,10 @@ impl FeedRunner {
             0 => String::new(),
             n => format!(" HFS reported {n} error(s); the first: {}", errors[0]),
         };
+        let missing_reason = bulk::scrub(
+            &format!("no receipt from HFS for this resource.{hint}"),
+            token,
+        );
         // Page through the submission: a large one holds a million records, and
         // each page's receipts are applied in sets.
         let mut after_id = 0;
@@ -1003,6 +1002,7 @@ impl FeedRunner {
                 break;
             }
             let mut sent = Vec::with_capacity(page.len());
+            let mut missing = Vec::new();
             for (record_id, _, resources) in &page {
                 let reference = resources
                     .get(0)
@@ -1012,16 +1012,13 @@ impl FeedRunner {
                     Some(r) if references.contains(&r) => {
                         sent.push((*record_id, json!([{"reference": r, "via": "$bulk-submit"}])))
                     }
-                    _ => self.db.mark_rejected(
-                        *record_id,
-                        "server",
-                        &format!("no receipt from HFS for this resource.{hint}"),
-                        None,
-                    )?,
+                    _ => missing.push(*record_id),
                 }
                 after_id = *record_id;
             }
-            self.db.mark_sent_many(&sent)?;
+            // The page's outcomes, its tallies and its events in one transaction.
+            self.db
+                .settle_page(token, &sent, &missing, &missing_reason)?;
         }
         self.archive_submission(token).await?;
         self.remove_submission_files(token).await;
@@ -1060,7 +1057,7 @@ impl FeedRunner {
             let ttl = Duration::from_secs(self.feed.delivery.url_ttl_seconds);
             let mut by_type: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
             let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-            for (_, resources) in &records {
+            for (_, _, resources) in &records {
                 for resource in resources.as_array().into_iter().flatten() {
                     let kind = resource["resourceType"]
                         .as_str()
@@ -1097,22 +1094,25 @@ impl FeedRunner {
                 };
                 entries.push((kind.clone(), url, counts[&kind]));
             }
-            let record_ids: Vec<i64> = records.iter().map(|(id, _)| *id).collect();
-            let span = format!(
-                "records {}-{}",
-                record_ids[0],
-                record_ids[record_ids.len() - 1]
-            );
+            let claims: Vec<(i64, i64)> = records.iter().map(|(id, rev, _)| (*id, *rev)).collect();
+            let span = format!("records {}-{}", claims[0].0, claims[claims.len() - 1].0);
             let submission_id = bulk::submission_id(&self.feed.id, &[span.as_str()]);
             let manifest = bulk.manifest(&entries);
-            self.db.create_submission(
+            if !self.db.create_submission(
                 &token,
                 &self.feed.id,
                 &submission_id,
                 &manifest,
-                &record_ids,
-            )?;
-            tracing::info!(feed = %self.feed.id, submission = %submission_id, files = entries.len(), records = record_ids.len(), "submission opened (transformed)");
+                &claims,
+            )? {
+                // A record changed while its file was written (a person put it
+                // back): nothing was opened; the files go, and the submission is
+                // built again from what is pending now.
+                tracing::info!(feed = %self.feed.id, "a record changed while its submission was written; building it again");
+                self.remove_submission_files(&token).await;
+                continue;
+            }
+            tracing::info!(feed = %self.feed.id, submission = %submission_id, files = entries.len(), records = claims.len(), "submission opened (transformed)");
         }
     }
 
@@ -1188,9 +1188,11 @@ impl FeedRunner {
         }
         match self.fhir.post_bundle(&fhir::batch_bundle(&entries)).await {
             Err(SendError::Transient(reason)) => {
-                for item in items {
-                    self.defer(item, &reason)?;
-                }
+                let deferred: Vec<_> = items
+                    .iter()
+                    .map(|item| (item, self.defer(item, &reason)))
+                    .collect();
+                self.db.delivered(&deferred)?;
                 let worst = items.iter().map(|i| i.attempts + 1).max().unwrap_or(0);
                 self.outage(worst, &reason)?;
                 Ok(false)
@@ -1210,13 +1212,22 @@ impl FeedRunner {
             }
             Err(SendError::Refused(status, body)) => {
                 let reason = format!("HTTP {status}: {}", fhir::outcome_text(&body));
-                self.db
-                    .mark_rejected(items[0].id, "server", &reason, Some(&body))?;
+                self.db.delivered(&[(
+                    &items[0],
+                    Delivery::Rejected {
+                        kind: "server",
+                        error: &reason,
+                        response: Some(&body),
+                    },
+                )])?;
                 Ok(true)
             }
             Ok(response) => {
                 self.recovered()?;
                 let results = fhir::entry_results(&response, entries.len());
+                // Each record's outcome, worked out first, then stored together
+                // with their events before the next batch is sent.
+                let mut decided: Vec<(&WorkItem, Decided)> = Vec::with_capacity(items.len());
                 for (i, item) in items.iter().enumerate() {
                     let mine: Vec<&EntryResult> = results
                         .iter()
@@ -1232,39 +1243,58 @@ impl FeedRunner {
                             | EntryResult::Transient(_, v) => v.clone(),
                         })
                         .collect();
+                    let responses = Value::Array(responses);
                     if let Some(EntryResult::Rejected(status, v)) =
                         mine.iter().find(|r| matches!(r, EntryResult::Rejected(..)))
                     {
                         let reason = format!("HTTP {status}: {}", fhir::outcome_text(v));
-                        self.db.mark_rejected(
-                            item.id,
-                            "server",
-                            &reason,
-                            Some(&Value::Array(responses)),
-                        )?;
+                        decided.push((item, Decided::Rejected(reason, responses)));
                     } else if let Some(EntryResult::Transient(status, _)) = mine
                         .iter()
                         .find(|r| matches!(r, EntryResult::Transient(..)))
                     {
-                        self.defer(item, &format!("HTTP {status} for this entry"))?;
+                        decided.push((
+                            item,
+                            Decided::Deferred(format!("HTTP {status} for this entry")),
+                        ));
                     } else {
-                        self.db.mark_sent(item.id, &Value::Array(responses))?;
+                        decided.push((item, Decided::Sent(responses)));
                     }
                 }
+                let outcomes: Vec<(&WorkItem, Delivery)> = decided
+                    .iter()
+                    .map(|(item, d)| {
+                        let outcome = match d {
+                            Decided::Sent(responses) => Delivery::Sent(responses),
+                            Decided::Rejected(reason, responses) => Delivery::Rejected {
+                                kind: "server",
+                                error: reason,
+                                response: Some(responses),
+                            },
+                            Decided::Deferred(reason) => self.defer(item, reason),
+                        };
+                        (*item, outcome)
+                    })
+                    .collect();
+                self.db.delivered(&outcomes)?;
                 Ok(true)
             }
         }
     }
 
-    fn defer(&self, item: &WorkItem, reason: &str) -> Result<()> {
+    /// The next attempt of a record whose delivery failed for a reason that may pass.
+    fn defer<'a>(&self, item: &WorkItem, reason: &'a str) -> Delivery<'a> {
         let attempts = item.attempts + 1;
         let d = &self.feed.delivery;
         let backoff = d
             .initial_backoff_ms
             .saturating_mul(1u64 << (attempts - 1).min(20))
             .min(d.max_backoff_ms);
-        self.db
-            .defer(item.id, attempts, now_ms() + backoff as i64, reason)
+        Delivery::Deferred {
+            attempts,
+            next_attempt_at: now_ms() + backoff as i64,
+            error: reason,
+        }
     }
 
     fn finish(&self) -> Result<()> {
@@ -1447,6 +1477,13 @@ impl FeedRunner {
         }
         Ok(())
     }
+}
+
+/// A record's outcome from a batch answer, before it is stored.
+enum Decided {
+    Sent(Value),
+    Rejected(String, Value),
+    Deferred(String),
 }
 
 pub fn human(d: Duration) -> String {

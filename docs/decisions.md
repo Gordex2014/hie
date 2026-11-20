@@ -438,6 +438,27 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - Plaintext copies outside the engine's wiped types: the S3 client's own credential strings for the client's lifetime, HTTP and JSON parser buffers. HMAC pad blocks and HKDF temporaries made once at start are not wiped.
 - Registrations belong to an instance (`HIE_INSTANCE_ID`, or an id kept in the sources directory). After a failure they err on keeping: a start that fails after a definition was published keeps both credentials registered until the next start or replace, a cleanup that keeps failing leaves a row until the next start, and a changed instance id leaves its old rows behind. Each only makes a delete answer `409`. A crash while the key file is created can leave a temporary copy of the key next to it.
 
+## 38. An append-only event log, and one retention for history
+
+**Chosen:** The engine appends an event for each attempt and outcome of a record (`record.delivered`, `record.recovered`, `record.attempt_failed`, `record.rejected`, `record.retried`), each step of a load and each step of a `$bulk-submit` submission, to an `events` table, and serves it oldest first by id at `GET /api/events` with filters and an opaque cursor. An event is written in the same transaction as the change it reports, and only for rows that change: every outcome is a guarded update (the status it leaves and, for a record, the revision it had when the work was selected; a person putting a record back bumps it) whose returned rows give the events. Admission is one transaction (the file row, its records or its unreadable state, and their events), so a failure leaves nothing and the next scan takes the object again. A load is finished, and a Retry or reprocess put back, under its file's row lock, so the two never miss each other. On PostgreSQL every event insert takes one advisory lock, keyed by the store's schema and held to commit, after every other change of its transaction. One setting, `retention.history` (30 days by default, from 1 to 3650 days), purges events and stored alerts, at start and hourly, in chunks; open alerts the engine still tracks are kept, and so is the newest alert, so an alert id is never given again on SQLite or PostgreSQL (event ids never are either: `AUTOINCREMENT` on SQLite, a sequence on PostgreSQL); purged alerts are added to a tally `/metrics` counts. Records, loads and submissions are not purged.
+
+**Why:**
+- The engine kept each record's current status only. A retry cleared the earlier failure, so nobody could count failures over a period or say what happened to a record; an external monitoring tool needs that history through the API, not the database.
+- In the same transaction as the change, the log can neither miss an outcome nor report one that was not stored; an outcome stored before the next record is sent (decision 36) has its event stored too.
+- Guarding each outcome by status and revision means a slow transform or delivery that finishes after a person corrected the record changes nothing and logs nothing, instead of overwriting the correction.
+- Ids in commit order let a reader poll with a cursor and never skip an event: a SQLite store has one writer at a time (`BEGIN IMMEDIATE`), and on PostgreSQL the lock makes event ids commit in order across instances. Taking it last means a holder never waits for a row lock, so it cannot deadlock with a finish or a Retry elsewhere.
+- One retention for every kind of history keeps one setting to explain; the module is where later kinds (check results, alert delivery state) add their purge.
+- Never purging the newest alert keeps SQLite from giving a purged alert's id again, without rebuilding the table; the purged tally keeps `hie_alerts_total` a counter.
+
+**Cost / not yet:**
+- One more write per decided record, batched per REST batch and per settled page; on the bulk path a million-record submission writes a million events.
+- On PostgreSQL, writers of events across instances take turns on one lock, held through each insert to commit; a file with many unparsable rows, or a large refusal, holds it while its events go in.
+- The purge runs hourly, so history can outlive the setting by up to an hour; instances sharing a store purge to the shortest setting among them.
+- Records, loads and submissions are still not purged (decision 5 keeps a records retention open).
+- The newest alert is always kept, whatever its age. An open alert of a rule whose source was deleted while it was open stays until the rule is deleted.
+- An outcome computed for a superseded revision of a record is discarded, and the record is transformed and sent again. A record reprocessed while held by a submission keeps that submission, as before, and is not picked up again by the bulk path.
+- `at` is the writer's clock and may be out of order with `id`; the log is ordered by `id`. A submission partly settled before the upgrade counts only the records settled after it.
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.

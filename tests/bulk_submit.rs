@@ -168,6 +168,23 @@ fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// The event log, oldest first, with each detail parsed.
+fn events(db: &hie::db::Db) -> Vec<Value> {
+    db.query_json(
+        "SELECT kind, record_id, error_kind, reason, detail FROM events ORDER BY id",
+        [],
+    )
+    .unwrap()
+    .into_iter()
+    .map(|mut e| {
+        if let Some(Value::String(text)) = e.get("detail") {
+            e["detail"] = serde_json::from_str(text).unwrap();
+        }
+        e
+    })
+    .collect()
+}
+
 #[tokio::test]
 async fn an_ndjson_drop_goes_through_bulk_submit_and_its_receipts_come_back() {
     let Some(python) = python() else {
@@ -316,6 +333,50 @@ async fn an_ndjson_drop_goes_through_bulk_submit_and_its_receipts_come_back() {
         db.query_json("SELECT status FROM files", []).unwrap()[0]["status"],
         "done"
     );
+
+    // The submission in the event log: opened over the two records handed over,
+    // one delivery per receipt, settled once with its counts. It is named by its
+    // run's key, never by its token.
+    let log = events(&db);
+    let submission: Vec<&Value> = log
+        .iter()
+        .filter(|e| {
+            let kind = e["kind"].as_str().unwrap();
+            kind.starts_with("submission.") || kind == "record.delivered"
+        })
+        .collect();
+    let kinds: Vec<&str> = submission
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "submission.opened",
+            "record.delivered",
+            "record.delivered",
+            "submission.settled"
+        ]
+    );
+    assert_eq!(submission[0]["detail"]["records"], 2);
+    assert_eq!(
+        (
+            &submission[3]["detail"]["sent"],
+            &submission[3]["detail"]["rejected"],
+            &submission[3]["detail"]["failures"]
+        ),
+        (&json!(2), &json!(0), &json!(0))
+    );
+    let token = db.query_json("SELECT token FROM submissions", []).unwrap()[0]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let run = submission[0]["detail"]["run"].as_str().unwrap();
+    assert_eq!(run.len(), 16);
+    assert!(!token.contains(run));
+    assert!(submission.iter().all(|e| e["detail"]["run"] == run));
+    assert!(!serde_json::to_string(&log).unwrap().contains(&token));
+    assert_eq!(log.last().unwrap()["kind"], "load.finished");
 }
 
 /// A lab CSV through the transform and then `$bulk-submit`: the engine writes the
@@ -1422,7 +1483,8 @@ async fn staged_by_an_earlier_version(relative_config: bool) {
             (id, records)
         };
         let open = |token: &str, file_id: i64, records: &[i64], kind: &str| {
-            db.mark_passthrough(records).unwrap();
+            let fresh: Vec<(i64, i64)> = records.iter().map(|id| (*id, 0)).collect();
+            db.mark_passthrough(&fresh).unwrap();
             let manifest = json!({"output": [{"type": kind,
                 "url": format!("{hie_url}/bulk/{token}/files/{file_id}"), "count": records.len()}]});
             db.create_submission_for_files(token, "open", token, &manifest, &[file_id])
@@ -1687,6 +1749,41 @@ async fn a_store_file_retried_after_its_source_became_a_folder_is_rejected() {
     let urls = manifest_urls(&engine.db);
     assert!(urls.iter().all(|u| !u.contains("/files/")), "{urls:?}");
     assert_eq!(urls, [format!("{bucket_url}/{BUCKET}/a.ndjson")]);
+
+    // The record's history: refused with its submission, put back, then
+    // rejected as a file that cannot be handed over.
+    let log = events(&engine.db);
+    let record: Vec<(&str, &str)> = log
+        .iter()
+        .filter(|e| !e["record_id"].is_null())
+        .map(|e| {
+            (
+                e["kind"].as_str().unwrap(),
+                e["error_kind"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        record,
+        [
+            ("record.rejected", "server"),
+            ("record.retried", ""),
+            ("record.rejected", "server")
+        ]
+    );
+    let last = log
+        .iter()
+        .rfind(|e| e["kind"] == "record.rejected")
+        .unwrap();
+    assert!(
+        last["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be handed over to the FHIR server"),
+        "{last}"
+    );
+    assert!(log.iter().any(|e| e["kind"] == "submission.refused"));
+    assert!(log.iter().any(|e| e["kind"] == "load.retried"));
 }
 
 /// A configuration reached through a symbolic link and `..` (`outer/link/..` where

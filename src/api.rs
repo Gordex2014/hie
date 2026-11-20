@@ -3,7 +3,7 @@ mod secrets;
 use std::sync::Arc;
 
 use crate::db::{Param, params};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -73,6 +73,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/records/{id}", get(get_record))
         .route("/api/records/{id}/reprocess", post(reprocess))
         .route("/api/alerts", get(list_alerts))
+        .route("/api/events", get(list_events))
         .route(
             "/api/secrets",
             get(secrets::list_secrets).post(secrets::create_secret),
@@ -792,6 +793,99 @@ async fn list_alerts(State(s): State<AppState>, Query(q): Query<AlertQuery>) -> 
     Ok(Json(json!({"alerts": rows})))
 }
 
+// ---- Events -----------------------------------------------------------------
+
+/// The text of a cursor: opaque to clients, the position after an event's id.
+const CURSOR_PREFIX: &str = "e1.";
+
+fn invalid_query(field: &'static str, error: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, error)
+        .code("invalid_query")
+        .with("field", field)
+}
+
+/// Reads `GET /api/events` parameters by hand, so that every refusal is a JSON
+/// `400 invalid_query` naming the parameter. Unknown parameters are ignored;
+/// a known one given twice is refused.
+fn event_query(raw: Option<&str>) -> Result<crate::db::EventQuery, ApiError> {
+    let mut given: std::collections::HashMap<&'static str, String> = Default::default();
+    for (key, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        let Some(field) = ["source", "kind", "since", "cursor", "limit"]
+            .into_iter()
+            .find(|f| *f == key)
+        else {
+            continue;
+        };
+        if given.insert(field, value.into_owned()).is_some() {
+            return Err(invalid_query(
+                field,
+                format!("{field} is given more than once"),
+            ));
+        }
+    }
+    let mut q = crate::db::EventQuery {
+        limit: 100,
+        ..Default::default()
+    };
+    if let Some(source) = given.remove("source") {
+        if source.is_empty() {
+            return Err(invalid_query("source", "source must name a source"));
+        }
+        q.source = Some(source);
+    }
+    if let Some(kinds) = given.remove("kind") {
+        for kind in kinds.split(',').map(str::trim) {
+            if !crate::events::is_known(kind) {
+                return Err(invalid_query(
+                    "kind",
+                    format!(
+                        "unknown event kind {kind:?} (use record, load, submission or an exact kind)"
+                    ),
+                ));
+            }
+            q.kinds.push(kind.to_string());
+        }
+    }
+    if let Some(since) = given.remove("since") {
+        let at = chrono::DateTime::parse_from_rfc3339(&since).map_err(|_| {
+            invalid_query(
+                "since",
+                "since must be an RFC 3339 instant, such as 2026-11-20T08:00:00Z",
+            )
+        })?;
+        q.since = Some(at.timestamp_millis());
+    }
+    if let Some(cursor) = given.remove("cursor") {
+        let id = cursor
+            .strip_prefix(CURSOR_PREFIX)
+            .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|id| id.parse::<i64>().ok())
+            .ok_or_else(|| {
+                invalid_query("cursor", "cursor is not one this API gave as next_cursor")
+            })?;
+        q.cursor = Some(id);
+    }
+    if let Some(limit) = given.remove("limit") {
+        q.limit = limit
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=1000).contains(n))
+            .ok_or_else(|| invalid_query("limit", "limit must be a whole number from 1 to 1000"))?;
+    }
+    Ok(q)
+}
+
+/// The event log, oldest first: see `docs/api.md` (Events).
+async fn list_events(State(s): State<AppState>, RawQuery(raw): RawQuery) -> ApiResult {
+    let q = event_query(raw.as_deref())?;
+    let page = s.db.list_events(&q)?;
+    Ok(Json(json!({
+        "events": page.events,
+        "next_cursor": page.next.map(|id| format!("{CURSOR_PREFIX}{id}")),
+        "has_more": page.has_more,
+    })))
+}
+
 // ---- Alert rules --------------------------------------------------------------
 
 async fn list_rules(State(s): State<AppState>, Query(q): Query<AlertQuery>) -> ApiResult {
@@ -906,13 +1000,11 @@ async fn metrics(State(s): State<AppState>) -> Result<Response, ApiError> {
             u8::from(s.db.is_paused(&f.id)?)
         ));
     }
+    // Alerts purged by the retention still count: the counter never goes down.
     out.push_str("# TYPE hie_alerts_total counter\n");
-    for row in s.db.query_json("SELECT COALESCE(feed_id, '') AS source, kind, COUNT(*) AS n FROM alerts GROUP BY feed_id, kind", [])? {
+    for (source, kind, n) in s.db.alert_totals()? {
         out.push_str(&format!(
-            "hie_alerts_total{{source=\"{}\",kind=\"{}\"}} {}\n",
-            row["source"].as_str().unwrap_or_default(),
-            row["kind"].as_str().unwrap_or_default(),
-            row["n"]
+            "hie_alerts_total{{source=\"{source}\",kind=\"{kind}\"}} {n}\n"
         ));
     }
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response())

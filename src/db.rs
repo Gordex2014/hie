@@ -14,6 +14,8 @@ use postgres::types::{IsNull, ToSql, Type};
 use rusqlite::types::ValueRef;
 use serde_json::{Map, Value, json};
 
+use crate::events::Event;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS files (
   id INTEGER PRIMARY KEY,
@@ -108,6 +110,27 @@ CREATE TABLE IF NOT EXISTS alert_rules (
   created_by TEXT,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at INTEGER NOT NULL,
+  source_id TEXT,
+  kind TEXT NOT NULL,
+  load_id INTEGER,
+  record_id INTEGER,
+  attempt INTEGER,
+  error_kind TEXT,
+  reason TEXT,
+  detail TEXT
+);
+CREATE INDEX IF NOT EXISTS events_at ON events(at);
+CREATE INDEX IF NOT EXISTS events_source ON events(source_id, id);
+CREATE INDEX IF NOT EXISTS events_kind ON events(kind, id);
+CREATE TABLE IF NOT EXISTS alert_counts_purged (
+  feed_id TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL,
+  n INTEGER NOT NULL,
+  PRIMARY KEY (feed_id, kind)
+);
 ";
 
 /// Columns added after a store was first created; each is added when missing.
@@ -116,6 +139,13 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("files", "archived", "INTEGER NOT NULL DEFAULT 0"),
     ("files", "origin", "TEXT"),
     ("records", "submission", "TEXT"),
+    // Bumped when a person puts a record back: an outcome computed for an older
+    // revision changes nothing.
+    ("records", "revision", "INTEGER NOT NULL DEFAULT 0"),
+    // A submission's failed attempts and its settled rows, counted per page.
+    ("submissions", "failures", "INTEGER NOT NULL DEFAULT 0"),
+    ("submissions", "sent", "INTEGER NOT NULL DEFAULT 0"),
+    ("submissions", "rejected", "INTEGER NOT NULL DEFAULT 0"),
     ("alerts", "rule_id", "INTEGER"),
     ("alerts", "cleared_at", "INTEGER"),
     ("alerts", "cleared_reason", "TEXT"),
@@ -186,6 +216,65 @@ pub struct WorkItem {
     pub raw: Value,
     pub resources: Option<Value>,
     pub attempts: u32,
+    /// The record's revision when it was selected: its outcome is stored only
+    /// while the record is still at it.
+    pub revision: i64,
+}
+
+/// A row as read from a file: its line, its data, and why it could not be
+/// parsed, if it could not.
+pub type ReadRow = (i64, Value, Option<String>);
+
+/// A file as it is recorded on arrival: see `Db::insert_file` for `source_key`
+/// and `origin`.
+#[derive(Debug, Clone, Copy)]
+pub struct NewFile<'a> {
+    pub feed: &'a str,
+    pub name: &'a str,
+    pub sha: &'a str,
+    pub size: u64,
+    pub source_key: Option<&'a str>,
+    pub origin: Option<&'a str>,
+}
+
+/// What became of one record of a batch sent to the FHIR server.
+#[derive(Debug, Clone, Copy)]
+pub enum Delivery<'a> {
+    Sent(&'a Value),
+    Rejected {
+        kind: &'a str,
+        error: &'a str,
+        response: Option<&'a Value>,
+    },
+    /// Tried again from `next_attempt_at`, as attempt `attempts`.
+    Deferred {
+        attempts: u32,
+        next_attempt_at: i64,
+        error: &'a str,
+    },
+}
+
+/// What `GET /api/events` asks for.
+#[derive(Debug, Clone, Default)]
+pub struct EventQuery {
+    pub source: Option<String>,
+    /// Exact kinds and families (`record`, `load`, `submission`); any of them.
+    pub kinds: Vec<String>,
+    /// Epoch milliseconds: events at or after it.
+    pub since: Option<i64>,
+    /// Events after this id.
+    pub cursor: Option<i64>,
+    pub limit: usize,
+}
+
+/// A page of events, oldest first, and where the next poll starts.
+#[derive(Debug, Clone)]
+pub struct EventPage {
+    pub events: Vec<Value>,
+    /// The id the next poll continues after; `None` when the log is empty and
+    /// no cursor was given.
+    pub next: Option<i64>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -628,6 +717,177 @@ fn pg_value(row: &postgres::Row, i: usize, kind: &Type) -> Value {
     }
 }
 
+// ---- transactions and events ------------------------------------------------
+
+/// One transaction on the store, under the connection's lock: see
+/// `Db::transaction`. Events are written only through `insert_events`.
+struct Tx<'a> {
+    conn: &'a mut Conn,
+    postgres: bool,
+    /// Whether this transaction holds the event lock (PostgreSQL).
+    events_locked: bool,
+    /// Ends the transaction with a rollback even when it succeeds.
+    rollback: bool,
+}
+
+impl Tx<'_> {
+    fn execute(&mut self, sql: &str, params: &[Param]) -> Result<u64> {
+        self.conn.execute(sql, params)
+    }
+
+    fn query(&mut self, sql: &str, params: &[Param]) -> Result<Vec<Row>> {
+        self.conn.query(sql, params)
+    }
+
+    fn query_one(&mut self, sql: &str, params: &[Param]) -> Result<Option<Row>> {
+        Ok(self.query(sql, params)?.into_iter().next())
+    }
+
+    /// ` FOR UPDATE` on PostgreSQL. On SQLite `BEGIN IMMEDIATE` already holds
+    /// the store's only write lock.
+    fn for_update(&self) -> &'static str {
+        if self.postgres { " FOR UPDATE" } else { "" }
+    }
+
+    /// Appends events. On PostgreSQL the first call takes the event lock, held
+    /// until the transaction ends, so ids are given in commit order: a reader
+    /// that sees an id knows every lower id is committed or gone. Callers make
+    /// every other change of the transaction before the first call, so a holder
+    /// of the lock never waits for a row lock.
+    fn insert_events(&mut self, events: &[Event]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        if self.postgres && !self.events_locked {
+            // Keyed by schema: stores in other schemas of one database do not
+            // wait on each other.
+            self.conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('hie.events'), hashtext(current_schema()))",
+                &[],
+            )?;
+            self.events_locked = true;
+        }
+        let at = now_ms();
+        for chunk in events.chunks(INSERT_ROWS_PER_STATEMENT) {
+            let mut sql = String::from(
+                "INSERT INTO events (at, source_id, kind, load_id, record_id, attempt, error_kind, reason, detail) VALUES ",
+            );
+            let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 9);
+            for (i, e) in chunk.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                let b = i * 9;
+                sql.push_str(&format!(
+                    "(CAST(${} AS BIGINT), CAST(${} AS TEXT), CAST(${} AS TEXT), CAST(${} AS BIGINT), CAST(${} AS BIGINT), \
+                     CAST(${} AS BIGINT), CAST(${} AS TEXT), CAST(${} AS TEXT), CAST(${} AS TEXT))",
+                    b + 1, b + 2, b + 3, b + 4, b + 5, b + 6, b + 7, b + 8, b + 9
+                ));
+                values.extend(params![
+                    at,
+                    e.source_id,
+                    e.kind,
+                    e.load_id,
+                    e.record_id,
+                    e.attempt,
+                    e.error_kind,
+                    e.reason,
+                    e.detail.as_ref().map(Value::to_string)
+                ]);
+            }
+            self.conn.execute(&sql, &values)?;
+        }
+        Ok(())
+    }
+}
+
+/// Stores a file's records, by the hundred per statement: one round trip each
+/// over a million rows is an hour; this is minutes. Returns the rows stored as
+/// rejected because they could not be parsed: (id, reason).
+fn insert_record_rows(
+    tx: &mut Tx,
+    file_id: i64,
+    feed: &str,
+    rows: &[(i64, Value, Option<String>)],
+) -> Result<Vec<(i64, String)>> {
+    let now = now_ms();
+    let mut rejected = Vec::new();
+    for chunk in rows.chunks(INSERT_ROWS_PER_STATEMENT) {
+        let mut sql = String::from(
+            "INSERT INTO records (file_id, feed_id, line, raw, status, error_kind, error, updated_at) VALUES ",
+        );
+        let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 8);
+        for (i, (line, raw, parse_error)) in chunk.iter().enumerate() {
+            let (status, kind) = match parse_error {
+                Some(_) => ("rejected", Some("parse")),
+                None => ("received", None),
+            };
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("({})", marks(i * 8 + 1, 8)));
+            values.extend(params![
+                file_id,
+                feed,
+                line,
+                raw.to_string(),
+                status,
+                kind,
+                parse_error,
+                now
+            ]);
+        }
+        sql.push_str(" RETURNING id, status, error");
+        for r in tx.query(&sql, &values)? {
+            if r.string(1) == "rejected" {
+                rejected.push((r.i64(0), r.string(2)));
+            }
+        }
+    }
+    Ok(rejected)
+}
+
+/// A new submission's row, waiting for its kick-off.
+fn insert_submission(
+    tx: &mut Tx,
+    token: &str,
+    feed: &str,
+    submission_id: &str,
+    manifest: &Value,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, created_at, updated_at)
+         VALUES ($1, $2, $3, 'kickoff', $4, $5, $6)",
+        &params![token, feed, submission_id, manifest.to_string(), now, now],
+    )
+    .map(drop)
+}
+
+/// `submission.opened`: the run's public key, never its token.
+fn opened(feed: &str, token: &str, submission_id: &str, records: usize, files: usize) -> Event {
+    Event::new("submission.opened", feed).detail(json!({
+        "submission": submission_id,
+        "run": crate::bulk::run_key(token),
+        "records": records,
+        "files": files,
+    }))
+}
+
+/// `$first, $first+1, ...` for `n` values.
+fn marks(first: usize, n: usize) -> String {
+    (first..first + n)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// An instant in epoch milliseconds as RFC 3339, for an event's detail.
+fn iso_ms(ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
 // ---- the store ----------------------------------------------------------------
 
 pub struct Db {
@@ -753,7 +1013,9 @@ impl Db {
                 test_schema = None;
             }
         }
+        // A sequence never gives an id twice, as SQLite's AUTOINCREMENT does not.
         let ddl = SCHEMA
+            .replace(" AUTOINCREMENT", "")
             .replace("INTEGER PRIMARY KEY", "BIGSERIAL PRIMARY KEY")
             .replace("INTEGER", "BIGINT");
         client
@@ -799,6 +1061,50 @@ impl Db {
     fn with<T>(&self, f: impl FnOnce(&mut Conn) -> Result<T>) -> Result<T> {
         let mut conn = self.conn.lock().expect("database mutex poisoned");
         f(&mut conn)
+    }
+
+    /// Runs `f` in one transaction: `BEGIN IMMEDIATE` on SQLite (the write lock
+    /// at once, so one writer at a time), `BEGIN` on PostgreSQL. Committed when
+    /// `f` succeeds, unless it asked for a rollback; rolled back on any error.
+    fn transaction<T>(&self, f: impl FnOnce(&mut Tx) -> Result<T>) -> Result<T> {
+        let postgres = self.postgres;
+        self.with(|c| {
+            c.batch(if postgres { "BEGIN" } else { "BEGIN IMMEDIATE" })?;
+            let (result, rollback) = {
+                let mut tx = Tx {
+                    conn: c,
+                    postgres,
+                    events_locked: false,
+                    rollback: false,
+                };
+                let result = f(&mut tx);
+                (result, tx.rollback)
+            };
+            match result {
+                Ok(value) if !rollback => match c.batch("COMMIT") {
+                    Ok(()) => Ok(value),
+                    Err(e) => {
+                        let _ = c.batch("ROLLBACK");
+                        Err(e)
+                    }
+                },
+                Ok(value) => c.batch("ROLLBACK").map(|()| value),
+                Err(e) => {
+                    let _ = c.batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    /// The schema the store's tables are in, on PostgreSQL.
+    pub fn schema(&self) -> Result<Option<String>> {
+        if !self.postgres {
+            return Ok(None);
+        }
+        Ok(self
+            .query_one("SELECT current_schema()", &[])?
+            .and_then(|r| r.opt_string(0)))
     }
 
     fn execute(&self, sql: &str, params: &[Param]) -> Result<u64> {
@@ -997,121 +1303,272 @@ impl Db {
         Ok(out)
     }
 
+    /// Records a file and admits what was read from it, in one transaction: its
+    /// records, or its unreadable state (`read` is the reason); then
+    /// `load.received` (or `load.unreadable`) and a `record.rejected` for each row
+    /// that could not be parsed. A failure leaves no file row, so the next scan
+    /// takes the object again. Returns the file's id.
+    pub fn admit_file(
+        &self,
+        file: &NewFile,
+        read: std::result::Result<&[ReadRow], &str>,
+    ) -> Result<i64> {
+        self.transaction(|tx| {
+            let now = now_ms();
+            let (status, finished_at, error) = match read {
+                Ok(_) => ("processing", None, None),
+                Err(reason) => ("unreadable", Some(now), Some(reason)),
+            };
+            let file_id = tx
+                .query_one(
+                    "INSERT INTO files (feed_id, name, sha256, size, status, received_at, finished_at, error, source_key, origin)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
+                    &params![
+                        file.feed,
+                        file.name,
+                        file.sha,
+                        file.size,
+                        status,
+                        now,
+                        finished_at,
+                        error,
+                        file.source_key,
+                        file.origin
+                    ],
+                )?
+                .map(|r| r.i64(0))
+                .context("INSERT returned no id")?;
+            let mut events = Vec::new();
+            match read {
+                Ok(rows) => {
+                    let mut rejected = insert_record_rows(tx, file_id, file.feed, rows)?;
+                    rejected.sort_by_key(|(id, _)| *id);
+                    events.push(
+                        Event::new("load.received", file.feed)
+                            .load(file_id)
+                            .detail(json!({"name": file.name, "size": file.size, "records": rows.len()})),
+                    );
+                    events.extend(rejected.into_iter().map(|(id, error)| {
+                        Event::new("record.rejected", file.feed)
+                            .load(file_id)
+                            .record(id)
+                            .error_kind("parse")
+                            .reason(&error)
+                    }));
+                }
+                Err(reason) => events.push(
+                    Event::new("load.unreadable", file.feed)
+                        .load(file_id)
+                        .reason(reason)
+                        .detail(json!({"name": file.name, "size": file.size})),
+                ),
+            }
+            tx.insert_events(&events)?;
+            Ok(file_id)
+        })
+    }
+
+    /// Records a file whose content was already received, with `load.duplicate`.
+    pub fn insert_duplicate(
+        &self,
+        feed: &str,
+        name: &str,
+        sha: &str,
+        size: u64,
+        original: i64,
+    ) -> Result<i64> {
+        self.transaction(|tx| {
+            let now = now_ms();
+            let id = tx
+                .query_one(
+                    "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at)
+                     VALUES ($1, $2, $3, $4, 'duplicate', $5, $6, $7) RETURNING id",
+                    &params![feed, name, sha, size, original, now, now],
+                )?
+                .map(|r| r.i64(0))
+                .context("INSERT returned no id")?;
+            tx.insert_events(&[Event::new("load.duplicate", feed)
+                .load(id)
+                .detail(json!({"name": name, "duplicate_of": original}))])?;
+            Ok(id)
+        })
+    }
+
+    /// Records a zip as `unpacked`, with `load.received` marked as a container;
+    /// its entries are loads of their own.
+    pub fn insert_container(&self, feed: &str, name: &str, sha: &str, size: u64) -> Result<i64> {
+        self.transaction(|tx| {
+            let now = now_ms();
+            let id = tx
+                .query_one(
+                    "INSERT INTO files (feed_id, name, sha256, size, status, received_at, finished_at)
+                     VALUES ($1, $2, $3, $4, 'unpacked', $5, $6) RETURNING id",
+                    &params![feed, name, sha, size, now, now],
+                )?
+                .map(|r| r.i64(0))
+                .context("INSERT returned no id")?;
+            tx.insert_events(&[Event::new("load.received", feed).load(id).detail(
+                json!({"name": name, "size": size, "records": 0, "container": true}),
+            )])?;
+            Ok(id)
+        })
+    }
+
     /// Puts a file's rejected records back at the start, all of them or those with
-    /// one reason. Returns how many.
+    /// one reason, with `load.retried` and a `record.retried` per record. The
+    /// file's row is locked first, so a finish of the same file waits or is seen
+    /// waiting. Returns how many; with none, nothing changes.
     pub fn reprocess_rejected(&self, file_id: i64, reason: Option<&str>) -> Result<usize> {
-        let n = self.execute(
-            "UPDATE records SET status = 'received', resources = NULL, error_kind = NULL, error = NULL,
-                    response = NULL, attempts = 0, next_attempt_at = 0, submission = NULL, updated_at = $3
-             WHERE file_id = $1 AND status = 'rejected' AND (CAST($2 AS TEXT) IS NULL OR error = CAST($2 AS TEXT))",
-            &params![file_id, reason, now_ms()],
-        )?;
-        if n > 0 {
-            self.execute(
+        self.transaction(|tx| {
+            let lock = format!(
+                "SELECT feed_id FROM files WHERE id = $1{}",
+                tx.for_update()
+            );
+            let Some(feed) = tx.query_one(&lock, &params![file_id])?.map(|r| r.string(0)) else {
+                return Ok(0);
+            };
+            let rows = tx.query(
+                "UPDATE records SET status = 'received', resources = NULL, error_kind = NULL, error = NULL,
+                        response = NULL, attempts = 0, next_attempt_at = 0, submission = NULL,
+                        revision = revision + 1, updated_at = $3
+                 WHERE file_id = $1 AND status = 'rejected' AND (CAST($2 AS TEXT) IS NULL OR error = CAST($2 AS TEXT))
+                 RETURNING id",
+                &params![file_id, reason, now_ms()],
+            )?;
+            if rows.is_empty() {
+                tx.rollback = true;
+                return Ok(0);
+            }
+            tx.execute(
                 "UPDATE files SET status = 'processing', finished_at = NULL WHERE id = $1",
                 &params![file_id],
             )?;
-        }
-        Ok(n as usize)
+            let mut ids: Vec<i64> = rows.iter().map(|r| r.i64(0)).collect();
+            ids.sort_unstable();
+            let mut retried = Event::new("load.retried", &feed)
+                .load(file_id)
+                .detail(json!({"retried": ids.len()}));
+            if let Some(reason) = reason {
+                retried = retried.reason(reason);
+            }
+            let mut events = vec![retried];
+            events.extend(ids.iter().map(|id| {
+                Event::new("record.retried", &feed)
+                    .load(file_id)
+                    .record(*id)
+                    .detail(json!({"from_status": "rejected", "corrected": false}))
+            }));
+            tx.insert_events(&events)?;
+            Ok(ids.len())
+        })
     }
 
+    /// A file that could not be read after it was recorded (a zip that does not
+    /// open), with `load.unreadable`.
     pub fn fail_file(&self, file_id: i64, error: &str) -> Result<()> {
-        self.execute(
-            "UPDATE files SET status = 'unreadable', error = $2, finished_at = $3 WHERE id = $1",
-            &params![file_id, error, now_ms()],
-        )
-        .map(drop)
+        self.transaction(|tx| {
+            let row = tx.query_one(
+                "UPDATE files SET status = 'unreadable', error = $2, finished_at = $3 WHERE id = $1
+                 RETURNING feed_id, name, size",
+                &params![file_id, error, now_ms()],
+            )?;
+            if let Some(r) = row {
+                tx.insert_events(&[Event::new("load.unreadable", &r.string(0))
+                    .load(file_id)
+                    .reason(error)
+                    .detail(json!({"name": r.string(1), "size": r.i64(2)}))])?;
+            }
+            Ok(())
+        })
     }
 
-    /// Marks files whose records have all reached `sent` or `rejected` as done and returns them.
+    /// Marks files whose records have all reached `sent` or `rejected` as done and
+    /// returns them, each with `load.finished`. Each file is finished in a
+    /// transaction of its own: its row is locked, then moved to `done` only if no
+    /// record is in progress, read after the lock; the counts are read after that.
+    /// A Retry that put records back first is seen; one that comes after waits.
     pub fn finish_files(&self, feed: &str) -> Result<Vec<FinishedFile>> {
-        let rows = self.query(
-            "SELECT f.id, f.name,
-                    COUNT(r.id),
-                    CAST(COALESCE(SUM(CASE WHEN r.status = 'sent' THEN 1 ELSE 0 END), 0) AS BIGINT),
-                    CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT),
-                    f.rejected_reported
-             FROM files f LEFT JOIN records r ON r.file_id = f.id
+        let candidates = self.query(
+            "SELECT f.id FROM files f
              WHERE f.feed_id = $1 AND f.status IN ('processing', 'unpacked')
-             GROUP BY f.id, f.name, f.rejected_reported
-             HAVING COALESCE(SUM(CASE WHEN r.status IN ('received', 'pending', 'submitted') THEN 1 ELSE 0 END), 0) = 0",
+               AND NOT EXISTS (SELECT 1 FROM records r WHERE r.file_id = f.id AND r.status IN ('received', 'pending', 'submitted'))
+             ORDER BY f.id",
             &params![feed],
         )?;
-        let mut done: Vec<FinishedFile> = rows
-            .iter()
-            .map(|r| FinishedFile {
-                id: r.i64(0),
-                name: r.string(1),
-                total: r.i64(2),
-                sent: r.i64(3),
-                rejected: r.i64(4),
-                newly_rejected: r.i64(4) - r.i64(5),
-                first_rejection: None,
-            })
-            .collect();
-        for f in &mut done {
-            self.execute(
-                "UPDATE files SET status = 'done', finished_at = $2,
-                        rejected_reported = CASE WHEN rejected_reported > $3 THEN rejected_reported ELSE $3 END
-                 WHERE id = $1",
-                &params![f.id, now_ms(), f.rejected],
-            )?;
-            f.first_rejection = self
-                .query_one(
-                    "SELECT line, error FROM records WHERE file_id = $1 AND status = 'rejected' ORDER BY line LIMIT 1",
-                    &params![f.id],
-                )?
-                .map(|r| (r.i64(0), r.string(1)));
+        let mut done = Vec::new();
+        for candidate in candidates.iter().map(|r| r.i64(0)) {
+            let finished = self.transaction(|tx| {
+                let lock = format!(
+                    "SELECT name, status, rejected_reported FROM files
+                     WHERE id = $1 AND status IN ('processing', 'unpacked'){}",
+                    tx.for_update()
+                );
+                let Some(file) = tx.query_one(&lock, &params![candidate])? else {
+                    return Ok(None);
+                };
+                let moved = tx.query_one(
+                    "UPDATE files SET status = 'done', finished_at = $2,
+                            rejected_reported = CASE
+                              WHEN rejected_reported > (SELECT COUNT(*) FROM records WHERE file_id = $1 AND status = 'rejected')
+                              THEN rejected_reported
+                              ELSE (SELECT COUNT(*) FROM records WHERE file_id = $1 AND status = 'rejected') END
+                     WHERE id = $1 AND status IN ('processing', 'unpacked')
+                       AND NOT EXISTS (SELECT 1 FROM records WHERE file_id = $1 AND status IN ('received', 'pending', 'submitted'))
+                     RETURNING id",
+                    &params![candidate, now_ms()],
+                )?;
+                if moved.is_none() {
+                    return Ok(None);
+                }
+                let counts = tx
+                    .query_one(
+                        "SELECT COUNT(id),
+                                CAST(COALESCE(SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END), 0) AS BIGINT),
+                                CAST(COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT)
+                         FROM records WHERE file_id = $1",
+                        &params![candidate],
+                    )?
+                    .context("no counts")?;
+                let (total, sent, rejected) = (counts.i64(0), counts.i64(1), counts.i64(2));
+                let first_rejection = tx
+                    .query_one(
+                        "SELECT line, error FROM records WHERE file_id = $1 AND status = 'rejected' ORDER BY line LIMIT 1",
+                        &params![candidate],
+                    )?
+                    .map(|r| (r.i64(0), r.string(1)));
+                let mut detail = json!({"records": total, "sent": sent, "rejected": rejected});
+                if file.string(1) == "unpacked" {
+                    detail["container"] = json!(true);
+                }
+                tx.insert_events(&[Event::new("load.finished", feed)
+                    .load(candidate)
+                    .detail(detail)])?;
+                Ok(Some(FinishedFile {
+                    id: candidate,
+                    name: file.string(0),
+                    total,
+                    sent,
+                    rejected,
+                    newly_rejected: rejected - file.i64(2),
+                    first_rejection,
+                }))
+            })?;
+            done.extend(finished);
         }
         Ok(done)
     }
 
     // ---- records -----------------------------------------------------------
 
+    /// Stores a file's records (rows that could not be parsed as rejected), with
+    /// no events: the pipeline admits files with `admit_file`.
     pub fn insert_records(
         &self,
         file_id: i64,
         feed: &str,
         rows: &[(i64, Value, Option<String>)],
     ) -> Result<()> {
-        self.with(|c| {
-            c.batch("BEGIN")?;
-            let now = now_ms();
-            let result = (|| {
-                // Rows go in by the hundred per statement: one round trip each
-                // over a million rows is an hour; this is minutes.
-                for chunk in rows.chunks(INSERT_ROWS_PER_STATEMENT) {
-                    let mut sql = String::from(
-                        "INSERT INTO records (file_id, feed_id, line, raw, status, error_kind, error, updated_at) VALUES ",
-                    );
-                    let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 8);
-                    for (i, (line, raw, parse_error)) in chunk.iter().enumerate() {
-                        let (status, kind) = match parse_error {
-                            Some(_) => ("rejected", Some("parse")),
-                            None => ("received", None),
-                        };
-                        if i > 0 {
-                            sql.push_str(", ");
-                        }
-                        let b = i * 8;
-                        sql.push_str(&format!(
-                            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                            b + 1, b + 2, b + 3, b + 4, b + 5, b + 6, b + 7, b + 8
-                        ));
-                        values.extend(params![file_id, feed, line, raw.to_string(), status, kind, parse_error, now]);
-                    }
-                    c.execute(&sql, &values)?;
-                }
-                Ok::<_, anyhow::Error>(())
-            })();
-            match result {
-                Ok(()) => c.batch("COMMIT"),
-                Err(e) => {
-                    let _ = c.batch("ROLLBACK");
-                    Err(e)
-                }
-            }
-        })
+        self.transaction(|tx| insert_record_rows(tx, file_id, feed, rows).map(drop))
     }
 
     fn work_items(&self, sql: &str, p: &[Param]) -> Result<Vec<WorkItem>> {
@@ -1126,13 +1583,14 @@ impl Db {
                 raw: r.json(4).unwrap_or(Value::Null),
                 resources: r.json(5),
                 attempts: r.i64(6) as u32,
+                revision: r.i64(7),
             })
             .collect())
     }
 
     pub fn received_records(&self, feed: &str, limit: usize) -> Result<Vec<WorkItem>> {
         self.work_items(
-            "SELECT r.id, r.file_id, r.line, f.name, r.raw, r.resources, r.attempts
+            "SELECT r.id, r.file_id, r.line, f.name, r.raw, r.resources, r.attempts, r.revision
              FROM records r JOIN files f ON f.id = r.file_id
              WHERE r.feed_id = $1 AND r.status = 'received' ORDER BY r.id LIMIT $2",
             &params![feed, limit],
@@ -1141,7 +1599,7 @@ impl Db {
 
     pub fn due_records(&self, feed: &str, limit: usize) -> Result<Vec<WorkItem>> {
         self.work_items(
-            "SELECT r.id, r.file_id, r.line, f.name, r.raw, r.resources, r.attempts
+            "SELECT r.id, r.file_id, r.line, f.name, r.raw, r.resources, r.attempts, r.revision
              FROM records r JOIN files f ON f.id = r.file_id
              WHERE r.feed_id = $1 AND r.status = 'pending' AND r.next_attempt_at <= $2
              ORDER BY r.id LIMIT $3",
@@ -1150,60 +1608,16 @@ impl Db {
     }
 
     /// Marks records whose source row is the resource to deliver as transformed,
-    /// in one statement per hundreds of ids: the resource list is built from the
-    /// row in the store, so no payload travels.
-    pub fn mark_passthrough(&self, ids: &[i64]) -> Result<()> {
-        let now = now_ms();
-        for chunk in ids.chunks(INSERT_ROWS_PER_STATEMENT) {
-            let marks: Vec<String> = (0..chunk.len()).map(|i| format!("${}", i + 2)).collect();
-            let mut values: Vec<Param> = Vec::with_capacity(chunk.len() + 1);
-            values.push(Param::Int(now));
-            values.extend(chunk.iter().map(|id| Param::Int(*id)));
-            self.execute(
-                &format!(
-                    "UPDATE records SET status = 'pending', resources = '[' || raw || ']', error_kind = NULL, error = NULL,
-                            attempts = 0, next_attempt_at = 0, updated_at = $1 WHERE id IN ({})",
-                    marks.join(", ")
-                ),
-                &values,
-            )?;
-        }
-        Ok(())
-    }
-
-    pub fn mark_transformed(&self, id: i64, resources: &Value) -> Result<()> {
-        self.execute(
-            "UPDATE records SET status = 'pending', resources = $2, error_kind = NULL, error = NULL,
-                    attempts = 0, next_attempt_at = 0, updated_at = $3 WHERE id = $1",
-            &params![id, resources.to_string(), now_ms()],
-        )
-        .map(drop)
-    }
-
-    pub fn mark_rejected(
-        &self,
-        id: i64,
-        kind: &str,
-        error: &str,
-        response: Option<&Value>,
-    ) -> Result<()> {
-        self.execute(
-            "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, response = $4, updated_at = $5 WHERE id = $1",
-            &params![id, kind, error, response.map(Value::to_string), now_ms()],
-        )
-        .map(drop)
-    }
-
-    /// Marks many records sent, each with its own response, in one statement per
-    /// hundreds of records: `UPDATE ... FROM (VALUES ...)`, which both engines
-    /// take with the columns named `column1` and `column2`.
-    pub fn mark_sent_many(&self, items: &[(i64, Value)]) -> Result<()> {
+    /// in one statement per hundreds of records: the resource list is built from
+    /// the row in the store, so no payload travels. Each is given as (id,
+    /// revision) and changes only while still `received` at that revision.
+    pub fn mark_passthrough(&self, items: &[(i64, i64)]) -> Result<()> {
         let now = now_ms();
         for chunk in items.chunks(INSERT_ROWS_PER_STATEMENT) {
             let rows: Vec<String> = (0..chunk.len())
                 .map(|i| {
                     format!(
-                        "(CAST(${} AS BIGINT), CAST(${} AS TEXT))",
+                        "(CAST(${} AS BIGINT), CAST(${} AS BIGINT))",
                         i * 2 + 2,
                         i * 2 + 3
                     )
@@ -1211,14 +1625,16 @@ impl Db {
                 .collect();
             let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 2 + 1);
             values.push(Param::Int(now));
-            for (id, response) in chunk {
+            for (id, revision) in chunk {
                 values.push(Param::Int(*id));
-                values.push(Param::Text(response.to_string()));
+                values.push(Param::Int(*revision));
             }
             self.execute(
                 &format!(
-                    "UPDATE records SET status = 'sent', response = v.column2, error_kind = NULL, error = NULL, updated_at = $1
-                     FROM (VALUES {}) AS v WHERE records.id = v.column1",
+                    "UPDATE records SET status = 'pending', resources = '[' || raw || ']', error_kind = NULL, error = NULL,
+                            attempts = 0, next_attempt_at = 0, updated_at = $1
+                     FROM (VALUES {}) AS v
+                     WHERE records.id = v.column1 AND records.revision = v.column2 AND records.status = 'received'",
                     rows.join(", ")
                 ),
                 &values,
@@ -1227,43 +1643,202 @@ impl Db {
         Ok(())
     }
 
-    pub fn mark_sent(&self, id: i64, response: &Value) -> Result<()> {
-        self.execute(
-            "UPDATE records SET status = 'sent', response = $2, error_kind = NULL, error = NULL, updated_at = $3 WHERE id = $1",
-            &params![id, response.to_string(), now_ms()],
-        )
-        .map(drop)
+    /// The transform's resources for a record still `received` at the item's
+    /// revision. Returns whether it changed. The transform step writes no event.
+    pub fn mark_transformed(&self, item: &WorkItem, resources: &Value) -> Result<bool> {
+        Ok(self.execute(
+            "UPDATE records SET status = 'pending', resources = $2, error_kind = NULL, error = NULL,
+                    attempts = 0, next_attempt_at = 0, updated_at = $3
+             WHERE id = $1 AND status = 'received' AND revision = $4",
+            &params![item.id, resources.to_string(), now_ms(), item.revision],
+        )? > 0)
     }
 
-    pub fn defer(&self, id: i64, attempts: u32, next_attempt_at: i64, error: &str) -> Result<()> {
-        self.execute(
-            "UPDATE records SET attempts = $2, next_attempt_at = $3, error_kind = 'transient', error = $4, updated_at = $5 WHERE id = $1",
-            &params![id, attempts, next_attempt_at, error, now_ms()],
-        )
-        .map(drop)
+    /// Rejects a record still in `from` at the item's revision (`received` for the
+    /// transform and the bulk preflight), with `record.rejected`. Returns whether
+    /// it changed: an outcome for a superseded revision changes nothing.
+    pub fn reject_item(
+        &self,
+        item: &WorkItem,
+        from: &str,
+        kind: &str,
+        error: &str,
+    ) -> Result<bool> {
+        self.transaction(|tx| {
+            let Some(r) = tx.query_one(
+                "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, updated_at = $4
+                 WHERE id = $1 AND status = $5 AND revision = $6
+                 RETURNING feed_id, file_id",
+                &params![item.id, kind, error, now_ms(), from, item.revision],
+            )?
+            else {
+                return Ok(false);
+            };
+            tx.insert_events(&[Event::new("record.rejected", &r.string(0))
+                .load(r.i64(1))
+                .record(item.id)
+                .error_kind(kind)
+                .reason(error)])?;
+            Ok(true)
+        })
     }
 
-    /// Puts a record back at the start of the pipeline, optionally with corrected source data.
+    /// The transform could not finish a record now and it stays `received`:
+    /// `record.attempt_failed`, while the record is still at the item's revision.
+    pub fn transform_deferred(&self, item: &WorkItem, reason: &str) -> Result<bool> {
+        self.transaction(|tx| {
+            let sql = format!(
+                "SELECT feed_id, file_id FROM records WHERE id = $1 AND status = 'received' AND revision = $2{}",
+                tx.for_update()
+            );
+            let Some(r) = tx.query_one(&sql, &params![item.id, item.revision])? else {
+                return Ok(false);
+            };
+            tx.insert_events(&[Event::new("record.attempt_failed", &r.string(0))
+                .load(r.i64(1))
+                .record(item.id)
+                .reason(reason)
+                .detail(json!({"phase": "transform"}))])?;
+            Ok(true)
+        })
+    }
+
+    /// Rejects a record whatever its state, with `record.rejected`. The engine's
+    /// own outcomes go through the guarded writes; this is for a record decided
+    /// from outside them.
+    pub fn mark_rejected(
+        &self,
+        id: i64,
+        kind: &str,
+        error: &str,
+        response: Option<&Value>,
+    ) -> Result<()> {
+        self.transaction(|tx| {
+            let Some(r) = tx.query_one(
+                "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, response = $4, updated_at = $5
+                 WHERE id = $1 RETURNING feed_id, file_id",
+                &params![id, kind, error, response.map(Value::to_string), now_ms()],
+            )?
+            else {
+                return Ok(());
+            };
+            tx.insert_events(&[Event::new("record.rejected", &r.string(0))
+                .load(r.i64(1))
+                .record(id)
+                .error_kind(kind)
+                .reason(error)])
+        })
+    }
+
+    /// Stores what one batch's answer decided for each of its records, in one
+    /// transaction, with their events: `record.delivered` (or `record.recovered`
+    /// after failed attempts), `record.rejected`, `record.attempt_failed`. Each
+    /// changes only while its record is still `pending` at the item's revision.
+    pub fn delivered(&self, outcomes: &[(&WorkItem, Delivery)]) -> Result<()> {
+        self.transaction(|tx| {
+            let now = now_ms();
+            let mut events = Vec::with_capacity(outcomes.len());
+            for (item, outcome) in outcomes {
+                let row = match outcome {
+                    Delivery::Sent(response) => tx.query_one(
+                        "UPDATE records SET status = 'sent', response = $2, error_kind = NULL, error = NULL, updated_at = $3
+                         WHERE id = $1 AND status = 'pending' AND revision = $4
+                         RETURNING feed_id, file_id, attempts",
+                        &params![item.id, response.to_string(), now, item.revision],
+                    )?,
+                    Delivery::Rejected {
+                        kind,
+                        error,
+                        response,
+                    } => tx.query_one(
+                        "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, response = $4, updated_at = $5
+                         WHERE id = $1 AND status = 'pending' AND revision = $6
+                         RETURNING feed_id, file_id, attempts",
+                        &params![item.id, kind, error, response.map(Value::to_string), now, item.revision],
+                    )?,
+                    Delivery::Deferred {
+                        attempts,
+                        next_attempt_at,
+                        error,
+                    } => tx.query_one(
+                        "UPDATE records SET attempts = $2, next_attempt_at = $3, error_kind = 'transient', error = $4, updated_at = $5
+                         WHERE id = $1 AND status = 'pending' AND revision = $6
+                         RETURNING feed_id, file_id, attempts",
+                        &params![item.id, attempts, next_attempt_at, error, now, item.revision],
+                    )?,
+                };
+                let Some(r) = row else {
+                    continue;
+                };
+                let (feed, file_id, attempts) = (r.string(0), r.i64(1), r.i64(2));
+                let base = |kind| Event::new(kind, &feed).load(file_id).record(item.id);
+                events.push(match outcome {
+                    Delivery::Sent(_) if attempts > 0 => base("record.recovered").attempt(attempts + 1),
+                    Delivery::Sent(_) => base("record.delivered").attempt(attempts + 1),
+                    Delivery::Rejected { kind, error, .. } => base("record.rejected")
+                        .attempt(attempts + 1)
+                        .error_kind(kind)
+                        .reason(error),
+                    Delivery::Deferred {
+                        next_attempt_at,
+                        error,
+                        ..
+                    } => base("record.attempt_failed")
+                        .attempt(attempts)
+                        .reason(error)
+                        .detail(json!({"phase": "delivery", "next_attempt_at": iso_ms(*next_attempt_at)})),
+                });
+            }
+            tx.insert_events(&events)
+        })
+    }
+
+    /// Puts a record back at the start of the pipeline, optionally with corrected
+    /// source data, with `record.retried`. Its file's row is locked first, as a
+    /// Retry does. The record keeps the submission it was in, if any.
     pub fn reprocess(&self, id: i64, raw: Option<&Value>) -> Result<bool> {
-        let n = match raw {
-            Some(raw) => self.execute(
-                "UPDATE records SET status = 'received', original_raw = COALESCE(original_raw, raw), raw = $2, resources = NULL, error_kind = NULL, error = NULL,
-                        response = NULL, attempts = 0, next_attempt_at = 0, updated_at = $3 WHERE id = $1",
-                &params![id, raw.to_string(), now_ms()],
-            )?,
-            None => self.execute(
-                "UPDATE records SET status = 'received', resources = NULL, error_kind = NULL, error = NULL,
-                        response = NULL, attempts = 0, next_attempt_at = 0, updated_at = $2 WHERE id = $1",
-                &params![id, now_ms()],
-            )?,
-        };
-        if n > 0 {
-            self.execute(
-                "UPDATE files SET status = 'processing', finished_at = NULL WHERE id = (SELECT file_id FROM records WHERE id = $1)",
-                &params![id],
+        self.transaction(|tx| {
+            let Some(file_id) = tx
+                .query_one("SELECT file_id FROM records WHERE id = $1", &params![id])?
+                .map(|r| r.i64(0))
+            else {
+                return Ok(false);
+            };
+            let lock_file = format!("SELECT id FROM files WHERE id = $1{}", tx.for_update());
+            tx.query(&lock_file, &params![file_id])?;
+            let lock_record = format!(
+                "SELECT status, feed_id FROM records WHERE id = $1{}",
+                tx.for_update()
+            );
+            let Some(before) = tx.query_one(&lock_record, &params![id])? else {
+                return Ok(false);
+            };
+            let now = now_ms();
+            match raw {
+                Some(raw) => tx.execute(
+                    "UPDATE records SET status = 'received', original_raw = COALESCE(original_raw, raw), raw = $2, resources = NULL,
+                            error_kind = NULL, error = NULL, response = NULL, attempts = 0, next_attempt_at = 0,
+                            revision = revision + 1, updated_at = $3
+                     WHERE id = $1",
+                    &params![id, raw.to_string(), now],
+                )?,
+                None => tx.execute(
+                    "UPDATE records SET status = 'received', resources = NULL, error_kind = NULL, error = NULL,
+                            response = NULL, attempts = 0, next_attempt_at = 0, revision = revision + 1, updated_at = $2
+                     WHERE id = $1",
+                    &params![id, now],
+                )?,
+            };
+            tx.execute(
+                "UPDATE files SET status = 'processing', finished_at = NULL WHERE id = $1",
+                &params![file_id],
             )?;
-        }
-        Ok(n > 0)
+            tx.insert_events(&[Event::new("record.retried", &before.string(1))
+                .load(file_id)
+                .record(id)
+                .detail(json!({"from_status": before.string(0), "corrected": raw.is_some()}))])?;
+            Ok(true)
+        })
     }
 
     // ---- submissions ($bulk-submit) ------------------------------------------
@@ -1309,22 +1884,24 @@ impl Db {
     }
 
     /// Pending records of a feed that no submission holds yet, with their
-    /// resources: what the engine writes out itself on the transformed bulk path.
-    pub fn submittable_records(&self, feed: &str, limit: usize) -> Result<Vec<(i64, Value)>> {
+    /// revision and resources: what the engine writes out itself on the
+    /// transformed bulk path.
+    pub fn submittable_records(&self, feed: &str, limit: usize) -> Result<Vec<(i64, i64, Value)>> {
         Ok(self
             .query(
-                "SELECT id, resources FROM records
+                "SELECT id, revision, resources FROM records
                  WHERE feed_id = $1 AND status = 'pending' AND submission IS NULL
                  ORDER BY id LIMIT $2",
                 &params![feed, limit],
             )?
             .iter()
-            .map(|r| (r.i64(0), r.json(1).unwrap_or(Value::Null)))
+            .map(|r| (r.i64(0), r.i64(1), r.json(2).unwrap_or(Value::Null)))
             .collect())
     }
 
-    /// Opens a submission over every pending record of the given files, which move
-    /// to `submitted` in one statement per file.
+    /// Opens a submission over every pending record of the given files that no
+    /// submission holds, which move to `submitted` in one statement per file,
+    /// with `submission.opened` over the records actually taken. Returns how many.
     pub fn create_submission_for_files(
         &self,
         token: &str,
@@ -1332,68 +1909,84 @@ impl Db {
         submission_id: &str,
         manifest: &Value,
         file_ids: &[i64],
-    ) -> Result<()> {
-        self.with(|c| {
-            c.batch("BEGIN")?;
+    ) -> Result<usize> {
+        self.transaction(|tx| {
             let now = now_ms();
-            let result = (|| {
-                c.execute(
-                    "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, created_at, updated_at)
-                     VALUES ($1, $2, $3, 'kickoff', $4, $5, $6)",
-                    &params![token, feed, submission_id, manifest.to_string(), now, now],
-                )?;
-                for file_id in file_ids {
-                    c.execute(
+            insert_submission(tx, token, feed, submission_id, manifest, now)?;
+            let mut records = 0;
+            let mut files = 0;
+            for file_id in file_ids {
+                let n = tx
+                    .query(
                         "UPDATE records SET status = 'submitted', submission = $1, updated_at = $2
-                         WHERE file_id = $3 AND feed_id = $4 AND status = 'pending' AND submission IS NULL",
+                         WHERE file_id = $3 AND feed_id = $4 AND status = 'pending' AND submission IS NULL
+                         RETURNING id",
                         &params![token, now, file_id, feed],
-                    )?;
-                }
-                Ok::<_, anyhow::Error>(())
-            })();
-            match result {
-                Ok(()) => c.batch("COMMIT"),
-                Err(e) => {
-                    let _ = c.batch("ROLLBACK");
-                    Err(e)
-                }
+                    )?
+                    .len();
+                records += n;
+                files += usize::from(n > 0);
             }
+            tx.insert_events(&[opened(feed, token, submission_id, records, files)])?;
+            Ok(records)
         })
     }
 
-    /// Opens a submission over the given records, which move to `submitted`.
+    /// Opens a submission over the given records, given as (id, revision), which
+    /// move to `submitted`, with `submission.opened`. Each is claimed only while
+    /// still pending at that revision and held by no submission; if any is not,
+    /// nothing is written and `false` comes back, so the caller builds the
+    /// submission again from what is pending now.
     pub fn create_submission(
         &self,
         token: &str,
         feed: &str,
         submission_id: &str,
         manifest: &Value,
-        record_ids: &[i64],
-    ) -> Result<()> {
-        self.with(|c| {
-            c.batch("BEGIN")?;
+        records: &[(i64, i64)],
+    ) -> Result<bool> {
+        self.transaction(|tx| {
             let now = now_ms();
-            let result = (|| {
-                c.execute(
-                    "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, created_at, updated_at)
-                     VALUES ($1, $2, $3, 'kickoff', $4, $5, $6)",
-                    &params![token, feed, submission_id, manifest.to_string(), now, now],
+            insert_submission(tx, token, feed, submission_id, manifest, now)?;
+            let mut claimed = 0;
+            let mut files = std::collections::BTreeSet::new();
+            for chunk in records.chunks(INSERT_ROWS_PER_STATEMENT) {
+                let rows: Vec<String> = (0..chunk.len())
+                    .map(|i| {
+                        format!(
+                            "(CAST(${} AS BIGINT), CAST(${} AS BIGINT))",
+                            i * 2 + 3,
+                            i * 2 + 4
+                        )
+                    })
+                    .collect();
+                let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 2 + 2);
+                values.push(Param::Text(token.to_string()));
+                values.push(Param::Int(now));
+                for (id, revision) in chunk {
+                    values.push(Param::Int(*id));
+                    values.push(Param::Int(*revision));
+                }
+                let taken = tx.query(
+                    &format!(
+                        "UPDATE records SET status = 'submitted', submission = $1, updated_at = $2
+                         FROM (VALUES {}) AS v
+                         WHERE records.id = v.column1 AND records.revision = v.column2
+                           AND records.status = 'pending' AND records.submission IS NULL
+                         RETURNING file_id",
+                        rows.join(", ")
+                    ),
+                    &values,
                 )?;
-                for id in record_ids {
-                    c.execute(
-                        "UPDATE records SET status = 'submitted', submission = $2, updated_at = $3 WHERE id = $1",
-                        &params![id, token, now],
-                    )?;
-                }
-                Ok::<_, anyhow::Error>(())
-            })();
-            match result {
-                Ok(()) => c.batch("COMMIT"),
-                Err(e) => {
-                    let _ = c.batch("ROLLBACK");
-                    Err(e)
-                }
+                claimed += taken.len();
+                files.extend(taken.iter().map(|r| r.i64(0)));
             }
+            if claimed < records.len() {
+                tx.rollback = true;
+                return Ok(false);
+            }
+            tx.insert_events(&[opened(feed, token, submission_id, claimed, files.len())])?;
+            Ok(true)
         })
     }
 
@@ -1432,6 +2025,8 @@ impl Db {
         )
     }
 
+    /// Moves an open submission on (kicked off, polled, still running). These
+    /// steps write no event.
     pub fn update_submission(
         &self,
         token: &str,
@@ -1445,7 +2040,7 @@ impl Db {
             "UPDATE submissions SET status = $2,
                     status_url = COALESCE(CAST($3 AS TEXT), status_url),
                     attempts = $4, next_attempt_at = $5, error = $6, updated_at = $7
-             WHERE token = $1",
+             WHERE token = $1 AND status IN ('kickoff', 'running')",
             &params![
                 token,
                 status,
@@ -1457,6 +2052,213 @@ impl Db {
             ],
         )
         .map(drop)
+    }
+
+    /// A kick-off or status poll failed for a reason that may pass: the next
+    /// attempt is due at `next_attempt_at`, with `submission.attempt_failed`.
+    /// `reason` is already scrubbed of URLs and the token.
+    pub fn submission_attempt_failed(
+        &self,
+        token: &str,
+        attempts: u32,
+        next_attempt_at: i64,
+        reason: &str,
+    ) -> Result<()> {
+        self.transaction(|tx| {
+            let Some(r) = tx.query_one(
+                "UPDATE submissions SET attempts = $2, next_attempt_at = $3, error = $4, failures = failures + 1, updated_at = $5
+                 WHERE token = $1 AND status IN ('kickoff', 'running')
+                 RETURNING feed_id, submission_id",
+                &params![token, attempts, next_attempt_at, reason, now_ms()],
+            )?
+            else {
+                return Ok(());
+            };
+            tx.insert_events(&[Event::new("submission.attempt_failed", &r.string(0))
+                .attempt(attempts as i64)
+                .reason(reason)
+                .detail(json!({"submission": r.string(1), "run": crate::bulk::run_key(token),
+                               "next_attempt_at": iso_ms(next_attempt_at)}))])
+        })
+    }
+
+    /// Settles one page of a submission's records from the receipts, in one
+    /// transaction: `sent` with their responses, `missing` rejected with
+    /// `error`, each only while still `submitted` under this token; the rows
+    /// that changed are added to the submission's tallies, and each gets
+    /// `record.delivered` (`record.recovered` when the submission had failed
+    /// attempts) or `record.rejected`.
+    pub fn settle_page(
+        &self,
+        token: &str,
+        sent: &[(i64, Value)],
+        missing: &[i64],
+        error: &str,
+    ) -> Result<()> {
+        self.transaction(|tx| {
+            let Some(sub) = tx.query_one(
+                "SELECT feed_id, submission_id, failures FROM submissions WHERE token = $1",
+                &params![token],
+            )?
+            else {
+                return Ok(());
+            };
+            let (feed, submission_id, failures) = (sub.string(0), sub.string(1), sub.i64(2));
+            let now = now_ms();
+            let mut delivered = Vec::new();
+            for chunk in sent.chunks(INSERT_ROWS_PER_STATEMENT) {
+                let rows: Vec<String> = (0..chunk.len())
+                    .map(|i| {
+                        format!(
+                            "(CAST(${} AS BIGINT), CAST(${} AS TEXT))",
+                            i * 2 + 3,
+                            i * 2 + 4
+                        )
+                    })
+                    .collect();
+                let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 2 + 2);
+                values.push(Param::Int(now));
+                values.push(Param::Text(token.to_string()));
+                for (id, response) in chunk {
+                    values.push(Param::Int(*id));
+                    values.push(Param::Text(response.to_string()));
+                }
+                delivered.extend(tx.query(
+                    &format!(
+                        "UPDATE records SET status = 'sent', response = v.column2, error_kind = NULL, error = NULL, updated_at = $1
+                         FROM (VALUES {}) AS v
+                         WHERE records.id = v.column1 AND records.status = 'submitted' AND records.submission = $2
+                         RETURNING id, file_id",
+                        rows.join(", ")
+                    ),
+                    &values,
+                )?);
+            }
+            let mut rejected = Vec::new();
+            for chunk in missing.chunks(INSERT_ROWS_PER_STATEMENT) {
+                let mut values = params![now, token, error].to_vec();
+                values.extend(chunk.iter().map(|id| Param::Int(*id)));
+                rejected.extend(tx.query(
+                    &format!(
+                        "UPDATE records SET status = 'rejected', error_kind = 'server', error = $3, updated_at = $1
+                         WHERE status = 'submitted' AND submission = $2 AND id IN ({})
+                         RETURNING id, file_id",
+                        marks(4, chunk.len())
+                    ),
+                    &values,
+                )?);
+            }
+            tx.execute(
+                "UPDATE submissions SET sent = sent + $2, rejected = rejected + $3 WHERE token = $1",
+                &params![token, delivered.len(), rejected.len()],
+            )?;
+            let run = crate::bulk::run_key(token);
+            let mut events: Vec<(i64, Event)> = Vec::with_capacity(delivered.len() + rejected.len());
+            for r in &delivered {
+                let event = if failures > 0 {
+                    Event::new("record.recovered", &feed).detail(
+                        json!({"submission": submission_id, "run": run, "failures": failures}),
+                    )
+                } else {
+                    Event::new("record.delivered", &feed)
+                        .detail(json!({"submission": submission_id, "run": run}))
+                };
+                events.push((r.i64(0), event.load(r.i64(1)).record(r.i64(0))));
+            }
+            for r in &rejected {
+                events.push((
+                    r.i64(0),
+                    Event::new("record.rejected", &feed)
+                        .load(r.i64(1))
+                        .record(r.i64(0))
+                        .error_kind("server")
+                        .reason(error)
+                        .detail(json!({"submission": submission_id, "run": run})),
+                ));
+            }
+            events.sort_by_key(|(id, _)| *id);
+            let events: Vec<Event> = events.into_iter().map(|(_, e)| e).collect();
+            tx.insert_events(&events)
+        })
+    }
+
+    /// Closes a submission whose receipts are all applied, with
+    /// `submission.settled` and its tallies. Only an open submission moves, so
+    /// the event is written once. Returns whether it moved.
+    pub fn settle_submission(&self, token: &str) -> Result<bool> {
+        self.transaction(|tx| {
+            let Some(r) = tx.query_one(
+                "UPDATE submissions SET status = 'done', attempts = 0, next_attempt_at = 0, error = NULL, updated_at = $2
+                 WHERE token = $1 AND status IN ('kickoff', 'running')
+                 RETURNING feed_id, submission_id, sent, rejected, failures",
+                &params![token, now_ms()],
+            )?
+            else {
+                return Ok(false);
+            };
+            tx.insert_events(&[Event::new("submission.settled", &r.string(0)).detail(json!({
+                "submission": r.string(1),
+                "run": crate::bulk::run_key(token),
+                "sent": r.i64(2),
+                "rejected": r.i64(3),
+                "failures": r.i64(4),
+            }))])?;
+            Ok(true)
+        })
+    }
+
+    /// The server refused a submission: it fails, and every record it still
+    /// holds is rejected with `reason` and the server's `response`, in one
+    /// transaction, with a `record.rejected` each and one `submission.refused`.
+    /// `reason` and `response` are already scrubbed; the events never carry the
+    /// response. Nothing happens unless the submission is open. Returns how many
+    /// records were rejected, or `None`.
+    pub fn reject_submission(
+        &self,
+        token: &str,
+        kind: &str,
+        reason: &str,
+        response: &Value,
+    ) -> Result<Option<usize>> {
+        self.transaction(|tx| {
+            let now = now_ms();
+            let Some(sub) = tx.query_one(
+                "UPDATE submissions SET status = 'failed', next_attempt_at = 0, error = $2, updated_at = $3
+                 WHERE token = $1 AND status IN ('kickoff', 'running')
+                 RETURNING feed_id, submission_id",
+                &params![token, reason, now],
+            )?
+            else {
+                return Ok(None);
+            };
+            let (feed, submission_id) = (sub.string(0), sub.string(1));
+            let mut rows = tx.query(
+                "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, response = $4, updated_at = $5
+                 WHERE submission = $1 AND status = 'submitted'
+                 RETURNING id, file_id",
+                &params![token, kind, reason, response.to_string(), now],
+            )?;
+            rows.sort_by_key(|r| r.i64(0));
+            let run = crate::bulk::run_key(token);
+            let mut events: Vec<Event> = rows
+                .iter()
+                .map(|r| {
+                    Event::new("record.rejected", &feed)
+                        .load(r.i64(1))
+                        .record(r.i64(0))
+                        .error_kind(kind)
+                        .reason(reason)
+                        .detail(json!({"submission": submission_id, "run": run}))
+                })
+                .collect();
+            events.push(
+                Event::new("submission.refused", &feed)
+                    .reason(reason)
+                    .detail(json!({"submission": submission_id, "run": run, "records": rows.len()})),
+            );
+            tx.insert_events(&events)?;
+            Ok(Some(rows.len()))
+        })
     }
 
     /// The records a submission holds: (record id, file id, resources).
@@ -1500,13 +2302,29 @@ impl Db {
     }
 
     /// Rejects a file's pending records that no submission holds: the file cannot
-    /// be handed over at all. Returns how many.
+    /// be handed over at all. Each gets `record.rejected`. Returns how many.
     pub fn reject_unsubmitted(&self, file_id: i64, kind: &str, error: &str) -> Result<usize> {
-        Ok(self.execute(
-            "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, updated_at = $4
-             WHERE file_id = $1 AND status = 'pending' AND submission IS NULL",
-            &params![file_id, kind, error, now_ms()],
-        )? as usize)
+        self.transaction(|tx| {
+            let mut rows = tx.query(
+                "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, updated_at = $4
+                 WHERE file_id = $1 AND status = 'pending' AND submission IS NULL
+                 RETURNING id, feed_id",
+                &params![file_id, kind, error, now_ms()],
+            )?;
+            rows.sort_by_key(|r| r.i64(0));
+            let events: Vec<Event> = rows
+                .iter()
+                .map(|r| {
+                    Event::new("record.rejected", &r.string(1))
+                        .load(file_id)
+                        .record(r.i64(0))
+                        .error_kind(kind)
+                        .reason(error)
+                })
+                .collect();
+            tx.insert_events(&events)?;
+            Ok(rows.len())
+        })
     }
 
     // ---- source state, cursors, leases ------------------------------------------
@@ -1666,6 +2484,160 @@ impl Db {
             &params![id, now_ms(), reason],
         )
         .map(drop)
+    }
+
+    /// Alerts raised so far, by source and kind, the purged ones included, so
+    /// the totals never go down: (source or "", kind, count).
+    pub fn alert_totals(&self) -> Result<Vec<(String, String, i64)>> {
+        Ok(self
+            .query(
+                "SELECT source, kind, CAST(SUM(n) AS BIGINT) FROM (
+                   SELECT COALESCE(feed_id, '') AS source, kind, COUNT(*) AS n FROM alerts GROUP BY feed_id, kind
+                   UNION ALL
+                   SELECT feed_id AS source, kind, n FROM alert_counts_purged
+                 ) t GROUP BY source, kind ORDER BY source, kind",
+                &[],
+            )?
+            .iter()
+            .map(|r| (r.string(0), r.string(1), r.i64(2)))
+            .collect())
+    }
+
+    // ---- history: events and their retention --------------------------------
+
+    /// A page of events, oldest first by id: see `docs/api.md` (Events). The
+    /// newest id is read first and nothing past it is listed, so a page never
+    /// skips an event that commits later with a lower id.
+    pub fn list_events(&self, q: &EventQuery) -> Result<EventPage> {
+        let mark = self
+            .query_one("SELECT MAX(id) FROM events", &[])?
+            .and_then(|r| r.opt_i64(0));
+        let Some(mark) = mark else {
+            return Ok(EventPage {
+                events: vec![],
+                next: q.cursor,
+                has_more: false,
+            });
+        };
+        let forward = |next: i64| Some(q.cursor.map_or(next, |c| c.max(next)));
+        // Without a cursor, `since` gives where to start, itself included.
+        let (start, inclusive) = match (q.cursor, q.since) {
+            (Some(cursor), _) => (cursor, false),
+            (None, Some(since)) => match self
+                .query_one("SELECT MIN(id) FROM events WHERE at >= $1", &params![since])?
+                .and_then(|r| r.opt_i64(0))
+            {
+                Some(first) => (first, true),
+                None => {
+                    return Ok(EventPage {
+                        events: vec![],
+                        next: forward(mark),
+                        has_more: false,
+                    });
+                }
+            },
+            (None, None) => (0, false),
+        };
+        let mut sql = format!(
+            "SELECT id, {} AS at, source_id, kind, load_id, record_id, attempt, error_kind, reason, detail
+             FROM events WHERE id {} $1 AND id <= $2",
+            self.iso("at"),
+            if inclusive { ">=" } else { ">" }
+        );
+        let mut values = params![start, mark].to_vec();
+        if let Some(source) = &q.source {
+            values.push(Param::Text(source.clone()));
+            sql.push_str(&format!(" AND source_id = ${}", values.len()));
+        }
+        if let Some(since) = q.since {
+            values.push(Param::Int(since));
+            sql.push_str(&format!(" AND at >= ${}", values.len()));
+        }
+        if !q.kinds.is_empty() {
+            let mut any = Vec::new();
+            for kind in &q.kinds {
+                if crate::events::FAMILIES.contains(&kind.as_str()) {
+                    any.push(format!("kind LIKE '{kind}.%'"));
+                } else {
+                    values.push(Param::Text(kind.clone()));
+                    any.push(format!("kind = ${}", values.len()));
+                }
+            }
+            sql.push_str(&format!(" AND ({})", any.join(" OR ")));
+        }
+        values.push(Param::Int(q.limit as i64 + 1));
+        sql.push_str(&format!(" ORDER BY id LIMIT ${}", values.len()));
+        let mut events: Vec<Value> = self
+            .query(&sql, &values)?
+            .iter()
+            .map(|r| {
+                let mut e = r.object();
+                if let Some(Value::String(text)) = e.get("detail") {
+                    e["detail"] = serde_json::from_str(text).unwrap_or(Value::Null);
+                }
+                e
+            })
+            .collect();
+        let has_more = events.len() > q.limit;
+        events.truncate(q.limit);
+        let next = match events.last() {
+            Some(last) if has_more => last["id"].as_i64(),
+            _ => forward(mark),
+        };
+        Ok(EventPage {
+            events,
+            next,
+            has_more,
+        })
+    }
+
+    /// Removes up to `limit` events older than `cutoff_ms` in one transaction.
+    /// Returns how many went.
+    pub fn purge_events(&self, cutoff_ms: i64, limit: usize) -> Result<usize> {
+        self.transaction(|tx| {
+            Ok(tx
+                .query(
+                    "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE at < $1 ORDER BY id LIMIT $2)
+                     RETURNING id",
+                    &params![cutoff_ms, limit],
+                )?
+                .len())
+        })
+    }
+
+    /// Removes up to `limit` alerts older than `cutoff_ms` (since they cleared, or
+    /// since they were raised while open) in one transaction, and adds what went
+    /// to the purged tallies `/metrics` counts. Kept at any age: open alerts of a
+    /// rule that exists and is enabled, open `credential` and `definition`
+    /// alerts, and the alert with the highest id, so no alert id is ever given
+    /// again. Returns how many went.
+    pub fn purge_alerts(&self, cutoff_ms: i64, limit: usize) -> Result<usize> {
+        self.transaction(|tx| {
+            let gone = tx.query(
+                "DELETE FROM alerts WHERE id IN (
+                   SELECT a.id FROM alerts a
+                   WHERE COALESCE(a.cleared_at, a.created_at) < $1
+                     AND a.id < (SELECT MAX(id) FROM alerts)
+                     AND NOT (a.cleared_at IS NULL AND (
+                           a.kind IN ('credential', 'definition')
+                           OR EXISTS (SELECT 1 FROM alert_rules r WHERE r.id = a.rule_id AND r.enabled = 1)))
+                   ORDER BY a.id LIMIT $2)
+                 RETURNING feed_id, kind",
+                &params![cutoff_ms, limit],
+            )?;
+            let mut tallies: std::collections::BTreeMap<(String, String), i64> = Default::default();
+            for r in &gone {
+                *tallies.entry((r.string(0), r.string(1))).or_default() += 1;
+            }
+            for ((feed, kind), n) in tallies {
+                tx.execute(
+                    "INSERT INTO alert_counts_purged (feed_id, kind, n) VALUES ($1, $2, $3)
+                     ON CONFLICT(feed_id, kind) DO UPDATE SET n = alert_counts_purged.n + excluded.n",
+                    &params![feed, kind, n],
+                )?;
+            }
+            Ok(gone.len())
+        })
     }
 
     // ---- alert rules -------------------------------------------------------
