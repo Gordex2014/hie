@@ -56,7 +56,9 @@ pub(super) fn cursor_id(cursor: Option<&str>) -> Result<Option<i64>, ApiError> {
         return Ok(None);
     };
     text.strip_prefix(CURSOR_MARK)
-        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        .filter(|id| {
+            !id.starts_with('0') && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+        })
         .and_then(|id| id.parse::<i64>().ok())
         .filter(|id| *id > 0)
         .map(Some)
@@ -106,6 +108,7 @@ mod tests {
             "abc",
             "a1.-1",
             "a1.0",
+            "a1.07",
             "a1.+5",
             "a1. 5",
             "a1.99999999999999999999",

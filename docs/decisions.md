@@ -451,8 +451,8 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 
 **Cost / not yet:**
 - The rule is per page, not a snapshot: a walk returns every alert that existed when it began and still matches, once each; an alert created meanwhile may or may not appear. On PostgreSQL an id is taken before its row commits, so an alert can commit behind a page already read; a new walk finds it. A page after a cursor can be empty when the alerts it would have held left in the meantime.
-- SQLite gives a new row the highest id plus one. If a purge ever removes the newest alerts, ids restart below ones already handed out, so an id can later name a different alert; a walk is unaffected.
-- There is no index on the creation time: `since` stops nothing early, and a period far in the past reads back through newer alerts. Alerts are few and retention bounds them.
+- SQLite gives a new row the highest id plus one. If a purge ever removes the newest alerts, ids restart below ones already handed out, so an id can later name a different alert; a walk keeps its guarantee, a new alert being one that may or may not appear.
+- There is no index on the creation time: `since` stops nothing early, and a period far in the past reads back through newer alerts. Alerts are few, and the retention of stored alerts bounds them once it applies.
 - Only `/api/alerts` checks its query this way; the other lists keep the extractor's plain-text `400`.
 
 ## Not in the prototype
