@@ -443,13 +443,13 @@ async fn source_stats(
     Path(id): Path<String>,
     Query(q): Query<StatsQuery>,
 ) -> ApiResult {
-    s.manager
-        .source(&id)
-        .ok_or_else(|| not_found(&format!("source {id}")))?;
     let zone = match q.tz.as_deref() {
         None => crate::zone::Zone::utc(),
         Some(name) => crate::zone::Zone::parse(name).map_err(|e| invalid_query("tz", e))?,
     };
+    s.manager
+        .source(&id)
+        .ok_or_else(|| not_found(&format!("source {id}")))?;
     let days = q.days.unwrap_or(14).clamp(1, 366) as u32;
     Ok(Json(daily_stats(
         &s.db,

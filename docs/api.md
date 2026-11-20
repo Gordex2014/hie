@@ -45,7 +45,7 @@ Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apar
 Daily figures are counted in UTC unless the request names a zone with `tz`, an IANA name such as `Europe/Madrid` or `America/New_York` (matched without regard to case; a `+` is sent as `%2B`, as in `Etc/GMT%2B5`). The answer's `tz` names the zone used, as the database spells it, and is `UTC` when none was asked for; a client that wants its own zone's days checks it before labelling them. A name that is not a zone answers `400` `{"error": "tz must be an IANA time zone name, such as Europe/Madrid or UTC", "code": "invalid_query", "field": "tz"}`; a `tz` given twice is refused before that, with a plain-text `400`.
 
 - A day runs from local midnight to the next local midnight. When a change to or from daylight saving time skips midnight, the day starts at the change, the first valid moment after it; when it repeats midnight, the day starts at the first one.
-- So a day with a change lasts 23 or 25 hours, as it did on the clock, and a date the zone skipped altogether is a day with nothing in it.
+- So a day with a change lasts as long as it did on the clock (23 or 25 hours in most zones, 23½ on Lord Howe Island), and a date the zone skipped altogether is a day with nothing in it.
 - Zone rules come from the IANA database built into the engine, the same on every instance and never the host's; a release brings newer rules.
 
 ### Secrets

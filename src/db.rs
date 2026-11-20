@@ -1615,6 +1615,23 @@ impl Db {
             .is_some())
     }
 
+    /// Whether an alert of a rule was open at `at` (epoch ms) or raised since.
+    pub fn rule_alert_alive_since(
+        &self,
+        feed: &str,
+        kind: &str,
+        rule_id: i64,
+        at: i64,
+    ) -> Result<bool> {
+        Ok(self
+            .query_one(
+                "SELECT 1 FROM alerts WHERE feed_id = $1 AND kind = $2 AND rule_id = $3
+                   AND (cleared_at IS NULL OR cleared_at >= $4) LIMIT 1",
+                &params![feed, kind, rule_id, at],
+            )?
+            .is_some())
+    }
+
     /// Any statement, for tests that set up rows by hand.
     #[cfg(test)]
     pub(crate) fn execute_for_test(&self, sql: &str, params: &[Param]) -> Result<u64> {

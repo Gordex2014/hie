@@ -93,6 +93,27 @@ impl Alerter {
             }
         };
         let check = missing_by(&zone, due, now);
+        // Yesterday's deadline, pushed onto today's start, is checked first and
+        // against its own day: a file of today must not hide that yesterday's
+        // never came. Once per day: not when an alert of the rule was still open
+        // at that deadline or raised since.
+        if let Some((day, from, to)) = check.due.filter(|(day, ..)| *day != check.today.0)
+            && !self.db.received_between(feed, from, to)?
+            && !self
+                .db
+                .rule_alert_alive_since(feed, "missing", rule.id, to)?
+        {
+            self.fire_once(
+                feed,
+                "missing",
+                rule,
+                &format!(
+                    "{feed_name}: nothing arrived on {day} and the file was expected by {} {}",
+                    rule.threshold,
+                    zone.name()
+                ),
+            )?;
+        }
         if self
             .db
             .received_between(feed, check.today.1, check.today.2)?
@@ -103,27 +124,19 @@ impl Alerter {
                 Some(rule.id),
                 &format!("{feed_name}: the file arrived"),
             )?;
-            return Ok(());
+        } else if check.due.is_some_and(|(day, ..)| day == check.today.0) {
+            self.fire_once(
+                feed,
+                "missing",
+                rule,
+                &format!(
+                    "{feed_name}: nothing has arrived today and the file was expected by {} {}",
+                    rule.threshold,
+                    zone.name()
+                ),
+            )?;
         }
-        let Some((day, from, to)) = check.due else {
-            return Ok(());
-        };
-        let message = if day == check.today.0 {
-            format!(
-                "{feed_name}: nothing has arrived today and the file was expected by {} {}",
-                rule.threshold,
-                zone.name()
-            )
-        } else if !self.db.received_between(feed, from, to)? {
-            format!(
-                "{feed_name}: nothing arrived on {day} and the file was expected by {} {}",
-                rule.threshold,
-                zone.name()
-            )
-        } else {
-            return Ok(());
-        };
-        self.fire_once(feed, "missing", rule, &message).map(drop)
+        Ok(())
     }
 
     fn fire(
@@ -240,13 +253,10 @@ pub fn missing_by(zone: &Zone, due_minute: u32, now: DateTime<Utc>) -> MissingBy
     } else {
         today.pred_opt().and_then(|yesterday| {
             let deadline = zone.instant(yesterday, time);
-            (deadline >= zone.day_start(today) && now >= deadline).then(|| {
-                (
-                    yesterday,
-                    zone.day_start(yesterday).timestamp_millis(),
-                    start,
-                )
-            })
+            let from = zone.day_start(yesterday).timestamp_millis();
+            // A date the zone skipped altogether has no instant to miss a file in.
+            (deadline.timestamp_millis() >= start && now >= deadline && from < start)
+                .then_some((yesterday, from, start))
         })
     };
     MissingBy {
@@ -447,6 +457,18 @@ mod tests {
                 .unwrap();
         }
 
+        /// How many alerts the rule raised, open or cleared.
+        fn alerts(&self) -> i64 {
+            self.db
+                .query_json(
+                    "SELECT COUNT(*) AS n FROM alerts WHERE rule_id = $1",
+                    crate::db::params![self.rule.id],
+                )
+                .unwrap()[0]["n"]
+                .as_i64()
+                .unwrap()
+        }
+
         /// Checks at `now`; the open alert's message, if any.
         fn check(&self, now: &str) -> Option<String> {
             self.alerter
@@ -502,11 +524,10 @@ mod tests {
         let lab = Lab::new("06:00", Some("America/New_York"));
         lab.receive("2026-11-20T05:00:00Z");
         assert_eq!(lab.check("2026-11-20T11:00:00Z"), None);
-        // The same receipt with a UTC rule is today's too, and a 02:00Z one is not
-        // yesterday's in UTC: the zone decides.
+        // The 02:00Z receipt that was the 19th in New York is the 20th in UTC.
         let lab = Lab::new("06:00", None);
-        lab.receive("2026-11-19T23:00:00Z");
-        assert!(lab.check("2026-11-20T06:00:00Z").is_some());
+        lab.receive("2026-11-20T02:00:00Z");
+        assert_eq!(lab.check("2026-11-20T06:00:00Z"), None);
     }
 
     #[test]
@@ -541,6 +562,44 @@ mod tests {
         let lab = Lab::new("23:30", Some("America/Nuuk"));
         lab.receive(&at(-60));
         assert_eq!(lab.check(&at(1)), None);
+        assert_eq!(lab.alerts(), 0);
+    }
+
+    #[test]
+    fn a_file_of_the_next_day_does_not_hide_a_pushed_deadline_missed() {
+        let start = Zone::parse("America/Nuuk")
+            .unwrap()
+            .day_start(date("2026-03-29"));
+        let at =
+            |offset_minutes: i64| (start + chrono::Duration::minutes(offset_minutes)).to_rfc3339();
+        // Nothing on the 28th, and the 29th's file already in at the first check:
+        // the 28th's alert is raised and cleared at once, then never raised again.
+        let lab = Lab::new("23:30", Some("America/Nuuk"));
+        lab.receive(&at(1));
+        assert_eq!(lab.check(&at(2)), None);
+        assert_eq!(lab.alerts(), 1);
+        assert_eq!(lab.check(&at(3)), None);
+        assert_eq!(lab.alerts(), 1);
+        // An alert of the rule still open at the deadline (the 27th's) covers the
+        // 28th too: cleared by the 29th's file, nothing more is raised.
+        let lab = Lab::new("23:30", Some("America/Nuuk"));
+        lab.alerter
+            .fire_once("lab", "missing", &lab.rule, "the 27th")
+            .unwrap();
+        lab.receive(&at(1));
+        assert_eq!(lab.check(&at(2)), None);
+        assert_eq!(lab.check(&at(3)), None);
+        assert_eq!(lab.alerts(), 1);
+    }
+
+    #[test]
+    fn a_skipped_date_misses_no_deadline() {
+        // Apia skipped 2011-12-30: its 06:00 resolves to the start of the 31st.
+        let apia = zone("Pacific/Apia");
+        let start = apia.day_start(date("2011-12-31"));
+        let check = missing_by(&apia, 6 * 60, start);
+        assert_eq!(check.today.0, date("2011-12-31"));
+        assert_eq!(check.due, None);
     }
 
     #[test]

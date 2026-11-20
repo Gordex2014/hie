@@ -134,6 +134,23 @@ impl Lab {
         self.check_now().await;
     }
 
+    /// Reads `path` until `ok` holds, passing the source meanwhile.
+    async fn wait_until(&self, path: &str, mut ok: impl FnMut(&Value) -> bool) -> Value {
+        let started = Instant::now();
+        loop {
+            let value = self.get(path).await;
+            if ok(&value) {
+                return value;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "timed out waiting on {path}: {value}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.check_now().await;
+        }
+    }
+
     async fn wait_for(&self, what: &str, mut ok: impl FnMut(&Value) -> bool) -> Value {
         let started = Instant::now();
         loop {
@@ -478,25 +495,52 @@ async fn stats_count_local_days_and_echo_the_zone() {
         return;
     };
     let lab = lab(&python).await;
-    let stats = lab.get("/api/sources/lab-results/stats?days=3").await;
-    assert_eq!(stats["tz"], "UTC");
-    assert_eq!(stats["by_day"].as_array().unwrap().len(), 3);
-    let today = chrono::Utc::now().date_naive().to_string();
-    let last = stats["by_day"][2]["day"].as_str().unwrap().to_string();
-    // Unless the test straddles midnight, the last day is the UTC date.
-    assert!(last <= today, "{last} vs {today}");
-
-    let stats = lab
-        .get("/api/sources/lab-results/stats?days=2&tz=asia/kathmandu")
+    lab.drop_file("labs.csv").await;
+    // The last day is the zone's today (or the next one, if the request
+    // straddled a local midnight), and the file just received is in it.
+    for (query, zone) in [
+        ("days=3", "UTC"),
+        ("days=3&tz=pacific/kiritimati", "Pacific/Kiritimati"),
+        ("days=3&tz=Pacific/Pago_Pago", "Pacific/Pago_Pago"),
+        ("days=3&tz=Etc/GMT%2B5", "Etc/GMT+5"),
+    ] {
+        let z = hie::zone::Zone::parse(zone).unwrap();
+        let before = z.today(chrono::Utc::now()).to_string();
+        let stats = lab
+            .wait_until(&format!("/api/sources/lab-results/stats?{query}"), |s| {
+                s["by_day"][2]["files"] == 1
+            })
+            .await;
+        let after = z.today(chrono::Utc::now()).to_string();
+        assert_eq!(stats["tz"], zone, "{query}");
+        assert_eq!(stats["by_day"].as_array().unwrap().len(), 3);
+        let last = stats["by_day"][2]["day"].as_str().unwrap().to_string();
+        assert!(
+            last == before || last == after,
+            "{query}: {last}, {before}..{after}"
+        );
+        assert_eq!(stats["today"]["files"], 1, "{query}: {stats}");
+    }
+    // Kiritimati (+14) and Pago Pago (-11) are a day and more apart.
+    let east = lab
+        .get("/api/sources/lab-results/stats?days=1&tz=Pacific/Kiritimati")
         .await;
-    assert_eq!(stats["tz"], "Asia/Kathmandu");
-    assert_eq!(stats["by_day"].as_array().unwrap().len(), 2);
-    // `+` is sent as %2B.
-    let stats = lab
-        .get("/api/sources/lab-results/stats?tz=Etc/GMT%2B5")
+    let west = lab
+        .get("/api/sources/lab-results/stats?days=1&tz=Pacific/Pago_Pago")
         .await;
-    assert_eq!(stats["tz"], "Etc/GMT+5");
+    assert_ne!(east["by_day"][0]["day"], west["by_day"][0]["day"]);
 
+    // An unknown zone is refused before the source is looked up.
+    let r = lab
+        .http
+        .get(format!(
+            "{}/api/sources/no-such-source/stats?tz=Mars/Base",
+            lab.api
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
     for zone in ["Mars/Base", "", "Etc/Unknown"] {
         let r = lab
             .http
