@@ -38,7 +38,7 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind |
 | `GET /health` | `{"status": "ok", "service": "hie", "version", "uptime_seconds", "started_at", "timestamp", "secrets"}`; `secrets` is `{"backend": "native"\|"none", "available", "key_id"}`, the key id being a one-way 16-hex fingerprint of the key in use, or `null` |
 
-A source's top-level `contact` and `name` are those of the definition it runs; `definition` is the definition as saved. They differ only after `500 source_not_started`, until the saved definition starts.
+A source's top-level `contact` and `name` are those of the definition it runs, normalised (a blank contact is `null`); `definition` is its file as saved, as written. The two views can differ: after `500 source_not_started` until the saved definition starts, after a hand edit of the file until the next start, and for a blank contact written by hand.
 
 Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), and the codes of the credential routes below.
 

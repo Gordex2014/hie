@@ -272,7 +272,7 @@ fn check_prints_a_source_contact() {
     );
     let out = check_source(CONTACT_FOLDER);
     assert!(out.status.success());
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("contact"));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("    contact: "));
 }
 
 #[test]
@@ -286,7 +286,10 @@ fn check_refuses_an_invalid_contact_naming_the_file() {
             format!("{CONTACT_FOLDER}contact: {long}\n"),
             "at most 500 characters",
         ),
-        (format!("{CONTACT_FOLDER}contact: 5550100\n"), "contact"),
+        (
+            format!("{CONTACT_FOLDER}contact: 5550100\n"),
+            "contact: invalid type: integer",
+        ),
         (
             format!("{s3}contact: \"a\\u202Eb\"\n"),
             "one line of plain text",

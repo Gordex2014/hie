@@ -297,7 +297,7 @@ fn contact_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>
     impl<'de> serde::de::Visitor<'de> for Text {
         type Value = Option<String>;
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("text (in YAML, quote a contact that would read as a number or true/false)")
+            f.write_str("a contact as text, or null (in a YAML file, quote one that reads as a number or true/false)")
         }
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
             Ok((!v.trim().is_empty()).then(|| v.to_string()))
@@ -1054,7 +1054,7 @@ mod tests {
             "contact:\n  name: x\n",
         ] {
             let err = contact_yaml(line).unwrap_err().to_string();
-            assert!(err.contains("contact"), "{line:?}: {err}");
+            assert!(err.starts_with("contact: invalid type"), "{line:?}: {err}");
         }
         for value in [
             json!(5550100),
@@ -1062,7 +1062,11 @@ mod tests {
             json!(["a"]),
             json!({"name": "x"}),
         ] {
-            assert!(contact_json(value.clone()).is_err(), "{value}");
+            let err = contact_json(value.clone()).unwrap_err().to_string();
+            assert!(
+                err.starts_with("invalid type") && err.contains("a contact as text, or null"),
+                "{value}: {err}"
+            );
         }
     }
 

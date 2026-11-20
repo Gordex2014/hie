@@ -925,6 +925,7 @@ async fn a_source_contact_is_read_kept_and_cleared() {
     assert_eq!(needs["contact"], contact);
 
     // Refused: too long, or more than one line. Nothing changes.
+    let saved = file();
     for bad in ["x".repeat(501), "Lab IT\n+1 555 0100".to_string()] {
         let mut body = read.clone();
         body["contact"] = json!(bad);
@@ -943,7 +944,10 @@ async fn a_source_contact_is_read_kept_and_cleared() {
         assert_eq!(refused.status(), 400);
         assert!(!root.join("sources/lab-2.yaml").exists());
     }
-    assert_eq!(get("/api/sources/lab".into()).await["contact"], contact);
+    assert_eq!(file(), saved);
+    let unchanged = get("/api/sources/lab".into()).await;
+    assert_eq!(unchanged["contact"], contact);
+    assert_eq!(unchanged["definition"]["contact"], contact);
 
     // A replace without it, with null or with a blank one clears it.
     for cleared in [None, Some(Value::Null), Some(json!("")), Some(json!("  "))] {
