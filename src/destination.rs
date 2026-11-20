@@ -119,31 +119,54 @@ impl InFlight {
             .record(self.started, self.via, outcome, detail, Instant::now());
     }
 
-    /// Records the result of sending the request. A request that could not be
-    /// built, or that went round in redirects, says nothing about the server.
+    /// Records the result of sending the request. A request that went round
+    /// in redirects says nothing about the server.
     pub fn observe_send(&self, result: &Result<reqwest::Response, reqwest::Error>) {
         if let Some(outcome) = classify(result) {
             let detail = match result {
                 Ok(response) => format!("HTTP {}", response.status().as_u16()),
-                Err(e) => crate::bulk::safe_reason(&error_chain(e)),
+                Err(e) => send_detail(e),
             };
             self.observe(outcome, &detail);
         }
     }
 }
 
-/// An error and every error under it, `outer: inner: …`: a `reqwest::Error`
-/// alone says only "error sending request", not "connection refused" or why a
-/// certificate was refused.
-pub fn error_chain(e: &dyn std::error::Error) -> String {
-    let mut text = e.to_string();
-    let mut next = e.source();
+/// Why sending a request failed, for the log: a word for the kind, then every
+/// error under it ("connection refused", why a certificate was refused). The
+/// top error's own text is left out, because it carries the request's URL.
+pub fn send_detail(e: &reqwest::Error) -> String {
+    let kind = if e.is_builder() {
+        "building the request"
+    } else if e.is_connect() {
+        "connecting"
+    } else if e.is_timeout() {
+        "waiting for the answer"
+    } else {
+        "sending the request"
+    };
+    let mut text = kind.to_string();
+    let mut next = std::error::Error::source(e);
     while let Some(inner) = next {
         text.push_str(": ");
         text.push_str(&inner.to_string());
         next = inner.source();
     }
-    text
+    crate::bulk::safe_reason(&text)
+}
+
+/// What a failure to send says about the server; `None` when it says nothing.
+pub fn send_failure(e: &reqwest::Error) -> Option<Failure> {
+    if e.is_builder() || e.is_redirect() {
+        None
+    } else if e.is_connect() {
+        // A connect timeout is both: it is a connection that could not be made.
+        Some(Failure::Connect)
+    } else if e.is_timeout() {
+        Some(Failure::Timeout)
+    } else {
+        Some(Failure::Lost)
+    }
 }
 
 /// What an HTTP status says about the server: 502 to 504 are what a server or
@@ -159,11 +182,7 @@ pub fn status_outcome(status: u16) -> Result<(), Failure> {
 pub fn classify(result: &Result<reqwest::Response, reqwest::Error>) -> Option<Result<(), Failure>> {
     match result {
         Ok(response) => Some(status_outcome(response.status().as_u16())),
-        Err(e) if e.is_builder() || e.is_redirect() => None,
-        // A connect timeout is both: it is a connection that could not be made.
-        Err(e) if e.is_connect() => Some(Err(Failure::Connect)),
-        Err(e) if e.is_timeout() => Some(Err(Failure::Timeout)),
-        Err(_) => Some(Err(Failure::Lost)),
+        Err(e) => send_failure(e).map(Err),
     }
 }
 
@@ -618,6 +637,24 @@ mod tests {
         let d = Destination::new("http://hfs:8080");
         assert_eq!(d.probe_url().unwrap().as_str(), "http://hfs:8080/metadata");
         assert!(Destination::new("not a url").probe_url().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_logged_detail_leaves_the_url_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let e = reqwest::Client::new()
+            .get(format!(
+                "http://u:CANARY-1@127.0.0.1:{port}/CANARY-2(x)?k=(CANARY-3)"
+            ))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(send_failure(&e), Some(Failure::Connect));
+        let detail = send_detail(&e);
+        assert!(detail.starts_with("connecting"), "{detail}");
+        assert!(!detail.contains("CANARY"), "{detail}");
     }
 
     #[tokio::test]

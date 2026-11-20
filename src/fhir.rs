@@ -61,8 +61,10 @@ impl FhirClient {
         &self.destination
     }
 
-    /// Posts a batch Bundle. Failure reasons name "the FHIR server", never its
-    /// URL: they reach the record's error and the delivery alert.
+    /// Posts a batch Bundle. A failure to reach the server is told with the
+    /// destination's fixed sentence, never the URL or a library's error text:
+    /// it reaches the record's error and the delivery alert. The log has the
+    /// detail.
     pub async fn post_bundle(&self, bundle: &Value) -> Result<Value, SendError> {
         let request = self
             .http
@@ -70,17 +72,29 @@ impl FhirClient {
             .header("Content-Type", "application/fhir+json")
             .header("Accept", "application/fhir+json")
             .json(bundle);
-        let request = authorize(request, &self.credentials).await?;
+        // Built before it counts as a request to the server: one that cannot
+        // be built never leaves the engine.
+        let request = authorize(request, &self.credentials)
+            .await?
+            .build()
+            .map_err(|e| {
+                tracing::warn!(
+                    "a request to the FHIR server could not be built: {}",
+                    crate::destination::send_detail(&e)
+                );
+                SendError::Transient("the request to the FHIR server could not be built".into())
+            })?;
         // Held until the answer has been read: the destination is not idle
         // while it downloads.
         let exchange = self.destination.start();
-        let sent = request.send().await;
+        let sent = self.http.execute(request).await;
         exchange.observe_send(&sent);
         let resp = sent.map_err(|e| {
-            SendError::Transient(format!(
-                "cannot reach the FHIR server: {}",
-                crate::bulk::safe_reason(&crate::destination::error_chain(&e.without_url()))
-            ))
+            SendError::Transient(
+                crate::destination::send_failure(&e)
+                    .map_or("the request to the FHIR server failed", |f| f.sentence())
+                    .into(),
+            )
         })?;
         let status = resp.status().as_u16();
         let body: Value = resp.json().await.unwrap_or(Value::Null);

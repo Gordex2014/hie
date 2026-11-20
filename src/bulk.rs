@@ -188,9 +188,19 @@ impl BulkSubmitter {
             .header("Content-Type", "application/fhir+json")
             .header("Accept", "application/fhir+json")
             .json(body);
-        let request = fhir::authorize(request, &self.credentials).await?;
+        // Built before it counts as a request to the server.
+        let request = fhir::authorize(request, &self.credentials)
+            .await?
+            .build()
+            .map_err(|e| {
+                SendError::Transient(format!(
+                    "the request to {} could not be built: {}",
+                    self.fhir_base,
+                    crate::destination::send_detail(&e)
+                ))
+            })?;
         let exchange = self.destination.as_ref().map(|d| d.start());
-        let sent = request.send().await;
+        let sent = self.http.execute(request).await;
         if let Some(exchange) = &exchange {
             exchange.observe_send(&sent);
         }

@@ -64,7 +64,7 @@ async fn metadata(State(s): State<Shared>, uri: Uri, headers: HeaderMap) -> Stat
     let mut s = s.lock().unwrap();
     s.metadata_hits += 1;
     s.probes.push((
-        uri.path().to_string(),
+        uri.path_and_query().unwrap().to_string(),
         headers.contains_key("authorization"),
     ));
     StatusCode::from_u16(s.metadata_status.unwrap_or(200)).unwrap()
@@ -117,7 +117,7 @@ fn repo() -> PathBuf {
 }
 
 struct Engine {
-    root: tempfile::TempDir,
+    _root: tempfile::TempDir,
     runner: Arc<FeedRunner>,
     state: hie::api::AppState,
     api: String,
@@ -163,7 +163,7 @@ async fn start(root: tempfile::TempDir, credentials: hie::credentials::Credentia
     manager.pause("lab-results", None).unwrap(); // the test drives the passes
     let api = serve(hie::api::router(state.clone())).await;
     Engine {
-        root,
+        _root: root,
         runner,
         state,
         api,
@@ -309,7 +309,10 @@ async fn an_unreachable_server_is_reported_with_a_fixed_reason_and_no_url() {
         .unwrap()
     {
         let text = row["text"].as_str().unwrap();
-        assert!(text.contains("cannot reach the FHIR server"), "{text}");
+        assert!(
+            text.contains("could not connect to the FHIR server"),
+            "{text}"
+        );
         assert!(!text.contains("CANARY") && !text.contains(&addr), "{text}");
     }
 }
@@ -396,11 +399,9 @@ async fn the_idle_probe_reports_the_server_with_no_delivery_and_no_credentials()
     let down = e.destination().await;
     assert_eq!(down["last_error"], "the FHIR server answered HTTP 503");
     assert!(instant(&down["observed_at"]) > instant(&first["observed_at"]));
-    let hits = hfs.lock().unwrap().metadata_hits;
-    until(async || hfs.lock().unwrap().metadata_hits > hits).await;
+    until(async || e.destination().await["consecutive_failures"].as_u64() >= Some(2)).await;
     let still = e.destination().await;
     assert_eq!(still["since"], down["since"], "the same outage");
-    until(async || e.destination().await["consecutive_failures"].as_u64() >= Some(2)).await;
 
     hfs.lock().unwrap().metadata_status = None;
     until(async || e.destination().await["reachable"] == true).await;
@@ -513,7 +514,9 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
     let (origin, hfs) = hfs().await;
     let root = tempfile::tempdir().unwrap();
     write_config(root.path(), &format!("{origin}/fhir"), 0, "");
-    {
+    // Kept open to the end: on PostgreSQL the handle that made the test's
+    // schema drops it when it closes.
+    let legacy = {
         // As an older version left the store: an outage and its recovery
         // notice, both open, for this source; an outage with no notice after
         // it for another.
@@ -551,7 +554,8 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
             &json!([]),
         )
         .unwrap();
-    }
+        db
+    };
     let e = start(root, None).await;
     assert_eq!(
         e.alerts("lab-results"),
@@ -625,7 +629,8 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
         ("delivery".into(), Some(999), true, Some(RECOVERED.into()))
     );
     assert!(!e.alerts("old-source")[0].2, "another source's alert stays");
-    drop(e.root);
+    drop(e);
+    drop(legacy);
 }
 
 #[test]
@@ -691,14 +696,16 @@ async fn the_webhook_hears_one_clear_per_recovered_outage_and_nothing_at_start()
         0,
         &format!("alerts:\n  webhook_url: {origin}/hook\n"),
     );
-    {
+    // Kept open to the end, as above.
+    let legacy = {
         std::fs::create_dir_all(root.path().join("data")).unwrap();
         let db = hie::db::Db::connect(&root.path().join("data/hie.db").to_string_lossy()).unwrap();
         db.insert_alert(Some("lab-results"), "delivery", "outage", None)
             .unwrap();
         db.insert_alert(Some("lab-results"), "delivery_recovered", "recovered", None)
             .unwrap();
-    }
+        db
+    };
     let e = start(root, None).await;
     hfs.lock().unwrap().post_status = Some(503);
     e.seed();
@@ -718,4 +725,18 @@ async fn the_webhook_hears_one_clear_per_recovered_outage_and_nothing_at_start()
     assert!(hooks[0]["cleared"].is_null(), "{hooks:?}");
     assert_eq!(hooks[1]["cleared"], true, "{hooks:?}");
     assert_eq!(hooks[1]["kind"], "delivery");
+    // Both name the new outage's alert.
+    let outage = e
+        .state
+        .db
+        .query_json(
+            "SELECT id FROM alerts WHERE kind = 'delivery' AND cleared_reason = $1",
+            [hie::db::Param::Text(RECOVERED.into())],
+        )
+        .unwrap();
+    assert_eq!(outage.len(), 1, "{outage:?}");
+    assert_eq!(hooks[0]["alert_id"], outage[0]["id"]);
+    assert_eq!(hooks[1]["alert_id"], outage[0]["id"]);
+    drop(e);
+    drop(legacy);
 }

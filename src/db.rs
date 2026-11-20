@@ -1683,8 +1683,9 @@ impl Db {
     /// Closes what versions before recovery cleared the `delivery` alert left
     /// open: every `delivery_recovered` alert (a notice, never a condition), and
     /// every rule-less `delivery` alert shown to be over, by a later
-    /// `delivery_recovered` of its source or a record of its source delivered
-    /// after it. A rule-less `delivery` alert with neither may be an outage
+    /// `delivery_recovered` of its source or by the source's newest record
+    /// being delivered after it (the newest by id, which the index finds at
+    /// once, so a start does not read every record). A rule-less `delivery` alert with neither may be an outage
     /// still going on: it stays, for the next successful delivery to clear.
     /// Only the store changes. Returns how many alerts were closed.
     pub fn close_legacy_recoveries(&self) -> Result<u64> {
@@ -1694,8 +1695,8 @@ impl Db {
              WHERE kind = 'delivery' AND rule_id IS NULL AND cleared_at IS NULL AND feed_id IS NOT NULL
                AND (EXISTS (SELECT 1 FROM alerts later WHERE later.feed_id = alerts.feed_id
                             AND later.kind = 'delivery_recovered' AND later.id > alerts.id)
-                    OR EXISTS (SELECT 1 FROM records r WHERE r.feed_id = alerts.feed_id
-                               AND r.status = 'sent' AND r.updated_at > alerts.created_at))",
+                    OR (SELECT r.updated_at FROM records r WHERE r.feed_id = alerts.feed_id
+                        AND r.status = 'sent' ORDER BY r.id DESC LIMIT 1) > alerts.created_at)",
             &params![
                 now,
                 "delivery to HFS recovered (recorded before recovery cleared this alert)"
