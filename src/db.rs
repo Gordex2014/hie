@@ -817,17 +817,25 @@ impl Db {
                 test_schema = None;
             }
         }
-        let ddl = SCHEMA
-            .replace("INTEGER PRIMARY KEY", "BIGSERIAL PRIMARY KEY")
-            .replace("INTEGER", "BIGINT");
-        client
-            .batch(&ddl)
-            .context("creating the schema in PostgreSQL")?;
+        // One transaction under an advisory lock: instances starting together
+        // on a store that needs a new table would otherwise race on
+        // `CREATE TABLE IF NOT EXISTS`, and all but one fail to start.
+        let mut ddl = String::from("BEGIN; SELECT pg_advisory_xact_lock(4849450001);\n");
+        ddl.push_str(
+            &SCHEMA
+                .replace("INTEGER PRIMARY KEY", "BIGSERIAL PRIMARY KEY")
+                .replace("INTEGER", "BIGINT"),
+        );
         for (table, column, kind) in ADDED_COLUMNS {
-            client.batch(&format!(
-                "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {}",
+            ddl.push_str(&format!(
+                "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {};\n",
                 kind.replace("INTEGER", "BIGINT")
-            ))?;
+            ));
+        }
+        ddl.push_str("COMMIT;");
+        if let Err(e) = client.batch(&ddl) {
+            let _ = client.batch("ROLLBACK");
+            return Err(e.context("creating the schema in PostgreSQL"));
         }
         Ok(Self {
             conn: Mutex::new(Conn::Postgres(client)),
@@ -1905,7 +1913,7 @@ impl Db {
         Ok(self
             .query_one(
                 &format!(
-                    "UPDATE alert_webhooks SET attempts = attempts + 1, next_attempt_at = $3
+                    "UPDATE alert_webhooks SET attempts = attempts + 1, next_attempt_at = $3, last_status = NULL
                      WHERE event_id = $1 AND destination = $2 AND state = 'pending'
                        AND next_attempt_at <= $4 AND attempts < $5 AND {WEBHOOK_UNBLOCKED}
                      RETURNING event_id, alert_id, event, attempts, payload"
@@ -2197,6 +2205,68 @@ mod tests {
             b.webhook_claim("e1", "other", 70_000, 130_000, 6)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_claims_on_two_connections_have_one_winner() {
+        let (_dir, a, b) = two_handles();
+        let (a, b) = (std::sync::Arc::new(a), std::sync::Arc::new(b));
+        for round in 0..40 {
+            let event_id = format!("race-{round}");
+            fire(&a, &event_id, "d");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let contenders: Vec<_> = [a.clone(), b.clone()]
+                .into_iter()
+                .map(|db| {
+                    let (barrier, event_id) = (barrier.clone(), event_id.clone());
+                    std::thread::spawn(move || {
+                        // Both see the event due before either claims it.
+                        assert_eq!(db.webhook_due("d", 2_000, 6, 100).unwrap().len(), 1);
+                        barrier.wait();
+                        db.webhook_claim(&event_id, "d", 2_000, 62_000, 6).unwrap()
+                    })
+                })
+                .collect();
+            let won: Vec<_> = contenders
+                .into_iter()
+                .filter_map(|t| t.join().unwrap())
+                .collect();
+            assert_eq!(won.len(), 1, "round {round}");
+            assert_eq!(state(&a, &event_id).1, 1);
+            a.webhook_delivered(&event_id, 1, 200, 3_000).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_claimed_attempt_has_no_status_until_it_is_answered() {
+        let (_dir, a, _b) = two_handles();
+        fire(&a, "e1", "d");
+        a.webhook_claim("e1", "d", 2_000, 62_000, 6)
+            .unwrap()
+            .unwrap();
+        a.webhook_attempt_failed(
+            "e1",
+            1,
+            "HTTP 503 Service Unavailable",
+            Some(503),
+            Some(2_100),
+        )
+        .unwrap();
+        a.webhook_claim("e1", "d", 2_200, 62_200, 6)
+            .unwrap()
+            .unwrap();
+        let r = a
+            .query_one(
+                "SELECT last_status, last_error FROM alert_webhooks WHERE event_id = 'e1'",
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.opt_i64(0), None, "the running attempt has no answer yet");
+        assert_eq!(
+            r.opt_string(1).as_deref(),
+            Some("HTTP 503 Service Unavailable")
         );
     }
 

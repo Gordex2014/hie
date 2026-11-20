@@ -80,6 +80,26 @@ fn check_refuses_bad_alert_settings_without_printing_them() {
             vec![],
         ),
         (
+            format!("{base}\"alerts\":\n  webhook_secret: !!int secretcanary\n"),
+            vec![],
+        ),
+        (
+            format!("{base}\"alerts\":\n  webhook_secret:\n    secretcanary: 1\n    secretcanary: 2\n"),
+            vec![],
+        ),
+        (
+            format!("{base}? alerts\n: webhook_secret: !!int secretcanary\n"),
+            vec![],
+        ),
+        (
+            "{fhir_base_url: http://127.0.0.1:1/fhir, alerts: {webhook_secret: !!int secretcanary}}\n".to_string(),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  webhook_secret: &s secretcanary\nworker:\n  memory_mib: *s\n"),
+            vec![],
+        ),
+        (
             base.to_string(),
             vec![(
                 "HIE_ALERT_WEBHOOK_URL",

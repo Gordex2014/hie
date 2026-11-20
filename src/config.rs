@@ -118,6 +118,12 @@ impl std::fmt::Debug for AlertConfig {
     }
 }
 
+fn is_http_url(text: &str) -> bool {
+    url::Url::parse(text)
+        .ok()
+        .is_some_and(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some())
+}
+
 /// What a malformed `alerts:` block is refused with: the keys it may have and
 /// nothing of the values it has.
 const ALERTS_SHAPE: &str = "alerts: expected a mapping with webhook_url (an http or https URL), webhook_secret (text) and webhook_backoff_ms (milliseconds)";
@@ -217,7 +223,13 @@ impl AlertConfig {
             }
         };
         if let Some(url) = read("HIE_ALERT_WEBHOOK_URL")? {
-            self.webhook_url = Some(url.trim().to_string());
+            let url = url.trim().to_string();
+            if !is_http_url(&url) {
+                bail!(
+                    "HIE_ALERT_WEBHOOK_URL (overriding alerts.webhook_url) is not an http or https URL"
+                );
+            }
+            self.webhook_url = Some(url);
         }
         if let Some(secret) = read("HIE_ALERT_WEBHOOK_SECRET")? {
             self.webhook_secret = Some(secrecy::SecretString::from(secret));
@@ -236,13 +248,8 @@ impl AlertConfig {
         {
             bail!("alerts.webhook_secret is blank");
         }
-        if let Some(url) = &self.webhook_url {
-            let ok = url::Url::parse(url)
-                .ok()
-                .is_some_and(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some());
-            if !ok {
-                bail!("alerts.webhook_url is not an http or https URL");
-            }
+        if self.webhook_url.as_deref().is_some_and(|u| !is_http_url(u)) {
+            bail!("alerts.webhook_url is not an http or https URL");
         }
         if !(1..=Self::MAX_BACKOFF_MS).contains(&self.backoff_ms()) {
             bail!(
@@ -885,11 +892,11 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     // and its transforms run in the local worker instead: refuse to start, whatever
     // its value (`runtime: null` and a bare `runtime:` included) and however the
     // key is tagged (`as_str` sees through YAML tags).
-    let raw: serde_yaml::Value =
-        serde_yaml::from_str(&text).map_err(|e| parse_error(path, &text, e))?;
-    if raw
-        .as_mapping()
-        .is_some_and(|m| m.keys().any(|k| k.as_str() == Some("runtime")))
+    // A file that is not YAML at all is reported by the typed parse below.
+    if let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(&text)
+        && raw
+            .as_mapping()
+            .is_some_and(|m| m.keys().any(|k| k.as_str() == Some("runtime")))
     {
         bail!(
             "`runtime:` in {} is no longer supported: transforms run in the local worker; remove it",
@@ -897,7 +904,7 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
         );
     }
     let mut config: Config =
-        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        serde_yaml::from_str(&text).map_err(|e| parse_error(path, &text, e))?;
     config
         .worker
         .check()
@@ -949,47 +956,46 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     Ok((config, feeds))
 }
 
-/// A YAML error in `hie.yaml`, without the parser's own words when it points
-/// into the `alerts:` block (or nowhere, while the file has one): they may
-/// quote the webhook URL or secret.
+/// A YAML error in `hie.yaml`. While the file names a webhook URL or secret,
+/// whatever the parser quotes is left out: YAML lets a value reach an error
+/// message from anywhere (an alias of the secret used in another field, a
+/// repeated key), so no line of the file is safe to quote.
 fn parse_error(path: &Path, text: &str, e: serde_yaml::Error) -> anyhow::Error {
-    let alerts = alerts_lines(text);
-    let hidden = match e.location() {
-        Some(at) => alerts
-            .as_ref()
-            .is_some_and(|lines| lines.contains(&at.line())),
-        None => alerts.is_some(),
-    };
-    if !hidden {
+    if !(text.contains("webhook_secret") || text.contains("webhook_url")) {
         return anyhow::Error::new(e).context(format!("parsing {}", path.display()));
     }
-    let at = e
-        .location()
-        .map(|at| format!(" at line {}", at.line()))
-        .unwrap_or_default();
     anyhow::anyhow!(
-        "parsing {}: the alerts: block is not valid YAML{at} (its values are not shown)",
-        path.display()
+        "parsing {}: {} (quoted values are not shown while the file holds alerts.webhook_url or webhook_secret)",
+        path.display(),
+        unquoted(&e.to_string())
     )
 }
 
-/// The lines (from 1) of the top-level `alerts:` key and its block, if any.
-fn alerts_lines(text: &str) -> Option<std::ops::Range<usize>> {
-    let top_level = |line: &str| {
-        line.chars()
-            .next()
-            .is_some_and(|c| !c.is_whitespace() && c != '#')
-    };
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.iter().position(|l| {
-        l.strip_prefix("alerts")
-            .is_some_and(|rest| rest.trim_start().starts_with(':'))
-    })?;
-    let end = lines[start + 1..]
-        .iter()
-        .position(|l| top_level(l))
-        .map_or(lines.len(), |n| start + 1 + n);
-    Some(start + 1..end + 1)
+/// `text` with whatever stands between double quotes or backticks replaced by `…`.
+fn unquoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        let close = match c {
+            '"' => '"',
+            '`' => '`',
+            _ => continue,
+        };
+        out.push('…');
+        let mut escaped = false;
+        for d in chars.by_ref() {
+            if escaped {
+                escaped = false;
+            } else if d == '\\' && close == '"' {
+                escaped = true;
+            } else if d == close {
+                out.push(d);
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// The source files in `dir`, in the order `load` reads them: every `*.yaml`
@@ -1143,6 +1149,14 @@ mod tests {
         );
         let typo = alerts_from("alerts:\n  webhook_secrt: x\n").unwrap_err();
         assert!(typo.contains("webhook_secrt"), "{typo}");
+    }
+
+    #[test]
+    fn quoted_values_can_be_left_out_of_errors() {
+        assert_eq!(
+            unquoted(r#"invalid type: string "s3c\"ret", expected `u64` at line 3"#),
+            "invalid type: string \"…\", expected `…` at line 3"
+        );
     }
 
     #[test]

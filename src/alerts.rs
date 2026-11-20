@@ -142,6 +142,9 @@ impl Alerter {
             .connect_timeout(tuning.connect_timeout)
             .timeout(tuning.timeout)
             .redirect(reqwest::redirect::Policy::none())
+            // HTTP/1.1 only: the HTTP/2 layer logs what the peer sends at
+            // `trace`, which a receiver may fill with the request's path.
+            .http1_only()
             .retry(reqwest::retry::never())
             .user_agent(concat!("hie/", env!("CARGO_PKG_VERSION")))
             .build()
