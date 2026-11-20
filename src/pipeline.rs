@@ -276,10 +276,16 @@ impl FeedRunner {
         if self.halted() {
             return Vec::new();
         }
-        self.db.pending_checks(&self.feed.id).unwrap_or_else(|e| {
+        let snapshot = self.db.pending_checks(&self.feed.id).unwrap_or_else(|e| {
             tracing::error!(feed = %self.feed.id, "reading the pending checks: {e:#}");
             Vec::new()
-        })
+        });
+        // Stopped while they were read: a check asked for after the replace
+        // may be among them, and is the successor's to answer.
+        if self.halted() {
+            return Vec::new();
+        }
+        snapshot
     }
 
     /// Answers the checks of `snapshot`. A store error is logged: they stay

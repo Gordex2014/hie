@@ -234,16 +234,41 @@ async fn a_source_lives_through_the_api() {
     )
     .await;
     assert_eq!(urls.lock().unwrap().len(), 3);
-    // The running source answered the check by itself (with the file, unless
+    // The running source answers the check by itself (with the file, unless
     // its first pass took it before the check was asked for).
-    let answered: Value = http
-        .get(format!("{api}{location}"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let answered = Arc::new(Mutex::new(Value::Null));
+    let (api2, http2, location2, answered2) = (
+        api.clone(),
+        http.clone(),
+        location.clone(),
+        answered.clone(),
+    );
+    wait_until(
+        move || {
+            let (api, http, location, answered) = (
+                api2.clone(),
+                http2.clone(),
+                location2.clone(),
+                answered2.clone(),
+            );
+            Box::pin(async move {
+                let check: Value = http
+                    .get(format!("{api}{location}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let done = check["status"] != "pending";
+                *answered.lock().unwrap() = check;
+                done
+            })
+        },
+        "the check answered",
+    )
+    .await;
+    let answered = answered.lock().unwrap().clone();
     assert!(
         answered["status"] == "found" && answered["files"][0]["name"] == "labs.csv"
             || answered["status"] == "nothing_new",

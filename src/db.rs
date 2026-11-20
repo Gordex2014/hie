@@ -1793,8 +1793,8 @@ impl Db {
 
     /// Fails every pending check of the source with the failure's fixed reason,
     /// with the loads since each was asked for, unless an instance other than
-    /// `owner` holds the source: that one may still answer them. One statement,
-    /// so a holder that takes the source meanwhile keeps its checks.
+    /// `owner` held the source when the statement ran: that one may still answer
+    /// them.
     pub fn fail_pending_checks(
         &self,
         feed: &str,
