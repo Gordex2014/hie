@@ -438,6 +438,23 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - Plaintext copies outside the engine's wiped types: the S3 client's own credential strings for the client's lifetime, HTTP and JSON parser buffers. HMAC pad blocks and HKDF temporaries made once at start are not wiped.
 - Registrations belong to an instance (`HIE_INSTANCE_ID`, or an id kept in the sources directory). After a failure they err on keeping: a start that fails after a definition was published keeps both credentials registered until the next start or replace, a cleanup that keeps failing leaves a row until the next start, and a changed instance id leaves its old rows behind. Each only makes a delete answer `409`. A crash while the key file is created can leave a temporary copy of the key next to it.
 
+## 39. Alerts are read by period and in pages, with a cursor on their id
+
+**Chosen:** `GET /api/alerts` takes `since`, an RFC 3339 instant that keeps the alerts created at or after it, and `cursor`, the previous page's `next_cursor`. Alerts stay newest first by id; a page is the next `limit` alerts (100 by default) with an id below the last one returned, read with one row more than the page so that `next_cursor` is `null` exactly when nothing more matches. The cursor is opaque; today it is the last id, in decimal. `source` and `open` are unchanged and combine with both. A query string that cannot be read answers `400 invalid_query`, with `field` for `since` and `cursor`, in a fixed sentence. A negative `limit` now means every matching alert on PostgreSQL too, as it always did on SQLite.
+
+**Why:**
+- A monitoring tool reads every alert of a period (the last seven days, say). With only the newest `limit` it could not tell whether it had them all.
+- A cursor on the id is stable without a snapshot: new alerts take higher ids, so they never shift a walk in progress, and an alert cleared or purged between pages moves no other. An offset would skip or repeat rows whenever alerts arrive.
+- `since` filters on the creation time but does not order: ids and clocks can disagree by a few milliseconds between instances, and paging stays correct either way. Rounding a finer instant up keeps "at or after" true against stored milliseconds.
+- The bound on the id lets SQLite seek on the primary key; the `IS NULL OR` form other filters use made it scan.
+- An opaque cursor leaves room to change it: a later form can be told apart from a plain number.
+
+**Cost / not yet:**
+- The rule is per page, not a snapshot: a walk returns every alert that existed when it began and still matches, once each; an alert created meanwhile may or may not appear. On PostgreSQL an id is taken before its row commits, so an alert can commit behind a page already read; it is on the next first page.
+- SQLite gives a new row the highest id plus one. If a purge ever removes the newest alerts, ids restart below ones already handed out, so an id can later name a different alert; a walk is unaffected.
+- There is no index on the creation time: `since` stops nothing early, and a period far in the past reads back through newer alerts. Alerts are few and retention bounds them.
+- Only `/api/alerts` checks its query this way; the other lists keep the extractor's plain-text `400`.
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.

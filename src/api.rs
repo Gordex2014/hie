@@ -1,8 +1,10 @@
+mod paging;
 mod secrets;
 
 use std::sync::Arc;
 
 use crate::db::{Param, params};
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -755,27 +757,69 @@ async fn reprocess(
     ))
 }
 
+/// What `GET /api/alert-rules` takes.
 #[derive(Deserialize)]
-struct AlertQuery {
+struct RuleQuery {
+    source: Option<String>,
+}
+
+/// What `GET /api/alerts` takes: today's filters, a period and a page.
+#[derive(Deserialize)]
+struct AlertListQuery {
     source: Option<String>,
     limit: Option<i64>,
     /// `true` lists only alerts that have not cleared.
     open: Option<bool>,
+    /// Only alerts created at or after this RFC 3339 instant.
+    since: Option<String>,
+    /// The previous page's `next_cursor`.
+    cursor: Option<String>,
 }
 
-async fn list_alerts(State(s): State<AppState>, Query(q): Query<AlertQuery>) -> ApiResult {
-    let rows = s.db.query_json(
+/// Newest first, a page at a time: `next_cursor` is set only when more alerts
+/// match, and the next page holds those older (by id) than the last one here.
+async fn list_alerts(
+    State(s): State<AppState>,
+    q: Result<Query<AlertListQuery>, QueryRejection>,
+) -> ApiResult {
+    let Query(q) = q.map_err(paging::rejected)?;
+    let since = paging::since_ms(q.since.as_deref())?;
+    let after = paging::cursor_id(q.cursor.as_deref())?;
+    // A negative limit has always meant every alert on SQLite; so it does on both stores.
+    let limit = match q.limit {
+        Some(n) if n < 0 => i64::MAX,
+        Some(n) => n,
+        None => 100,
+    };
+    let mut rows = s.db.query_json(
         &format!(
             "SELECT id, feed_id AS source_id, kind, message, rule_id, notify, channels,
                     {} AS created_at, {} AS cleared_at, cleared_reason
              FROM alerts
              WHERE (CAST($1 AS TEXT) IS NULL OR feed_id = CAST($1 AS TEXT)) AND (CAST($3 AS BIGINT) = 0 OR cleared_at IS NULL)
+               AND (CAST($4 AS BIGINT) IS NULL OR created_at >= CAST($4 AS BIGINT)) AND id <= $5
              ORDER BY id DESC LIMIT $2",
             s.db.iso("created_at"),
             s.db.iso("cleared_at")
         ),
-        params![q.source, q.limit.unwrap_or(100), q.open.unwrap_or(false)],
+        params![
+            q.source,
+            limit.saturating_add(1),
+            q.open.unwrap_or(false),
+            since,
+            // A bound SQLite seeks on, where `IS NULL OR` would scan.
+            after.map_or(i64::MAX, |id| id - 1)
+        ],
     )?;
+    let page = usize::try_from(limit).unwrap_or(usize::MAX);
+    let next_cursor = if rows.len() > page {
+        rows.truncate(page);
+        rows.last()
+            .and_then(|row| row["id"].as_i64())
+            .map(paging::next_cursor)
+    } else {
+        None
+    };
     let rows: Vec<Value> = rows
         .into_iter()
         .map(|mut row| {
@@ -789,12 +833,12 @@ async fn list_alerts(State(s): State<AppState>, Query(q): Query<AlertQuery>) -> 
             row
         })
         .collect();
-    Ok(Json(json!({"alerts": rows})))
+    Ok(Json(json!({"alerts": rows, "next_cursor": next_cursor})))
 }
 
 // ---- Alert rules --------------------------------------------------------------
 
-async fn list_rules(State(s): State<AppState>, Query(q): Query<AlertQuery>) -> ApiResult {
+async fn list_rules(State(s): State<AppState>, Query(q): Query<RuleQuery>) -> ApiResult {
     let rules: Vec<Rule> =
         s.db.rules()?
             .into_iter()

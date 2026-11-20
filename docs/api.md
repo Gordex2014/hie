@@ -27,7 +27,7 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /api/records?source=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
 | `GET /api/records/{id}` | One record: file, line, original and corrected row, resources sent, HFS response |
 | `POST /api/records/{id}/reprocess` | Runs a record again; body `{"raw": {...}}` replaces the row and keeps the original |
-| `GET /api/alerts?source=&open=true` | Alerts, newest first, each with its rule, recipients, channels, and when and why it cleared; `open=true` lists only those not cleared |
+| `GET /api/alerts?source=&open=true&since=&limit=&cursor=` | Alerts, newest first, each with its rule, recipients, channels, and when and why it cleared; `open=true` lists only those not cleared. `since` and `cursor` read a period page by page ([below](#alerts)) |
 | `GET /api/alert-rules?source=` | Every rule; `POST` creates one (`400` names what is wrong with it) |
 | `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove |
 | `GET /api/secrets` | Every stored credential, by name, without its value |
@@ -39,6 +39,25 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /health` | `{"status": "ok", "service": "hie", "version", "uptime_seconds", "started_at", "timestamp", "secrets"}`; `secrets` is `{"backend": "native"\|"none", "available", "key_id"}`, the key id being a one-way 16-hex fingerprint of the key in use, or `null` |
 
 Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), and the codes of the credential routes below.
+
+A query string that cannot be read answers `400` with `code: invalid_query`, and with `field` when one parameter is at fault. Only `/api/alerts` checks its query this way so far.
+
+### Alerts
+
+`GET /api/alerts` reads every alert of a period by following a cursor:
+
+```
+GET /api/alerts?since=2026-11-13T00:00:00Z&limit=100
+→ {"alerts": [...], "next_cursor": "8421"}
+GET /api/alerts?since=2026-11-13T00:00:00Z&limit=100&cursor=8421
+→ {"alerts": [...], "next_cursor": null}
+```
+
+- **`since`** keeps the alerts created at or after an RFC 3339 instant (`Z` or an offset, with `+` sent as `%2B`). Alerts are stored to the millisecond, so a finer instant counts from the next millisecond; more than nine fraction digits and leap seconds (`:60`) are refused.
+- **`next_cursor`** is set when more alerts match, and `null` on the last page, so a reader stops there without asking again. It is opaque: pass it back as `cursor` with the same `source`, `open`, `since` and `limit`; it does not carry them. Empty `since=` and `cursor=` are the same as leaving them out.
+- **`limit`** is 100 by default. `0` answers an empty page, and a negative value every matching alert, as before.
+- **While a reader pages**, the order holds: a walk returns, once each and newest first, every alert that existed when it began and still matches when its page is read. An alert created meanwhile may or may not appear; it is on the next first page. An alert that clears, or is removed, between two pages leaves the others where they were: with `open=true` it simply no longer appears, and the alert a cursor points after need not exist any more.
+- **Refused** with `400 invalid_query`: a `since` that is not such an instant (`field: since`), a `cursor` that is not one this list returned (`field: cursor`), and values of the wrong type (`limit=abc`, `open=yes`, without `field`). The sentence never repeats what was sent.
 
 ### Secrets
 
