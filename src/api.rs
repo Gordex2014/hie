@@ -757,10 +757,15 @@ async fn reprocess(
     ))
 }
 
-/// What `GET /api/alert-rules` takes.
+/// What `GET /api/alert-rules` takes. `limit` and `open` mean nothing here,
+/// but are still checked as they always were.
 #[derive(Deserialize)]
 struct RuleQuery {
     source: Option<String>,
+    #[serde(rename = "limit")]
+    _limit: Option<i64>,
+    #[serde(rename = "open")]
+    _open: Option<bool>,
 }
 
 /// What `GET /api/alerts` takes: today's filters, a period and a page.
@@ -791,6 +796,9 @@ async fn list_alerts(
         Some(n) => n,
         None => 100,
     };
+    if limit == 0 {
+        return Ok(Json(json!({"alerts": [], "next_cursor": null})));
+    }
     let mut rows = s.db.query_json(
         &format!(
             "SELECT id, feed_id AS source_id, kind, message, rule_id, notify, channels,
@@ -814,9 +822,10 @@ async fn list_alerts(
     let page = usize::try_from(limit).unwrap_or(usize::MAX);
     let next_cursor = if rows.len() > page {
         rows.truncate(page);
-        rows.last()
-            .and_then(|row| row["id"].as_i64())
-            .map(paging::next_cursor)
+        let last = rows.last().and_then(|row| row["id"].as_i64());
+        Some(paging::next_cursor(last.ok_or_else(|| {
+            anyhow::anyhow!("an alert row without an id")
+        })?))
     } else {
         None
     };

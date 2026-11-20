@@ -457,9 +457,18 @@ impl Store {
     /// order. Each page has at most `limit` alerts, carries `next_cursor`, and
     /// only the first may be empty.
     async fn walk(&self, query: &[(&str, &str)], limit: usize) -> Vec<i64> {
+        self.walk_from(query, limit, None).await
+    }
+
+    /// `walk`, starting after a cursor already in hand.
+    async fn walk_from(
+        &self,
+        query: &[(&str, &str)],
+        limit: usize,
+        mut cursor: Option<String>,
+    ) -> Vec<i64> {
         let limit_text = limit.to_string();
         let mut ids = Vec::new();
-        let mut cursor: Option<String> = None;
         for page in 0.. {
             assert!(page < 1000, "the walk does not end");
             let mut q = query.to_vec();
@@ -609,23 +618,13 @@ async fn a_walk_keeps_its_place_while_alerts_change() {
         .unwrap();
     assert_eq!(deleted, vec![json!({"id": s[4].id})]);
 
-    let mut rest = Vec::new();
-    let mut cursor = Some(cursor);
-    while let Some(c) = cursor {
-        let (status, body) = store
-            .list(&[("open", "true"), ("limit", "2"), ("cursor", &c)])
-            .await;
-        assert_eq!(status, 200, "{body}");
-        rest.extend(
-            body["alerts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|a| a["id"].as_i64().unwrap()),
-        );
-        cursor = body["next_cursor"].as_str().map(str::to_string);
-    }
+    let rest = store
+        .walk_from(&[("open", "true")], 2, Some(cursor.clone()))
+        .await;
     assert_eq!(rest, vec![s[3].id, s[1].id, s[0].id]);
+    // Without `open`, the cleared alert stays where it was.
+    let rest = store.walk_from(&[], 2, Some(cursor)).await;
+    assert_eq!(rest, vec![s[3].id, s[2].id, s[1].id, s[0].id]);
 
     // The new alert is on a fresh first page.
     let (_, fresh) = store.list(&open).await;

@@ -55,9 +55,9 @@ GET /api/alerts?since=2026-11-13T00:00:00Z&limit=100&cursor=8421
 
 - **`since`** keeps the alerts created at or after an RFC 3339 instant (`Z` or an offset, with `+` sent as `%2B`). Alerts are stored to the millisecond, so a finer instant counts from the next millisecond; more than nine fraction digits and leap seconds (`:60`) are refused.
 - **`next_cursor`** is set when more alerts match, and `null` on the last page, so a reader stops there without asking again. It is opaque: pass it back as `cursor` with the same `source`, `open`, `since` and `limit`; it does not carry them. Empty `since=` and `cursor=` are the same as leaving them out.
-- **`limit`** is 100 by default. `0` answers an empty page, and a negative value every matching alert, as before.
-- **While a reader pages**, the order holds: a walk returns, once each and newest first, every alert that existed when it began and still matches when its page is read. An alert created meanwhile may or may not appear; it is on the next first page. An alert that clears, or is removed, between two pages leaves the others where they were: with `open=true` it simply no longer appears, and the alert a cursor points after need not exist any more.
-- **Refused** with `400 invalid_query`: a `since` that is not such an instant (`field: since`), a `cursor` that is not one this list returned (`field: cursor`), and values of the wrong type (`limit=abc`, `open=yes`, without `field`). The sentence never repeats what was sent.
+- **`limit`** is 100 by default. `0` answers an empty page, and a negative value every matching alert (as SQLite always did; PostgreSQL used to answer `500`).
+- **While a reader pages**, the order holds: a walk returns, once each and newest first, every alert that existed when it began and still matches when its page is read. An alert created meanwhile may or may not appear; a new walk finds it. An alert that clears, or is removed, between two pages leaves the others where they were: with `open=true` it simply no longer appears, and the alert a cursor points after need not exist any more. So a page after a cursor can be empty, when the alerts it would have held left in the meantime: stop on `null`, not on an empty page.
+- **Refused** with `400 invalid_query`: a `since` that is not such an instant (`field: since`), a malformed `cursor` (`field: cursor`), and values of the wrong type (`limit=abc`, `open=yes`, without `field`). The sentence never repeats what was sent.
 
 ### Secrets
 

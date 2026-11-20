@@ -23,8 +23,10 @@ pub(super) fn since_ms(since: Option<&str>) -> Result<Option<i64>, ApiError> {
         return Ok(None);
     };
     let bad = || {
-        invalid_query("since must be an RFC 3339 instant, such as 2026-11-13T00:00:00Z")
-            .with("field", "since")
+        invalid_query(
+            "since must be an RFC 3339 instant, such as 2026-11-13T00:00:00Z (send + as %2B)",
+        )
+        .with("field", "since")
     };
     // The parser drops fraction digits past the ninth, which would round the
     // wrong way; and a leap second has no millisecond of its own in the store.
