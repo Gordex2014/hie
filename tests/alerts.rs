@@ -629,6 +629,20 @@ async fn a_walk_keeps_its_place_while_alerts_change() {
     // The new alert is on a fresh first page.
     let (_, fresh) = store.list(&open).await;
     assert_eq!(fresh["alerts"][0]["id"], new.id);
+
+    // A cursor whose remaining alerts all left leads to an empty last page.
+    let (_, four) = store.list(&[("open", "true"), ("limit", "4")]).await;
+    assert_eq!(four["alerts"][3]["id"], s[1].id);
+    let cursor = four["next_cursor"].as_str().unwrap().to_string();
+    store
+        .db
+        .clear_alert(s[0].id, "cleared by the test")
+        .unwrap();
+    let (status, empty) = store
+        .list(&[("open", "true"), ("limit", "4"), ("cursor", &cursor)])
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(empty, json!({"alerts": [], "next_cursor": null}));
 }
 
 #[tokio::test]
@@ -666,7 +680,7 @@ async fn a_malformed_query_is_refused_without_echoing_it() {
     let store = store().await;
     store.seed("lab", base_ms(), true);
     type Case<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>);
-    let cases: [Case; 12] = [
+    let cases: [Case; 14] = [
         (&[("since", "yesterday")], Some("since")),
         (&[("since", "2025-01-02")], Some("since")),
         (&[("since", "2016-12-31T23:59:60Z")], Some("since")),
@@ -675,13 +689,15 @@ async fn a_malformed_query_is_refused_without_echoing_it() {
             Some("since"),
         ),
         (&[("cursor", "abc")], Some("cursor")),
-        (&[("cursor", "-1")], Some("cursor")),
-        (&[("cursor", "0")], Some("cursor")),
-        (&[("cursor", "+5")], Some("cursor")),
-        (&[("cursor", "99999999999999999999")], Some("cursor")),
+        (&[("cursor", "17")], Some("cursor")),
+        (&[("cursor", "a1.-1")], Some("cursor")),
+        (&[("cursor", "a1.0")], Some("cursor")),
+        (&[("cursor", "a1.+5")], Some("cursor")),
+        (&[("cursor", "a1.99999999999999999999")], Some("cursor")),
         (&[("limit", "0"), ("since", "garbage")], Some("since")),
         (&[("limit", "abc")], None),
         (&[("open", "yes")], None),
+        (&[("limit", "1"), ("limit", "2")], None),
     ];
     for (query, field) in cases {
         let (status, body) = store.list(query).await;
@@ -694,5 +710,15 @@ async fn a_malformed_query_is_refused_without_echoing_it() {
                 assert!(!body.to_string().contains(value), "echoed: {body}");
             }
         }
+    }
+    // The rules list still checks the types of what it ignores.
+    for query in ["limit=abc", "open=yes"] {
+        let r = store
+            .http
+            .get(format!("{}/api/alert-rules?{query}", store.api))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{query}");
     }
 }

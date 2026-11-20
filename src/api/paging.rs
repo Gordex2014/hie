@@ -45,16 +45,19 @@ pub(super) fn since_ms(since: Option<&str>) -> Result<Option<i64>, ApiError> {
     Ok(Some(if nanos % 1_000_000 == 0 { ms } else { ms + 1 }))
 }
 
+/// What a cursor starts with: its form's version, so that a later form can be
+/// told apart, and a bare id is not taken for one.
+const CURSOR_MARK: &str = "a1.";
+
 /// The id a `cursor` stands for: the last row of the previous page. Empty means
 /// the first page.
 pub(super) fn cursor_id(cursor: Option<&str>) -> Result<Option<i64>, ApiError> {
     let Some(text) = cursor.filter(|t| !t.is_empty()) else {
         return Ok(None);
     };
-    text.bytes()
-        .all(|b| b.is_ascii_digit())
-        .then(|| text.parse::<i64>().ok())
-        .flatten()
+    text.strip_prefix(CURSOR_MARK)
+        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|id| id.parse::<i64>().ok())
         .filter(|id| *id > 0)
         .map(Some)
         .ok_or_else(|| {
@@ -64,7 +67,7 @@ pub(super) fn cursor_id(cursor: Option<&str>) -> Result<Option<i64>, ApiError> {
 
 /// The cursor that continues after the row with this id.
 pub(super) fn next_cursor(id: i64) -> String {
-    id.to_string()
+    format!("{CURSOR_MARK}{id}")
 }
 
 #[cfg(test)]
@@ -92,11 +95,21 @@ mod tests {
     }
 
     #[test]
-    fn a_cursor_is_a_positive_decimal_id() {
-        assert_eq!(cursor_id(Some("42")).ok().flatten(), Some(42));
+    fn a_cursor_is_a_marked_positive_id() {
+        assert_eq!(cursor_id(Some("a1.42")).ok().flatten(), Some(42));
         assert_eq!(cursor_id(Some(&next_cursor(7))).ok().flatten(), Some(7));
         assert_eq!(cursor_id(Some("")).ok().flatten(), None);
-        for bad in ["abc", "-1", "0", "+5", " 5", "99999999999999999999"] {
+        for bad in [
+            "42",
+            "a1.",
+            "a2.42",
+            "abc",
+            "a1.-1",
+            "a1.0",
+            "a1.+5",
+            "a1. 5",
+            "a1.99999999999999999999",
+        ] {
             assert!(cursor_id(Some(bad)).is_err(), "{bad}");
         }
     }

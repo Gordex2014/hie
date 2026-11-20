@@ -440,14 +440,14 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 
 ## 39. Alerts are read by period and in pages, with a cursor on their id
 
-**Chosen:** `GET /api/alerts` takes `since`, an RFC 3339 instant that keeps the alerts created at or after it, and `cursor`, the previous page's `next_cursor`. Alerts stay newest first by id; a page is the next `limit` alerts (100 by default) with an id below the last one returned, read with one row more than the page so that `next_cursor` is `null` exactly when nothing more matches. The cursor is opaque; today it is the last id, in decimal. `source` and `open` are unchanged and combine with both. A query string that cannot be read answers `400 invalid_query`, with `field` for `since` and `cursor`, in a fixed sentence. A negative `limit` now means every matching alert on PostgreSQL too, as it always did on SQLite.
+**Chosen:** `GET /api/alerts` takes `since`, an RFC 3339 instant that keeps the alerts created at or after it, and `cursor`, the previous page's `next_cursor`. Alerts stay newest first by id; a page is the next `limit` alerts (100 by default) with an id below the last one returned, read with one row more than the page so that `next_cursor` is `null` exactly when nothing more matches (or `limit` is `0`, an empty page). The cursor is opaque: it carries the last id behind a mark of its form's version, and a bare id is refused. `source` and `open` are unchanged and combine with both. A query string that cannot be read answers `400 invalid_query`, with `field` for `since` and `cursor`, in a fixed sentence. A negative `limit` now means every matching alert on PostgreSQL too, as it always did on SQLite.
 
 **Why:**
 - A monitoring tool reads every alert of a period (the last seven days, say). With only the newest `limit` it could not tell whether it had them all.
 - A cursor on the id is stable without a snapshot: new alerts take higher ids, so they never shift a walk in progress, and an alert cleared or purged between pages moves no other. An offset would skip or repeat rows whenever alerts arrive.
 - `since` filters on the creation time but does not order: ids and clocks can disagree by a few milliseconds between instances, and paging stays correct either way. Rounding a finer instant up keeps "at or after" true against stored milliseconds.
 - The bound on the id lets SQLite seek on the primary key; the `IS NULL OR` form other filters use made it scan.
-- An opaque cursor leaves room to change it: a later form can be told apart from a plain number.
+- An opaque cursor leaves room to change it: the mark tells a later form apart, and a client cannot take an alert id for a cursor.
 
 **Cost / not yet:**
 - The rule is per page, not a snapshot: a walk returns every alert that existed when it began and still matches, once each; an alert created meanwhile may or may not appear. On PostgreSQL an id is taken before its row commits, so an alert can commit behind a page already read; a new walk finds it. A page after a cursor can be empty when the alerts it would have held left in the meantime.
