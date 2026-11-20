@@ -1660,12 +1660,54 @@ impl Db {
             .map(|r| (r.i64(0), r.i64(1))))
     }
 
-    pub fn clear_alert(&self, id: i64, reason: &str) -> Result<()> {
-        self.execute(
+    /// Clears an alert that is still open. Returns whether this call cleared it.
+    pub fn clear_alert(&self, id: i64, reason: &str) -> Result<bool> {
+        Ok(self.execute(
             "UPDATE alerts SET cleared_at = $2, cleared_reason = $3 WHERE id = $1 AND cleared_at IS NULL",
             &params![id, now_ms(), reason],
-        )
-        .map(drop)
+        )? > 0)
+    }
+
+    /// The open alerts of a kind for a source, with a rule or without, oldest first.
+    pub fn open_alert_ids(&self, feed: &str, kind: &str) -> Result<Vec<i64>> {
+        Ok(self
+            .query(
+                "SELECT id FROM alerts WHERE feed_id = $1 AND kind = $2 AND cleared_at IS NULL ORDER BY id",
+                &params![feed, kind],
+            )?
+            .iter()
+            .map(|r| r.i64(0))
+            .collect())
+    }
+
+    /// Closes what versions before recovery cleared the `delivery` alert left
+    /// open: every `delivery_recovered` alert (a notice, never a condition), and
+    /// every rule-less `delivery` alert that a later `delivery_recovered` of its
+    /// source shows to be over. A rule-less `delivery` alert with no later
+    /// recovery may be an outage still going on: it stays, for the next
+    /// successful delivery to clear. Only the store changes. Returns how many
+    /// alerts were closed.
+    pub fn close_legacy_recoveries(&self) -> Result<u64> {
+        let now = now_ms();
+        let over = self.execute(
+            "UPDATE alerts SET cleared_at = $1, cleared_reason = $2
+             WHERE kind = 'delivery' AND rule_id IS NULL AND cleared_at IS NULL AND feed_id IS NOT NULL
+               AND EXISTS (SELECT 1 FROM alerts later WHERE later.feed_id = alerts.feed_id
+                           AND later.kind = 'delivery_recovered' AND later.id > alerts.id)",
+            &params![
+                now,
+                "delivery to HFS recovered (recorded before recovery cleared this alert)"
+            ],
+        )?;
+        let notices = self.execute(
+            "UPDATE alerts SET cleared_at = $1, cleared_reason = $2
+             WHERE kind = 'delivery_recovered' AND cleared_at IS NULL",
+            &params![
+                now,
+                "a recovery notice; recovery now clears the delivery alert instead"
+            ],
+        )?;
+        Ok(over + notices)
     }
 
     // ---- alert rules -------------------------------------------------------

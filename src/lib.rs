@@ -31,6 +31,7 @@ pub mod credentials;
 pub mod crypto;
 pub mod database;
 pub mod db;
+pub mod destination;
 pub mod fhir;
 pub mod hl7;
 pub mod manager;
@@ -132,6 +133,16 @@ pub fn build_with(
             )?;
         }
     }
+    // Alerts older versions left open after a recovery: closed before any
+    // source runs, so none of them stands in for a new outage.
+    let closed = db.close_legacy_recoveries()?;
+    if closed > 0 {
+        tracing::info!("closed {closed} delivery alert(s) left open by an earlier version");
+    }
+    destination::spawn_probe(
+        Arc::downgrade(fhir.destination()),
+        config.destination.probe_every(),
+    );
     let manager = manager::SourceManager::new(
         config,
         runtime_dir,

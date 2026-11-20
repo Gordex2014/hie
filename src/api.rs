@@ -305,7 +305,7 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         _ => "receiving",
     };
     let last_alert = db.query_json(
-        &format!("SELECT kind, message, {} AS created_at FROM alerts WHERE feed_id = $1 ORDER BY id DESC LIMIT 1", db.iso("created_at")),
+        &format!("SELECT kind, message, {} AS created_at, {} AS cleared_at FROM alerts WHERE feed_id = $1 ORDER BY id DESC LIMIT 1", db.iso("created_at"), db.iso("cleared_at")),
         params![feed.id],
     )?;
     let since = now_ms() - DAY_MS;
@@ -588,10 +588,18 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
         "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'rejected' AND updated_at >= $1", params![since])?,
         "alerts": count(&s.db, "SELECT COUNT(*) AS n FROM alerts WHERE created_at >= $1", params![since])?,
     });
+    let destination = s.manager.destination().snapshot();
     Ok(Json(json!({
         "state": if needs_you.is_empty() { "all_receiving" } else { "needs_you" },
         "needs_you": needs_you,
         "last_24h": last_24h,
+        "destination": {
+            "reachable": destination.reachable,
+            "since": destination.since_ms.and_then(iso_ms),
+            "last_error": destination.last_error,
+            "consecutive_failures": destination.consecutive_failures,
+            "observed_at": destination.observed_ms.and_then(iso_ms),
+        },
         "sources": sources,
     })))
 }

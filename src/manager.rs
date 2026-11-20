@@ -203,6 +203,11 @@ impl SourceManager {
         })
     }
 
+    /// Whether the FHIR server answers, as this engine sees it.
+    pub fn destination(&self) -> Arc<crate::destination::Destination> {
+        self.fhir.destination().clone()
+    }
+
     /// How long a replacement waits for the runner it replaces before aborting it.
     pub fn set_handover_grace(&self, grace: Duration) {
         self.handover_grace_ms

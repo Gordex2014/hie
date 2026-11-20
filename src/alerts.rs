@@ -57,7 +57,15 @@ impl Alerter {
         let Some((id, _)) = self.db.open_alert(feed, kind, rule_id)? else {
             return Ok(false);
         };
-        self.db.clear_alert(id, reason)?;
+        self.clear(id, feed, kind, reason)
+    }
+
+    /// Clears alert `id` if it is still open, and tells the webhook only when
+    /// this call is the one that cleared it.
+    pub fn clear(&self, id: i64, feed: &str, kind: &str, reason: &str) -> Result<bool> {
+        if !self.db.clear_alert(id, reason)? {
+            return Ok(false);
+        }
         tracing::info!(alert = id, feed, kind, "cleared: {reason}");
         self.post(json!({"text": format!("[HIE] cleared: {reason}"), "feed": feed, "kind": kind, "alert_id": id, "cleared": true}));
         Ok(true)

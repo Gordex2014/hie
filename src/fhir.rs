@@ -1,8 +1,10 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use crate::credentials::Credentials;
+use crate::destination::Destination;
 
 /// Why a Bundle could not be delivered as a whole.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +27,7 @@ pub struct FhirClient {
     base: String,
     http: reqwest::Client,
     credentials: Credentials,
+    destination: Arc<Destination>,
 }
 
 /// How long one HTTP call to FHIR may take, `$bulk-submit` calls included.
@@ -45,6 +48,7 @@ impl FhirClient {
             base: base.trim_end_matches('/').to_string(),
             http,
             credentials,
+            destination: Arc::new(Destination::new(base)),
         }
     }
 
@@ -52,6 +56,13 @@ impl FhirClient {
         &self.credentials
     }
 
+    /// Whether the server answers, as this client and the probe saw it.
+    pub fn destination(&self) -> &Arc<Destination> {
+        &self.destination
+    }
+
+    /// Posts a batch Bundle. Failure reasons name "the FHIR server", never its
+    /// URL: they reach the record's error and the delivery alert.
     pub async fn post_bundle(&self, bundle: &Value) -> Result<Value, SendError> {
         let request = self
             .http
@@ -59,18 +70,22 @@ impl FhirClient {
             .header("Content-Type", "application/fhir+json")
             .header("Accept", "application/fhir+json")
             .json(bundle);
-        let resp = authorize(request, &self.credentials)
-            .await?
-            .send()
-            .await
-            .map_err(|e| SendError::Transient(format!("cannot reach {}: {e}", self.base)))?;
+        let request = authorize(request, &self.credentials).await?;
+        // Held until the answer has been read: the destination is not idle
+        // while it downloads.
+        let exchange = self.destination.start();
+        let sent = request.send().await;
+        exchange.observe_send(&sent);
+        let resp = sent.map_err(|e| {
+            SendError::Transient(format!("cannot reach the FHIR server: {}", e.without_url()))
+        })?;
         let status = resp.status().as_u16();
         let body: Value = resp.json().await.unwrap_or(Value::Null);
+        drop(exchange);
         match status {
             200..=299 => Ok(body),
             429 | 500..=599 => Err(SendError::Transient(format!(
-                "HTTP {status} from {}",
-                self.base
+                "HTTP {status} from the FHIR server"
             ))),
             401 | 403 if self.credentials.is_some() => {
                 Err(refused_token(status, &self.credentials).await)

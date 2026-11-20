@@ -96,7 +96,7 @@ A complete .NET 10 port of the engine exists in the history (commit `c3272d4`), 
 | Kind | Examples | Handling |
 |---|---|---|
 | Data | Wrong column count, non-numeric value, unknown code or unit, missing identifier, a 4xx from HFS for that entry | Rejected at once. Kept with file, line, original row and reason. Reprocessable after a fix. |
-| Transient | HFS unreachable, timeout, 429, 5xx | Retried with exponential backoff (2 s doubling to 5 min), never dropped. One alert after `alert_after_attempts`, one when delivery recovers. |
+| Transient | HFS unreachable, timeout, 429, 5xx | Retried with exponential backoff (2 s doubling to 5 min), never dropped. One alert after `alert_after_attempts`, cleared when delivery recovers (decision 43). |
 
 **Why:**
 - In the exercise, retrying a bad row only multiplied writes, and treating an outage as a bad file stopped good data.
@@ -142,7 +142,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 ## 12. Alerts for data events in the engine; routing left to a product
 
 **Chosen:**
-- HIE raises alerts for rejected records, unreadable files, delivery outages and recovery, and **silence**: no data within the feed's `expect_every`.
+- HIE raises alerts for rejected records, unreadable files, delivery outages and recovery, and **silence**: no data within the feed's `expect_every`. (Recovery now clears the outage alert instead of raising one: decision 43.)
 - Alerts are stored, logged, and posted to a webhook (`text` field, the shape Slack and Teams accept).
 - A repeated condition alerts once. (Superseded in part by decision 22: conditions are rules, and an alert clears itself.)
 
@@ -437,6 +437,30 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - A replaced value remains in database files (SQLite WAL and free pages, PostgreSQL dead rows) and backups until overwritten, under the same key. A whole row rolled back to an older revision still opens: nothing outside the row counts revisions.
 - Plaintext copies outside the engine's wiped types: the S3 client's own credential strings for the client's lifetime, HTTP and JSON parser buffers. HMAC pad blocks and HKDF temporaries made once at start are not wiped.
 - Registrations belong to an instance (`HIE_INSTANCE_ID`, or an id kept in the sources directory). After a failure they err on keeping: a start that fails after a definition was published keeps both credentials registered until the next start or replace, a cleanup that keeps failing leaves a row until the next start, and a changed instance id leaves its old rows behind. Each only makes a delete answer `409`. A crash while the key file is created can leave a temporary copy of the key next to it.
+
+## 43. The destination's reachability, from deliveries and an idle probe
+
+**Chosen:**
+- `GET /api/monitoring/status` carries `destination`: `{reachable, since, last_error, consecutive_failures, observed_at}`, kept in memory per engine process.
+- Observed: every request a delivery sends under the base URL (batch Bundles, `$bulk-submit` kick-off and status requests), and a probe, `GET {base}/metadata`, once nothing has reached the server for `destination.probe_seconds` (60 by default, `0` off). The probe sends no token and no user information, and follows no redirect.
+- No connection, a timeout, a lost connection, or `502`/`503`/`504` is a failure; any other answer means the server answers. `last_error` is one of six fixed sentences.
+- A request that started before the latest observation does not overwrite it; a probe gives way to a delivery started after it; a probe's answer does not end an outage deliveries see as `502`–`504` until none has for ten minutes.
+- Recovery clears every open `delivery` alert of the source, with a rule or without, and `delivery_recovered` is no longer raised. A rule-less outage alert is raised once per outage, checked in the store. REST recovery needs HFS to decide at least one entry of a batch. At start-up the engine closes, in the store only, the `delivery_recovered` alerts earlier versions left open and the rule-less outage alerts they show to be over.
+
+**Why:**
+- When the FHIR server is down, every source fails on its own; one shared answer says the destination is the cause, and since when.
+- Deliveries are the best evidence and cost nothing; the probe only fills the silence, so an idle engine does not report a state hours old, and a busy one never probes. `/metadata` is the one read every FHIR server serves, usually without a token.
+- `502`–`504` are what a server or its proxy answers when the service is down; a `500` or a `4xx` is about the request. Counting a payload-specific `500` would make the state flap against the probe. Keeping the token endpoint out keeps the answer about the server.
+- Fixed sentences can be shown to anyone: the failure text a delivery stores names the server's URL and a library's error.
+- The rule-less outage alert stayed open after recovery, beside a `delivery_recovered` alert that never cleared either, so a list of open alerts showed outages that were over. Clearing it is what rule-governed outage alerts already did, and the clear is posted to the webhook like any other.
+
+**Cost / not yet:**
+- `reachable: true` is not "delivering": a server answering `500` to every batch, a batch whose every entry is retried, or a token problem leaves it `true`. The sources' records and alerts say that.
+- The state starts unknown at each start, and each instance on a shared store has its own. With the probe off and nothing delivered, it stays unknown.
+- While deliveries see `502`–`504`, `observed_at` advances only with the probe's failures and the retries, which back off up to `max_backoff_ms`; and if the retrying source is paused, the probe takes over only after ten minutes.
+- `delivery_recovered` disappears: a consumer that counted it (`hie_alerts_total{kind="delivery_recovered"}` stops growing) reads cleared `delivery` alerts instead. The old outage alerts with no recovery after them stay open until the source's next successful delivery.
+- Alert transitions are not fenced by the source's lease: two instances overlapping in a hand-over can each raise an outage alert, as for every other alert. A store failure at the clear leaves the alert open until the next recovery; on the bulk path that is the next completed submission.
+- Delivery failure reasons that are not about reaching the server (a token endpoint's answer, HFS's own OperationOutcome text) reach records and alerts as before.
 
 ## Not in the prototype
 

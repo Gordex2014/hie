@@ -166,7 +166,17 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
     runner.tick().await.unwrap();
     assert_eq!(count(&state, "sent"), 3);
     assert_eq!(fhir.lock().unwrap().versions.len(), 3);
-    assert_eq!(alert_kinds(&state), ["delivery", "delivery_recovered"]);
+    // The outage alert is cleared by the recovery; no second alert is raised.
+    assert_eq!(alert_kinds(&state), ["delivery"]);
+    let outage = &state
+        .db
+        .query_json("SELECT cleared_at, cleared_reason FROM alerts", [])
+        .unwrap()[0];
+    assert!(outage["cleared_at"].as_i64().is_some(), "{outage}");
+    assert_eq!(
+        outage["cleared_reason"],
+        "Lab results: delivery to HFS recovered"
+    );
 
     // The identical file again: recognized by its hash and not reprocessed.
     let before = fhir.lock().unwrap().requests;

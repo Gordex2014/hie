@@ -23,7 +23,7 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /api/transforms/{name}` | The transform's code |
 | `PUT /api/transforms/{name}` | Saves the code (`{"code": "..."}`); the sources using it restart their Python worker. `201` when new |
 | `POST /api/transforms/{name}/try` | Runs the transform on `{"records": [...]}` (up to 100) without loading: per record, the resources it became or the rejection reason. At most four tries run at once; `503` when one cannot start within 10 s |
-| `GET /api/monitoring/status` | What the monitoring page opens on: `needs_you` (late, paused, or rejecting sources with the reason), `last_24h` (files, sent, rejected, alerts), every source |
+| `GET /api/monitoring/status` | What the monitoring page opens on: `needs_you` (late, paused, or rejecting sources with the reason), `last_24h` (files, sent, rejected, alerts), `destination` (whether the FHIR server answers, see [The destination](#the-destination)), every source with its `last_alert` (`kind`, `message`, `created_at`, `cleared_at`) |
 | `GET /api/records?source=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
 | `GET /api/records/{id}` | One record: file, line, original and corrected row, resources sent, HFS response |
 | `POST /api/records/{id}/reprocess` | Runs a record again; body `{"raw": {...}}` replaces the row and keeps the original |
@@ -39,6 +39,38 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /health` | `{"status": "ok", "service": "hie", "version", "uptime_seconds", "started_at", "timestamp", "secrets"}`; `secrets` is `{"backend": "native"\|"none", "available", "key_id"}`, the key id being a one-way 16-hex fingerprint of the key in use, or `null` |
 
 Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), and the codes of the credential routes below.
+
+### The destination
+
+`destination` in `GET /api/monitoring/status` says whether the FHIR server at `fhir_base_url` answers, as this engine process saw it:
+
+```json
+"destination": {
+  "reachable": false,
+  "since": "2026-11-20T10:00:00.123+00:00",
+  "last_error": "could not connect to the FHIR server",
+  "consecutive_failures": 7,
+  "observed_at": "2026-11-20T10:06:00.456+00:00"
+}
+```
+
+| Member | Meaning |
+|---|---|
+| `reachable` | `true`, `false`, or `null` while nothing has been observed since the engine started |
+| `since` | When `reachable` took its current value: the first failure of the current outage, or the first answer after one |
+| `last_error` | While unreachable, why, as one of these fixed sentences; `null` otherwise: `could not connect to the FHIR server`, `the FHIR server did not answer in time`, `the connection to the FHIR server was lost`, `the FHIR server answered HTTP 502` (or `503`, `504`). Never a URL, a host or a library's error text; the engine log has the detail |
+| `consecutive_failures` | Failed observations in a row, every source's deliveries and the probe together, so several failing sources add up quickly; `0` while reachable. It is not a source's attempt count and is not compared with `alert_after_attempts` |
+| `observed_at` | The latest observation that counted: "last checked" |
+
+Timestamps are RFC 3339 in UTC, as everywhere in the API.
+
+**What is observed.** Each request a delivery sends under the base (a batch Bundle, a `$bulk-submit` kick-off or status request), and the **idle probe**: once nothing has reached the server for `destination.probe_seconds` (60 by default; see [running](running.md#the-destination-probe)), a `GET {base}/metadata`, anonymous (no token, and no user information from the base URL), without following redirects. Deliveries push the probe back, so a busy engine does not probe. Bulk status pages and receipt files, whose URLs HFS chooses, are not observed; neither are the token endpoint, the terminology server, sources that read another FHIR server, or the alert webhook. A request the server redirects counts as the server's.
+
+**What counts.** No connection, no answer in time, a connection lost before the answer, or an answer of `502`, `503` or `504` is a failure. Any other answer, `4xx` (`401`, `403`, `429` included) and `500` included, means the server answers. So `reachable` says the server's HTTP route answers, not that delivery works: an HFS answering `500` to every batch, a batch whose every entry is to be retried, a token the server refuses, or a token endpoint that is down (which records nothing) all leave it `true`. Each source's records, loads and `delivery` alerts say what failed.
+
+**Order.** A request that started before the latest observation does not overwrite it, and a probe gives way to a delivery that started after it. While deliveries see `502` to `504`, a probe that gets an answer does not end the outage (the server may serve `/metadata` and still be unable to store); a delivery's answer does, or the probe's once no delivery has seen `502` to `504` for ten minutes. In that state `observed_at` advances with the probe's failures and the deliveries' retries, which back off up to `max_backoff_ms`.
+
+**Per process.** The state is kept in memory: it starts unknown at every start of the engine (`since` is not kept across a restart), and with several instances on one store each answers with what it observed itself. An instance that holds no source answers from its probe only.
 
 ### Secrets
 

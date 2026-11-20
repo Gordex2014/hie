@@ -55,7 +55,6 @@ pub struct FeedRunner {
     transformer: Transformer,
     alerts: Arc<Alerter>,
     started_at: i64,
-    outage_alerted: AtomicBool,
     /// Which engine instance this runner acts as, for the source's lease.
     instance: String,
     /// Where transformed submissions are written when the engine serves them.
@@ -133,6 +132,7 @@ impl FeedRunner {
         let bulk = (feed.delivery.method == DeliveryMethod::BulkSubmit).then(|| {
             BulkSubmitter::new(fhir_base_url, public_url)
                 .with_credentials(fhir.credentials().clone())
+                .with_destination(fhir.destination().clone())
         });
         Self {
             feed,
@@ -151,7 +151,6 @@ impl FeedRunner {
             instance: instance_id().to_string(),
             bulk_dir: std::env::temp_dir().join("hie-bulk"),
             bulk_transformed: feed_bulk_transformed,
-            outage_alerted: AtomicBool::new(false),
             control: std::sync::OnceLock::new(),
         }
     }
@@ -1215,8 +1214,16 @@ impl FeedRunner {
                 Ok(true)
             }
             Ok(response) => {
-                self.recovered()?;
                 let results = fhir::entry_results(&response, entries.len());
+                // HFS answered, but delivery recovered only if it decided at
+                // least one entry: a batch whose every entry is to be retried
+                // is still an outage for this source.
+                if results
+                    .iter()
+                    .any(|r| matches!(r, EntryResult::Ok(_) | EntryResult::Rejected(..)))
+                {
+                    self.recovered()?;
+                }
                 for (i, item) in items.iter().enumerate() {
                     let mine: Vec<&EntryResult> = results
                         .iter()
@@ -1338,7 +1345,8 @@ impl FeedRunner {
     }
 
     /// Delivery failed `attempts` times in a row. The unreachable rules say when to
-    /// tell someone; without one, the source's `alert_after_attempts` does.
+    /// tell someone; without one, the source's `alert_after_attempts` does, once
+    /// per outage: no second alert while one is open, whichever process raised it.
     fn outage(&self, attempts: u32, reason: &str) -> Result<()> {
         let message = format!(
             "{}: cannot deliver to HFS after {attempts} attempts ({reason}); data is kept and retried",
@@ -1347,7 +1355,10 @@ impl FeedRunner {
         let rules = self.rules("unreachable")?;
         if rules.is_empty() {
             if attempts >= self.feed.delivery.alert_after_attempts
-                && !self.outage_alerted.swap(true, Ordering::SeqCst)
+                && self
+                    .db
+                    .open_alert(&self.feed.id, "delivery", None)?
+                    .is_none()
             {
                 self.alerts
                     .raise(Some(&self.feed.id), "delivery", &message)?;
@@ -1363,15 +1374,17 @@ impl FeedRunner {
         Ok(())
     }
 
+    /// Delivery works again: every open `delivery` alert of the source is
+    /// cleared, with a rule or without, and whether or not its rule still
+    /// exists. The cleared alert is the recovery notice.
     fn recovered(&self) -> Result<()> {
-        let message = format!("{}: delivery to HFS recovered", self.feed.name);
-        if self.outage_alerted.swap(false, Ordering::SeqCst) {
-            self.alerts
-                .raise(Some(&self.feed.id), "delivery_recovered", &message)?;
+        let open = self.db.open_alert_ids(&self.feed.id, "delivery")?;
+        if open.is_empty() {
+            return Ok(());
         }
-        for rule in self.rules("unreachable")? {
-            self.alerts
-                .clear_open(&self.feed.id, "delivery", Some(rule.id), &message)?;
+        let message = format!("{}: delivery to HFS recovered", self.feed.name);
+        for id in open {
+            self.alerts.clear(id, &self.feed.id, "delivery", &message)?;
         }
         Ok(())
     }

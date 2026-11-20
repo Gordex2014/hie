@@ -100,6 +100,17 @@ worker:
 
 Every value must be at least 1. A transform that imports a heavy library may need a larger `memory_mib`. A reply line is at most 32 MiB. Each worker process gets a fresh run directory under the system temporary directory, deleted when it ends.
 
+### The destination probe
+
+The engine reports whether the FHIR server answers (`destination` in `GET /api/monitoring/status`, see [The destination](api.md#the-destination)) from its deliveries, and probes `{fhir_base_url}/metadata` once nothing has reached the server for a while, so the report does not go stale when nothing arrives:
+
+```yaml
+destination:
+  probe_seconds: 60   # seconds of quiet before a probe; 0 turns the probe off
+```
+
+`probe_seconds` is at most 86400. The probe is a plain `GET` with a 10-second limit and no token: a running engine keeps probing while its token endpoint is down, and an answer such as `401` still means the server answers. With the probe off, `destination` is `null` until the first delivery.
+
 ### Credentials and the secret key
 
 S3 sources sign with credentials stored in the engine (`/api/secrets`, see [Secrets](api.md#secrets)), sealed in its database with XChaCha20-Poly1305 under a key derived from one **secret key**. Only metadata is ever answered; values never leave the engine except to sign requests.
