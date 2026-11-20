@@ -154,6 +154,7 @@ fn submission(db: &hie::db::Db, which: &str, status: Option<&str>) {
     let file = db
         .insert_file(
             "drops",
+            "drops",
             &format!("{which}.ndjson"),
             which,
             1,

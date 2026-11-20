@@ -438,6 +438,25 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - Plaintext copies outside the engine's wiped types: the S3 client's own credential strings for the client's lifetime, HTTP and JSON parser buffers. HMAC pad blocks and HKDF temporaries made once at start are not wiped.
 - Registrations belong to an instance (`HIE_INSTANCE_ID`, or an id kept in the sources directory). After a failure they err on keeping: a start that fails after a definition was published keeps both credentials registered until the next start or replace, a cleanup that keeps failing leaves a row until the next start, and a changed instance id leaves its old rows behind. Each only makes a delete answer `409`. A crash while the key file is created can leave a temporary copy of the key next to it.
 
+## 42. Loads are listed across sources, newest first in pages, with `failed` derived from their rows
+
+**Chosen:** `GET /api/loads` lists the loads of every source, newest first by id, with the fields of the per-source list (and `GET /api/loads/{id}`), which all gain `failed` and `source_name`. `source` keeps one source id; `status` keeps one stored status (`processing`, `unpacked`, `done`, `unreadable`, `duplicate`) or `failed`: a load that is `unreadable` or has at least one row rejected when the page is read, whatever its status. A page is at most 200 loads (50 by default) below the previous page's `next_cursor`, an opaque cursor on the id in the form `/api/alerts` uses; `next_cursor` is `null` exactly when nothing more matched. The page, whether more follow, and the counts come from one statement. Each way of choosing a page reads an index: `files(feed_id, id)`, `files(status, id)`, `files(feed_id, status, id)`, and two partial indexes on records holding only rejected rows (`(file_id)` and `(feed_id, file_id)`), from which a recursive query takes the failed loads one seek each. The runner keeps the source's name with each load it records (`files.source_name`). A deleted source's loads stay listed under their id and name; a source created again with that id takes over everything kept under it, loads included. A query string that cannot be read answers `400 invalid_query`, with `field` for `limit`, `status` and `cursor`.
+
+**Why:**
+- A monitoring tool needs every source's loads in one list, and to page through them; per source and only the newest 50, it could neither see them together nor tell whether it had them all.
+- There is no failed load status: a load is `done` once every row is sent or rejected, whatever the share rejected, and rows are rejected while the load is still in progress. "Failing now" is what a person acts on, so it is derived from the rows when the page is read: a Retry takes a load out at once, and a row rejected later puts it back. Storing a flag would need every path that rejects or puts back a row to keep it.
+- The cursor on the id is stable without a snapshot, as for alerts (39): new loads take higher ids and never shift a walk, and a load that leaves a filter between pages moves no other.
+- One statement per page, so a page never holds a load that stopped matching between two reads, and its counts and `next_cursor` agree.
+- Rejected rows are few and the loads with any are fewer, so a partial index holds only them and changes only when a row enters or leaves `rejected`. Seeking from one failed load to the next stops a page from reading every rejected row of an older load, or walking every load, when failures are sparse.
+- A source id is the only identity a source has, in the store and across instances that may each hold their own definitions. A marker of deletion kept in the store could not tell which definition recorded a load once two instances, a renamed definition file, or a delete that fails halfway disagree; the name kept with each load, and the documented take-over, say what the engine knows.
+
+**Cost / not yet:**
+- The rule is per page, not a snapshot: a load created during a walk may or may not appear (on PostgreSQL an id is taken before its row commits), and with `failed` or a changing status a load can start or stop matching between pages.
+- The counts of a page read every row of each of its loads, in one call that holds the store; 200 bounds the number of loads, not their rows. The per-source list has the same cost with no bound.
+- A reused id shares history: the new source's lists, stats, pause state, rules, alerts, cursors, unfinished rows and deduplication include the earlier source's. A new source should get a new id. Loads recorded before this version have no `source_name`.
+- The first start of this version builds the new indexes; each partial one reads `records` once. On a large store that is a pause at start (see [running](running.md#the-store-and-more-than-one-instance)).
+- `limit` here is 1 to 200; `/api/alerts` keeps its older meaning of `0` and negative values. There is no `since` on loads; other parameters are ignored.
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.

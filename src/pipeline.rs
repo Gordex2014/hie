@@ -506,6 +506,7 @@ impl FeedRunner {
             }
             let id = self.db.insert_file(
                 feed,
+                &self.feed.name,
                 &name,
                 &sha,
                 bytes.len() as u64,
@@ -535,6 +536,7 @@ impl FeedRunner {
         };
         let file_id = self.db.insert_file(
             feed,
+            &self.feed.name,
             &name,
             &sha,
             bytes.len() as u64,
@@ -586,6 +588,7 @@ impl FeedRunner {
         let feed = &self.feed.id;
         let container = self.db.insert_file(
             feed,
+            &self.feed.name,
             name,
             sha,
             bytes.len() as u64,
@@ -649,6 +652,7 @@ impl FeedRunner {
             if let Some(original) = self.db.find_file_by_hash(feed, &entry_sha)? {
                 self.db.insert_file(
                     feed,
+                    &self.feed.name,
                     &entry_name,
                     &entry_sha,
                     data.len() as u64,
@@ -680,6 +684,7 @@ impl FeedRunner {
             };
             let file_id = self.db.insert_file(
                 feed,
+                &self.feed.name,
                 &entry_name,
                 &entry_sha,
                 data.len() as u64,

@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS files_feed_sha ON files(feed_id, sha256);
 CREATE INDEX IF NOT EXISTS files_feed_received ON files(feed_id, received_at);
+CREATE INDEX IF NOT EXISTS files_feed_id ON files(feed_id, id);
+CREATE INDEX IF NOT EXISTS files_status_id ON files(status, id);
+CREATE INDEX IF NOT EXISTS files_feed_status_id ON files(feed_id, status, id);
 CREATE TABLE IF NOT EXISTS records (
   id INTEGER PRIMARY KEY,
   file_id INTEGER NOT NULL REFERENCES files(id),
@@ -52,6 +55,8 @@ CREATE TABLE IF NOT EXISTS records (
 CREATE INDEX IF NOT EXISTS records_feed_status ON records(feed_id, status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS records_feed_status_id ON records(feed_id, status, id);
 CREATE INDEX IF NOT EXISTS records_file ON records(file_id);
+CREATE INDEX IF NOT EXISTS records_rejected_file ON records(file_id) WHERE status = 'rejected';
+CREATE INDEX IF NOT EXISTS records_rejected_feed_file ON records(feed_id, file_id) WHERE status = 'rejected';
 CREATE TABLE IF NOT EXISTS alerts (
   id INTEGER PRIMARY KEY,
   feed_id TEXT,
@@ -115,6 +120,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("files", "source_key", "TEXT"),
     ("files", "archived", "INTEGER NOT NULL DEFAULT 0"),
     ("files", "origin", "TEXT"),
+    ("files", "source_name", "TEXT"),
     ("records", "submission", "TEXT"),
     ("alerts", "rule_id", "INTEGER"),
     ("alerts", "cleared_at", "INTEGER"),
@@ -872,11 +878,13 @@ impl Db {
     ///   by the engine and removed once settled.
     ///
     /// A row without one (written by an earlier version and not backfilled) is
-    /// never served by the engine.
+    /// never served by the engine. `source_name` is the source's name as the
+    /// load is recorded, kept with it after the source is renamed or deleted.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_file(
         &self,
         feed: &str,
+        source_name: &str,
         name: &str,
         sha: &str,
         size: u64,
@@ -892,9 +900,9 @@ impl Db {
             Some(now)
         };
         self.insert_returning_id(
-            "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at, source_key, origin)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-            &params![feed, name, sha, size, status, duplicate_of, now, finished_at, source_key, origin],
+            "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at, source_key, origin, source_name)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            &params![feed, name, sha, size, status, duplicate_of, now, finished_at, source_key, origin, source_name],
         )
     }
 

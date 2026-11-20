@@ -1,3 +1,5 @@
+mod loads;
+mod paging;
 mod secrets;
 
 use std::sync::Arc;
@@ -59,6 +61,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sources/{id}/check-now", post(check_now))
         .route("/api/sources/{id}/files", get(list_files))
         .route("/api/sources/{id}/loads", get(list_files))
+        .route("/api/loads", get(loads::list_loads))
         .route("/api/loads/{file_id}", get(get_load))
         .route("/api/loads/{file_id}/retry", post(retry_load))
         .route("/api/sources/{id}/stats", get(source_stats))
@@ -601,12 +604,56 @@ struct Limit {
     limit: Option<i64>,
 }
 
-const LOAD_COLUMNS: &str = "f.id, f.feed_id AS source_id, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived,
+const LOAD_COLUMNS: &str = "f.id, f.feed_id AS source_id, f.source_name, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived,
                     COUNT(r.id) AS records,
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'sent' THEN 1 ELSE 0 END), 0) AS BIGINT) AS sent,
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT) AS rejected,
                     CAST(COALESCE(SUM(CASE WHEN r.status IN ('received', 'pending', 'submitted') THEN 1 ELSE 0 END), 0) AS BIGINT) AS in_progress,
                     CASE WHEN f.finished_at IS NULL THEN NULL ELSE f.finished_at - f.received_at END AS took_ms";
+
+/// Every `files` column a load row selects, for its `GROUP BY`.
+const LOAD_GROUP: &str = "GROUP BY f.id, f.feed_id, f.source_name, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived, f.finished_at, f.received_at";
+
+/// The load rows of the files `filter` keeps (a condition on `f`), each with
+/// what became of its records; `tail` orders and limits them, `with` and
+/// `extra` add a `WITH` clause and columns. Every load answer reads its rows
+/// here, so they carry the same fields.
+fn load_rows(
+    s: &AppState,
+    with: &str,
+    extra: &str,
+    filter: &str,
+    tail: &str,
+    p: Vec<Param>,
+) -> Result<Vec<Value>, ApiError> {
+    let mut rows = s.db.query_json(
+        &format!(
+            "{with} SELECT {LOAD_COLUMNS}{extra}, {} AS received_at, {} AS finished_at
+             FROM files f LEFT JOIN records r ON r.file_id = f.id
+             WHERE {filter} {LOAD_GROUP} {tail}",
+            s.db.iso("f.received_at"),
+            s.db.iso("f.finished_at")
+        ),
+        p,
+    )?;
+    let mut methods: std::collections::HashMap<String, Value> = Default::default();
+    for row in &mut rows {
+        let source = row["source_id"].as_str().unwrap_or_default().to_string();
+        row["method"] = methods
+            .entry(source)
+            .or_insert_with_key(|id| {
+                s.manager
+                    .source(id)
+                    .map(|f| serde_json::to_value(f.delivery.method).unwrap_or(Value::Null))
+                    .unwrap_or(Value::Null)
+            })
+            .clone();
+        // Failing now: some of its rows are rejected, or the file could not be read.
+        row["failed"] =
+            Value::Bool(row["status"] == "unreadable" || row["rejected"].as_i64().unwrap_or(0) > 0);
+    }
+    Ok(rows)
+}
 
 /// A load is one file (or object) and what became of its rows. The same rows serve
 /// `/files` and `/loads`; the UI calls them loads.
@@ -615,50 +662,24 @@ async fn list_files(
     Path(id): Path<String>,
     Query(q): Query<Limit>,
 ) -> ApiResult {
-    let method = s
-        .manager
-        .source(&id)
-        .map(|f| serde_json::to_value(f.delivery.method).unwrap_or(Value::Null))
-        .unwrap_or(Value::Null);
-    let mut rows = s.db.query_json(
-        &format!(
-            "SELECT {LOAD_COLUMNS}, {} AS received_at, {} AS finished_at
-             FROM files f LEFT JOIN records r ON r.file_id = f.id
-             WHERE f.feed_id = $1 GROUP BY f.id, f.feed_id, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived, f.finished_at, f.received_at ORDER BY f.id DESC LIMIT $2",
-            s.db.iso("f.received_at"),
-            s.db.iso("f.finished_at")
-        ),
-        params![id, q.limit.unwrap_or(50)],
+    let rows = load_rows(
+        &s,
+        "",
+        "",
+        "f.feed_id = $1",
+        "ORDER BY f.id DESC LIMIT $2",
+        params![id, q.limit.unwrap_or(50)].into(),
     )?;
-    for row in &mut rows {
-        row["method"] = method.clone();
-    }
     Ok(Json(json!({"files": rows, "loads": rows})))
 }
 
 /// One load with its failures grouped by reason, each with sample rows, so a
 /// person can see what went wrong and retry the rows after a fix.
 async fn get_load(State(s): State<AppState>, Path(file_id): Path<i64>) -> ApiResult {
-    let mut load =
-        s.db.query_json(
-            &format!(
-                "SELECT {LOAD_COLUMNS}, {} AS received_at, {} AS finished_at
-                 FROM files f LEFT JOIN records r ON r.file_id = f.id
-                 WHERE f.id = $1 GROUP BY f.id, f.feed_id, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived, f.finished_at, f.received_at",
-                s.db.iso("f.received_at"),
-                s.db.iso("f.finished_at")
-            ),
-            params![file_id],
-        )?
+    let mut load = load_rows(&s, "", "", "f.id = $1", "", params![file_id].into())?
         .into_iter()
         .next()
         .ok_or_else(|| not_found(&format!("load {file_id}")))?;
-    let source_id = load["source_id"].as_str().unwrap_or_default().to_string();
-    load["method"] = s
-        .manager
-        .source(&source_id)
-        .map(|f| serde_json::to_value(f.delivery.method).unwrap_or(Value::Null))
-        .unwrap_or(Value::Null);
     load["failures"] = Value::Array(s.db.failure_groups(file_id)?);
     Ok(Json(load))
 }
