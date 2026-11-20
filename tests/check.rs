@@ -114,11 +114,42 @@ fn check_refuses_bad_alert_settings_without_printing_them() {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(!out.status.success(), "{yaml}: {printed}");
-        assert!(printed.contains("alerts"), "{printed}");
+        assert!(printed.contains("alert"), "{printed}");
         for canary in ["urlcanary", "secretcanary", "987654321"] {
             assert!(!printed.contains(canary), "{canary} printed: {printed}");
         }
     }
+    // A malformed leftover `runtime:` is still refused.
+    let out = check_alerts(&format!("{base}runtime: a\nruntime: b\n"), &[]);
+    assert!(
+        !out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // Without webhook settings in the file, errors keep their names: the
+    // template's blank `webhook_url:` and a misspelt worker key.
+    let out = check_alerts(
+        &format!("{base}alerts:\n  webhook_url:\nworker:\n  memroy_mib: 5\n"),
+        &[],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("memroy_mib"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // An escaped key is the same key.
+    let out = check_alerts(
+        &format!(
+            "{base}alerts:\n  \"webhook_\\x73ecret\": &s secretcanary\nworker:\n  memory_mib: *s\n"
+        ),
+        &[],
+    );
+    let printed = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && !printed.contains("secretcanary"),
+        "{printed}"
+    );
     // Good settings, from the file and from the environment, are not printed either.
     let out = check_alerts(
         &format!("{base}alerts:\n  webhook_url: https://urlcanary.example.org/hook\n"),

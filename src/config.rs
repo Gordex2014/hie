@@ -892,19 +892,20 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     // and its transforms run in the local worker instead: refuse to start, whatever
     // its value (`runtime: null` and a bare `runtime:` included) and however the
     // key is tagged (`as_str` sees through YAML tags).
-    // A file that is not YAML at all is reported by the typed parse below.
-    if let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(&text)
-        && raw
-            .as_mapping()
-            .is_some_and(|m| m.keys().any(|k| k.as_str() == Some("runtime")))
+    // Its errors may quote anything in the file, a webhook secret included.
+    let raw: serde_yaml::Value =
+        serde_yaml::from_str(&text).map_err(|e| parse_error(path, true, e))?;
+    if raw
+        .as_mapping()
+        .is_some_and(|m| m.keys().any(|k| k.as_str() == Some("runtime")))
     {
         bail!(
             "`runtime:` in {} is no longer supported: transforms run in the local worker; remove it",
             path.display()
         );
     }
-    let mut config: Config =
-        serde_yaml::from_str(&text).map_err(|e| parse_error(path, &text, e))?;
+    let mut config: Config = serde_yaml::from_str(&text)
+        .map_err(|e| parse_error(path, holds_alert_settings(&raw), e))?;
     config
         .worker
         .check()
@@ -956,19 +957,40 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     Ok((config, feeds))
 }
 
-/// A YAML error in `hie.yaml`. While the file names a webhook URL or secret,
-/// whatever the parser quotes is left out: YAML lets a value reach an error
-/// message from anywhere (an alias of the secret used in another field, a
-/// repeated key), so no line of the file is safe to quote.
-fn parse_error(path: &Path, text: &str, e: serde_yaml::Error) -> anyhow::Error {
-    if !(text.contains("webhook_secret") || text.contains("webhook_url")) {
+/// A YAML error in `hie.yaml`; with `hide`, without whatever the parser quotes.
+/// YAML lets a value reach an error from anywhere in the file (an alias of the
+/// secret used in another field, a repeated key), so no line is safe to quote
+/// while the file may hold the webhook's URL or secret.
+fn parse_error(path: &Path, hide: bool, e: serde_yaml::Error) -> anyhow::Error {
+    if !hide {
         return anyhow::Error::new(e).context(format!("parsing {}", path.display()));
     }
     anyhow::anyhow!(
-        "parsing {}: {} (quoted values are not shown while the file holds alerts.webhook_url or webhook_secret)",
+        "parsing {}: {} (quoted values are not shown: the file may hold the alert webhook's URL or secret)",
         path.display(),
         unquoted(&e.to_string())
     )
+}
+
+/// Whether the parsed file gives `alerts:` anything but blank values, keys
+/// taken as YAML decodes them.
+fn holds_alert_settings(raw: &serde_yaml::Value) -> bool {
+    use serde_yaml::Value;
+    let blank = |v: &Value| match v {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        _ => false,
+    };
+    let Some(top) = raw.as_mapping() else {
+        return false;
+    };
+    top.iter()
+        .filter(|(k, _)| k.as_str() == Some("alerts"))
+        .any(|(_, alerts)| match alerts {
+            Value::Null => false,
+            Value::Mapping(m) => m.values().any(|v| !blank(v)),
+            _ => true,
+        })
 }
 
 /// `text` with whatever stands between double quotes or backticks replaced by `…`.

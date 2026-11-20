@@ -817,25 +817,37 @@ impl Db {
                 test_schema = None;
             }
         }
-        // One transaction under an advisory lock: instances starting together
-        // on a store that needs a new table would otherwise race on
-        // `CREATE TABLE IF NOT EXISTS`, and all but one fail to start.
-        let mut ddl = String::from("BEGIN; SELECT pg_advisory_xact_lock(4849450001);\n");
-        ddl.push_str(
-            &SCHEMA
+        // The tables and indexes in one transaction under an advisory lock:
+        // instances starting together on a store that needs a new table would
+        // otherwise race on `CREATE TABLE IF NOT EXISTS`, and all but one fail
+        // to start.
+        let ddl = format!(
+            "BEGIN; SELECT pg_advisory_xact_lock(4849450001);\n{}\nCOMMIT;",
+            SCHEMA
                 .replace("INTEGER PRIMARY KEY", "BIGSERIAL PRIMARY KEY")
-                .replace("INTEGER", "BIGINT"),
+                .replace("INTEGER", "BIGINT")
         );
-        for (table, column, kind) in ADDED_COLUMNS {
-            ddl.push_str(&format!(
-                "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {};\n",
-                kind.replace("INTEGER", "BIGINT")
-            ));
-        }
-        ddl.push_str("COMMIT;");
         if let Err(e) = client.batch(&ddl) {
             let _ = client.batch("ROLLBACK");
             return Err(e.context("creating the schema in PostgreSQL"));
+        }
+        // Each added column on its own, and only when it is missing: an
+        // `ALTER TABLE` locks its table exclusively, and holding several such
+        // locks at once could deadlock with a query joining those tables.
+        for (table, column, kind) in ADDED_COLUMNS {
+            let present = !client
+                .query(
+                    "SELECT 1 FROM information_schema.columns
+                     WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2",
+                    &params![table, column],
+                )?
+                .is_empty();
+            if !present {
+                client.batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {}",
+                    kind.replace("INTEGER", "BIGINT")
+                ))?;
+            }
         }
         Ok(Self {
             conn: Mutex::new(Conn::Postgres(client)),
@@ -2220,9 +2232,12 @@ mod tests {
                 .into_iter()
                 .map(|db| {
                     let (barrier, event_id) = (barrier.clone(), event_id.clone());
+                    // Both see the event due before either claims it.
+                    assert_eq!(
+                        db.webhook_due("d", 2_000, 6, 100).unwrap(),
+                        std::slice::from_ref(&event_id)
+                    );
                     std::thread::spawn(move || {
-                        // Both see the event due before either claims it.
-                        assert_eq!(db.webhook_due("d", 2_000, 6, 100).unwrap().len(), 1);
                         barrier.wait();
                         db.webhook_claim(&event_id, "d", 2_000, 62_000, 6).unwrap()
                     })
