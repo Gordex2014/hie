@@ -798,15 +798,15 @@ async fn list_alerts(State(s): State<AppState>, Query(q): Query<AlertQuery>) -> 
 /// The text of a cursor: opaque to clients, the position after an event's id.
 const CURSOR_PREFIX: &str = "e1.";
 
-fn invalid_query(field: &'static str, error: impl Into<String>) -> ApiError {
+fn invalid_query(field: &str, error: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::BAD_REQUEST, error)
         .code("invalid_query")
         .with("field", field)
 }
 
 /// Reads `GET /api/events` parameters by hand, so that every refusal is a JSON
-/// `400 invalid_query` naming the parameter. Unknown parameters are ignored;
-/// a known one given twice is refused.
+/// `400 invalid_query` naming the parameter: an unknown one, a known one given
+/// twice, or a value that cannot be read.
 fn event_query(raw: Option<&str>) -> Result<crate::db::EventQuery, ApiError> {
     let mut given: std::collections::HashMap<&'static str, String> = Default::default();
     for (key, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
@@ -814,7 +814,11 @@ fn event_query(raw: Option<&str>) -> Result<crate::db::EventQuery, ApiError> {
             .into_iter()
             .find(|f| *f == key)
         else {
-            continue;
+            let shown: String = key.chars().take(64).collect();
+            return Err(invalid_query(
+                &shown,
+                format!("unknown parameter {shown:?} (use source, kind, since, cursor or limit)"),
+            ));
         };
         if given.insert(field, value.into_owned()).is_some() {
             return Err(invalid_query(
@@ -843,7 +847,9 @@ fn event_query(raw: Option<&str>) -> Result<crate::db::EventQuery, ApiError> {
                     ),
                 ));
             }
-            q.kinds.push(kind.to_string());
+            if !q.kinds.iter().any(|k| k == kind) {
+                q.kinds.push(kind.to_string());
+            }
         }
     }
     if let Some(since) = given.remove("since") {
@@ -866,9 +872,10 @@ fn event_query(raw: Option<&str>) -> Result<crate::db::EventQuery, ApiError> {
         q.cursor = Some(id);
     }
     if let Some(limit) = given.remove("limit") {
-        q.limit = limit
-            .parse::<usize>()
-            .ok()
+        // Digits only: `parse` would take a sign.
+        q.limit = Some(limit.as_str())
+            .filter(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|l| l.parse::<usize>().ok())
             .filter(|n| (1..=1000).contains(n))
             .ok_or_else(|| invalid_query("limit", "limit must be a whole number from 1 to 1000"))?;
     }

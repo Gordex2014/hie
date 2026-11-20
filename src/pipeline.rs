@@ -11,7 +11,7 @@ use chrono::Timelike;
 use crate::alerts::{Alerter, parse_clock};
 use crate::bulk::{self, BulkSubmitter, Poll};
 use crate::config::{DeliveryMethod, FeedConfig, Format, parse_duration};
-use crate::db::{Db, Delivery, NewFile, Rule, WorkItem, now_ms};
+use crate::db::{Admission, Db, Delivery, NewFile, Rule, WorkItem, now_ms};
 use crate::fhir::{self, DeliveryKey, EntryResult, FhirClient, SendError};
 use crate::reader;
 use crate::secrets::Secrets;
@@ -64,6 +64,9 @@ pub struct FeedRunner {
     bulk_transformed: bool,
     /// How the manager drives this runner, once it runs: a halt is seen between records.
     control: std::sync::OnceLock<Arc<RunnerControl>>,
+    /// The last record the transform could not finish now, as (id, revision,
+    /// reason): its `record.attempt_failed` is written once, not on every pass.
+    last_transient: std::sync::Mutex<Option<(i64, i64, String)>>,
 }
 
 /// This process's name among the instances sharing a store: `HIE_INSTANCE_ID`,
@@ -153,6 +156,7 @@ impl FeedRunner {
             bulk_transformed: feed_bulk_transformed,
             outage_alerted: AtomicBool::new(false),
             control: std::sync::OnceLock::new(),
+            last_transient: std::sync::Mutex::new(None),
         }
     }
 
@@ -496,23 +500,9 @@ impl FeedRunner {
         let sha = reader::sha256_hex(&bytes);
 
         if let Some(original) = self.db.find_file_by_hash(feed, &sha)? {
-            if self.source().is_read_only() {
-                // Someone else's bucket: the object stays, and was already taken.
-                return Ok(());
-            }
-            if self.bulk.is_some() && self.db.file_source(original)?.is_some() {
-                // The same object, still waiting for HFS to fetch it: leave it alone.
-                return Ok(());
-            }
-            let id = self
-                .db
-                .insert_duplicate(feed, &name, &sha, bytes.len() as u64, original)?;
-            tracing::info!(feed, file = %name, duplicate_of = original, "same content already received; not reprocessed");
-            let archived = self
-                .source()
-                .acknowledge(&key, &format!("{id}-{name}"))
-                .await?;
-            return self.db.mark_file_archived(id, &archived);
+            return self
+                .duplicate(&key, &name, &sha, bytes.len() as u64, original)
+                .await;
         }
 
         if name.to_ascii_lowercase().ends_with(".zip") {
@@ -526,7 +516,7 @@ impl FeedRunner {
         } else {
             "local"
         };
-        let (file_id, readable) = self.admit(
+        let (admission, readable) = self.admit(
             &NewFile {
                 feed,
                 name: &name,
@@ -537,6 +527,15 @@ impl FeedRunner {
             },
             &bytes,
         )?;
+        let file_id = match admission {
+            Admission::Admitted(id) => id,
+            // Taken meanwhile, by an instance that held the source before.
+            Admission::AlreadyTaken(original) => {
+                return self
+                    .duplicate(&key, &name, &sha, bytes.len() as u64, original)
+                    .await;
+            }
+        };
         if keep && readable {
             return Ok(());
         }
@@ -547,9 +546,37 @@ impl FeedRunner {
         self.db.mark_file_archived(file_id, &archived)
     }
 
+    /// A file whose content was already taken, as `original`.
+    async fn duplicate(
+        &self,
+        key: &str,
+        name: &str,
+        sha: &str,
+        size: u64,
+        original: i64,
+    ) -> Result<()> {
+        let feed = &self.feed.id;
+        if self.source().is_read_only() {
+            // Someone else's bucket: the object stays, and was already taken.
+            return Ok(());
+        }
+        if self.bulk.is_some() && self.db.file_source(original)?.is_some() {
+            // The same object, still waiting for HFS to fetch it: leave it alone.
+            return Ok(());
+        }
+        let id = self.db.insert_duplicate(feed, name, sha, size, original)?;
+        tracing::info!(feed, file = %name, duplicate_of = original, "same content already received; not reprocessed");
+        let archived = self
+            .source()
+            .acknowledge(key, &format!("{id}-{name}"))
+            .await?;
+        self.db.mark_file_archived(id, &archived)
+    }
+
     /// Records a file and reads its records into the store, in one transaction
-    /// (`Db::admit_file`). Returns its id, and `false` when it could not be read.
-    fn admit(&self, file: &NewFile, bytes: &[u8]) -> Result<(i64, bool)> {
+    /// (`Db::admit_file`). Returns what was done with it, and `false` when it
+    /// could not be read.
+    fn admit(&self, file: &NewFile, bytes: &[u8]) -> Result<(Admission, bool)> {
         let feed = &self.feed.id;
         let name = file.name;
         match reader::read(self.feed.format, bytes) {
@@ -558,18 +585,22 @@ impl FeedRunner {
                     .into_iter()
                     .map(|r| (r.line, r.raw, r.parse_error))
                     .collect();
-                let file_id = self.db.admit_file(file, Ok(&rows))?;
-                tracing::info!(feed, file = %name, records = rows.len(), "received");
-                Ok((file_id, true))
+                let admission = self.db.admit_file(file, Ok(&rows))?;
+                if let Admission::Admitted(_) = admission {
+                    tracing::info!(feed, file = %name, records = rows.len(), "received");
+                }
+                Ok((admission, true))
             }
             Err(e) => {
-                let file_id = self.db.admit_file(file, Err(&format!("{e:#}")))?;
-                self.alerts.raise(
-                    Some(feed),
-                    "unreadable_file",
-                    &format!("{}: cannot read {name}: {e:#}", self.feed.name),
-                )?;
-                Ok((file_id, false))
+                let admission = self.db.admit_file(file, Err(&format!("{e:#}")))?;
+                if let Admission::Admitted(_) = admission {
+                    self.alerts.raise(
+                        Some(feed),
+                        "unreadable_file",
+                        &format!("{}: cannot read {name}: {e:#}", self.feed.name),
+                    )?;
+                }
+                Ok((admission, false))
             }
         }
     }
@@ -665,7 +696,7 @@ impl FeedRunner {
             };
             // Each entry is admitted in a transaction of its own; one that fails
             // part way leaves the container recognised by its hash next time.
-            self.admit(
+            let (admission, _) = self.admit(
                 &NewFile {
                     feed,
                     name: &entry_name,
@@ -676,6 +707,20 @@ impl FeedRunner {
                 },
                 &data,
             )?;
+            if let Admission::AlreadyTaken(original) = admission {
+                // Taken meanwhile: a duplicate, and its staged copy goes.
+                if let Some((path, "staged")) = &staged {
+                    let _ = std::fs::remove_file(path);
+                }
+                self.db.insert_duplicate(
+                    feed,
+                    &entry_name,
+                    &entry_sha,
+                    data.len() as u64,
+                    original,
+                )?;
+                continue;
+            }
             taken += 1;
         }
         tracing::info!(feed, file = %name, entries = taken, "unpacked");
@@ -715,7 +760,18 @@ impl FeedRunner {
                     Outcome::Transient(message) => {
                         // Not the row's fault: leave it and the rest for the next pass.
                         tracing::warn!(feed = %self.feed.id, line = item.line, "transform cannot finish now, will retry: {message}");
-                        self.db.transform_deferred(item, &message)?;
+                        // Logged once for the record and reason while this runner
+                        // runs; again when the reason changes.
+                        let seen = (item.id, item.revision, message);
+                        let repeat = {
+                            let mut last = self.last_transient.lock().expect("transient lock");
+                            let repeat = last.as_ref() == Some(&seen);
+                            *last = Some(seen.clone());
+                            repeat
+                        };
+                        if !repeat {
+                            self.db.transform_deferred(item, &seen.2)?;
+                        }
                         return Ok(());
                     }
                     Outcome::Rejected { kind, message } => {
@@ -815,7 +871,7 @@ impl FeedRunner {
             let token = bulk::token();
             let ttl = Duration::from_secs(self.feed.delivery.url_ttl_seconds);
             let mut entries = Vec::new();
-            let mut file_ids = Vec::new();
+            let mut claims = Vec::new();
             let mut records = 0usize;
             let mut hashes = Vec::new();
             for file in &files {
@@ -855,7 +911,7 @@ impl FeedRunner {
                     },
                 };
                 entries.push((file.resource_type.clone(), url, file.count));
-                file_ids.push(file.file_id);
+                claims.push((file.file_id, file.count));
                 records += file.count;
                 hashes.push(file.name.clone());
             }
@@ -865,13 +921,18 @@ impl FeedRunner {
             let hash_refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
             let submission_id = bulk::submission_id(&self.feed.id, &hash_refs);
             let manifest = bulk.manifest(&entries);
-            self.db.create_submission_for_files(
+            if !self.db.create_submission_for_files(
                 &token,
                 &self.feed.id,
                 &submission_id,
                 &manifest,
-                &file_ids,
-            )?;
+                &claims,
+            )? {
+                // A record changed after the manifest was built for it: nothing
+                // was opened, and it is built again from what is pending now.
+                tracing::info!(feed = %self.feed.id, "a record changed while its submission was built; building it again");
+                continue;
+            }
             tracing::info!(feed = %self.feed.id, submission = %submission_id, files = files.len(), records, "submission opened");
         }
     }
@@ -1028,14 +1089,20 @@ impl FeedRunner {
     /// Drops what the engine wrote for a transformed submission, now that HFS has
     /// read it and answered.
     async fn remove_submission_files(&self, token: &str) {
+        // The token names the directory and the objects: never logged.
         let dir = self.bulk_dir.join(token);
         if dir.is_dir()
             && let Err(e) = std::fs::remove_dir_all(&dir)
         {
-            tracing::warn!(feed = %self.feed.id, "cannot remove {}: {e}", dir.display());
+            let reason = bulk::scrub(&format!("cannot remove {}: {e}", dir.display()), token);
+            tracing::warn!(feed = %self.feed.id, "{reason}");
         }
         if let Err(e) = self.source().remove_submission_files(token).await {
-            tracing::warn!(feed = %self.feed.id, "cannot remove submission files at the source: {e:#}");
+            let reason = bulk::scrub(
+                &format!("cannot remove submission files at the source: {e:#}"),
+                token,
+            );
+            tracing::warn!(feed = %self.feed.id, "{reason}");
         }
     }
 
@@ -1069,31 +1136,40 @@ impl FeedRunner {
                     *counts.entry(kind).or_default() += 1;
                 }
             }
-            let mut entries = Vec::new();
-            for (n, (kind, bytes)) in by_type.into_iter().enumerate() {
-                let n = n as i64 + 1;
-                let name = format!("{n}.ndjson");
-                let shared = match self
-                    .source()
-                    .put_submission_file(&token, &name, bytes.clone())
-                    .await?
-                {
-                    Some(key) => self.source().share(&key, ttl).await?,
-                    None => None,
-                };
-                let url = match shared {
-                    Some(url) => url,
-                    None => {
-                        let dir = self.bulk_dir.join(&token);
-                        std::fs::create_dir_all(&dir)
-                            .with_context(|| format!("creating {}", dir.display()))?;
-                        std::fs::write(dir.join(&name), &bytes)
-                            .with_context(|| format!("writing {}", dir.join(&name).display()))?;
-                        bulk.file_url(&token, n)
-                    }
-                };
-                entries.push((kind.clone(), url, counts[&kind]));
+            let written = async {
+                let mut entries = Vec::new();
+                for (n, (kind, bytes)) in by_type.into_iter().enumerate() {
+                    let n = n as i64 + 1;
+                    let name = format!("{n}.ndjson");
+                    let shared = match self
+                        .source()
+                        .put_submission_file(&token, &name, bytes.clone())
+                        .await?
+                    {
+                        Some(key) => self.source().share(&key, ttl).await?,
+                        None => None,
+                    };
+                    let url = match shared {
+                        Some(url) => url,
+                        None => {
+                            let dir = self.bulk_dir.join(&token);
+                            std::fs::create_dir_all(&dir)
+                                .with_context(|| format!("creating {}", dir.display()))?;
+                            std::fs::write(dir.join(&name), &bytes).with_context(|| {
+                                format!("writing {}", dir.join(&name).display())
+                            })?;
+                            bulk.file_url(&token, n)
+                        }
+                    };
+                    entries.push((kind.clone(), url, counts[&kind]));
+                }
+                Ok::<_, anyhow::Error>(entries)
             }
+            .await;
+            // The paths and keys written are named after the token: an error
+            // about them never carries it.
+            let entries =
+                written.map_err(|e| anyhow::anyhow!(bulk::scrub(&format!("{e:#}"), &token)))?;
             let claims: Vec<(i64, i64)> = records.iter().map(|(id, rev, _)| (*id, *rev)).collect();
             let span = format!("records {}-{}", claims[0].0, claims[claims.len() - 1].0);
             let submission_id = bulk::submission_id(&self.feed.id, &[span.as_str()]);

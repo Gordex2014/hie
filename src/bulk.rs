@@ -105,6 +105,19 @@ pub fn run_key(token: &str) -> String {
     hex::encode(sha2::Sha256::digest(token.as_bytes()))[..16].to_string()
 }
 
+/// A request target as a failure reason may name it: the origin of an absolute
+/// URL followed by `/…`, or `<URL>` for anything else (a relative target, or text
+/// that does not parse). Never the path, query or user information, which may
+/// carry signatures and tokens.
+pub fn shown(target: &str) -> String {
+    let lower = target.trim_start().to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        origin_of(target.trim())
+    } else {
+        "<URL>".into()
+    }
+}
+
 /// `scheme://host[:port]/…` of a URL, or `<URL>` when it has no host.
 fn origin_of(url: &str) -> String {
     match url::Url::parse(url) {
@@ -207,7 +220,7 @@ impl BulkSubmitter {
             .map_err(|e| {
                 SendError::Transient(format!(
                     "cannot reach {}: {}",
-                    self.fhir_base,
+                    shown(&self.fhir_base),
                     e.without_url()
                 ))
             })
@@ -219,7 +232,9 @@ impl BulkSubmitter {
             .await?
             .send()
             .await
-            .map_err(|e| SendError::Transient(format!("fetching {}: {}", url, e.without_url())))
+            .map_err(|e| {
+                SendError::Transient(format!("fetching {}: {}", shown(url), e.without_url()))
+            })
     }
 
     async fn classify(&self, response: reqwest::Response) -> Result<reqwest::Response, SendError> {
@@ -295,7 +310,7 @@ impl BulkSubmitter {
                 status @ (500..=599) => {
                     return Err(SendError::Transient(format!(
                         "HTTP {status} polling {}",
-                        url
+                        shown(&url)
                     )));
                 }
                 status => {
@@ -304,7 +319,11 @@ impl BulkSubmitter {
                 }
             }
             let manifest: Value = response.json().await.map_err(|e| {
-                SendError::Transient(format!("status manifest at {}: {}", url, e.without_url()))
+                SendError::Transient(format!(
+                    "status manifest at {}: {}",
+                    shown(&url),
+                    e.without_url()
+                ))
             })?;
             for entry in manifest["output"].as_array().into_iter().flatten() {
                 if let Some(file_url) = entry["url"].as_str() {
@@ -338,10 +357,14 @@ impl BulkSubmitter {
             .get(url, "application/fhir+ndjson, application/x-ndjson, */*")
             .await?
             .error_for_status()
-            .map_err(|e| SendError::Transient(format!("fetching {}: {}", url, e.without_url())))?
+            .map_err(|e| {
+                SendError::Transient(format!("fetching {}: {}", shown(url), e.without_url()))
+            })?
             .text()
             .await
-            .map_err(|e| SendError::Transient(format!("reading {}: {}", url, e.without_url())))?;
+            .map_err(|e| {
+                SendError::Transient(format!("reading {}: {}", shown(url), e.without_url()))
+            })?;
         Ok(text
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -426,6 +449,17 @@ mod tests {
             safe_reason("no URL here, HTTP 503"),
             "no URL here, HTTP 503"
         );
+    }
+
+    #[test]
+    fn a_request_target_is_shown_by_its_origin_or_not_at_all() {
+        assert_eq!(
+            shown("https://h:8443/s?X-Amz-Signature=CANARY"),
+            "https://h:8443/…"
+        );
+        assert_eq!(shown("/status/1?X-Amz-Signature=CANARY"), "<URL>");
+        assert_eq!(shown("status/1?sig=CANARY"), "<URL>");
+        assert_eq!(shown("https://[::1]/a(b)?sig=CANARY"), "https://[::1]/…");
     }
 
     #[test]

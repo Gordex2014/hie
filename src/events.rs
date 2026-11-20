@@ -77,6 +77,13 @@ impl Event {
         self
     }
 
+    /// A reason already made safe with `reason_text`, kept as it is: for a set
+    /// of events that share one reason, made safe once.
+    pub fn prepared_reason(mut self, text: &str) -> Self {
+        self.reason = Some(text.to_string());
+        self
+    }
+
     pub fn detail(mut self, detail: Value) -> Self {
         self.detail = Some(detail);
         self

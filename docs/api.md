@@ -61,8 +61,8 @@ Record events carry `load_id` and `record_id`:
 |---|---|---|
 | `record.delivered` | The FHIR server took the record (its batch entry answered 2xx, or a bulk receipt named it) with no failed attempt since it was received or put back | `attempt` (REST); `detail.submission`, `detail.run` (bulk) |
 | `record.recovered` | The same, after failed attempts: on REST the record's own; on the bulk path its submission's | `attempt` (REST); `detail.failures` (bulk) |
-| `record.attempt_failed` | An attempt failed for a reason that may pass; the record is kept and tried again. A delivery (`detail.phase: "delivery"`, `attempt`, `detail.next_attempt_at`), or a transform that could not finish now (`detail.phase: "transform"`, no `attempt`, at most one per record per pass) | `reason` |
-| `record.rejected` | The record is rejected: `error_kind` is `parse`, `data`, `validation`, `filtered`, `transform` or `server`, including a file that can no longer be handed over and a refused submission | `error_kind`, `reason` |
+| `record.attempt_failed` | An attempt failed for a reason that may pass; the record is kept and tried again. A delivery (`detail.phase: "delivery"`, `attempt`, `detail.next_attempt_at`), or a transform that could not finish now (`detail.phase: "transform"`, no `attempt`; one for a record and reason while the source's runner runs, and again when the reason changes, the record is put back or the runner starts again) | `reason` |
+| `record.rejected` | The record is rejected: `error_kind` is `parse`, `data`, `validation`, `filtered`, `transform` or `server`, including a file that can no longer be handed over and a refused submission | `error_kind`, `reason`; `attempt` when the FHIR server refused it on REST |
 | `record.retried` | A person put the record back: a load's Retry or a record's reprocess | `detail.from_status`, `detail.corrected` |
 
 Load events carry `load_id`:
@@ -92,13 +92,13 @@ Nothing else is an event: a Try, a worker that cannot start (no record is involv
 - An outcome worked out for a record that a person put back meanwhile (a Retry or a reprocess while it was being transformed or sent) changes nothing and writes no event; the record goes through again.
 - On a store upgraded from an earlier version, a submission that was partly settled before the upgrade counts in `submission.settled` only the records settled after it.
 
-**Text.** A `reason` is the engine's own text for the fact (the stored error), with every URL cut to its origin followed by `/…` (a signed URL's path and query never appear), and at most 500 characters. On the bulk path the submission's token is replaced by `<token>` wherever it would appear, in the records' stored errors and answers too. No event carries a submission's token, its status URL or a server's full answer.
+**Text.** A `reason` is the engine's own text for the fact (the stored error), with every URL cut to its origin followed by `/…` (a signed URL's path and query never appear), and at most 500 characters. A request target the engine names in a failure (a status, manifest or receipt URL, absolute or relative) is only ever its origin, or `<URL>`. On the bulk path the submission's token is replaced by `<token>` wherever it would appear, in the records' stored errors and answers too. No event carries a submission's token, its status URL or a server's full answer.
 
 **Reading.** `GET /api/events` lists events oldest first, by `id`:
 
 - `source`: one source id.
 - `kind`: one or more kinds or families (`record`, `load`, `submission`), separated by commas.
-- `since`: an RFC 3339 instant (`2026-11-20T08:00:00Z`). Without a cursor, the page starts at the first event, by id, stored at or after it; with a cursor, it only leaves out events stored before it.
+- `since`: an RFC 3339 instant (`2026-11-20T08:00:00Z`). Only events stored at or after it (`at >= since`) are listed, with or without a cursor. Without a cursor it also sets where the page starts: at the first event, by id, stored at or after it.
 - `cursor`: the `next_cursor` of an earlier answer, to continue after it. Its text is opaque (today `e1.` and a number). Give the same filters again with it. A cursor stays valid after its event is purged.
 - `limit`: 1 to 1000, 100 by default.
 
@@ -108,7 +108,9 @@ Nothing else is an event: a Try, a worker that cannot start (no record is involv
 
 `has_more` says another page is ready now. `next_cursor` is where the next request continues: after the last event listed when `has_more`, otherwise the newest position of the log when the request was read, or the cursor given if that is later. A poller whose filters matched nothing still moves forward, and a cursor never moves back, even after a purge. It is `null` only when the log is empty and no cursor was given. Ids are given in commit order (on PostgreSQL every instance writes events under one lock, in turn), and a page never lists past the newest id committed when it was read, so polling from `next_cursor` never skips an event.
 
-Every parameter that cannot be read is refused with `400`, `code: "invalid_query"` and `field` naming it (`source`, `kind`, `since`, `cursor`, `limit`), also when one is given twice. Other parameters are ignored.
+Every parameter that cannot be read is refused with `400`, `code: "invalid_query"` and `field` naming it: a value that does not parse (`limit` is digits only), a parameter given twice, or one that is not `source`, `kind`, `since`, `cursor` or `limit`.
+
+A poller pages with `cursor`: the first request may give `since`, and each next one the `next_cursor` it got (with the same filters). A `since` without a cursor reads a range of the log by time on every request, which costs more on a large log.
 
 ### Alerts and retention
 

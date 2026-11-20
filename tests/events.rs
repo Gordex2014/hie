@@ -14,7 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use hie::db::{Db, EventQuery, NewFile, Rule};
+use hie::db::{Admission, Db, Delivery, EventQuery, NewFile, Rule};
 use serde_json::{Value, json};
 
 fn python() -> Option<String> {
@@ -619,7 +619,7 @@ async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
 }
 
 #[tokio::test]
-async fn a_transform_that_cannot_finish_now_is_logged_once_per_pass() {
+async fn a_transform_that_cannot_finish_now_is_logged_once_per_reason_and_runner() {
     let Some(python) = python() else {
         eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
@@ -635,10 +635,7 @@ async fn a_transform_that_cannot_finish_now_is_logged_once_per_pass() {
     let record = record_id(&state.db, "gate", 2);
     assert_eq!(status(&state.db, record), "received");
     let mine = of_record(&events(&state.db), record);
-    assert_eq!(
-        kinds(&mine),
-        ["record.attempt_failed", "record.attempt_failed"]
-    );
+    assert_eq!(kinds(&mine), ["record.attempt_failed"]);
     assert_eq!(mine[0]["detail"]["phase"], "transform");
     assert!(mine[0]["attempt"].is_null());
     assert!(
@@ -646,6 +643,16 @@ async fn a_transform_that_cannot_finish_now_is_logged_once_per_pass() {
             .as_str()
             .unwrap()
             .contains("terminology server is down")
+    );
+
+    // A runner that starts again logs it again, once.
+    manager.start(manager.source("gate").unwrap()).unwrap();
+    let runner = manager.runner("gate").unwrap();
+    runner.tick().await.unwrap();
+    runner.tick().await.unwrap();
+    assert_eq!(
+        kinds(&of_record(&events(&state.db), record)),
+        ["record.attempt_failed", "record.attempt_failed"]
     );
 }
 
@@ -1004,7 +1011,10 @@ fn load(db: &Db, feed: &str, name: &str, bad: usize, good: usize) -> i64 {
             )
         })
         .collect();
-    db.admit_file(&new_file(feed, name), Ok(&rows)).unwrap()
+    match db.admit_file(&new_file(feed, name), Ok(&rows)).unwrap() {
+        Admission::Admitted(id) => id,
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -1188,7 +1198,7 @@ async fn events_are_paged_in_order_and_a_cursor_only_moves_forward() {
     let all = events(&db);
     for (i, e) in all.iter().enumerate() {
         db.query_json(
-            "UPDATE events SET at = $1 WHERE id = $2",
+            "UPDATE events SET at = CAST($1 AS BIGINT) WHERE id = CAST($2 AS BIGINT)",
             hie::db::params![
                 1_800_000_000_000i64 + i as i64 * 1000,
                 e["id"].as_i64().unwrap()
@@ -1241,8 +1251,11 @@ async fn an_events_query_that_cannot_be_read_is_refused_naming_the_parameter() {
         ("limit=0", "limit"),
         ("limit=1001", "limit"),
         ("limit=ten", "limit"),
+        ("limit=+5", "limit"),
         ("source=", "source"),
         ("limit=1&limit=2", "limit"),
+        ("other=1", "other"),
+        ("limit=10&Kind=load", "Kind"),
     ] {
         let (code, body) = get_json(&format!("{api}/api/events?{query}")).await;
         assert_eq!(code, 400, "{query}: {body}");
@@ -1251,13 +1264,45 @@ async fn an_events_query_that_cannot_be_read_is_refused_naming_the_parameter() {
         assert!(body["error"].is_string(), "{query}: {body}");
     }
     let (code, _) = get_json(&format!(
-        "{api}/api/events?limit=1000&kind=record,load&other=1"
+        "{api}/api/events?limit=1000&kind=record,load,record"
     ))
     .await;
     assert_eq!(code, 200);
 }
 
 // ---- order across writers on PostgreSQL ---------------------------------------
+
+/// Waits until some session is blocked by the session `pid`, as seen from a
+/// connection of its own.
+fn wait_until_blocked_by(pid: i32) {
+    let mut monitor =
+        postgres::Client::connect(&test_database_url().unwrap(), postgres::NoTls).unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        let waiting: i64 = monitor
+            .query_one(
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                &[&pid],
+            )
+            .unwrap()
+            .get(0);
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "nothing waits for session {pid}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn backend_pid(client: &mut postgres::Client) -> i32 {
+    client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0)
+}
 
 /// A raw client on the store's schema, as another instance's transaction.
 fn raw_client(db: &Db) -> Option<postgres::Client> {
@@ -1312,7 +1357,7 @@ fn an_event_committed_later_with_a_lower_id_is_never_skipped_on_postgres() {
         let db = db.clone();
         std::thread::spawn(move || db.mark_rejected(record, "data", "decided meanwhile", None))
     };
-    std::thread::sleep(Duration::from_millis(300));
+    wait_until_blocked_by(backend_pid(&mut other));
     assert!(
         !writer.is_finished(),
         "the engine's event waits for the lock"
@@ -1374,7 +1419,7 @@ fn a_finish_that_waits_for_a_retry_sees_the_rows_put_back_on_postgres() {
         let db = db.clone();
         std::thread::spawn(move || db.finish_files("s"))
     };
-    std::thread::sleep(Duration::from_millis(300));
+    wait_until_blocked_by(backend_pid(&mut other));
     assert!(
         !finisher.is_finished(),
         "the finish waits for the file's row"
@@ -1396,6 +1441,147 @@ fn a_finish_that_waits_for_a_retry_sees_the_rows_put_back_on_postgres() {
         .unwrap();
     assert_eq!(row[0]["status"], "processing");
     assert_eq!(events(&db).len(), before, "no load.finished");
+}
+
+#[test]
+fn an_alert_cleared_while_the_purge_waits_for_it_is_kept_on_postgres() {
+    if test_database_url().is_none() {
+        eprintln!("skipping: HIE_TEST_DATABASE_URL is not set");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open(&dir.path().join("hie.db")).unwrap());
+    let day = 86_400_000i64;
+    let now = hie::db::now_ms();
+    let open = db.insert_alert(Some("s"), "delivery", "m", None).unwrap();
+    let cleared = db.insert_alert(Some("s"), "delivery", "m", None).unwrap();
+    db.clear_alert(cleared, "done").unwrap();
+    let newest = db.insert_alert(Some("s"), "delivery", "m", None).unwrap();
+    db.query_json(
+        "UPDATE alerts SET created_at = CAST($1 AS BIGINT),
+                cleared_at = CASE WHEN cleared_at IS NULL THEN NULL ELSE CAST($1 AS BIGINT) END",
+        hie::db::params![now - 40 * day],
+    )
+    .unwrap();
+
+    // Another instance clears the old open alert, not committed yet.
+    let mut other = raw_client(&db).unwrap();
+    other.batch_execute("BEGIN").unwrap();
+    other
+        .execute(
+            "UPDATE alerts SET cleared_at = $1, cleared_reason = 'data arrived' WHERE id = $2",
+            &[&now, &open],
+        )
+        .unwrap();
+    let purger = {
+        let db = db.clone();
+        std::thread::spawn(move || hie::retention::purge(&db, now - 30 * day))
+    };
+    wait_until_blocked_by(backend_pid(&mut other));
+    other.batch_execute("COMMIT").unwrap();
+
+    // Read again once free, the alert cleared just now is not old any more.
+    let purged = purger.join().unwrap().unwrap();
+    assert_eq!(purged.alerts, 1);
+    assert_eq!(alert_ids(&db), [open, newest]);
+}
+
+#[test]
+fn a_source_object_submission_is_not_opened_when_a_file_changed_meanwhile() {
+    let db = Db::in_memory().unwrap();
+    let file = load(&db, "s", "a", 0, 2);
+    let ids: Vec<i64> = db
+        .query_json(
+            "SELECT id FROM records WHERE file_id = $1 ORDER BY id",
+            hie::db::params![file],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    db.mark_passthrough(&[(ids[0], 0), (ids[1], 0)]).unwrap();
+    let before = events(&db).len();
+    // The manifest was built for three records; two are pending now.
+    assert!(
+        !db.create_submission_for_files("t1", "s", "sub-1", &json!({}), &[(file, 3)])
+            .unwrap()
+    );
+    assert!(
+        db.query_json("SELECT token FROM submissions", [])
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(status(&db, ids[0]), "pending");
+    assert_eq!(events(&db).len(), before);
+    assert!(
+        db.create_submission_for_files("t2", "s", "sub-2", &json!({}), &[(file, 2)])
+            .unwrap()
+    );
+    assert_eq!(status(&db, ids[1]), "submitted");
+    let opened = events(&db).pop().unwrap();
+    assert_eq!(opened["kind"], "submission.opened");
+    assert_eq!(opened["detail"]["records"], 2);
+}
+
+#[test]
+fn an_older_answer_cannot_roll_back_a_records_attempts() {
+    let db = Db::in_memory().unwrap();
+    let file = load(&db, "s", "a", 0, 1);
+    let id = record_id(&db, "s", 1);
+    db.mark_passthrough(&[(id, 0)]).unwrap();
+    let selected = db.due_records("s", 10).unwrap().remove(0);
+    let deferred = Delivery::Deferred {
+        attempts: 1,
+        next_attempt_at: 0,
+        error: "HTTP 503",
+    };
+    db.delivered(&[(&selected, deferred)]).unwrap();
+    // The same selection answered again, as a runner that held it before would.
+    db.delivered(&[(&selected, deferred)]).unwrap();
+    db.delivered(&[(&selected, Delivery::Sent(&json!([])))])
+        .unwrap();
+    let row = db
+        .query_json(
+            "SELECT status, attempts FROM records WHERE id = $1",
+            hie::db::params![id],
+        )
+        .unwrap();
+    assert_eq!(
+        (&row[0]["status"], &row[0]["attempts"]),
+        (&json!("pending"), &json!(1))
+    );
+    let mine = of_record(&events(&db), id);
+    assert_eq!(kinds(&mine), ["record.attempt_failed"]);
+
+    // Selected again, it goes through as the next attempt.
+    let selected = db.due_records("s", 10).unwrap().remove(0);
+    db.delivered(&[(&selected, Delivery::Sent(&json!([])))])
+        .unwrap();
+    let mine = of_record(&events(&db), id);
+    assert_eq!(kinds(&mine), ["record.attempt_failed", "record.recovered"]);
+    assert_eq!(mine[1]["attempt"], 2);
+    assert_eq!(mine[1]["load_id"], file);
+}
+
+#[test]
+fn content_taken_meanwhile_is_not_admitted_twice() {
+    let db = Db::in_memory().unwrap();
+    let first = load(&db, "s", "a", 0, 1);
+    let before = events(&db).len();
+    let rows = [(1, json!({"resourceType": "Patient", "id": "x"}), None)];
+    let again = db
+        .admit_file(
+            &NewFile {
+                sha: "a",
+                ..new_file("s", "copy-of-a")
+            },
+            Ok(&rows),
+        )
+        .unwrap();
+    assert_eq!(again, Admission::AlreadyTaken(first));
+    let files = db.query_json("SELECT id FROM files", []).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(events(&db).len(), before);
 }
 
 // ---- retention ----------------------------------------------------------------
@@ -1475,15 +1661,20 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
     db.clear_alert(highest, "done").unwrap();
     db.delete_rule(deleted.id).unwrap();
     db.query_json(
-        "UPDATE alerts SET created_at = $1, cleared_at = CASE WHEN cleared_at IS NULL THEN NULL ELSE $1 END WHERE id <> $2",
+        "UPDATE alerts SET created_at = CAST($1 AS BIGINT),
+                cleared_at = CASE WHEN cleared_at IS NULL THEN NULL ELSE CAST($1 AS BIGINT) END
+         WHERE id <> CAST($2 AS BIGINT)",
         hie::db::params![old, cleared_recent],
     )
     .unwrap();
 
     // Events: more than one chunk of them old, one recent.
     load(&db, "s", "big", 5_001, 0);
-    db.query_json("UPDATE events SET at = $1", hie::db::params![old])
-        .unwrap();
+    db.query_json(
+        "UPDATE events SET at = CAST($1 AS BIGINT)",
+        hie::db::params![old],
+    )
+    .unwrap();
     load(&db, "s", "recent", 0, 1);
     let total = events(&db).len();
     assert_eq!(total, 5_003);
@@ -1525,12 +1716,15 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
         db.clear_alert(id, "done").unwrap();
     }
     db.query_json(
-        "UPDATE alerts SET created_at = $1, cleared_at = $1",
+        "UPDATE alerts SET created_at = CAST($1 AS BIGINT), cleared_at = CAST($1 AS BIGINT)",
         hie::db::params![old],
     )
     .unwrap();
-    db.query_json("UPDATE events SET at = $1", hie::db::params![old])
-        .unwrap();
+    db.query_json(
+        "UPDATE events SET at = CAST($1 AS BIGINT)",
+        hie::db::params![old],
+    )
+    .unwrap();
     let last_event = events(&db)[0]["id"].as_i64().unwrap();
     let purged = hie::retention::purge(&db, cutoff).unwrap();
     assert_eq!((purged.events, purged.alerts), (1, 4));
@@ -1543,49 +1737,102 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
     drop(other);
 }
 
+/// An engine and its API, which `stop` shuts down for good.
+struct Running {
+    manager: Arc<hie::manager::SourceManager>,
+    state: hie::api::AppState,
+    api: String,
+    stop: tokio::sync::oneshot::Sender<()>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+async fn start_engine(root: &Path, yaml: &str) -> Running {
+    let (manager, state) = engine(root, yaml, &[]);
+    let (listener, api) = bind().await;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let router = hie::api::router(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap()
+    });
+    Running {
+        manager,
+        state,
+        api,
+        stop,
+        server,
+    }
+}
+
+/// Shuts the API down and drops the engine, until nothing holds its store.
+async fn stop_engine(running: Running) {
+    let Running {
+        manager,
+        state,
+        stop,
+        server,
+        ..
+    } = running;
+    let _ = stop.send(());
+    server.await.unwrap();
+    let store = Arc::downgrade(&state.db);
+    drop((manager, state));
+    wait_for("the store is still held after the engine stopped", || {
+        store.upgrade().is_none()
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn events_and_cursors_survive_a_restart_and_ids_are_never_given_again() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let yaml = "fhir_base_url: http://127.0.0.1:9\nretention:\n  history: 3650d\n";
-    let start = || async move {
-        let (manager, state) = engine(root, yaml, &[]);
-        let api = serve(hie::api::router(state.clone())).await;
-        (manager, state, api)
-    };
-    // On PostgreSQL this handle owns the test schema, so it outlives each engine.
+    // On PostgreSQL this handle owns the test schema, so it outlives each
+    // engine; on SQLite the file does, and nothing else stays open.
     std::fs::write(
         root.join("hie.yaml"),
         format!("database: data/hie.db\n{yaml}"),
     )
     .unwrap();
     let (config, _) = hie::config::load(&root.join("hie.yaml")).unwrap();
-    let seed = Db::connect(&config.database.to_string_lossy()).unwrap();
+    let seed =
+        test_database_url().map(|_| Db::connect(&config.database.to_string_lossy()).unwrap());
 
-    let (manager, state, api) = start().await;
-    load(&state.db, "s", "a", 1, 1);
-    let (_, before) = get_json(&format!("{api}/api/events")).await;
+    let first = start_engine(root, yaml).await;
+    load(&first.state.db, "s", "a", 1, 1);
+    let (_, before) = get_json(&format!("{}/api/events", first.api)).await;
     let cursor = before["next_cursor"].as_str().unwrap().to_string();
-    drop((manager, state));
+    stop_engine(first).await;
 
-    let (manager, state, api) = start().await;
+    let second = start_engine(root, yaml).await;
+    let api = second.api.clone();
     let (_, again) = get_json(&format!("{api}/api/events")).await;
     assert_eq!(again["events"], before["events"]);
     let (_, page) = get_json(&format!("{api}/api/events?cursor={cursor}")).await;
     assert!(ids(&page).is_empty());
-    load(&state.db, "s", "b", 0, 1);
+    load(&second.state.db, "s", "b", 0, 1);
     let (_, page) = get_json(&format!("{api}/api/events?cursor={cursor}")).await;
     assert_eq!(page["events"].as_array().unwrap().len(), 1);
     assert_eq!(page["events"][0]["detail"]["name"], "b");
     let highest = page["events"][0]["id"].as_i64().unwrap();
 
     // Every event purged, then a restart: the next id is still above them all.
-    state.db.query_json("UPDATE events SET at = 0", []).unwrap();
-    hie::retention::purge(&state.db, 1).unwrap();
-    assert!(events(&state.db).is_empty());
-    drop((manager, state));
-    let (_manager, state, _api) = start().await;
-    load(&state.db, "s", "c", 0, 1);
-    assert!(events(&state.db)[0]["id"].as_i64().unwrap() > highest);
+    second
+        .state
+        .db
+        .query_json("UPDATE events SET at = 0", [])
+        .unwrap();
+    hie::retention::purge(&second.state.db, 1).unwrap();
+    assert!(events(&second.state.db).is_empty());
+    stop_engine(second).await;
+    let third = start_engine(root, yaml).await;
+    load(&third.state.db, "s", "c", 0, 1);
+    assert!(events(&third.state.db)[0]["id"].as_i64().unwrap() > highest);
+    stop_engine(third).await;
     drop(seed);
 }

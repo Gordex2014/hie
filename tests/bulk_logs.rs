@@ -77,6 +77,9 @@ async fn status(State(base): State<String>, Path(which): Path<String>) -> Respon
             "url": format!("{base}/receipts/1?X-Amz-Signature=CANARY-RECEIPT-SIGNATURE&X-Amz-Security-Token=CANARY-RECEIPT-TOKEN"),
             "count": 1}], "outcome": []}))
         .into_response(),
+        "settled" => Json(json!({"output": [{"type": "Patient",
+            "url": format!("{base}/receipts-ok/cleanup"), "count": 1}], "outcome": []}))
+        .into_response(),
         "refused" => (
             StatusCode::BAD_REQUEST,
             Json(json!({"resourceType": "OperationOutcome", "issue": [{"severity": "error", "code": "processing",
@@ -105,18 +108,25 @@ async fn status_kickoff(State(base): State<String>) -> Response {
 /// The stand-in FHIR server, at the returned URL.
 async fn fhir_server() -> String {
     let (listener, base) = bind().await;
-    let app = Router::new()
-        .route(
-            "/$bulk-submit",
-            post(|| async { Json(json!({"resourceType": "OperationOutcome", "issue": []})) }),
-        )
-        .route("/$bulk-submit-status", post(status_kickoff))
-        .route("/status/{which}", get(status))
-        .route(
-            "/receipts/{n}",
-            get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
-        )
-        .with_state(base.clone());
+    let app =
+        Router::new()
+            .route(
+                "/$bulk-submit",
+                post(|| async { Json(json!({"resourceType": "OperationOutcome", "issue": []})) }),
+            )
+            .route("/$bulk-submit-status", post(status_kickoff))
+            .route("/status/{which}", get(status))
+            .route(
+                "/receipts/{n}",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route(
+                "/receipts-ok/{id}",
+                get(|Path(id): Path<String>| async move {
+                    format!("{{\"reference\":\"Patient/{id}\"}}\n")
+                }),
+            )
+            .with_state(base.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     base
 }
@@ -188,7 +198,7 @@ fn submission(db: &hie::db::Db, which: &str, status: Option<&str>) {
         "drops",
         &format!("sub-{which}"),
         &json!({"output": []}),
-        &[file],
+        &[(file, 1)],
     )
     .unwrap();
     if let Some(status) = status {
@@ -374,4 +384,106 @@ async fn a_status_url_stored_during_delivery_is_never_logged() {
     let logs = logged();
     assert!(logs.contains(" TRACE "), "the filter lets TRACE through");
     assert!(!logs.contains("CANARY-RUNTIME"), "{logs}");
+}
+
+/// A FHIR server whose status kick-off names a relative target that carries a
+/// signature: it cannot be polled, and its text is never shown.
+async fn relative_server() -> String {
+    let (listener, base) = bind().await;
+    let app = Router::new()
+        .route(
+            "/$bulk-submit",
+            post(|| async { Json(json!({"resourceType": "OperationOutcome", "issue": []})) }),
+        )
+        .route(
+            "/$bulk-submit-status",
+            post(|| async {
+                (
+                    StatusCode::ACCEPTED,
+                    [(
+                        "content-location",
+                        "/status/poll?X-Amz-Signature=CANARY-RELATIVE-SIGNATURE",
+                    )],
+                )
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    base
+}
+
+/// The event log, the records' errors and answers, the submissions' errors and
+/// the alerts, as one text.
+fn everything_stored(db: &hie::db::Db) -> String {
+    let (submissions, records, alerts) = stored(db);
+    let (events, _) = logged_events(db);
+    let responses = db
+        .query_json("SELECT response FROM records", [])
+        .unwrap()
+        .iter()
+        .map(|r| r["response"].to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    [submissions, records, alerts, events, responses].join("\n")
+}
+
+#[tokio::test]
+async fn a_relative_status_target_is_never_shown() {
+    logs();
+    let base = relative_server().await;
+    let db = Arc::new(hie::db::Db::in_memory().unwrap());
+    let runner = runner(&db, hie::fhir::FhirClient::new(&base), &base);
+    submission(&db, "relative", None);
+    // Kicked off; then the poll of a target that cannot be reached.
+    runner.tick().await.unwrap();
+    runner.tick().await.unwrap();
+
+    let (_, kinds) = logged_events(&db);
+    assert!(
+        kinds.contains(&"submission.attempt_failed".to_string()),
+        "{kinds:?}"
+    );
+    let stored = everything_stored(&db);
+    assert!(stored.contains("fetching <URL>"), "{stored}");
+    for text in [&logged(), &stored] {
+        assert!(!text.contains("CANARY-RELATIVE"), "{text}");
+    }
+}
+
+/// A settled submission whose files cannot be removed: the reason is logged,
+/// without the token that names the directory.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_cleanup_that_fails_never_logs_the_token() {
+    use std::os::unix::fs::PermissionsExt;
+    logs();
+    let base = fhir_server().await;
+    let db = Arc::new(hie::db::Db::in_memory().unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let bulk_dir = dir.path().join("bulk");
+    let token = "hie-canary-cleanup";
+    std::fs::create_dir_all(bulk_dir.join(token)).unwrap();
+    std::fs::write(bulk_dir.join(token).join("1.ndjson"), "{}\n").unwrap();
+    let runner = runner(&db, hie::fhir::FhirClient::new(&base), &base).with_bulk_dir(&bulk_dir);
+    submission(&db, "cleanup", Some(&format!("{base}/status/settled")));
+    // The bulk directory cannot be written: its submission directory stays.
+    std::fs::set_permissions(&bulk_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    runner.tick().await.unwrap();
+    let kept = bulk_dir.join(token).exists();
+    std::fs::set_permissions(&bulk_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(db.feed_counts("drops").unwrap()["sent"], 1);
+    // Only root could remove it anyway.
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(kept, "the cleanup was expected to fail");
+    }
+    let logs = logged();
+    if kept {
+        assert!(
+            logs.contains("cannot remove") && logs.contains("<token>"),
+            "{logs}"
+        );
+    }
+    for text in [&logs, &everything_stored(&db)] {
+        assert!(!text.contains(token), "{text}");
+    }
 }

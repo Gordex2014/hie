@@ -1487,8 +1487,16 @@ async fn staged_by_an_earlier_version(relative_config: bool) {
             db.mark_passthrough(&fresh).unwrap();
             let manifest = json!({"output": [{"type": kind,
                 "url": format!("{hie_url}/bulk/{token}/files/{file_id}"), "count": records.len()}]});
-            db.create_submission_for_files(token, "open", token, &manifest, &[file_id])
-                .unwrap();
+            assert!(
+                db.create_submission_for_files(
+                    token,
+                    "open",
+                    token,
+                    &manifest,
+                    &[(file_id, records.len())]
+                )
+                .unwrap()
+            );
         };
         let (e1, e1_records) = file(
             "drop.zip!/Patient.ndjson",
