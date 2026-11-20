@@ -646,6 +646,22 @@ impl SourceManager {
         if path.exists() {
             std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         }
+        // Its waiting checks will not be answered here. Another instance holding
+        // the source may still run its own definition of it, and answers them.
+        match self.db.lease(id) {
+            Ok(Some(lease)) if lease.owner != crate::pipeline::instance_id() => {}
+            Ok(_) => {
+                if let Err(e) = self
+                    .db
+                    .fail_pending_checks(id, crate::db::CheckFailure::Deleted)
+                {
+                    tracing::error!(feed = %id, "answering the checks of a deleted source: {e:#}");
+                }
+            }
+            Err(e) => {
+                tracing::error!(feed = %id, "answering the checks of a deleted source: {e:#}")
+            }
+        }
         let manager = Arc::downgrade(self);
         let grace = Duration::from_millis(self.handover_grace_ms.load(Ordering::Relaxed));
         let id = id.to_string();
@@ -774,6 +790,26 @@ impl SourceManager {
         self.require(id)?;
         self.db.set_paused(id, false, None)?;
         self.check_now(id)
+    }
+
+    /// Records a check of the source and makes it pass now: the check's id,
+    /// answered by the first scan of the source that starts after it. Under the
+    /// source's lock, so a delete either refuses it or answers it.
+    pub async fn request_check(&self, id: &str) -> Result<i64, ManagerError> {
+        let lock = self.source_lock(id);
+        let _changing = lock.lock().await;
+        self.require(id)?;
+        let check = self.db.insert_check(id).map_err(|e| {
+            if crate::db::is_busy(&e) {
+                ManagerError::StoreBusy
+            } else {
+                ManagerError::Internal(e)
+            }
+        })?;
+        // Gone only if the source was removed without its lock; the check is
+        // then left to the retention purge.
+        let _ = self.check_now(id);
+        Ok(check)
     }
 
     /// Makes the source pass now instead of at its next poll.

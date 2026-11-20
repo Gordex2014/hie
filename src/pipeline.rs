@@ -11,7 +11,7 @@ use chrono::Timelike;
 use crate::alerts::{Alerter, parse_clock};
 use crate::bulk::{self, BulkSubmitter, Poll};
 use crate::config::{DeliveryMethod, FeedConfig, Format, parse_duration};
-use crate::db::{Db, Rule, WorkItem, now_ms};
+use crate::db::{CheckFailure, Db, Rule, WorkItem, now_ms};
 use crate::fhir::{self, DeliveryKey, EntryResult, FhirClient, SendError};
 use crate::reader;
 use crate::secrets::Secrets;
@@ -23,6 +23,9 @@ use tokio::sync::Notify;
 const TRANSFORM_CHUNK: usize = 200;
 /// Records settled per page when a submission's receipts come back.
 const SETTLE_PAGE: usize = 5_000;
+
+/// A scan that failed: at which step, for the check it answers, and why, for the log.
+struct ScanError(CheckFailure, anyhow::Error);
 
 /// How the manager drives a running feed: `poke` makes it pass now, `stopped` ends it.
 #[derive(Default)]
@@ -247,11 +250,42 @@ impl FeedRunner {
                 &format!("{}: {e:#}", self.feed.name),
             )?;
         }
-        if !self.db.is_paused(&self.feed.id)? {
+        if self.db.is_paused(&self.feed.id)? {
+            // A pause seen here fails the checks waiting now; a check asked for
+            // after a resume waits for the pass the resume starts.
+            let snapshot = self.pending_checks();
+            self.answer_checks(&snapshot, Some(CheckFailure::Paused));
+        } else {
             self.ensure_credential().await;
-            self.tick().await?;
+            // Read here, after the credential, so the snapshot is taken just
+            // before the scan; `tick_with` directly keeps this future shallow.
+            let snapshot = self.pending_checks();
+            self.tick_with(&snapshot).await?;
         }
         Ok(true)
+    }
+
+    /// The source's checks waiting now, which the scan about to start answers;
+    /// none for a runner that is being replaced or stopped, so its successor
+    /// answers them. A store error is logged: the scan runs anyway.
+    #[doc(hidden)]
+    pub fn pending_checks(&self) -> Vec<i64> {
+        if self.halted() {
+            return Vec::new();
+        }
+        self.db.pending_checks(&self.feed.id).unwrap_or_else(|e| {
+            tracing::error!(feed = %self.feed.id, "reading the pending checks: {e:#}");
+            Vec::new()
+        })
+    }
+
+    /// Answers the checks of `snapshot`. A store error is logged: they stay
+    /// pending, and the next scan answers them with every load since each was
+    /// asked for, so nothing taken meanwhile is left out.
+    fn answer_checks(&self, snapshot: &[i64], failure: Option<CheckFailure>) {
+        if let Err(e) = self.db.answer_checks(&self.feed.id, snapshot, failure) {
+            tracing::error!(feed = %self.feed.id, "answering checks {snapshot:?}: {e:#}");
+        }
     }
 
     /// Whether the source can read its store: it names no credential, or it is
@@ -409,14 +443,30 @@ impl FeedRunner {
     /// One pass of the whole pipeline. Each step picks up whatever the previous
     /// passes left, so a step that fails is simply retried on the next pass.
     pub async fn tick(&self) -> Result<()> {
+        let snapshot = self.pending_checks();
+        self.tick_with(&snapshot).await
+    }
+
+    /// A pass that answers the checks of `snapshot`, taken before it started.
+    #[doc(hidden)]
+    pub async fn tick_with(&self, snapshot: &[i64]) -> Result<()> {
         // Without its credential loaded, a source cannot read its store: nothing
         // is listed and nothing is handed over this pass, but what is open is
         // still polled and settled.
         let ready = self.credential_ready();
         // A source that cannot be read this pass must not hold back what is
         // already in the store: the rest of the pass runs, the scan is retried next.
-        if ready && let Err(e) = self.scan().await {
-            tracing::error!(feed = %self.feed.id, "scan failed, will retry next pass: {e:#}");
+        // The checks are answered by the scan, before anything is delivered.
+        if ready {
+            match self.scan().await {
+                Ok(()) => self.answer_checks(snapshot, None),
+                Err(ScanError(failure, e)) => {
+                    tracing::error!(feed = %self.feed.id, "scan failed, will retry next pass: {e:#}");
+                    self.answer_checks(snapshot, Some(failure));
+                }
+            }
+        } else {
+            self.answer_checks(snapshot, Some(CheckFailure::CredentialNotLoaded));
         }
         if self.bulk.is_some() {
             if self.bulk_transformed {
@@ -439,13 +489,24 @@ impl FeedRunner {
         Ok(())
     }
 
-    async fn scan(&self) -> Result<()> {
+    async fn scan(&self) -> Result<(), ScanError> {
+        use CheckFailure::*;
         let source = self.source();
         let read_only = source.is_read_only();
-        for (key, name, size) in source.list_meta().await? {
+        let listed = source
+            .list_meta()
+            .await
+            .map_err(|e| ScanError(Listing, e))?;
+        for (key, name, size) in listed {
             // Someone else's bucket keeps what we took: known by name and size,
             // it is not downloaded again just to recognise its hash.
-            if read_only && size > 0 && self.db.has_file(&self.feed.id, &name, size)? {
+            if read_only
+                && size > 0
+                && self
+                    .db
+                    .has_file(&self.feed.id, &name, size)
+                    .map_err(|e| ScanError(Taking, e))?
+            {
                 continue;
             }
             let incoming = match source.fetch(&key).await {
@@ -455,13 +516,18 @@ impl FeedRunner {
                     tracing::warn!(feed = %self.feed.id, key, "object no longer there, skipped");
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(ScanError(Fetching, e)),
             };
-            self.ingest(incoming).await?;
+            self.ingest(incoming)
+                .await
+                .map_err(|e| ScanError(Taking, e))?;
         }
         // Notifications are acknowledged only once what they announced is in the
         // store: a pass that failed before this leaves them to be delivered again.
-        source.settle_notifications().await?;
+        source
+            .settle_notifications()
+            .await
+            .map_err(|e| ScanError(Notifications, e))?;
         Ok(())
     }
 

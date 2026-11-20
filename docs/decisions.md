@@ -206,7 +206,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 ## 18. Sources are API resources, persisted as the same files
 
-**Chosen:** `POST /api/sources` creates a source from its definition (the YAML document as JSON), the engine writes `sources/{id}.yaml` and starts the source without a restart; `PUT` replaces and restarts it; `DELETE` stops it and removes the file. Pause and resume are operational state kept in the database with who and when, not in the definition. `check-now` makes a source pass at once. `POST /api/sources/test` lists a connection once and returns the evidence (reachable, elapsed, objects, newest).
+**Chosen:** `POST /api/sources` creates a source from its definition (the YAML document as JSON), the engine writes `sources/{id}.yaml` and starts the source without a restart; `PUT` replaces and restarts it; `DELETE` stops it and removes the file. Pause and resume are operational state kept in the database with who and when, not in the definition. `check-now` makes a source pass at once (and, since decision 41, records a check that says what the pass found). `POST /api/sources/test` lists a connection once and returns the evidence (reachable, elapsed, objects, newest).
 
 **Why:**
 - The client UI's design configures a source in the application, in five steps, with a connection test whose result stays on the page, and pauses, resumes and re-checks a source from its page. All of that needs the engine to own the definition.
@@ -333,7 +333,7 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - A lease per source rather than a lock per record: the sources are the unit of ownership people reason about ("who is running the lab feed?"), the folder and MLLP sources cannot be shared across machines anyway, and a pulling source with a cursor must not be pulled by two instances at once. Record-level claims, for throughput on one feed, can be added under the lease later.
 - The synchronous client on its own thread rather than an async store: the pipeline calls the store from many places; making them all async would have touched every call site for no gain, since a SQLite call blocks the same way.
 
-**Cost / not yet:** no TLS to PostgreSQL yet (same host or a private network); one connection per instance, no pool; a `check-now` reaches only the instance it was sent to; no per-record parallelism within a source.
+**Cost / not yet:** no TLS to PostgreSQL yet (same host or a private network); one connection per instance, no pool; a `check-now` makes a pass only on the instance it was sent to (the check it records is answered by the holder's next scan, decision 41); no per-record parallelism within a source.
 
 ## 29. `$bulk-submit` from any source: the engine writes the NDJSON, and derives ids
 
@@ -437,6 +437,22 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - A replaced value remains in database files (SQLite WAL and free pages, PostgreSQL dead rows) and backups until overwritten, under the same key. A whole row rolled back to an older revision still opens: nothing outside the row counts revisions.
 - Plaintext copies outside the engine's wiped types: the S3 client's own credential strings for the client's lifetime, HTTP and JSON parser buffers. HMAC pad blocks and HKDF temporaries made once at start are not wiped.
 - Registrations belong to an instance (`HIE_INSTANCE_ID`, or an id kept in the sources directory). After a failure they err on keeping: a start that fails after a definition was published keeps both credentials registered until the next start or replace, a cleanup that keeps failing leaves a row until the next start, and a changed instance id leaves its old rows behind. Each only makes a delete answer `409`. A crash while the key file is created can leave a temporary copy of the key next to it.
+
+## 41. Check now has an id and an outcome
+
+**Chosen:** `POST /api/sources/{id}/check-now` records a check in the store and answers its `check_id`; `GET /api/checks/{id}` answers `pending`, `found`, `nothing_new` or `failed`, with when it was asked for and answered. A check is recorded with a baseline, the source's newest load at that moment, and is answered by the first scan of the source that starts after it was recorded, on the instance holding the source: each pass reads the source's pending checks just before its scan and answers exactly those when the scan ends, before delivering. `found` lists the source's loads after the baseline up to the end of that scan, read with their current status when asked; `nothing_new` when there are none; `failed` when the source is paused, its credential is not loaded, the scan failed, or the source was deleted (on the instance that ran it, unless another instance holds it), with one of a fixed set of reasons and the loads taken before the failure. The first answer stays. Checks are purged after the retention period, counted from when they were asked for, answered or not. The route keeps its name; nothing new is needed to ask for a check.
+
+**Why:**
+- A monitoring tool that asks for a check needs to know whether it ran and what came of it, not only that it was accepted: "did my file get picked up" has an answer per request.
+- The baseline makes the answer what the source took from the request on, not what one scan did: a file taken by a scan already running when the check came, or by a scan that crashed, was aborted while its source was replaced, or could not store its answer, is still in the answer the next scan gives. The pass reads the pending checks as an explicit set rather than up to an id, so a check another instance commits late is never answered by a scan that started before it.
+- Fixed reasons: a scan error can hold a signed URL, a query, a cursor or a server's answer; an endpoint any reading token can call must not show them. The log keeps the error.
+- Ids from `AUTOINCREMENT` on SQLite (a sequence on PostgreSQL): a purged check's id is never handed to another, so an old `Location` cannot show someone else's check.
+
+**Cost / not yet:**
+- A check sent to an instance that stands by waits for the holder's next poll: the pass it starts is local. A check whose source is gone from every instance without being deleted through the API (removed from disk while the engine was down), or held by an older engine that does not know checks, stays pending until purged.
+- A pass that outlives its lease (longer than three poll intervals, at least 30 s) can overlap another instance's pass, as before: a check is then answered by whichever finishes first, and both list real loads of the source, but on PostgreSQL a load the other instance has not committed yet may be left out of the answer.
+- A pause seen when a pass starts fails the checks waiting then, even if a resume follows a moment later; a check asked for after the resume is answered by the pass the resume starts.
+- No list of a source's checks; a caller keeps the ids it was given.
 
 ## Not in the prototype
 

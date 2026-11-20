@@ -108,6 +108,19 @@ CREATE TABLE IF NOT EXISTS alert_rules (
   created_by TEXT,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS checks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  feed_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  requested_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  after_file INTEGER NOT NULL,
+  upto_file INTEGER,
+  file_count INTEGER,
+  reason TEXT
+);
+CREATE INDEX IF NOT EXISTS checks_feed_status ON checks(feed_id, status);
+CREATE INDEX IF NOT EXISTS checks_requested ON checks(requested_at);
 ";
 
 /// Columns added after a store was first created; each is added when missing.
@@ -149,6 +162,42 @@ fn default_channels() -> Vec<String> {
 }
 fn default_enabled() -> bool {
     true
+}
+
+/// Why a check failed. Only these fixed sentences are stored and answered: the
+/// error behind one, which may carry a URL, a query or a server's answer, goes
+/// to the engine log only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckFailure {
+    Paused,
+    CredentialNotLoaded,
+    Listing,
+    Fetching,
+    Taking,
+    Notifications,
+    Deleted,
+}
+
+impl CheckFailure {
+    pub fn reason(self) -> &'static str {
+        match self {
+            CheckFailure::Paused => "the source is paused",
+            CheckFailure::CredentialNotLoaded => {
+                "the source's credential is not loaded; see its credential alert"
+            }
+            CheckFailure::Listing => "listing the source failed; the engine log has the details",
+            CheckFailure::Fetching => {
+                "reading an object from the source failed; the engine log has the details"
+            }
+            CheckFailure::Taking => {
+                "taking an object in (recording, unpacking or acknowledging it) failed; the engine log has the details"
+            }
+            CheckFailure::Notifications => {
+                "acknowledging the source's notifications failed; the engine log has the details"
+            }
+            CheckFailure::Deleted => "the source was deleted",
+        }
+    }
 }
 
 /// A `$bulk-submit` submission the engine handed to HFS and is waiting on.
@@ -754,6 +803,7 @@ impl Db {
             }
         }
         let ddl = SCHEMA
+            .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
             .replace("INTEGER PRIMARY KEY", "BIGSERIAL PRIMARY KEY")
             .replace("INTEGER", "BIGINT");
         client
@@ -1668,6 +1718,143 @@ impl Db {
         .map(drop)
     }
 
+    // ---- checks ------------------------------------------------------------
+
+    /// Records a check of a source, pending, with its baseline: the source's
+    /// newest load when it was asked for.
+    pub fn insert_check(&self, feed: &str) -> Result<i64> {
+        let after = self.max_file_id(feed)?;
+        self.insert_returning_id(
+            "INSERT INTO checks (feed_id, status, requested_at, after_file) VALUES ($1, 'pending', $2, $3)",
+            &params![feed, now_ms(), after],
+        )
+    }
+
+    fn max_file_id(&self, feed: &str) -> Result<i64> {
+        Ok(self
+            .query_one(
+                "SELECT MAX(id) FROM files WHERE feed_id = $1",
+                &params![feed],
+            )?
+            .and_then(|r| r.opt_i64(0))
+            .unwrap_or(0))
+    }
+
+    /// The source's checks waiting for an answer, as they are now: what the scan
+    /// about to start answers. Checks recorded after this wait for the next one.
+    pub fn pending_checks(&self, feed: &str) -> Result<Vec<i64>> {
+        Ok(self
+            .query(
+                "SELECT id FROM checks WHERE feed_id = $1 AND status = 'pending' ORDER BY id",
+                &params![feed],
+            )?
+            .iter()
+            .map(|r| r.i64(0))
+            .collect())
+    }
+
+    /// Answers the checks of `snapshot` still pending: `failed` with the
+    /// failure's fixed reason, or else `found` or `nothing_new` by the loads the
+    /// source recorded after each check's baseline, up to now. A check another
+    /// pass answered first keeps that answer.
+    pub fn answer_checks(
+        &self,
+        feed: &str,
+        snapshot: &[i64],
+        failure: Option<CheckFailure>,
+    ) -> Result<()> {
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        const COUNT: &str = "(SELECT COUNT(*) FROM files WHERE files.feed_id = checks.feed_id
+                               AND files.id > checks.after_file AND files.id <= $3)";
+        let upto = self.max_file_id(feed)?;
+        let now = now_ms();
+        let status = match failure {
+            Some(_) => "'failed'".to_string(),
+            None => format!("CASE WHEN {COUNT} > 0 THEN 'found' ELSE 'nothing_new' END"),
+        };
+        let sql = format!(
+            "UPDATE checks SET status = {status}, file_count = {COUNT}, upto_file = $3,
+               finished_at = CASE WHEN requested_at > $4 THEN requested_at ELSE $4 END,
+               reason = $5
+             WHERE id = $1 AND feed_id = $2 AND status = 'pending'"
+        );
+        for &id in snapshot {
+            self.execute(
+                &sql,
+                &params![id, feed, upto, now, failure.map(CheckFailure::reason)],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Fails every pending check of the source with the failure's fixed reason.
+    pub fn fail_pending_checks(&self, feed: &str, failure: CheckFailure) -> Result<()> {
+        let snapshot = self.pending_checks(feed)?;
+        self.answer_checks(feed, &snapshot, Some(failure))
+    }
+
+    /// One check, with up to `limit` of its loads after load `after` (each with
+    /// its current status), or `None` when there is no such check.
+    pub fn check(&self, id: i64, after: i64, limit: i64) -> Result<Option<Value>> {
+        let Some(mut check) = self
+            .query_json(
+                &format!(
+                    "SELECT id AS check_id, feed_id AS source, status, {} AS requested_at, {} AS finished_at,
+                            file_count, reason, after_file, upto_file
+                     FROM checks WHERE id = $1",
+                    self.iso("requested_at"),
+                    self.iso("finished_at")
+                ),
+                params![id],
+            )?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let from = check["after_file"].as_i64().unwrap_or(0).max(after);
+        let files = match check["upto_file"].as_i64() {
+            Some(upto) => self.query_json(
+                "SELECT id, name, status, duplicate_of FROM files
+                 WHERE feed_id = $1 AND id > $2 AND id <= $3 ORDER BY id LIMIT $4",
+                params![
+                    check["source"].as_str().unwrap_or(""),
+                    from,
+                    upto,
+                    limit + 1
+                ],
+            )?,
+            None => Vec::new(),
+        };
+        let more = files.len() as i64 > limit;
+        let files: Vec<Value> = files.into_iter().take(limit as usize).collect();
+        let next = if more {
+            files.last().and_then(|f| f["id"].as_i64())
+        } else {
+            None
+        };
+        let object = check.as_object_mut().expect("a row is an object");
+        object.remove("after_file");
+        object.remove("upto_file");
+        if object["file_count"].is_null() {
+            object.insert("file_count".into(), json!(0));
+        }
+        object.insert("files".into(), Value::Array(files));
+        object.insert("next_after".into(), json!(next));
+        Ok(Some(check))
+    }
+
+    /// Removes the checks asked for before `before_ms`, answered or not: what
+    /// the store's retention purges.
+    pub fn purge_checks(&self, before_ms: i64) -> Result<u64> {
+        self.execute(
+            "DELETE FROM checks WHERE requested_at < $1",
+            &params![before_ms],
+        )
+    }
+
     // ---- alert rules -------------------------------------------------------
 
     const RULE_SELECT: &'static str = "SELECT id, source_id, condition, threshold, notify, channels, enabled, created_by FROM alert_rules";
@@ -1881,6 +2068,135 @@ mod tests {
         assert!(!db.acquire_lease("lab", "a", 60_000).unwrap());
         db.release_lease("lab", "b").unwrap();
         assert!(db.acquire_lease("lab", "a", 60_000).unwrap());
+    }
+
+    fn file(db: &Db, feed: &str, name: &str) -> i64 {
+        db.insert_file(feed, name, name, 1, "processing", None, None, None)
+            .unwrap()
+    }
+
+    fn status(db: &Db, check: i64) -> Value {
+        db.check(check, 0, 1000).unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_check_is_answered_by_the_scan_whose_snapshot_holds_it() {
+        let db = Db::in_memory().unwrap();
+        file(&db, "lab", "old.csv");
+        let first = db.insert_check("lab").unwrap();
+        let snapshot = db.pending_checks("lab").unwrap();
+        assert_eq!(snapshot, vec![first]);
+        // Asked for while that scan runs: not in its snapshot.
+        let second = db.insert_check("lab").unwrap();
+        let new = file(&db, "lab", "new.csv");
+        file(&db, "other", "elsewhere.csv");
+        db.answer_checks("lab", &snapshot, None).unwrap();
+
+        let answered = status(&db, first);
+        assert_eq!(answered["status"], "found");
+        assert_eq!(answered["source"], "lab");
+        assert_eq!(answered["file_count"], 1);
+        assert_eq!(answered["files"][0]["id"], new);
+        assert_eq!(answered["files"][0]["name"], "new.csv");
+        assert_eq!(answered["files"][0]["status"], "processing");
+        assert!(answered["reason"].is_null());
+        assert!(
+            answered["finished_at"].as_str().unwrap() >= answered["requested_at"].as_str().unwrap()
+        );
+        assert!(answered["next_after"].is_null());
+
+        let waiting = status(&db, second);
+        assert_eq!(waiting["status"], "pending");
+        assert!(waiting["finished_at"].is_null());
+        assert_eq!(waiting["files"], json!([]));
+        assert_eq!(waiting["file_count"], 0);
+
+        // The next scan answers it with the load taken after it was asked for,
+        // though an earlier scan recorded that load.
+        let snapshot = db.pending_checks("lab").unwrap();
+        assert_eq!(snapshot, vec![second]);
+        db.answer_checks("lab", &snapshot, None).unwrap();
+        assert_eq!(status(&db, second)["status"], "found");
+        assert_eq!(status(&db, second)["files"][0]["id"], new);
+
+        // Nothing since.
+        let third = db.insert_check("lab").unwrap();
+        db.answer_checks("lab", &[third], None).unwrap();
+        let empty = status(&db, third);
+        assert_eq!(empty["status"], "nothing_new");
+        assert_eq!(empty["files"], json!([]));
+    }
+
+    #[test]
+    fn the_first_answer_stays_and_a_failure_keeps_what_was_taken() {
+        let db = Db::in_memory().unwrap();
+        let check = db.insert_check("lab").unwrap();
+        let taken = file(&db, "lab", "a.csv");
+        db.answer_checks("lab", &[check], Some(CheckFailure::Listing))
+            .unwrap();
+        db.answer_checks("lab", &[check], None).unwrap();
+        db.fail_pending_checks("lab", CheckFailure::Deleted)
+            .unwrap();
+        let answered = status(&db, check);
+        assert_eq!(answered["status"], "failed");
+        assert_eq!(answered["reason"], CheckFailure::Listing.reason());
+        assert_eq!(answered["files"][0]["id"], taken);
+
+        let deleted = db.insert_check("lab").unwrap();
+        db.fail_pending_checks("lab", CheckFailure::Deleted)
+            .unwrap();
+        assert_eq!(status(&db, deleted)["reason"], "the source was deleted");
+        // An unknown check.
+        assert!(db.check(deleted + 100, 0, 10).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_check_with_many_loads_lists_them_in_pages() {
+        let db = Db::in_memory().unwrap();
+        let check = db.insert_check("lab").unwrap();
+        let ids: Vec<i64> = (0..5)
+            .map(|i| file(&db, "lab", &format!("{i}.csv")))
+            .collect();
+        db.answer_checks("lab", &[check], None).unwrap();
+        // Recorded after the answer: never part of it.
+        file(&db, "lab", "later.csv");
+        let page = db.check(check, 0, 2).unwrap().unwrap();
+        assert_eq!(page["file_count"], 5);
+        assert_eq!(page["files"].as_array().unwrap().len(), 2);
+        assert_eq!(page["next_after"], ids[1]);
+        let rest = db.check(check, ids[1], 10).unwrap().unwrap();
+        let rest: Vec<i64> = rest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(rest, ids[2..]);
+    }
+
+    #[test]
+    fn checks_are_purged_by_age_and_their_ids_never_come_back() {
+        let db = Db::in_memory().unwrap();
+        let old = db.insert_check("lab").unwrap();
+        let newest = db.insert_check("lab").unwrap();
+        db.execute(
+            "UPDATE checks SET requested_at = 1000 WHERE id = $1",
+            &params![old],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE checks SET requested_at = 2000 WHERE id = $1",
+            &params![newest],
+        )
+        .unwrap();
+        // The cutoff itself is kept.
+        assert_eq!(db.purge_checks(1000).unwrap(), 0);
+        assert_eq!(db.purge_checks(1001).unwrap(), 1);
+        assert!(db.check(old, 0, 10).unwrap().is_none());
+        assert_eq!(status(&db, newest)["status"], "pending");
+        // Purging the newest does not hand its id to the next check.
+        assert_eq!(db.purge_checks(i64::MAX).unwrap(), 1);
+        assert!(db.insert_check("lab").unwrap() > newest);
     }
 
     #[test]

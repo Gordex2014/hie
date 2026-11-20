@@ -585,8 +585,16 @@ mod stored {
         let waiting = runner(feed("later"));
         let seen = bucket.seen().len();
         tokio::time::sleep(Duration::from_millis(50)).await;
+        let check = db.insert_check("drops").unwrap();
         assert!(waiting.pass().await.unwrap());
         assert_eq!(bucket.seen().len(), seen, "nothing listed or fetched");
+        // A check asked for meanwhile says why nothing was listed.
+        let answered = db.check(check, 0, 10).unwrap().unwrap();
+        assert_eq!(answered["status"], "failed");
+        assert_eq!(
+            answered["reason"],
+            hie::db::CheckFailure::CredentialNotLoaded.reason()
+        );
         assert!(
             *hfs.polls.lock().unwrap() > polls,
             "the open submission was polled"

@@ -57,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sources/{id}/pause", post(pause_source))
         .route("/api/sources/{id}/resume", post(resume_source))
         .route("/api/sources/{id}/check-now", post(check_now))
+        .route("/api/checks/{id}", get(get_check))
         .route("/api/sources/{id}/files", get(list_files))
         .route("/api/sources/{id}/loads", get(list_files))
         .route("/api/loads/{file_id}", get(get_load))
@@ -404,15 +405,41 @@ async fn resume_source(State(s): State<AppState>, Path(id): Path<String>) -> Api
     get_source(State(s), Path(id)).await
 }
 
+/// Records a check of the source and makes it pass now; `GET /api/checks/{id}`
+/// answers what the check found.
 async fn check_now(
     State(s): State<AppState>,
     Path(id): Path<String>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    s.manager.check_now(&id)?;
+) -> Result<Response, ApiError> {
+    let check = s.manager.request_check(&id).await?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(json!({"id": id, "checking": true})),
-    ))
+        [(header::LOCATION, format!("/api/checks/{check}"))],
+        Json(json!({"id": id, "checking": true, "check_id": check})),
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+struct CheckQuery {
+    /// Lists the check's loads after this load id: the previous answer's `next_after`.
+    after: Option<i64>,
+    limit: Option<i64>,
+}
+
+/// Loads listed per answer of `GET /api/checks/{id}` unless `limit` asks for fewer.
+const CHECK_FILES: i64 = 1000;
+
+async fn get_check(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<CheckQuery>,
+) -> Result<Response, ApiError> {
+    let limit = q.limit.unwrap_or(CHECK_FILES).clamp(1, CHECK_FILES);
+    let check =
+        s.db.check(id, q.after.unwrap_or(0), limit)?
+            .ok_or_else(|| not_found(&format!("check {id}")))?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(check)).into_response())
 }
 
 async fn test_source(State(s): State<AppState>, Json(body): Json<Value>) -> ApiResult {
