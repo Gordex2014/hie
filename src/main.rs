@@ -85,6 +85,9 @@ async fn main() -> Result<()> {
                 f.source.describe(),
                 f.transform.display()
             );
+            if let Some(contact) = &f.contact {
+                println!("    contact: {contact}");
+            }
         }
         for skipped in &config.skipped {
             println!("skipped {}: {}", skipped.file.display(), skipped.reason);

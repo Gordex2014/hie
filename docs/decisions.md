@@ -438,6 +438,19 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - Plaintext copies outside the engine's wiped types: the S3 client's own credential strings for the client's lifetime, HTTP and JSON parser buffers. HMAC pad blocks and HKDF temporaries made once at start are not wiped.
 - Registrations belong to an instance (`HIE_INSTANCE_ID`, or an id kept in the sources directory). After a failure they err on keeping: a start that fails after a definition was published keeps both credentials registered until the next start or replace, a cleanup that keeps failing leaves a row until the next start, and a changed instance id leaves its old rows behind. Each only makes a delete answer `409`. A crash while the key file is created can leave a temporary copy of the key next to it.
 
+## 45. A source's contact: one line of display text on its definition
+
+**Chosen:** A source definition may carry `contact`: free text saying whom to call about the source, with no directory behind it. It is optional, at most 500 characters, one line without control, line-separator or text-direction characters, and must be text (in YAML, a bare number or boolean is refused). Absent, `null` and blank mean none; a blank one is not written. Otherwise it is stored and returned exactly as given. It is answered as `contact` by every source read and write, by each source of `GET /api/monitoring/status` and by each of its `needs_you` entries, and printed by `hie check`; it is checked wherever a definition is (at start, by `hie check`, on `POST` and `PUT`), before anything that can skip a file. `PUT` stays a whole replace: a definition without `contact` has none, and a client that changes one member sends back the `definition` it read.
+
+**Why:**
+- A monitoring tool needs to know whom to call about a late or failing feed, and the person who sets up the source knows it. One line of text answers that without a directory of people, which the engine has no use for.
+- Never interpreting it keeps the engine out of notification: escalation and paging are the receiving tool's job, fed by the alert webhook.
+- One line without control or text-direction characters, because it is shown on status pages and printed on a terminal by `hie check`: no escape sequences, no reordered text, and a plain YAML scalar in the file. 500 characters leave room for a team, a person, a number, an address and hours, while the monitoring status, which lists every source, stays small.
+- Text only, because `definition` is the file as written: a bare `5550100` in YAML would come back as a number, and the same definition sent back would be refused.
+- A whole replace rather than "absent keeps it": a client that reads and writes back the whole definition, as one changing a transform does, keeps the contact without knowing about it; a merge for one member would make `PUT` partial, need a special value to clear, and let the file differ from the body sent.
+
+**Cost / not yet:** a contact-only `PUT` restarts the source, as any replace does. After `500 source_not_started` the top-level `contact` (what runs) and `definition.contact` (what is saved) differ until the saved definition starts. An engine before this one drops the member from a definition without a word, so a client checks the version before offering it. It is not in alerts or the webhook body; a receiver reads the source by its id. A source file not named `{id}.yaml` has no `definition` in the answer, so its contact is read from the top-level member only.
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.

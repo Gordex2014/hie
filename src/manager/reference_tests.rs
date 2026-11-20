@@ -569,6 +569,44 @@ async fn a_transform_save_after_a_failed_start_runs_the_saved_definition() {
     a.delete_secret(&x).await.unwrap();
 }
 
+/// After a start that failed, the running source keeps its contact and the
+/// saved definition has the new one, until the saved definition starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_failed_start_the_running_and_saved_contacts_differ() {
+    let dir = tempfile::tempdir().unwrap();
+    let (database, _keeper) = store(dir.path());
+    let bucket = refusing_bucket().await;
+    let a = Instance::start(&dir.path().join("a"), &database, &key());
+    a.secret("x").await;
+    let with_contact = |contact: &str| {
+        let mut definition = a.definition("s", "x", &bucket);
+        definition["contact"] = json!(contact);
+        definition
+    };
+    a.manager.create(&with_contact("Ann"), None).await.unwrap();
+    a.settled("s").await;
+    a.manager.fail_next_start.store(true, Ordering::SeqCst);
+    let err = a
+        .manager
+        .replace("s", &with_contact("Bea"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ManagerError::NotStarted(_)), "{err:?}");
+    let running = |a: &Instance| a.manager.source("s").unwrap().contact;
+    assert_eq!(running(&a).as_deref(), Some("Ann"));
+    assert_eq!(
+        a.manager.definition("s").unwrap().unwrap()["contact"],
+        "Bea"
+    );
+
+    a.manager
+        .save_transform("t", "def transform(r, c):\n    return []\n")
+        .await
+        .unwrap();
+    a.settled("s").await;
+    assert_eq!(running(&a).as_deref(), Some("Bea"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nothing_is_released_while_the_saved_and_running_definitions_differ() {
     let dir = tempfile::tempdir().unwrap();

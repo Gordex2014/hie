@@ -806,6 +806,7 @@ impl SourceManager {
         let feed = FeedConfig {
             id: "test".into(),
             name: "test".into(),
+            contact: None,
             source,
             format: Default::default(),
             transform: PathBuf::new(),
