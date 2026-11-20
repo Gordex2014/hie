@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,8 +171,17 @@ impl<'de> Deserialize<'de> for AlertConfig {
                     };
                 }
                 Some(other) => {
+                    // A key that looks like a key is named; anything else
+                    // (a pasted URL, say) is not.
+                    let named = other.len() <= 64
+                        && other.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    let which = if named {
+                        format!(" {other:?}")
+                    } else {
+                        String::new()
+                    };
                     return Err(D::Error::custom(format!(
-                        "alerts: unknown key {other:?} (use webhook_url, webhook_secret or webhook_backoff_ms)"
+                        "alerts: unknown key{which} (use webhook_url, webhook_secret or webhook_backoff_ms)"
                     )));
                 }
                 None => return Err(D::Error::custom(ALERTS_SHAPE)),
@@ -215,9 +225,17 @@ impl AlertConfig {
         Ok(())
     }
 
-    /// Refuses a URL that is not http or https, and a backoff out of range.
+    /// Refuses a blank secret, a URL that is not http or https, and a backoff
+    /// out of range.
     /// The messages never quote the URL.
     pub fn validate(&self) -> Result<()> {
+        if self
+            .webhook_secret
+            .as_ref()
+            .is_some_and(|s| s.expose_secret().trim().is_empty())
+        {
+            bail!("alerts.webhook_secret is blank");
+        }
         if let Some(url) = &self.webhook_url {
             let ok = url::Url::parse(url)
                 .ok()
@@ -868,7 +886,7 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     // its value (`runtime: null` and a bare `runtime:` included) and however the
     // key is tagged (`as_str` sees through YAML tags).
     let raw: serde_yaml::Value =
-        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        serde_yaml::from_str(&text).map_err(|e| parse_error(path, &text, e))?;
     if raw
         .as_mapping()
         .is_some_and(|m| m.keys().any(|k| k.as_str() == Some("runtime")))
@@ -929,6 +947,49 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
         feeds.push(feed);
     }
     Ok((config, feeds))
+}
+
+/// A YAML error in `hie.yaml`, without the parser's own words when it points
+/// into the `alerts:` block (or nowhere, while the file has one): they may
+/// quote the webhook URL or secret.
+fn parse_error(path: &Path, text: &str, e: serde_yaml::Error) -> anyhow::Error {
+    let alerts = alerts_lines(text);
+    let hidden = match e.location() {
+        Some(at) => alerts
+            .as_ref()
+            .is_some_and(|lines| lines.contains(&at.line())),
+        None => alerts.is_some(),
+    };
+    if !hidden {
+        return anyhow::Error::new(e).context(format!("parsing {}", path.display()));
+    }
+    let at = e
+        .location()
+        .map(|at| format!(" at line {}", at.line()))
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "parsing {}: the alerts: block is not valid YAML{at} (its values are not shown)",
+        path.display()
+    )
+}
+
+/// The lines (from 1) of the top-level `alerts:` key and its block, if any.
+fn alerts_lines(text: &str) -> Option<std::ops::Range<usize>> {
+    let top_level = |line: &str| {
+        line.chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace() && c != '#')
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().position(|l| {
+        l.strip_prefix("alerts")
+            .is_some_and(|rest| rest.trim_start().starts_with(':'))
+    })?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| top_level(l))
+        .map_or(lines.len(), |n| start + 1 + n);
+    Some(start + 1..end + 1)
 }
 
 /// The source files in `dir`, in the order `load` reads them: every `*.yaml`
@@ -1004,7 +1065,6 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::ExposeSecret;
 
     fn alerts_from(yaml: &str) -> Result<AlertConfig, String> {
         serde_yaml::from_str::<Config>(&format!("fhir_base_url: http://hfs\n{yaml}"))
@@ -1083,6 +1143,16 @@ mod tests {
         );
         let typo = alerts_from("alerts:\n  webhook_secrt: x\n").unwrap_err();
         assert!(typo.contains("webhook_secrt"), "{typo}");
+    }
+
+    #[test]
+    fn a_blank_secret_is_refused_on_every_path() {
+        let alerts = AlertConfig {
+            webhook_url: Some("https://hooks.example.org/x".into()),
+            webhook_secret: Some(secrecy::SecretString::from(" ".to_string())),
+            webhook_backoff_ms: None,
+        };
+        assert!(alerts.validate().unwrap_err().to_string().contains("blank"));
     }
 
     #[test]

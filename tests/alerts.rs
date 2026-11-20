@@ -401,14 +401,15 @@ async fn the_webhook_gets_each_alert_change_and_the_api_shows_its_delivery() {
     let got = Received::default();
     let receiver = serve(
         Router::new()
-            .route("/hook", post(receive))
+            .route("/hook/urlcanary", post(receive))
             .with_state(got.clone()),
     )
     .await;
+    let url = format!("{receiver}/hook/urlcanary");
     let lab = lab_with(
         &python,
         &format!(
-            "alerts:\n  webhook_url: {receiver}/hook\n  webhook_secret: test-secret\n  webhook_backoff_ms: 50\n"
+            "alerts:\n  webhook_url: {url}\n  webhook_secret: secretcanary\n  webhook_backoff_ms: 50\n"
         ),
     )
     .await;
@@ -429,6 +430,32 @@ async fn the_webhook_gets_each_alert_change_and_the_api_shows_its_delivery() {
          RETURNING id",
         vec![hie::db::Param::Int(webhook_rule.as_i64().unwrap())],
     ).unwrap()[0]["id"].clone();
+    // Two events that are not due: one for this URL, one for another.
+    use sha2::Digest;
+    let ours = hex::encode(&sha2::Sha256::digest(url.as_bytes())[..8]);
+    let mut waiting = vec![];
+    for (event_id, destination) in [
+        ("waits-here", ours.as_str()),
+        ("waits-elsewhere", "0123456789abcdef"),
+    ] {
+        let id = lab.db.query_json(
+            "INSERT INTO alerts (feed_id, kind, message, created_at) VALUES ('other', 'unreadable_file', 'x', 1) RETURNING id",
+            vec![],
+        ).unwrap()[0]["id"].clone();
+        lab.db.query_json(
+            "INSERT INTO alert_webhooks (event_id, alert_id, event, destination, payload, state, attempts, next_attempt_at, created_at)
+             VALUES ($1, $2, 'fired', $3, '{}', 'pending', 0, 9000000000000000, 1) RETURNING id",
+            vec![
+                hie::db::Param::Text(event_id.into()),
+                hie::db::Param::Int(id.as_i64().unwrap()),
+                hie::db::Param::Text(destination.into()),
+            ],
+        ).unwrap();
+        waiting.push(id);
+    }
+    let all = lab.get("/api/alerts").await;
+    assert_eq!(webhook_of(&all, &waiting[0])["state"], "pending");
+    assert_eq!(webhook_of(&all, &waiting[1])["state"], "parked");
     let alerts = lab.get("/api/alerts?source=lab-results").await;
     assert_eq!(
         alerts["webhook"],
@@ -486,7 +513,7 @@ async fn the_webhook_gets_each_alert_change_and_the_api_shows_its_delivery() {
     let (headers, body) = &got[0];
     assert_eq!(
         headers["x-hie-signature"].to_str().unwrap(),
-        hie::alerts::signature(b"test-secret", body)
+        hie::alerts::signature(b"secretcanary", body)
     );
     let payload: Value = serde_json::from_slice(body).unwrap();
     assert_eq!(payload["event_id"], hook["event_id"]);
@@ -505,6 +532,11 @@ async fn the_webhook_gets_each_alert_change_and_the_api_shows_its_delivery() {
     assert_eq!(payload["alert"]["created_at"], "2023-11-14T22:13:20.123Z");
     assert_eq!(payload["alert"]["cleared_at"], listed["cleared_at"]);
     assert_eq!(payload["alert"]["message"], "from before");
+    // Neither the URL nor the secret is in any answer, nor is the stored fingerprint.
+    let answer = lab.get("/api/alerts").await.to_string();
+    for canary in ["urlcanary", "secretcanary", ours.as_str()] {
+        assert!(!answer.contains(canary), "{canary} in {answer}");
+    }
 }
 
 #[tokio::test]

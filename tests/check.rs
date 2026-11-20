@@ -72,6 +72,14 @@ fn check_refuses_bad_alert_settings_without_printing_them() {
             vec![],
         ),
         (
+            format!("{base}alerts:\n  webhook_secret:\n    secretcanary: 1\n    secretcanary: 2\n"),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  https://urlcanary.example.org/hook: 1\n"),
+            vec![],
+        ),
+        (
             base.to_string(),
             vec![(
                 "HIE_ALERT_WEBHOOK_URL",

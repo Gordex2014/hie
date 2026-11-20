@@ -454,6 +454,9 @@ async fn an_attempt_whose_outcome_was_lost_is_sent_again_unchanged() {
     let (receiver, url) = receiver().await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hie.db");
+    // Holds the store for the whole test: on PostgreSQL, the first handle on a
+    // schema drops it when it goes.
+    let _store = Db::open(&path).unwrap();
     let config = settings(Some(&url), Some(SECRET_CANARY), 50);
     // Instance A records the alert, claims the attempt and posts it; the
     // receiver applies it; A stops before storing the outcome.
@@ -504,6 +507,7 @@ async fn an_event_waits_for_its_own_url() {
     let (second, second_url) = receiver().await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("hie.db");
+    let _store = Db::open(&path).unwrap();
     // Written while the first URL was configured; the engine stops before sending.
     let a = engine(&path, &settings(Some(&first_url), None, 50), false);
     a.alerts
@@ -535,4 +539,37 @@ async fn an_event_waits_for_its_own_url() {
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].body, stored["payload"].as_str().unwrap().as_bytes());
     assert_eq!(got[0].header("x-hie-event-id").unwrap(), stored["event_id"]);
+}
+
+#[tokio::test]
+async fn a_receiver_that_does_not_answer_in_time_is_a_timeout() {
+    logs();
+    async fn slow() -> StatusCode {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        StatusCode::OK
+    }
+    let app = Router::new().route(&format!("/hook/{URL_CANARY}"), post(slow));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let url = format!("http://{addr}/hook/{URL_CANARY}");
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(
+        &dir.path().join("hie.db"),
+        &settings(Some(&url), None, 60_000),
+        true,
+    );
+    e.alerts
+        .raise(Some("lab-results"), "unreadable_file", "cannot read h.csv")
+        .unwrap();
+    let alert = last_alert(&e.db);
+    wait_for("one attempt", || {
+        events(&e.db, alert)[0]["last_error"].is_string()
+    })
+    .await;
+    let ev = &events(&e.db, alert)[0];
+    assert_eq!(ev["last_error"], "timeout");
+    assert_eq!(ev["last_status"], Value::Null);
+    assert_eq!(ev["state"], "pending");
+    assert_no_canary_logged();
 }

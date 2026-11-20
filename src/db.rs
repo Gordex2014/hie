@@ -1759,7 +1759,13 @@ impl Db {
                 Ok::<_, anyhow::Error>(row)
             })();
             match result {
-                Ok(row) => c.batch("COMMIT").map(|()| row),
+                Ok(row) => match c.batch("COMMIT") {
+                    Ok(()) => Ok(row),
+                    Err(e) => {
+                        let _ = c.batch("ROLLBACK");
+                        Err(e)
+                    }
+                },
                 Err(e) => {
                     let _ = c.batch("ROLLBACK");
                     Err(e)
@@ -1816,7 +1822,13 @@ impl Db {
                 Ok::<_, anyhow::Error>(Some(row))
             })();
             match result {
-                Ok(row) => c.batch("COMMIT").map(|()| row),
+                Ok(row) => match c.batch("COMMIT") {
+                    Ok(()) => Ok(row),
+                    Err(e) => {
+                        let _ = c.batch("ROLLBACK");
+                        Err(e)
+                    }
+                },
                 Err(e) => {
                     let _ = c.batch("ROLLBACK");
                     Err(e)
@@ -2196,18 +2208,44 @@ mod tests {
             .webhook_claim("e1", "d", 2_000, 62_000, 6)
             .unwrap()
             .unwrap();
-        // The lease runs out; the other instance takes the next attempt and delivers.
+        // The lease runs out; the other instance takes the next attempt.
         let fresh = b
             .webhook_claim("e1", "d", 63_000, 123_000, 6)
             .unwrap()
             .unwrap();
         assert_eq!(fresh.attempt, 2);
+        // While that attempt runs, the stale one's outcomes change nothing.
         assert!(
-            b.webhook_delivered("e1", fresh.attempt, 200, 64_000)
+            !a.webhook_delivered("e1", stale.attempt, 200, 64_000)
                 .unwrap()
         );
         assert!(
             !a.webhook_attempt_failed("e1", stale.attempt, "timeout", None, Some(70_000))
+                .unwrap()
+        );
+        assert!(
+            !a.webhook_attempt_failed("e1", stale.attempt, "timeout", None, None)
+                .unwrap()
+        );
+        let r = a
+            .query_one(
+                "SELECT state, attempts, next_attempt_at, delivered_at, last_error FROM alert_webhooks WHERE event_id = 'e1'",
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                r.string(0),
+                r.i64(1),
+                r.i64(2),
+                r.opt_i64(3),
+                r.opt_string(4)
+            ),
+            ("pending".to_string(), 2, 123_000, None, None)
+        );
+        assert!(
+            b.webhook_delivered("e1", fresh.attempt, 200, 65_000)
                 .unwrap()
         );
         assert_eq!(state(&a, "e1").0, "delivered");

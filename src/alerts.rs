@@ -80,7 +80,9 @@ impl Drop for SenderGuard {
 }
 
 impl Alerter {
-    /// An alerter posting unsigned to `webhook_url`, when there is one.
+    /// An alerter whose events are for `webhook_url` (unsigned), when there is
+    /// one. They are sent only once `start` runs the sender and its guard is
+    /// kept; until then they wait in the store. The URL is not validated here.
     pub fn new(db: Arc<Db>, webhook_url: Option<String>) -> Self {
         Self::from_config(
             db,
