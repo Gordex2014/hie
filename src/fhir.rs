@@ -77,7 +77,10 @@ impl FhirClient {
         let sent = request.send().await;
         exchange.observe_send(&sent);
         let resp = sent.map_err(|e| {
-            SendError::Transient(format!("cannot reach the FHIR server: {}", e.without_url()))
+            SendError::Transient(format!(
+                "cannot reach the FHIR server: {}",
+                crate::bulk::safe_reason(&crate::destination::error_chain(&e.without_url()))
+            ))
         })?;
         let status = resp.status().as_u16();
         let body: Value = resp.json().await.unwrap_or(Value::Null);

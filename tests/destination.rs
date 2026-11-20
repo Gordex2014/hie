@@ -28,6 +28,8 @@ struct Hfs {
     metadata_hits: u32,
     /// The path and whether an `Authorization` header came, per probe.
     probes: Vec<(String, bool)>,
+    /// What the alert webhook received.
+    hooks: Vec<Value>,
 }
 
 type Shared = Arc<Mutex<Hfs>>;
@@ -72,6 +74,15 @@ async fn bulk_submit(State(s): State<Shared>) -> StatusCode {
     StatusCode::from_u16(s.lock().unwrap().post_status.unwrap_or(202)).unwrap()
 }
 
+async fn status_page() -> StatusCode {
+    StatusCode::SERVICE_UNAVAILABLE
+}
+
+async fn hook(State(s): State<Shared>, Json(payload): Json<Value>) -> StatusCode {
+    s.lock().unwrap().hooks.push(payload);
+    StatusCode::OK
+}
+
 async fn serve(app: Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -86,6 +97,9 @@ async fn hfs() -> (String, Shared) {
         .route("/fhir", post(batch))
         .route("/fhir/metadata", get(metadata))
         .route("/fhir/$bulk-submit", post(bulk_submit))
+        .route("/fhir/$bulk-submit-status", post(bulk_submit))
+        .route("/fhir/status/{id}", get(status_page))
+        .route("/hook", post(hook))
         .with_state(state.clone());
     (serve(app).await, state)
 }
@@ -110,7 +124,8 @@ struct Engine {
     _manager: Arc<hie::manager::SourceManager>,
 }
 
-fn write_config(root: &Path, base: &str, probe_seconds: u64) {
+/// The engine's files: `extra` is appended to `hie.yaml`.
+fn write_config(root: &Path, base: &str, probe_seconds: u64, extra: &str) {
     std::fs::create_dir_all(root.join("sources")).unwrap();
     std::fs::create_dir_all(root.join("transforms")).unwrap();
     std::fs::create_dir_all(root.join("inbox")).unwrap();
@@ -122,7 +137,7 @@ fn write_config(root: &Path, base: &str, probe_seconds: u64) {
     std::fs::write(
         root.join("hie.yaml"),
         format!(
-            "fhir_base_url: {base}\ndatabase: data/hie.db\ndestination:\n  probe_seconds: {probe_seconds}\n"
+            "fhir_base_url: {base}\ndatabase: data/hie.db\ndestination:\n  probe_seconds: {probe_seconds}\n{extra}"
         ),
     )
     .unwrap();
@@ -158,7 +173,7 @@ async fn start(root: tempfile::TempDir, credentials: hie::credentials::Credentia
 
 async fn engine(base: &str, probe_seconds: u64) -> Engine {
     let root = tempfile::tempdir().unwrap();
-    write_config(root.path(), base, probe_seconds);
+    write_config(root.path(), base, probe_seconds, "");
     start(root, None).await
 }
 
@@ -434,7 +449,7 @@ async fn a_token_that_cannot_be_fetched_says_nothing_about_the_server() {
     let (origin, hfs) = hfs().await;
     let idp = closed().await;
     let root = tempfile::tempdir().unwrap();
-    write_config(root.path(), &format!("{origin}/fhir"), 0);
+    write_config(root.path(), &format!("{origin}/fhir"), 0, "");
     let tokens = TokenSource::new(CredentialSettings {
         token_url: format!("http://{idp}/token"),
         client_id: "hie".into(),
@@ -470,8 +485,18 @@ async fn bulk_requests_under_the_base_are_observed_and_status_pages_are_not() {
         .await
         .unwrap();
     assert_eq!(destination.snapshot().reachable, Some(true));
-    // A status URL is wherever HFS says: one that cannot be reached is not the
-    // destination's failure.
+    // The status request is a POST under the base: observed.
+    hfs.lock().unwrap().post_status = Some(503);
+    assert!(bulk.status_url("lab-results", "s1").await.is_err());
+    assert_eq!(destination.snapshot().reachable, Some(false));
+    hfs.lock().unwrap().post_status = None;
+    bulk.kickoff("lab-results", "s1", "http://hie/m")
+        .await
+        .unwrap();
+    // A status page is wherever HFS says, so it is not observed: neither one
+    // on the server's own origin answering 503, nor one that cannot be reached.
+    assert!(bulk.poll(&format!("{base}/status/1")).await.is_err());
+    assert_eq!(destination.snapshot().reachable, Some(true));
     let elsewhere = closed().await;
     assert!(
         bulk.poll(&format!("http://{elsewhere}/status/1"))
@@ -487,7 +512,7 @@ async fn bulk_requests_under_the_base_are_observed_and_status_pages_are_not() {
 async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
     let (origin, hfs) = hfs().await;
     let root = tempfile::tempdir().unwrap();
-    write_config(root.path(), &format!("{origin}/fhir"), 0);
+    write_config(root.path(), &format!("{origin}/fhir"), 0, "");
     {
         // As an older version left the store: an outage and its recovery
         // notice, both open, for this source; an outage with no notice after
@@ -500,6 +525,32 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
             .unwrap();
         db.insert_alert(Some("old-source"), "delivery", "outage", None)
             .unwrap();
+        // An outage alert whose source delivered a record after it, though
+        // no recovery notice was written (the engine restarted in between).
+        db.insert_alert(Some("sent-source"), "delivery", "outage", None)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        let file = db
+            .insert_file(
+                "sent-source",
+                "a.csv",
+                "sha-a",
+                1,
+                "processing",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        db.insert_records(file, "sent-source", &[(1, json!({}), None)])
+            .unwrap();
+        db.mark_sent(
+            db.query_json("SELECT id FROM records", []).unwrap()[0]["id"]
+                .as_i64()
+                .unwrap(),
+            &json!([]),
+        )
+        .unwrap();
     }
     let e = start(root, None).await;
     assert_eq!(
@@ -526,6 +577,15 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
         e.alerts("old-source"),
         [("delivery".into(), None, false, None)],
         "maybe still going on"
+    );
+    assert_eq!(
+        e.alerts("sent-source"),
+        [(
+            "delivery".into(),
+            None,
+            true,
+            Some("delivery to HFS recovered (recorded before recovery cleared this alert)".into())
+        )]
     );
 
     // A new outage is alerted, though the old one was never followed by a success.
@@ -591,4 +651,71 @@ fn the_probe_interval_is_checked() {
         "{too_long:#}"
     );
     assert!(load("destination:\n  probe_every: 5\n").is_err());
+}
+
+#[tokio::test]
+async fn a_connection_closed_before_the_answer_is_a_lost_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            drop(socket);
+        }
+    });
+    let client = hie::fhir::FhirClient::new(&format!("http://{addr}/fhir"));
+    let sent = client
+        .post_bundle(&json!({"resourceType": "Bundle", "type": "batch", "entry": []}))
+        .await;
+    assert!(
+        matches!(sent, Err(hie::fhir::SendError::Transient(_))),
+        "{sent:?}"
+    );
+    let s = client.destination().snapshot();
+    assert_eq!(s.reachable, Some(false));
+    assert_eq!(
+        s.last_error,
+        Some("the connection to the FHIR server was lost")
+    );
+}
+
+#[tokio::test]
+async fn the_webhook_hears_one_clear_per_recovered_outage_and_nothing_at_start() {
+    let (origin, hfs) = hfs().await;
+    let root = tempfile::tempdir().unwrap();
+    write_config(
+        root.path(),
+        &format!("{origin}/fhir"),
+        0,
+        &format!("alerts:\n  webhook_url: {origin}/hook\n"),
+    );
+    {
+        std::fs::create_dir_all(root.path().join("data")).unwrap();
+        let db = hie::db::Db::connect(&root.path().join("data/hie.db").to_string_lossy()).unwrap();
+        db.insert_alert(Some("lab-results"), "delivery", "outage", None)
+            .unwrap();
+        db.insert_alert(Some("lab-results"), "delivery_recovered", "recovered", None)
+            .unwrap();
+    }
+    let e = start(root, None).await;
+    hfs.lock().unwrap().post_status = Some(503);
+    e.seed();
+    e.runner.tick().await.unwrap();
+    until(async || hfs.lock().unwrap().hooks.len() == 1).await;
+    hfs.lock().unwrap().post_status = None;
+    e.make_due();
+    e.runner.tick().await.unwrap();
+    until(async || hfs.lock().unwrap().hooks.len() == 2).await;
+    // A recovery with nothing open posts nothing more.
+    e.seed();
+    e.runner.tick().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let hooks = hfs.lock().unwrap().hooks.clone();
+    assert_eq!(hooks.len(), 2, "{hooks:?}");
+    assert_eq!(hooks[0]["kind"], "delivery");
+    assert!(hooks[0]["cleared"].is_null(), "{hooks:?}");
+    assert_eq!(hooks[1]["cleared"], true, "{hooks:?}");
+    assert_eq!(hooks[1]["kind"], "delivery");
 }

@@ -109,7 +109,7 @@ destination:
   probe_seconds: 60   # seconds of quiet before a probe; 0 turns the probe off
 ```
 
-`probe_seconds` is at most 86400. The probe is a plain `GET` with a 10-second limit and no token: a running engine keeps probing while its token endpoint is down, and an answer such as `401` still means the server answers. With the probe off, `destination` is `null` until the first delivery.
+`probe_seconds` is at most 86400. The probe is a plain `GET` with a 10-second limit and no token: a running engine keeps probing while its token endpoint is down, and an answer such as `401` still means the server answers. With the probe off, the members of `destination` stay `null` (and `consecutive_failures` `0`) until the first delivery.
 
 ### Credentials and the secret key
 

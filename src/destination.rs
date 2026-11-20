@@ -39,7 +39,8 @@ impl Failure {
             Failure::Lost => "the connection to the FHIR server was lost",
             Failure::Status(502) => "the FHIR server answered HTTP 502",
             Failure::Status(503) => "the FHIR server answered HTTP 503",
-            Failure::Status(_) => "the FHIR server answered HTTP 504",
+            Failure::Status(504) => "the FHIR server answered HTTP 504",
+            Failure::Status(_) => "the FHIR server answered with a server error",
         }
     }
 }
@@ -112,34 +113,52 @@ impl Drop for InFlight {
 }
 
 impl InFlight {
-    /// Records how the request went, now.
-    pub fn observe(&self, outcome: Result<(), Failure>) {
+    /// Records how the request went, now. `detail` is for the log only.
+    pub fn observe(&self, outcome: Result<(), Failure>, detail: &str) {
         self.destination
-            .record(self.started, self.via, outcome, Instant::now());
+            .record(self.started, self.via, outcome, detail, Instant::now());
     }
 
     /// Records the result of sending the request. A request that could not be
     /// built, or that went round in redirects, says nothing about the server.
     pub fn observe_send(&self, result: &Result<reqwest::Response, reqwest::Error>) {
         if let Some(outcome) = classify(result) {
-            if let Err(e) = result {
-                tracing::debug!(
-                    "a request to the FHIR server failed: {}",
-                    crate::bulk::safe_reason(&e.to_string())
-                );
-            }
-            self.observe(outcome);
+            let detail = match result {
+                Ok(response) => format!("HTTP {}", response.status().as_u16()),
+                Err(e) => crate::bulk::safe_reason(&error_chain(e)),
+            };
+            self.observe(outcome, &detail);
         }
+    }
+}
+
+/// An error and every error under it, `outer: inner: …`: a `reqwest::Error`
+/// alone says only "error sending request", not "connection refused" or why a
+/// certificate was refused.
+pub fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut next = e.source();
+    while let Some(inner) = next {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        next = inner.source();
+    }
+    text
+}
+
+/// What an HTTP status says about the server: 502 to 504 are what a server or
+/// its proxy answers when the service is down; anything else is an answer.
+pub fn status_outcome(status: u16) -> Result<(), Failure> {
+    match status {
+        502..=504 => Err(Failure::Status(status)),
+        _ => Ok(()),
     }
 }
 
 /// What a request's result says about the server; `None` when it says nothing.
 pub fn classify(result: &Result<reqwest::Response, reqwest::Error>) -> Option<Result<(), Failure>> {
     match result {
-        Ok(response) => Some(match response.status().as_u16() {
-            status @ 502..=504 => Err(Failure::Status(status)),
-            _ => Ok(()),
-        }),
+        Ok(response) => Some(status_outcome(response.status().as_u16())),
         Err(e) if e.is_builder() || e.is_redirect() => None,
         // A connect timeout is both: it is a connection that could not be made.
         Err(e) if e.is_connect() => Some(Err(Failure::Connect)),
@@ -173,11 +192,15 @@ impl Destination {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A delivery's request starts now.
+    /// A delivery's request starts now. The instant is taken under the lock,
+    /// so starts are ordered as they register.
     pub fn start(self: &Arc<Self>) -> InFlight {
-        self.begin(Via::Delivery, Instant::now())
+        let mut s = self.lock();
+        let now = Instant::now();
+        self.begin_locked(&mut s, Via::Delivery, now)
     }
 
+    #[cfg(test)]
     fn begin(self: &Arc<Self>, via: Via, now: Instant) -> InFlight {
         let mut s = self.lock();
         self.begin_locked(&mut s, via, now)
@@ -200,12 +223,17 @@ impl Destination {
     /// none started or ended within `every`. Checked and started under one
     /// lock, so a delivery either counts against the idleness or starts after
     /// the probe, and outweighs it.
-    fn try_probe(self: &Arc<Self>, now: Instant, every: Duration) -> Option<InFlight> {
+    fn try_probe(self: &Arc<Self>, every: Duration) -> Option<InFlight> {
         let mut s = self.lock();
+        let now = Instant::now();
+        self.admit(&mut s, now, every)
+    }
+
+    fn admit(self: &Arc<Self>, s: &mut State, now: Instant, every: Duration) -> Option<InFlight> {
         let idle = s.in_flight == 0
             && s.last_activity
                 .is_none_or(|at| now.saturating_duration_since(at) >= every);
-        idle.then(|| self.begin_locked(&mut s, Via::Probe, now))
+        idle.then(|| self.begin_locked(s, Via::Probe, now))
     }
 
     /// How long until the destination may be idle for a probe.
@@ -225,7 +253,14 @@ impl Destination {
     /// after. Neither does a probe's answer while deliveries see the server
     /// answer 502 to 504, which `/metadata` may not show; once no delivery has
     /// had one for `authority`, the probe's answer counts again.
-    fn record(&self, started: Instant, via: Via, outcome: Result<(), Failure>, now: Instant) {
+    fn record(
+        &self,
+        started: Instant,
+        via: Via,
+        outcome: Result<(), Failure>,
+        detail: &str,
+        now: Instant,
+    ) {
         let mut s = self.lock();
         if s.latest_start.is_some_and(|latest| started < latest) {
             return;
@@ -263,8 +298,13 @@ impl Destination {
             }
             Err(failure) => {
                 if s.reachable != Some(false) {
-                    tracing::warn!("the FHIR server cannot be reached: {}", failure.sentence());
+                    tracing::warn!(
+                        "the FHIR server cannot be reached: {} ({detail})",
+                        failure.sentence()
+                    );
                     s.since_ms = Some(at);
+                } else {
+                    tracing::debug!("the FHIR server still cannot be reached: {detail}");
                 }
                 s.reachable = Some(false);
                 s.failure = Some(failure);
@@ -324,10 +364,9 @@ pub fn spawn_probe(
                 let Some(d) = destination.upgrade() else {
                     return;
                 };
-                let now = Instant::now();
-                match d.try_probe(now, every) {
+                match d.try_probe(every) {
                     Some(probe) => Ok(probe),
-                    None => Err(d.probe_wait(now, every)),
+                    None => Err(d.probe_wait(Instant::now(), every)),
                 }
             };
             match probe {
@@ -382,6 +421,20 @@ mod tests {
     }
 
     #[test]
+    fn only_502_to_504_say_the_server_is_down() {
+        for status in [200, 201, 301, 400, 401, 403, 404, 409, 429, 500, 501, 505] {
+            assert_eq!(status_outcome(status), Ok(()), "{status}");
+        }
+        for status in [502, 503, 504] {
+            assert_eq!(status_outcome(status), Err(Failure::Status(status)));
+        }
+        assert_eq!(
+            Failure::Status(500).sentence(),
+            "the FHIR server answered with a server error"
+        );
+    }
+
+    #[test]
     fn nothing_observed_is_unknown() {
         let d = destination();
         assert_eq!(
@@ -400,12 +453,18 @@ mod tests {
     fn failures_count_until_an_answer_and_since_marks_the_change() {
         let d = destination();
         let t0 = Instant::now();
-        d.record(t0, Via::Delivery, Err(Failure::Connect), t0);
+        d.record(t0, Via::Delivery, Err(Failure::Connect), "test", t0);
         let first = d.snapshot();
         assert_eq!(first.reachable, Some(false));
         assert_eq!(first.consecutive_failures, 1);
         std::thread::sleep(ms(3));
-        d.record(t0 + ms(1), Via::Delivery, Err(Failure::Timeout), t0 + ms(2));
+        d.record(
+            t0 + ms(1),
+            Via::Delivery,
+            Err(Failure::Timeout),
+            "test",
+            t0 + ms(2),
+        );
         let second = d.snapshot();
         assert_eq!(second.since_ms, first.since_ms, "same outage, same since");
         assert!(second.observed_ms > first.observed_ms);
@@ -415,7 +474,7 @@ mod tests {
             Some("the FHIR server did not answer in time")
         );
         std::thread::sleep(ms(3));
-        d.record(t0 + ms(3), Via::Delivery, Ok(()), t0 + ms(4));
+        d.record(t0 + ms(3), Via::Delivery, Ok(()), "test", t0 + ms(4));
         let back = d.snapshot();
         assert_eq!(back.reachable, Some(true));
         assert!(back.since_ms > second.since_ms);
@@ -428,8 +487,14 @@ mod tests {
         let d = destination();
         let t0 = Instant::now();
         // A slow request times out after a newer one got an answer.
-        d.record(t0 + ms(10), Via::Delivery, Ok(()), t0 + ms(11));
-        d.record(t0, Via::Delivery, Err(Failure::Timeout), t0 + ms(120));
+        d.record(t0 + ms(10), Via::Delivery, Ok(()), "test", t0 + ms(11));
+        d.record(
+            t0,
+            Via::Delivery,
+            Err(Failure::Timeout),
+            "test",
+            t0 + ms(120),
+        );
         assert_eq!(d.snapshot().reachable, Some(true));
     }
 
@@ -440,12 +505,13 @@ mod tests {
         let d = destination();
         let probe = d.begin(Via::Probe, t0);
         let delivery = d.begin(Via::Delivery, t0 + ms(1));
-        d.record(probe.started, Via::Probe, Ok(()), t0 + ms(2));
+        d.record(probe.started, Via::Probe, Ok(()), "test", t0 + ms(2));
         assert_eq!(d.snapshot().reachable, None);
         d.record(
             delivery.started,
             Via::Delivery,
             Err(Failure::Status(503)),
+            "test",
             t0 + ms(3),
         );
         assert_eq!(d.snapshot().reachable, Some(false));
@@ -457,9 +523,10 @@ mod tests {
             delivery.started,
             Via::Delivery,
             Err(Failure::Status(503)),
+            "test",
             t0 + ms(2),
         );
-        d.record(probe.started, Via::Probe, Ok(()), t0 + ms(3));
+        d.record(probe.started, Via::Probe, Ok(()), "test", t0 + ms(3));
         let s = d.snapshot();
         assert_eq!(s.reachable, Some(false));
         assert_eq!(s.consecutive_failures, 1);
@@ -470,20 +537,26 @@ mod tests {
         let d = destination();
         d.lock().authority = ms(100);
         let t0 = Instant::now();
-        d.record(t0, Via::Delivery, Err(Failure::Status(503)), t0);
+        d.record(t0, Via::Delivery, Err(Failure::Status(503)), "test", t0);
         let since = d.snapshot().since_ms;
         // The probe answers, within the window: no change.
-        d.record(t0 + ms(10), Via::Probe, Ok(()), t0 + ms(10));
+        d.record(t0 + ms(10), Via::Probe, Ok(()), "test", t0 + ms(10));
         assert_eq!(d.snapshot().reachable, Some(false));
         // A probe that fails counts, and does not end the delivery's authority.
-        d.record(t0 + ms(20), Via::Probe, Err(Failure::Connect), t0 + ms(20));
-        d.record(t0 + ms(30), Via::Probe, Ok(()), t0 + ms(30));
+        d.record(
+            t0 + ms(20),
+            Via::Probe,
+            Err(Failure::Connect),
+            "test",
+            t0 + ms(20),
+        );
+        d.record(t0 + ms(30), Via::Probe, Ok(()), "test", t0 + ms(30));
         let s = d.snapshot();
         assert_eq!(s.reachable, Some(false));
         assert_eq!(s.since_ms, since);
         assert_eq!(s.consecutive_failures, 2);
         // No delivery for longer than the window: the probe's answer counts.
-        d.record(t0 + ms(150), Via::Probe, Ok(()), t0 + ms(150));
+        d.record(t0 + ms(150), Via::Probe, Ok(()), "test", t0 + ms(150));
         assert_eq!(d.snapshot().reachable, Some(true));
     }
 
@@ -491,12 +564,18 @@ mod tests {
     fn a_delivery_answer_ends_the_outage_at_once() {
         let d = destination();
         let t0 = Instant::now();
-        d.record(t0, Via::Delivery, Err(Failure::Status(502)), t0);
-        d.record(t0 + ms(1), Via::Delivery, Ok(()), t0 + ms(1));
+        d.record(t0, Via::Delivery, Err(Failure::Status(502)), "test", t0);
+        d.record(t0 + ms(1), Via::Delivery, Ok(()), "test", t0 + ms(1));
         assert_eq!(d.snapshot().reachable, Some(true));
         // And the probe's answers count again.
-        d.record(t0 + ms(2), Via::Probe, Err(Failure::Connect), t0 + ms(2));
-        d.record(t0 + ms(3), Via::Probe, Ok(()), t0 + ms(3));
+        d.record(
+            t0 + ms(2),
+            Via::Probe,
+            Err(Failure::Connect),
+            "test",
+            t0 + ms(2),
+        );
+        d.record(t0 + ms(3), Via::Probe, Ok(()), "test", t0 + ms(3));
         assert_eq!(d.snapshot().reachable, Some(true));
     }
 
@@ -507,19 +586,22 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(d.probe_wait(t0, every), Duration::ZERO, "never observed");
         let delivery = d.begin(Via::Delivery, t0);
-        assert!(d.try_probe(t0 + ms(1), every).is_none(), "one in flight");
+        assert!(
+            d.admit(&mut d.lock(), t0 + ms(1), every).is_none(),
+            "one in flight"
+        );
         assert_eq!(d.probe_wait(t0 + ms(1), every), every);
         drop(delivery);
         let ended = d.lock().last_activity.unwrap();
         assert!(
-            d.try_probe(ended + Duration::from_secs(10), every)
+            d.admit(&mut d.lock(), ended + Duration::from_secs(10), every)
                 .is_none()
         );
         assert_eq!(
             d.probe_wait(ended + Duration::from_secs(10), every),
             Duration::from_secs(50)
         );
-        let probe = d.try_probe(ended + every, every);
+        let probe = d.admit(&mut d.lock(), ended + every, every);
         assert!(probe.is_some());
         assert_eq!(d.lock().in_flight, 1);
         drop(probe);
