@@ -657,6 +657,7 @@ impl FeedRunner {
                 }
             };
         let mut taken = 0;
+        let mut stage_count = 0usize;
         for (path, data) in entries {
             let extension = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
             if !wanted.contains(&extension.as_str()) {
@@ -678,7 +679,10 @@ impl FeedRunner {
             // On the source_objects bulk path HFS reads the entry, not the zip: the
             // entry is staged where HFS can fetch it and kept until the receipts.
             let staged = if self.bulk.is_some() && !self.bulk_transformed {
-                let base = format!("{}.ndjson", taken + 1);
+                // Each entry staged gets a name of its own, also after one that
+                // turned out to be taken already.
+                stage_count += 1;
+                let base = format!("{stage_count}.ndjson");
                 match self.source().put_unpacked(container, &base, &data).await? {
                     Some(key) => Some((key, "store")),
                     None => {
@@ -708,7 +712,9 @@ impl FeedRunner {
                 &data,
             )?;
             if let Admission::AlreadyTaken(original) = admission {
-                // Taken meanwhile: a duplicate, and its staged copy goes.
+                // Taken meanwhile: a duplicate. A copy staged on disk goes; one
+                // staged in the store stays where it was written (the source has
+                // no way to remove a single object), under a name not used again.
                 if let Some((path, "staged")) = &staged {
                     let _ = std::fs::remove_file(path);
                 }
@@ -761,16 +767,13 @@ impl FeedRunner {
                         // Not the row's fault: leave it and the rest for the next pass.
                         tracing::warn!(feed = %self.feed.id, line = item.line, "transform cannot finish now, will retry: {message}");
                         // Logged once for the record and reason while this runner
-                        // runs; again when the reason changes.
+                        // runs; again when the reason changes. Remembered only once
+                        // stored, so an event that could not be is tried again.
                         let seen = (item.id, item.revision, message);
-                        let repeat = {
-                            let mut last = self.last_transient.lock().expect("transient lock");
-                            let repeat = last.as_ref() == Some(&seen);
-                            *last = Some(seen.clone());
-                            repeat
-                        };
-                        if !repeat {
-                            self.db.transform_deferred(item, &seen.2)?;
+                        let repeat = self.last_transient.lock().expect("transient lock").as_ref()
+                            == Some(&seen);
+                        if !repeat && self.db.transform_deferred(item, &seen.2)? {
+                            *self.last_transient.lock().expect("transient lock") = Some(seen);
                         }
                         return Ok(());
                     }

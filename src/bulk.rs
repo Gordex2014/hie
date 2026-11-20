@@ -49,7 +49,9 @@ pub fn historical_origin(
 /// becomes its origin followed by `/…`: its path, query, fragment and user
 /// information may carry signatures and tokens. Brackets and parentheses are
 /// part of a URL, so a bracketed IPv6 host or a path with parentheses goes with
-/// it. The rest of the reason, the operation, the HTTP status and the error, is
+/// it. A relative target with a query (a path such as `/receipts/1?sig=…`, as a
+/// server may echo one) keeps its path and loses its query: `/receipts/1?…`.
+/// The rest of the reason, the operation, the HTTP status and the error, is
 /// kept.
 pub fn safe_reason(reason: &str) -> String {
     let lower = reason.to_ascii_lowercase();
@@ -68,6 +70,34 @@ pub fn safe_reason(reason: &str) -> String {
         at = end;
     }
     out.push_str(&reason[at..]);
+    cut_relative_queries(&out)
+}
+
+/// Every word (up to whitespace, a quote, `<` or `>`) where a `/` comes before
+/// a `?` loses what follows the `?`.
+fn cut_relative_queries(text: &str) -> String {
+    let stop = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>');
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        match (word.find('/'), word.find('?')) {
+            (Some(slash), Some(query)) if slash < query => {
+                out.push_str(&word[..query]);
+                out.push_str("?…");
+            }
+            _ => out.push_str(word),
+        }
+        word.clear();
+    };
+    for c in text.chars() {
+        if stop(c) {
+            flush(&mut word, &mut out);
+            out.push(c);
+        } else {
+            word.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
     out
 }
 
@@ -449,6 +479,12 @@ mod tests {
             safe_reason("no URL here, HTTP 503"),
             "no URL here, HTTP 503"
         );
+        // A relative target keeps its path, not its query.
+        assert_eq!(
+            safe_reason(r#"cannot read "/receipts/1?X-Amz-Signature=CANARY" (or ./r?sig=x): 404"#),
+            r#"cannot read "/receipts/1?…" (or ./r?… 404"#
+        );
+        assert_eq!(safe_reason("is it done? yes"), "is it done? yes");
     }
 
     #[test]

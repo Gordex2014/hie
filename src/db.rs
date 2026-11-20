@@ -154,6 +154,12 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("alerts", "channels", "TEXT"),
 ];
 
+/// Indexes made after the added columns, since they may name one.
+const ADDED_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS records_file_id ON records(file_id, id);
+CREATE INDEX IF NOT EXISTS records_submission_id ON records(submission, id);
+";
+
 /// A rule in words: "nothing arrives for 2 hours", "more than 1% of a load's rows
 /// fail", "the file is not there by 06:00", "HFS cannot be reached after 5 attempts".
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -882,21 +888,58 @@ fn insert_record_rows(
     Ok(rejected)
 }
 
-/// Ids the chunked statement `sql` changes, `INSERT_ROWS_PER_STATEMENT` at a time, until a
-/// statement changes fewer: only the ids are kept (with one more column when the
-/// statement returns it), never the rows. Each statement must stop matching the
-/// rows it changed.
-fn changed_ids(tx: &mut Tx, sql: &str, params: &[Param]) -> Result<Vec<(i64, i64)>> {
-    let mut ids = Vec::new();
+/// Updates the records that match `guard`, `INSERT_ROWS_PER_STATEMENT` at a
+/// time, paged by id: each step selects the next ids that match (locked on
+/// PostgreSQL), then updates exactly those, with the guard checked again on
+/// each row, so a record changed meanwhile is left alone. `guard` uses the
+/// parameters `$1..$g` (`guard_params`), `set` the ones after (`set_params`).
+/// Only the ids changed are kept, with the second column `returning` names
+/// (or 0): never the rows.
+fn update_records_paged(
+    tx: &mut Tx,
+    guard: &str,
+    guard_params: &[Param],
+    set: &str,
+    set_params: &[Param],
+    returning: &str,
+) -> Result<Vec<(i64, i64)>> {
+    let g = guard_params.len();
+    let select = format!(
+        "SELECT id FROM records WHERE {guard} AND id > ${} ORDER BY id LIMIT {INSERT_ROWS_PER_STATEMENT}{}",
+        g + 1,
+        tx.for_update()
+    );
+    let mut changed = Vec::new();
+    let mut last = 0i64;
     loop {
-        let rows = tx.query(sql, params)?;
-        let n = rows.len();
-        ids.extend(rows.iter().map(|r| (r.i64(0), r.opt_i64(1).unwrap_or(0))));
-        if n < INSERT_ROWS_PER_STATEMENT {
-            ids.sort_unstable();
-            return Ok(ids);
+        let mut values = guard_params.to_vec();
+        values.push(Param::Int(last));
+        let ids: Vec<i64> = tx
+            .query(&select, &values)?
+            .iter()
+            .map(|r| r.i64(0))
+            .collect();
+        let Some(&end) = ids.last() else {
+            break;
+        };
+        let mut values = guard_params.to_vec();
+        values.extend_from_slice(set_params);
+        values.extend(ids.iter().map(|id| Param::Int(*id)));
+        let rows = tx.query(
+            &format!(
+                "UPDATE records SET {set} WHERE id IN ({}) AND {guard} RETURNING {returning}",
+                marks(g + set_params.len() + 1, ids.len())
+            ),
+            &values,
+        )?;
+        changed.extend(rows.iter().map(|r| (r.i64(0), r.opt_i64(1).unwrap_or(0))));
+        last = end;
+        if ids.len() < INSERT_ROWS_PER_STATEMENT {
+            break;
         }
     }
+    changed.sort_unstable();
+    Ok(changed)
 }
 
 /// A new submission's row, waiting for its kick-off.
@@ -1037,6 +1080,7 @@ impl Db {
                 )?;
             }
         }
+        conn.execute_batch(ADDED_INDEXES)?;
         Ok(Self {
             conn: Mutex::new(Conn::Sqlite(conn)),
             postgres: false,
@@ -1079,6 +1123,7 @@ impl Db {
                 kind.replace("INTEGER", "BIGINT")
             ))?;
         }
+        client.batch(ADDED_INDEXES)?;
         Ok(Self {
             conn: Mutex::new(Conn::Postgres(client)),
             postgres: true,
@@ -1496,19 +1541,15 @@ impl Db {
             let Some(feed) = tx.query_one(&lock, &params![file_id])?.map(|r| r.string(0)) else {
                 return Ok(0);
             };
-            let ids = changed_ids(
+            let ids = update_records_paged(
                 tx,
-                &format!(
-                    "UPDATE records SET status = 'received', resources = NULL, error_kind = NULL, error = NULL,
-                            response = NULL, attempts = 0, next_attempt_at = 0, submission = NULL,
-                            revision = revision + 1, updated_at = $3
-                     WHERE id IN (SELECT id FROM records
-                                  WHERE file_id = $1 AND status = 'rejected'
-                                    AND (CAST($2 AS TEXT) IS NULL OR error = CAST($2 AS TEXT))
-                                  ORDER BY id LIMIT {INSERT_ROWS_PER_STATEMENT})
-                     RETURNING id"
-                ),
-                &params![file_id, reason, now_ms()],
+                "file_id = $1 AND status = 'rejected' AND (CAST($2 AS TEXT) IS NULL OR error = CAST($2 AS TEXT))",
+                &params![file_id, reason],
+                "status = 'received', resources = NULL, error_kind = NULL, error = NULL,
+                 response = NULL, attempts = 0, next_attempt_at = 0, submission = NULL,
+                 revision = revision + 1, updated_at = $3",
+                &params![now_ms()],
+                "id",
             )?;
             if ids.is_empty() {
                 tx.rollback = true;
@@ -2320,15 +2361,13 @@ impl Db {
                 return Ok(None);
             };
             let (feed, submission_id) = (sub.string(0), sub.string(1));
-            let rows = changed_ids(
+            let rows = update_records_paged(
                 tx,
-                &format!(
-                    "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, response = $4, updated_at = $5
-                     WHERE id IN (SELECT id FROM records WHERE submission = $1 AND status = 'submitted'
-                                  ORDER BY id LIMIT {INSERT_ROWS_PER_STATEMENT})
-                     RETURNING id, file_id"
-                ),
-                &params![token, kind, reason, response.to_string(), now],
+                "submission = $1 AND status = 'submitted'",
+                &params![token],
+                "status = 'rejected', error_kind = $2, error = $3, response = $4, updated_at = $5",
+                &params![kind, reason, response.to_string(), now],
+                "id, file_id",
             )?;
             let text = crate::events::reason_text(reason);
             let detail = json!({"submission": submission_id, "run": crate::bulk::run_key(token)});
@@ -2399,15 +2438,13 @@ impl Db {
             else {
                 return Ok(0);
             };
-            let ids = changed_ids(
+            let ids = update_records_paged(
                 tx,
-                &format!(
-                    "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, updated_at = $4
-                     WHERE id IN (SELECT id FROM records WHERE file_id = $1 AND status = 'pending' AND submission IS NULL
-                                  ORDER BY id LIMIT {INSERT_ROWS_PER_STATEMENT})
-                     RETURNING id"
-                ),
-                &params![file_id, kind, error, now_ms()],
+                "file_id = $1 AND status = 'pending' AND submission IS NULL",
+                &params![file_id],
+                "status = 'rejected', error_kind = $2, error = $3, updated_at = $4",
+                &params![kind, error, now_ms()],
+                "id",
             )?;
             let text = crate::events::reason_text(error);
             tx.insert_each(&ids, |(id, _)| {

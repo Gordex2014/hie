@@ -859,7 +859,10 @@ fn event_query(raw: Option<&str>) -> Result<crate::db::EventQuery, ApiError> {
                 "since must be an RFC 3339 instant, such as 2026-11-20T08:00:00Z",
             )
         })?;
-        q.since = Some(at.timestamp_millis());
+        // Events are stored to the millisecond: a finer instant starts at the
+        // next one, so nothing before it is listed.
+        let rounded_up = at.timestamp_subsec_nanos() % 1_000_000 != 0;
+        q.since = Some(at.timestamp_millis() + i64::from(rounded_up));
     }
     if let Some(cursor) = given.remove("cursor") {
         let id = cursor

@@ -86,7 +86,8 @@ async fn status(State(base): State<String>, Path(which): Path<String>) -> Respon
                 "diagnostics": "could not fetch https://b.s3.amazonaws.com/a.ndjson?X-Amz-Signature=CANARY-REFUSED-SIGNATURE&X-Amz-Security-Token=CANARY-REFUSED-TOKEN \
                     nor https://[2001:db8::1]:9000/b/a.ndjson?X-Amz-Signature=CANARY-REFUSED-V6 \
                     nor https://b.test/a(CANARY-REFUSED-PAREN)/b?sig=CANARY-REFUSED-SIG; \
-                    manifest /bulk/hie-canary-refused/manifest.json"}]})),
+                    manifest /bulk/hie-canary-refused/manifest.json; \
+                    receipts /receipts/1?X-Amz-Signature=CANARY-REFUSED-RELATIVE"}]})),
         )
             .into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),

@@ -92,13 +92,13 @@ Nothing else is an event: a Try, a worker that cannot start (no record is involv
 - An outcome worked out for a record that a person put back meanwhile (a Retry or a reprocess while it was being transformed or sent) changes nothing and writes no event; the record goes through again.
 - On a store upgraded from an earlier version, a submission that was partly settled before the upgrade counts in `submission.settled` only the records settled after it.
 
-**Text.** A `reason` is the engine's own text for the fact (the stored error), with every URL cut to its origin followed by `/…` (a signed URL's path and query never appear), and at most 500 characters. A request target the engine names in a failure (a status, manifest or receipt URL, absolute or relative) is only ever its origin, or `<URL>`. On the bulk path the submission's token is replaced by `<token>` wherever it would appear, in the records' stored errors and answers too. No event carries a submission's token, its status URL or a server's full answer.
+**Text.** A `reason` is the engine's own text for the fact (the stored error), with every URL cut to its origin followed by `/…` (a signed URL's path and query never appear), and at most 500 characters. A request target the engine names in a failure (a status, manifest or receipt URL, absolute or relative) is only ever its origin, or `<URL>`. A relative target that a server's answer echoes keeps its path and loses its query (`/receipts/1?…`). On the bulk path the submission's token is replaced by `<token>` wherever it would appear, in the records' stored errors and answers too. No event carries a submission's token, its status URL or a server's full answer.
 
 **Reading.** `GET /api/events` lists events oldest first, by `id`:
 
 - `source`: one source id.
 - `kind`: one or more kinds or families (`record`, `load`, `submission`), separated by commas.
-- `since`: an RFC 3339 instant (`2026-11-20T08:00:00Z`). Only events stored at or after it (`at >= since`) are listed, with or without a cursor. Without a cursor it also sets where the page starts: at the first event, by id, stored at or after it.
+- `since`: an RFC 3339 instant (`2026-11-20T08:00:00Z`). Only events stored at or after it (`at >= since`) are listed, with or without a cursor. Events are stored to the millisecond, so a finer instant counts from the next millisecond. Without a cursor it also sets where the page starts: at the first event, by id, stored at or after it.
 - `cursor`: the `next_cursor` of an earlier answer, to continue after it. Its text is opaque (today `e1.` and a number). Give the same filters again with it. A cursor stays valid after its event is purged.
 - `limit`: 1 to 1000, 100 by default.
 

@@ -457,6 +457,7 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - Records, loads and submissions are still not purged (decision 5 keeps a records retention open).
 - The newest alert is always kept, whatever its age. An open alert of a rule whose source was deleted while it was open stays until the rule is deleted.
 - An outcome computed for a superseded revision of a record is discarded, and the record is transformed and sent again; so is a submission whose records changed while it was built.
+- A zip entry whose content turns out to be taken already, after it was staged in the source's store for `$bulk-submit`, leaves that copy under the store's `unpacked/` prefix: the source has no way to remove one object, and the name is not used again.
 - A transform that cannot finish a record now is logged once per record and reason while its runner runs, not on every pass, so a long wait on a terminology server is one event per record, not one per poll. A record reprocessed while held by a submission keeps that submission, as before, and is not picked up again by the bulk path.
 - `at` is the writer's clock and may be out of order with `id`; the log is ordered by `id`. A submission partly settled before the upgrade counts only the records settled after it.
 

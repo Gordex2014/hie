@@ -394,6 +394,17 @@ async fn each_rejection_is_stored_with_its_event_before_the_next_record_is_trans
 }
 
 /// A SQLite trigger that refuses every event, or its removal.
+/// A SQLite trigger that refuses the events of one kind.
+fn refuse_events_of(db_path: &Path, kind: &str) {
+    let c = rusqlite::Connection::open(db_path).unwrap();
+    c.busy_timeout(Duration::from_secs(5)).unwrap();
+    c.execute_batch(&format!(
+        "CREATE TRIGGER refuse_events BEFORE INSERT ON events WHEN NEW.kind = '{kind}' \
+         BEGIN SELECT RAISE(ABORT, 'events refused'); END;"
+    ))
+    .unwrap();
+}
+
 fn refuse_events(db_path: &Path, refuse: bool) {
     let c = rusqlite::Connection::open(db_path).unwrap();
     c.busy_timeout(Duration::from_secs(5)).unwrap();
@@ -629,6 +640,15 @@ async fn a_transform_that_cannot_finish_now_is_logged_once_per_reason_and_runner
     let (manager, state) = gate_engine(dir.path(), &base, &python);
     std::fs::write(dir.path().join("inbox/rows.csv"), "id,mode\n1,transient\n").unwrap();
     let runner = manager.runner("gate").unwrap();
+    if test_database_url().is_none() {
+        // The event cannot be stored on the first pass: it is not taken as
+        // logged, and the next pass logs it.
+        let db_path = dir.path().join("data/hie.db");
+        refuse_events_of(&db_path, "record.attempt_failed");
+        assert!(runner.tick().await.is_err());
+        assert!(!kinds(&events(&state.db)).contains(&"record.attempt_failed".to_string()));
+        refuse_events(&db_path, false);
+    }
     runner.tick().await.unwrap();
     runner.tick().await.unwrap();
     // Line 1 is the header.
@@ -748,7 +768,8 @@ fn echoed(manifest_url: &str) -> String {
     let path = &manifest_url[manifest_url.find("/bulk/").unwrap()..];
     format!(
         "could not fetch {path} (also tried https://[::1]:8443/b/a.ndjson?X-Amz-Signature=CANARY-V6 \
-         and https://h.test/a(CANARY-PAREN)/b?sig=CANARY-SIG)"
+         and https://h.test/a(CANARY-PAREN)/b?sig=CANARY-SIG); receipts at \
+         /receipts/1?X-Amz-Signature=CANARY-RELATIVE"
     )
 }
 
@@ -946,6 +967,7 @@ async fn a_refused_submission_rejects_its_records_and_keeps_what_was_echoed_out(
         let diagnostics = row["response"]["issue"][0]["diagnostics"].as_str().unwrap();
         assert!(
             diagnostics.contains("/bulk/<token>/manifest.json")
+                && diagnostics.contains("/receipts/1?…")
                 && diagnostics.contains("https://[::1]:8443/…")
                 && diagnostics.contains("https://h.test/…"),
             "{diagnostics}"
@@ -1216,6 +1238,12 @@ async fn events_are_paged_in_order_and_a_cursor_only_moves_forward() {
     ))
     .await;
     assert_eq!(ids(&page), &from[2..]);
+    // A finer instant starts at the next millisecond: the event at :03.000 is
+    // before it.
+    let (_, page) = get_json(&format!("{api}/api/events?since=2027-01-15T08:00:03.0001Z")).await;
+    assert_eq!(ids(&page), &from[1..]);
+    let (_, page) = get_json(&format!("{api}/api/events?since=2027-01-15T08:00:03.000Z")).await;
+    assert_eq!(ids(&page), from);
     let (_, page) = get_json(&format!("{api}/api/events?since=2030-01-01T00:00:00Z")).await;
     assert!(ids(&page).is_empty());
     let last = format!("e1.{}", all.last().unwrap()["id"]);
@@ -1484,6 +1512,115 @@ fn an_alert_cleared_while_the_purge_waits_for_it_is_kept_on_postgres() {
     let purged = purger.join().unwrap().unwrap();
     assert_eq!(purged.alerts, 1);
     assert_eq!(alert_ids(&db), [open, newest]);
+}
+
+#[test]
+fn set_writes_over_more_than_one_chunk_change_and_log_every_row_once() {
+    let db = Db::in_memory().unwrap();
+    let ids_of = |file: i64| -> Vec<i64> {
+        db.query_json(
+            "SELECT id FROM records WHERE file_id = $1 ORDER BY id",
+            hie::db::params![file],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect()
+    };
+    let logged = |kind: &str, from: usize| -> Vec<i64> {
+        let mut ids: Vec<i64> = events(&db)[from..]
+            .iter()
+            .filter(|e| e["kind"] == kind)
+            .map(|e| e["record_id"].as_i64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+
+    // A Retry of 450 rejected rows.
+    let file = load(&db, "s", "retried", 450, 0);
+    let before = events(&db).len();
+    assert_eq!(db.reprocess_rejected(file, None).unwrap(), 450);
+    assert_eq!(logged("record.retried", before), ids_of(file));
+    assert_eq!(events(&db)[before]["detail"]["retried"], 450);
+
+    // 450 pending rows of a file that cannot be handed over.
+    let file = load(&db, "s", "unsubmitted", 0, 450);
+    let ids = ids_of(file);
+    db.mark_passthrough(&ids.iter().map(|id| (*id, 0)).collect::<Vec<_>>())
+        .unwrap();
+    let before = events(&db).len();
+    assert_eq!(
+        db.reject_unsubmitted(file, "server", "cannot be handed over")
+            .unwrap(),
+        450
+    );
+    assert_eq!(logged("record.rejected", before), ids);
+
+    // A refused submission of 450 rows.
+    let file = load(&db, "s", "refused", 0, 450);
+    let ids = ids_of(file);
+    db.mark_passthrough(&ids.iter().map(|id| (*id, 0)).collect::<Vec<_>>())
+        .unwrap();
+    assert!(
+        db.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 450)])
+            .unwrap()
+    );
+    let before = events(&db).len();
+    assert_eq!(
+        db.reject_submission("t", "server", "HTTP 400", &json!({}))
+            .unwrap(),
+        Some(450)
+    );
+    assert_eq!(logged("record.rejected", before), ids);
+    let refused = events(&db).pop().unwrap();
+    assert_eq!(refused["kind"], "submission.refused");
+    assert_eq!(refused["detail"]["records"], 450);
+    let statuses = db
+        .query_json(
+            "SELECT DISTINCT status FROM records WHERE file_id = $1",
+            hie::db::params![file],
+        )
+        .unwrap();
+    assert_eq!(statuses, [json!({"status": "rejected"})]);
+}
+
+#[test]
+fn a_record_put_back_while_its_file_is_rejected_stays_put_back_on_postgres() {
+    if test_database_url().is_none() {
+        eprintln!("skipping: HIE_TEST_DATABASE_URL is not set");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open(&dir.path().join("hie.db")).unwrap());
+    let file = load(&db, "s", "a", 0, 2);
+    let (held, other_id) = (record_id(&db, "s", 1), record_id(&db, "s", 2));
+    db.mark_passthrough(&[(held, 0), (other_id, 0)]).unwrap();
+
+    // A person's reprocess on another instance, not committed yet.
+    let mut other = raw_client(&db).unwrap();
+    other.batch_execute("BEGIN").unwrap();
+    other
+        .execute(
+            "UPDATE records SET status = 'received', revision = revision + 1 WHERE id = $1",
+            &[&held],
+        )
+        .unwrap();
+    let rejecting = {
+        let db = db.clone();
+        std::thread::spawn(move || db.reject_unsubmitted(file, "server", "cannot be handed over"))
+    };
+    wait_until_blocked_by(backend_pid(&mut other));
+    other.batch_execute("COMMIT").unwrap();
+
+    assert_eq!(rejecting.join().unwrap().unwrap(), 1);
+    assert_eq!(status(&db, held), "received");
+    assert_eq!(status(&db, other_id), "rejected");
+    assert!(of_record(&events(&db), held).is_empty());
+    assert_eq!(
+        kinds(&of_record(&events(&db), other_id)),
+        ["record.rejected"]
+    );
 }
 
 #[test]
