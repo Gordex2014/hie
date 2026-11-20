@@ -450,8 +450,8 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 
 **Cost / not yet:**
 - A check sent to an instance that stands by waits for the holder's next poll: the pass it starts is local. A check whose source is gone from every instance without being deleted through the API (removed from disk while the engine was down), or held by an older engine that does not know checks, stays pending until purged.
-- A pass that outlives its lease (longer than three poll intervals, at least 30 s) can overlap another instance's pass, as before: a check is then answered by whichever finishes first, and both list real loads of the source, but on PostgreSQL a load the other instance has not committed yet may be left out of the answer.
-- A pause seen when a pass starts fails the checks waiting then, even if a resume follows a moment later; a check asked for after the resume is answered by the pass the resume starts.
+- A pass that outlives its lease (longer than three poll intervals, at least 30 s) can overlap another instance's pass, as before: a check is then answered by whichever finishes first, and both list real loads of the source, but on PostgreSQL a load the other instance commits late may be left out of the answer, or appear in an answered check's `files` after `file_count` was counted.
+- A pass fails the waiting checks when the source is paused both before and after it reads them; a resume in between leaves them to the pass the resume starts. A pause that lands after the checks were read does not stop that pass's scan, which answers them.
 - No list of a source's checks; a caller keeps the ids it was given.
 
 ## Not in the prototype

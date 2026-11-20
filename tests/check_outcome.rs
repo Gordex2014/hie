@@ -384,10 +384,21 @@ async fn a_replaced_source_answers_earlier_checks_and_a_paused_or_deleted_one_fa
     }
 
     // Deleted: a check nobody scanned for fails once the source is gone here.
+    // Recorded without a poke, while the other instance's lease runs out, so
+    // this instance's runner never scans before the delete.
     let gone = "gone";
-    engine.create_held(gone).await;
-    let orphan = engine.check_now(gone).await;
-    engine.db.release_lease(gone, OTHER).unwrap();
+    assert!(engine.db.acquire_lease(gone, OTHER, 1_000).unwrap());
+    let created = engine
+        .http
+        .post(format!("{}/api/sources", engine.api))
+        .json(&Engine::definition(gone))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let orphan = engine.db.insert_check(gone).unwrap();
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert!(engine.db.lease(gone).unwrap().is_none());
     let deleted = engine
         .http
         .delete(format!("{}/api/sources/{gone}", engine.api))

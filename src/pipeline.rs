@@ -251,10 +251,13 @@ impl FeedRunner {
             )?;
         }
         if self.db.is_paused(&self.feed.id)? {
-            // A pause seen here fails the checks waiting now; a check asked for
-            // after a resume waits for the pass the resume starts.
+            // A pause still in place once the waiting checks are read fails
+            // them. Resumed meanwhile, they are left to the pass the resume
+            // starts, which scans.
             let snapshot = self.pending_checks();
-            self.answer_checks(&snapshot, Some(CheckFailure::Paused));
+            if !snapshot.is_empty() && self.db.is_paused(&self.feed.id)? {
+                self.answer_checks(&snapshot, Some(CheckFailure::Paused));
+            }
         } else {
             self.ensure_credential().await;
             // Read here, after the credential, so the snapshot is taken just
@@ -267,8 +270,8 @@ impl FeedRunner {
 
     /// The source's checks waiting now, which the scan about to start answers;
     /// none for a runner that is being replaced or stopped, so its successor
-    /// answers them. A store error is logged: the scan runs anyway.
-    #[doc(hidden)]
+    /// answers them. A store error is logged: the scan runs anyway. Public for
+    /// tests that drive a scan by hand.
     pub fn pending_checks(&self) -> Vec<i64> {
         if self.halted() {
             return Vec::new();
@@ -448,7 +451,7 @@ impl FeedRunner {
     }
 
     /// A pass that answers the checks of `snapshot`, taken before it started.
-    #[doc(hidden)]
+    /// Public for tests that drive a scan by hand.
     pub async fn tick_with(&self, snapshot: &[i64]) -> Result<()> {
         // Without its credential loaded, a source cannot read its store: nothing
         // is listed and nothing is handed over this pass, but what is open is

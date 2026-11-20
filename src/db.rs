@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS files_feed_sha ON files(feed_id, sha256);
 CREATE INDEX IF NOT EXISTS files_feed_received ON files(feed_id, received_at);
+CREATE INDEX IF NOT EXISTS files_feed_id ON files(feed_id, id);
 CREATE TABLE IF NOT EXISTS records (
   id INTEGER PRIMARY KEY,
   file_id INTEGER NOT NULL REFERENCES files(id),
@@ -1723,10 +1724,11 @@ impl Db {
     /// Records a check of a source, pending, with its baseline: the source's
     /// newest load when it was asked for.
     pub fn insert_check(&self, feed: &str) -> Result<i64> {
-        let after = self.max_file_id(feed)?;
+        // One statement: no load can be recorded between the baseline and the check.
         self.insert_returning_id(
-            "INSERT INTO checks (feed_id, status, requested_at, after_file) VALUES ($1, 'pending', $2, $3)",
-            &params![feed, now_ms(), after],
+            "INSERT INTO checks (feed_id, status, requested_at, after_file)
+             VALUES ($1, 'pending', $2, (SELECT COALESCE(MAX(id), 0) FROM files WHERE feed_id = $1))",
+            &params![feed, now_ms()],
         )
     }
 
@@ -1789,10 +1791,28 @@ impl Db {
         Ok(())
     }
 
-    /// Fails every pending check of the source with the failure's fixed reason.
-    pub fn fail_pending_checks(&self, feed: &str, failure: CheckFailure) -> Result<()> {
-        let snapshot = self.pending_checks(feed)?;
-        self.answer_checks(feed, &snapshot, Some(failure))
+    /// Fails every pending check of the source with the failure's fixed reason,
+    /// with the loads since each was asked for, unless an instance other than
+    /// `owner` holds the source: that one may still answer them. One statement,
+    /// so a holder that takes the source meanwhile keeps its checks.
+    pub fn fail_pending_checks(
+        &self,
+        feed: &str,
+        owner: &str,
+        failure: CheckFailure,
+    ) -> Result<u64> {
+        self.execute(
+            "UPDATE checks SET status = 'failed',
+               file_count = (SELECT COUNT(*) FROM files
+                             WHERE files.feed_id = checks.feed_id AND files.id > checks.after_file),
+               upto_file = (SELECT COALESCE(MAX(id), 0) FROM files WHERE feed_id = $1),
+               finished_at = CASE WHEN requested_at > $4 THEN requested_at ELSE $4 END,
+               reason = $2
+             WHERE feed_id = $1 AND status = 'pending'
+               AND NOT EXISTS (SELECT 1 FROM source_leases
+                               WHERE feed_id = $1 AND owner <> $3 AND until >= $4)",
+            &params![feed, failure.reason(), owner, now_ms()],
+        )
     }
 
     /// One check, with up to `limit` of its loads after load `after` (each with
@@ -2135,17 +2155,35 @@ mod tests {
         db.answer_checks("lab", &[check], Some(CheckFailure::Listing))
             .unwrap();
         db.answer_checks("lab", &[check], None).unwrap();
-        db.fail_pending_checks("lab", CheckFailure::Deleted)
+        db.fail_pending_checks("lab", "me", CheckFailure::Deleted)
             .unwrap();
         let answered = status(&db, check);
         assert_eq!(answered["status"], "failed");
         assert_eq!(answered["reason"], CheckFailure::Listing.reason());
         assert_eq!(answered["files"][0]["id"], taken);
 
+        // Another instance holding the source keeps its checks; once nobody
+        // else holds it, they fail with the loads since they were asked for.
         let deleted = db.insert_check("lab").unwrap();
-        db.fail_pending_checks("lab", CheckFailure::Deleted)
-            .unwrap();
-        assert_eq!(status(&db, deleted)["reason"], "the source was deleted");
+        let since = file(&db, "lab", "b.csv");
+        assert!(db.acquire_lease("lab", "other", 60_000).unwrap());
+        assert_eq!(
+            db.fail_pending_checks("lab", "me", CheckFailure::Deleted)
+                .unwrap(),
+            0
+        );
+        assert_eq!(status(&db, deleted)["status"], "pending");
+        db.release_lease("lab", "other").unwrap();
+        assert!(db.acquire_lease("lab", "me", 60_000).unwrap());
+        assert_eq!(
+            db.fail_pending_checks("lab", "me", CheckFailure::Deleted)
+                .unwrap(),
+            1
+        );
+        let failed = status(&db, deleted);
+        assert_eq!(failed["reason"], "the source was deleted");
+        assert_eq!(failed["file_count"], 1);
+        assert_eq!(failed["files"][0]["id"], since);
         // An unknown check.
         assert!(db.check(deleted + 100, 0, 10).unwrap().is_none());
     }

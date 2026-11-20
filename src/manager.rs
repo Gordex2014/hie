@@ -630,6 +630,24 @@ impl SourceManager {
     pub async fn delete(self: &Arc<Self>, id: &str) -> Result<(), ManagerError> {
         let lock = self.source_lock(id);
         let _changing = lock.lock().await;
+        self.require(id)?;
+        // Its waiting checks will not be answered here, so they fail first: a
+        // store that refuses leaves the source as it was, for the delete to be
+        // sent again. Another instance holding the source may still run its own
+        // definition of it, and keeps them.
+        self.db
+            .fail_pending_checks(
+                id,
+                crate::pipeline::instance_id(),
+                crate::db::CheckFailure::Deleted,
+            )
+            .map_err(|e| {
+                if crate::db::is_busy(&e) {
+                    ManagerError::StoreBusy
+                } else {
+                    ManagerError::Internal(e)
+                }
+            })?;
         let (removed, halted) = {
             let mut sources = self.sources.lock().expect("manager mutex");
             let removed = sources.remove(id);
@@ -645,22 +663,6 @@ impl SourceManager {
         let path = self.file_for(id);
         if path.exists() {
             std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-        }
-        // Its waiting checks will not be answered here. Another instance holding
-        // the source may still run its own definition of it, and answers them.
-        match self.db.lease(id) {
-            Ok(Some(lease)) if lease.owner != crate::pipeline::instance_id() => {}
-            Ok(_) => {
-                if let Err(e) = self
-                    .db
-                    .fail_pending_checks(id, crate::db::CheckFailure::Deleted)
-                {
-                    tracing::error!(feed = %id, "answering the checks of a deleted source: {e:#}");
-                }
-            }
-            Err(e) => {
-                tracing::error!(feed = %id, "answering the checks of a deleted source: {e:#}")
-            }
         }
         let manager = Arc::downgrade(self);
         let grace = Duration::from_millis(self.handover_grace_ms.load(Ordering::Relaxed));

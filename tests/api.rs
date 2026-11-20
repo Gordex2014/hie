@@ -208,6 +208,11 @@ async fn a_source_lives_through_the_api() {
         .await
         .unwrap();
     assert_eq!(checking.status(), 202);
+    let location = checking.headers()["location"].to_str().unwrap().to_string();
+    let check = checking.json::<Value>().await.unwrap()["check_id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(location, format!("/api/checks/{check}"));
     let api2 = api.clone();
     let http2 = http.clone();
     wait_until(
@@ -229,6 +234,21 @@ async fn a_source_lives_through_the_api() {
     )
     .await;
     assert_eq!(urls.lock().unwrap().len(), 3);
+    // The running source answered the check by itself (with the file, unless
+    // its first pass took it before the check was asked for).
+    let answered: Value = http
+        .get(format!("{api}{location}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        answered["status"] == "found" && answered["files"][0]["name"] == "labs.csv"
+            || answered["status"] == "nothing_new",
+        "{answered}"
+    );
 
     // Pause: a new file is left where it is.
     let paused: Value = http
