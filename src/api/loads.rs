@@ -69,8 +69,17 @@ impl Ask {
                 .with("field", "status"));
             }
         };
+        let source = q.source.filter(|t| !t.is_empty());
+        // Any id a load may carry is accepted, but no control character, which
+        // a PostgreSQL text value cannot even hold.
+        if source
+            .as_deref()
+            .is_some_and(|id| id.chars().any(char::is_control))
+        {
+            return Err(paging::invalid_query("source must be a source id").with("field", "source"));
+        }
         Ok(Ask {
-            source: q.source.filter(|t| !t.is_empty()),
+            source,
             keep,
             after,
             limit,
@@ -237,7 +246,7 @@ mod tests {
             );
         }
         let field = |query: &[(&str, &str)]| {
-            let e = ask(query).err().expect("refused");
+            let e = ask(query).expect_err("refused");
             assert_eq!(e.code, Some("invalid_query"));
             e.extra
                 .get("field")
@@ -248,6 +257,8 @@ mod tests {
             assert_eq!(field(&[("limit", limit)]).as_deref(), Some("limit"));
         }
         assert_eq!(field(&[("status", "rejected")]).as_deref(), Some("status"));
+        assert_eq!(field(&[("source", "lab%00")]).as_deref(), Some("source"));
+        assert_eq!(field(&[("source", "lab%0A")]).as_deref(), Some("source"));
         for cursor in ["42", "a1.0", "a1.07", "l1.5"] {
             assert_eq!(field(&[("cursor", cursor)]).as_deref(), Some("cursor"));
         }

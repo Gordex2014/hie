@@ -283,10 +283,13 @@ async fn loads_are_filtered_by_source_status_and_failing_now() {
         )
         .unwrap();
 
-    assert_eq!(
-        e.walk("status=failed").await,
-        [refused, unreadable, parsing, rejected]
-    );
+    for limit in [1, 2, 50] {
+        assert_eq!(
+            e.walk(&format!("status=failed&limit={limit}")).await,
+            [refused, unreadable, parsing, rejected],
+            "limit {limit}"
+        );
+    }
     assert_eq!(
         e.walk("status=failed&source=alpha").await,
         [parsing, rejected]
@@ -434,6 +437,38 @@ async fn a_walk_holds_while_loads_arrive_and_change() {
         e.walk("status=processing&source=gamma&limit=2").await,
         [above, f[3], f[2], f[1], f[0]]
     );
+
+    // Unreadable loads alone page as rejected ones do.
+    let u: Vec<i64> = (1..=3)
+        .map(|n| {
+            let id = e.load("delta", &format!("{n}.csv"), 0, &[]);
+            e.db.fail_file(id, "not UTF-8").unwrap();
+            id
+        })
+        .collect();
+    let first = e.page("status=failed&source=delta&limit=2").await;
+    assert_eq!(ids_of(&first), [u[2], u[1]]);
+    assert!(first["next_cursor"].is_string());
+    assert_eq!(
+        e.walk("status=failed&source=delta&limit=2").await,
+        [u[2], u[1], u[0]]
+    );
+
+    // Mixed, a load with many rejected rows among them, one load a page.
+    let many = e.load("eps", "many.csv", 4, &[1, 2, 3, 4]);
+    let unreadable = e.load("eps", "unreadable.csv", 0, &[]);
+    e.db.fail_file(unreadable, "not UTF-8").unwrap();
+    let clean = e.load("eps", "clean.csv", 1, &[]);
+    let two = e.load("eps", "two.csv", 3, &[1, 3]);
+    e.send(clean, 1);
+    assert_eq!(
+        e.walk("status=failed&source=eps&limit=1").await,
+        [two, unreadable, many]
+    );
+    assert_eq!(
+        e.walk("status=failed&limit=1").await[..3],
+        [two, unreadable, many]
+    );
 }
 
 #[tokio::test]
@@ -471,6 +506,7 @@ async fn limits_and_malformed_queries() {
         ("cursor=l1.5", Some("cursor")),
         ("limit=abc", None),
         ("limit=1&limit=2", None),
+        ("source=lab%00", Some("source")),
     ] {
         let (status, body) = e.get(&format!("/api/loads?{query}")).await;
         assert_eq!(status, 400, "{query}");
@@ -483,6 +519,28 @@ async fn limits_and_malformed_queries() {
             "{query} echoed: {sentence}"
         );
     }
+}
+
+/// A source name PostgreSQL cannot hold does not stop its loads: it is not kept.
+#[tokio::test]
+async fn a_name_that_cannot_be_stored_is_not_kept() {
+    let e = engine().await;
+    let id =
+        e.db.insert_file(
+            "alpha",
+            "lab\0feed",
+            "x.csv",
+            "sha-x",
+            1,
+            "processing",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let page = e.page("source=alpha").await;
+    assert_eq!(ids_of(&page), [id]);
+    assert_eq!(page["loads"][0]["source_name"], Value::Null);
 }
 
 /// A store made by an earlier version: its loads have no source name.
@@ -651,11 +709,13 @@ async fn a_deleted_source_keeps_its_loads_and_a_reused_id_shares_them() {
         .await
         .unwrap();
     assert_eq!(created.status(), 201);
+    // Written under another name and renamed, so a pass never reads half a file.
     std::fs::copy(
         repo().join("examples/data/labs.csv"),
-        root.join("inbox/first.csv"),
+        root.join("inbox/first.tmp"),
     )
     .unwrap();
+    std::fs::rename(root.join("inbox/first.tmp"), root.join("inbox/first.csv")).unwrap();
     take(1).await;
     let deleted = http
         .delete(format!("{api}/api/sources/labs"))
@@ -681,7 +741,8 @@ async fn a_deleted_source_keeps_its_loads_and_a_reused_id_shares_them() {
     // Other content, so it is not a duplicate of the first.
     let mut second = std::fs::read_to_string(repo().join("examples/data/labs.csv")).unwrap();
     second.push('\n');
-    std::fs::write(root.join("inbox/second.csv"), second).unwrap();
+    std::fs::write(root.join("inbox/second.tmp"), second).unwrap();
+    std::fs::rename(root.join("inbox/second.tmp"), root.join("inbox/second.csv")).unwrap();
     take(2).await;
     let both = loads("source=labs").await;
     let names: Vec<(&str, &str)> = both

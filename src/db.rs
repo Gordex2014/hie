@@ -879,7 +879,9 @@ impl Db {
     ///
     /// A row without one (written by an earlier version and not backfilled) is
     /// never served by the engine. `source_name` is the source's name as the
-    /// load is recorded, kept with it after the source is renamed or deleted.
+    /// load is recorded, kept with it after the source is renamed or deleted;
+    /// a name PostgreSQL cannot hold as text (with a NUL) is not kept, so that
+    /// it never stops a load.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_file(
         &self,
@@ -894,6 +896,7 @@ impl Db {
         origin: Option<&str>,
     ) -> Result<i64> {
         let now = now_ms();
+        let source_name = Some(source_name).filter(|n| !n.contains('\0'));
         let finished_at = if status == "processing" {
             None
         } else {
