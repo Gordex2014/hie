@@ -29,6 +29,10 @@ struct Hfs {
     submitted: Vec<String>,
     /// The NDJSON lines fetched for each submission id.
     fetched: HashMap<String, Vec<Value>>,
+    /// The same, as the text fetched.
+    fetched_raw: HashMap<String, String>,
+    /// Statuses the next kick-offs answer with before taking anything.
+    kickoff_answers: Vec<u16>,
     /// `$bulk-submit-status` is refused (`404`) after the kick-off was taken.
     refuse_status: bool,
     /// Polls answer "in progress" for ever.
@@ -76,8 +80,15 @@ async fn kickoff(State(h): State<Shared>, Json(body): Json<Value>) -> Response {
         .as_str()
         .unwrap()
         .to_string();
-    if h.lock().unwrap().submitted.contains(&id) {
-        return StatusCode::CONFLICT.into_response();
+    {
+        let mut h = h.lock().unwrap();
+        if !h.kickoff_answers.is_empty() {
+            let status = h.kickoff_answers.remove(0);
+            return StatusCode::from_u16(status).unwrap().into_response();
+        }
+        if h.submitted.contains(&id) {
+            return StatusCode::CONFLICT.into_response();
+        }
     }
     let manifest_url = param(&body, "manifestUrl").unwrap()["valueUrl"]
         .as_str()
@@ -90,6 +101,7 @@ async fn kickoff(State(h): State<Shared>, Json(body): Json<Value>) -> Response {
         .await
         .unwrap();
     let mut lines = Vec::new();
+    let mut raw = String::new();
     for entry in manifest["output"].as_array().unwrap() {
         let text = reqwest::get(entry["url"].as_str().unwrap())
             .await
@@ -97,6 +109,7 @@ async fn kickoff(State(h): State<Shared>, Json(body): Json<Value>) -> Response {
             .text()
             .await
             .unwrap();
+        raw.push_str(&text);
         lines.extend(
             text.lines()
                 .filter(|l| !l.trim().is_empty())
@@ -105,6 +118,7 @@ async fn kickoff(State(h): State<Shared>, Json(body): Json<Value>) -> Response {
     }
     let mut h = h.lock().unwrap();
     h.submitted.push(id.clone());
+    h.fetched_raw.insert(id.clone(), raw);
     h.fetched.insert(id, lines);
     StatusCode::OK.into_response()
 }
@@ -699,10 +713,35 @@ async fn a_tagged_submission_is_served_only_the_file_the_engine_wrote() {
     let served = reqwest::get(&url).await.unwrap();
     assert_eq!(served.status(), 200);
     assert!(served.text().await.unwrap().contains(SYSTEM));
-    // The engine's file is gone: nothing else is served in its place, though
-    // the submission's source file has the same number.
+    // The engine's file is gone, and the submission's source file has the
+    // same number and a kept copy the engine would serve (as a file taken for
+    // direct bulk before the source changed path): nothing is served in its
+    // place.
     std::fs::remove_file(dir.path().join("data/bulk").join(&token).join("1.ndjson")).unwrap();
+    let kept = dir.path().join("kept.ndjson");
+    std::fs::write(
+        &kept,
+        "{\"resourceType\":\"Patient\",\"id\":\"untagged\"}\n",
+    )
+    .unwrap();
+    let db = &engine.state.db;
+    let file_id = db.query_json("SELECT file_id FROM records", []).unwrap()[0]["file_id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(file_id, 1);
+    db.query_json(
+        "UPDATE files SET source_key = $1, origin = 'local' WHERE id = 1 RETURNING id",
+        hie::db::params![kept.to_string_lossy().to_string()],
+    )
+    .unwrap();
     assert_eq!(reqwest::get(&url).await.unwrap().status(), 404);
+    // The same submission untagged would be served that copy: the guard is
+    // what refuses it.
+    db.query_json("UPDATE submissions SET stamped = 0 RETURNING token", [])
+        .unwrap();
+    let fallback = reqwest::get(&url).await.unwrap();
+    assert_eq!(fallback.status(), 200);
+    assert!(fallback.text().await.unwrap().contains("untagged"));
 }
 
 #[tokio::test]
@@ -725,10 +764,7 @@ async fn direct_bulk_is_never_tagged_and_an_unresolved_submission_stays_open() {
     std::fs::write(dir.path().join("inbox/a.ndjson"), object).unwrap();
     engine.tick().await;
     let id = hfs.lock().unwrap().submitted[0].clone();
-    assert_eq!(
-        hfs.lock().unwrap().fetched[&id],
-        [serde_json::from_str::<Value>(object).unwrap()]
-    );
+    assert_eq!(hfs.lock().unwrap().fetched_raw[&id], object);
     assert_eq!(engine.stamping().await["untagged"], "open");
     engine.settle().await;
     assert_eq!(engine.statuses(), ["sent"]);
@@ -786,4 +822,94 @@ async fn an_untagged_submission_left_behind_by_a_replaced_source_stays_open() {
     let stamping = engine.stamping().await;
     assert_eq!(stamping["active"], true);
     assert_eq!(stamping["untagged"], "open");
+}
+
+/// A kick-off that got no answer and was then refused: HFS may have taken the
+/// first one, so the source stays open.
+#[tokio::test]
+async fn a_kickoff_refused_after_one_went_unanswered_stays_open() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let (hfs_url, hfs) = hfs().await;
+    hfs.lock().unwrap().kickoff_answers = vec![503, 400];
+    let dir = root(DIRECT_SOURCE);
+    let engine = Engine::start(dir.path(), &hfs_url, &python, false).await;
+    std::fs::write(
+        dir.path().join("inbox/a.ndjson"),
+        "{\"resourceType\":\"Patient\",\"id\":\"p1\"}\n",
+    )
+    .unwrap();
+    engine.tick().await;
+    engine.tick().await;
+    assert_eq!(engine.statuses(), ["rejected"]);
+    let row = &engine
+        .state
+        .db
+        .query_json("SELECT status, attempts FROM submissions", [])
+        .unwrap()[0];
+    assert_eq!(
+        (row["status"].as_str(), row["attempts"].as_i64()),
+        (Some("failed"), Some(1))
+    );
+    assert_eq!(engine.stamping().await["untagged"], "open");
+}
+
+#[derive(Default)]
+struct Slow {
+    token_answered_at: Option<i64>,
+}
+
+/// The bound before an untagged request is taken once the token is in hand,
+/// not before a slow token endpoint answered.
+#[tokio::test]
+async fn the_untagged_bound_is_taken_after_the_token_arrives() {
+    async fn token(State(s): State<Arc<Mutex<Slow>>>) -> Json<Value> {
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        s.lock().unwrap().token_answered_at = Some(chrono::Utc::now().timestamp_millis());
+        Json(json!({"access_token": "t", "token_type": "Bearer", "expires_in": 3600}))
+    }
+    let slow: Arc<Mutex<Slow>> = Arc::default();
+    let (listener, idp) = bind().await;
+    let app = Router::new()
+        .route("/token", post(token))
+        .with_state(slow.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (hfs_url, hfs) = hfs().await;
+    let source = Arc::new(hie::credentials::TokenSource::new(
+        hie::credentials::CredentialSettings {
+            token_url: format!("{idp}/token"),
+            client_id: "hie".into(),
+            client_secret: "s".into(),
+            scope: None,
+        },
+    ));
+    let client = hie::fhir::FhirClient::with_credentials(&hfs_url, Some(source));
+    let bundle = json!({"resourceType": "Bundle", "type": "batch", "entry": [
+        {"resource": {"resourceType": "Patient", "id": "p"}, "request": {"method": "PUT", "url": "Patient/p"}}]});
+    let mut before_send = None;
+    let sent = client
+        .post_bundle_with(&bundle, || {
+            before_send = Some(chrono::Utc::now().timestamp_millis());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(sent.is_ok());
+    let answered = slow.lock().unwrap().token_answered_at.unwrap();
+    assert!(before_send.unwrap() >= answered);
+    assert_eq!(hfs.lock().unwrap().bundles.len(), 1);
+
+    // A hook that fails sends nothing, and says so apart from HFS's answers.
+    let refused = client
+        .post_bundle_with(&bundle, || anyhow::bail!("the store is gone"))
+        .await;
+    assert!(
+        refused
+            .unwrap_err()
+            .to_string()
+            .contains("the store is gone")
+    );
+    assert_eq!(hfs.lock().unwrap().bundles.len(), 1);
 }

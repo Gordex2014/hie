@@ -226,18 +226,22 @@ impl FeedRunner {
         self
     }
 
-    /// The resources of one record as they are sent: tagged with the source
-    /// when stamping is on, as stored otherwise.
-    fn outgoing(&self, resources: Option<&Value>) -> Result<Vec<Value>, String> {
+    /// The resources of one record as they are sent: tagged copies when
+    /// stamping is on, the stored ones, borrowed, otherwise.
+    fn outgoing<'a>(
+        &self,
+        resources: Option<&'a Value>,
+    ) -> Result<Vec<std::borrow::Cow<'a, Value>>, String> {
+        use std::borrow::Cow;
         resources
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .map(|r| {
                 if self.stamp_source {
-                    fhir::stamp_source(r, &self.feed.id)
+                    fhir::stamp_source(r, &self.feed.id).map(Cow::Owned)
                 } else {
-                    Ok(r.clone())
+                    Ok(Cow::Borrowed(r))
                 }
             })
             .collect()
@@ -1105,7 +1109,7 @@ impl FeedRunner {
             let mut by_type: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
             let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
             for (_, resources) in &records_out {
-                for resource in resources {
+                for resource in resources.iter().map(|r| &**r) {
                     let kind = resource["resourceType"]
                         .as_str()
                         .unwrap_or("Resource")
@@ -1149,14 +1153,20 @@ impl FeedRunner {
                 self.stamp_source.then_some(token.as_str()),
             );
             let manifest = bulk.manifest(&entries);
-            self.db.create_submission(
+            if !self.db.create_submission(
                 &token,
                 &self.feed.id,
                 &submission_id,
                 &manifest,
                 &record_ids,
                 self.stamp_source,
-            )?;
+            )? {
+                // Another runner submitted some of these records meanwhile:
+                // this one's files go, and the next page is read afresh.
+                tracing::warn!(feed = %self.feed.id, "records were submitted by another runner; this submission is dropped");
+                self.remove_submission_files(&token).await;
+                continue;
+            }
             tracing::info!(feed = %self.feed.id, submission = %submission_id, files = entries.len(), records = record_ids.len(), "submission opened (transformed)");
         }
     }
@@ -1218,13 +1228,19 @@ impl FeedRunner {
     async fn deliver(&self, items: &[WorkItem]) -> Result<bool> {
         // A record whose resources cannot carry the source tag is rejected as a
         // whole and goes no further: not in the Bundle, not in what is settled.
-        let mut kept = Vec::with_capacity(items.len());
-        let mut outgoing = Vec::with_capacity(items.len());
+        let mut kept: Vec<&WorkItem> = Vec::with_capacity(items.len());
+        let mut entries = Vec::new();
+        let mut owner = Vec::new();
         for item in items {
             match self.outgoing(item.resources.as_ref()) {
                 Ok(resources) => {
-                    kept.push(item.clone());
-                    outgoing.push(resources);
+                    for resource in resources {
+                        let key =
+                            transform::check_resource(&resource).map_err(anyhow::Error::msg)?;
+                        entries.push((fhir::request_url(&key), resource.into_owned()));
+                        owner.push(kept.len());
+                    }
+                    kept.push(item);
                 }
                 Err(msg) => self.db.mark_rejected(item.id, "validation", &msg, None)?,
             }
@@ -1233,40 +1249,29 @@ impl FeedRunner {
             return Ok(true);
         }
         let items = &kept[..];
-        let mut entries = Vec::new();
-        let mut owner = Vec::new();
-        for (i, resources) in outgoing.into_iter().enumerate() {
-            for resource in resources {
-                let key = transform::check_resource(&resource).map_err(anyhow::Error::msg)?;
-                entries.push((fhir::request_url(&key), resource));
-                owner.push(i);
-            }
-        }
         // Untagged, HFS may hold what this request writes until well after it
         // was sent: the bound is stored before it leaves, once the token is in
         // hand, and never cleared, so neither a crash nor another instance's
-        // request can make it earlier. A store that cannot take it fails the
-        // pass, as any store failure does: nothing was sent, HFS is not to blame.
+        // request can make it earlier. A store that cannot take it in time
+        // fails the pass, as any store failure does: nothing is sent.
         let untagged = !self.stamp_source;
-        let mut not_recorded = None;
         let sent = self
             .fhir
             .post_bundle_with(&fhir::batch_bundle(&entries), || {
-                if untagged
-                    && let Err(e) = self
-                        .db
-                        .mark_untagged(&self.feed.id, now_ms() + crate::db::UNTAGGED_MARGIN_MS)
-                {
-                    let refusal = anyhow::anyhow!("the untagged bound could not be stored");
-                    not_recorded = Some(e);
-                    return Err(refusal);
+                if untagged {
+                    let start = now_ms();
+                    self.db
+                        .mark_untagged(&self.feed.id, start + crate::db::UNTAGGED_MARGIN_MS)
+                        .context("recording an untagged delivery before sending it")?;
+                    if now_ms() - start > crate::db::UNTAGGED_WRITE_SLACK_MS {
+                        anyhow::bail!(
+                            "recording an untagged delivery took longer than its slack; not sent"
+                        );
+                    }
                 }
                 Ok(())
             })
-            .await;
-        if let Some(e) = not_recorded {
-            return Err(e.context("recording an untagged delivery before sending it"));
-        }
+            .await?;
         match sent {
             Err(SendError::Transient(reason)) => {
                 for item in items {

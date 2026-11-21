@@ -133,10 +133,16 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("submissions", "accepted", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
-/// How long after the engine sends an untagged REST request HFS may still be
-/// writing it: the request's own timeout, and as long again for a server that
-/// keeps working after the engine stopped waiting.
-pub const UNTAGGED_MARGIN_MS: i64 = 2 * crate::fhir::HTTP_TIMEOUT.as_millis() as i64;
+/// How long the store write before an untagged REST request may take: a
+/// slower one sends nothing, so the bound below always covers the send.
+pub const UNTAGGED_WRITE_SLACK_MS: i64 = 10_000;
+
+/// From the moment the engine starts recording an untagged REST request, how
+/// long HFS may still be writing it: the store write, the request's own
+/// timeout, and as long again for a server that keeps working after the
+/// engine stopped waiting.
+pub const UNTAGGED_MARGIN_MS: i64 =
+    UNTAGGED_WRITE_SLACK_MS + 2 * crate::fhir::HTTP_TIMEOUT.as_millis() as i64;
 
 /// The store mark that says since when the store records untagged deliveries.
 const STAMPING_TRACKED: &str = "stamping_tracked";
@@ -148,7 +154,8 @@ pub struct Stamping {
     /// there is no bound yet.
     pub open: bool,
     /// The latest instant up to which HFS may have written a resource of this
-    /// source without the tag; `None` when nothing was delivered without it.
+    /// source without the tag (when `open`, only the last known bound); `None`
+    /// when nothing was delivered without it.
     pub untagged_until: Option<i64>,
 }
 
@@ -1397,7 +1404,9 @@ impl Db {
     }
 
     /// Opens a submission over the given records, which move to `submitted`;
-    /// `stamped` when its NDJSON carries the source tag.
+    /// `stamped` when its NDJSON carries the source tag. Only records still
+    /// pending and held by no submission are taken, all or none: `false`, and
+    /// nothing opened, when another runner took one first (a lease handover).
     pub fn create_submission(
         &self,
         token: &str,
@@ -1406,7 +1415,7 @@ impl Db {
         manifest: &Value,
         record_ids: &[i64],
         stamped: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.with(|c| {
             c.batch("BEGIN")?;
             let now = now_ms();
@@ -1417,15 +1426,20 @@ impl Db {
                     &params![token, feed, submission_id, manifest.to_string(), now, now, stamped],
                 )?;
                 for id in record_ids {
-                    c.execute(
-                        "UPDATE records SET status = 'submitted', submission = $2, updated_at = $3 WHERE id = $1",
+                    let taken = c.execute(
+                        "UPDATE records SET status = 'submitted', submission = $2, updated_at = $3
+                         WHERE id = $1 AND status = 'pending' AND submission IS NULL",
                         &params![id, token, now],
                     )?;
+                    if taken == 0 {
+                        return Ok(false);
+                    }
                 }
-                Ok::<_, anyhow::Error>(())
+                Ok::<_, anyhow::Error>(true)
             })();
             match result {
-                Ok(()) => c.batch("COMMIT"),
+                Ok(true) => c.batch("COMMIT").map(|()| true),
+                Ok(false) => c.batch("ROLLBACK").map(|()| false),
                 Err(e) => {
                     let _ = c.batch("ROLLBACK");
                     Err(e)
@@ -1498,6 +1512,7 @@ impl Db {
                     &params![STAMPING_TRACKED, now],
                 )?;
                 if claimed > 0 {
+                    // `WHERE` keeps SQLite from reading `ON CONFLICT` as a join's `ON`.
                     c.execute(
                         "INSERT INTO source_stamping (feed_id, untagged_until)
                          SELECT DISTINCT feed_id, CAST($1 AS BIGINT) FROM files WHERE 1 = 1
@@ -1535,9 +1550,9 @@ impl Db {
     /// What the store knows about `feed`'s deliveries without the tag, read in
     /// one statement. Untagged submissions count whatever the source's path
     /// is now: one nobody polls any more stays open. A failed one that HFS may
-    /// have accepted is open for good; one refused at its first kick-off
-    /// is a bound. Failed ones that ended before the store recorded stamping
-    /// are inside the upgrade's bound.
+    /// have accepted is open for good, however old: the server's import may
+    /// outlive the engine that started it. One refused at its first kick-off
+    /// is a bound.
     pub fn stamping(&self, feed: &str, now: i64) -> Result<Stamping> {
         let row = self
             .query_one(
@@ -1551,9 +1566,8 @@ impl Db {
                      WHERE feed_id = $1 AND stamped = 0
                        AND (status IN ('kickoff', 'running')
                             OR (status = 'failed'
-                                AND (accepted = 1 OR status_url IS NOT NULL OR attempts > 0)
-                                AND updated_at >= COALESCE((SELECT at FROM store_marks WHERE name = $2), 0)))) AS open",
-                &params![feed, STAMPING_TRACKED],
+                                AND (accepted = 1 OR status_url IS NOT NULL OR attempts > 0)))) AS open",
+                &params![feed],
             )?
             .context("the stamping read returned no row")?;
         let rest = row.opt_i64(0);
@@ -2134,19 +2148,12 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let now = now_ms();
         assert_eq!(db.stamping("lab", now).unwrap().untagged_until, None);
-        // As an earlier version leaves a store: files, a failed submission, no mark.
+        // As an earlier version leaves a store: files, a done submission, no mark.
         db.insert_file("lab", "a.csv", "h", 1, "done", None, None, None)
             .unwrap();
-        submission_row(
-            &db,
-            "old",
-            "failed",
-            false,
-            false,
-            Some("u"),
-            0,
-            now - 60_000,
-        );
+        db.insert_file("polled", "b.csv", "h", 1, "done", None, None, None)
+            .unwrap();
+        submission_row(&db, "old", "done", false, false, Some("u"), 0, now - 60_000);
         db.execute("DELETE FROM store_marks", &[]).unwrap();
         let before = now_ms();
         // Two instances open it at once: one backfills.
@@ -2159,9 +2166,17 @@ mod tests {
         let bound = db.stamping("lab", after).unwrap();
         let until = bound.untagged_until.unwrap();
         assert!(until >= before + UNTAGGED_MARGIN_MS && until <= after + UNTAGGED_MARGIN_MS);
-        // The failed submission ended before the store recorded stamping: inside
-        // the upgrade's bound, not open for good.
+        // The done submission is inside the upgrade's bound.
         assert!(!db.stamping("lab", until + 1).unwrap().open);
+        // One that failed after the server may have taken it stays open,
+        // however long ago: the server's import may outlive the engine.
+        db.execute(
+            "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, status_url, created_at, updated_at)
+             VALUES ('older', 'polled', 'older', 'failed', '{}', 'u', $1, $1)",
+            &params![now - 86_400_000],
+        )
+        .unwrap();
+        assert!(db.stamping("polled", until + 1).unwrap().open);
         let marks = db.query_json("SELECT name FROM store_marks", []).unwrap();
         assert_eq!(marks.len(), 1);
         drop(opened);
@@ -2178,6 +2193,43 @@ mod tests {
                 .untagged_until,
             None
         );
+    }
+
+    #[test]
+    fn a_submission_takes_its_records_all_or_none() {
+        let db = Db::in_memory().unwrap();
+        let file = db
+            .insert_file("lab", "a.ndjson", "h", 1, "processing", None, None, None)
+            .unwrap();
+        for line in 1..=2 {
+            db.execute(
+                "INSERT INTO records (file_id, feed_id, line, raw, status, updated_at) VALUES ($1, 'lab', $2, '{}', 'pending', 0)",
+                &params![file, line],
+            )
+            .unwrap();
+        }
+        let ids: Vec<i64> = db
+            .query_json("SELECT id FROM records ORDER BY id", [])
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        // Another runner took the second record first (a lease handover).
+        assert!(
+            db.create_submission("b", "lab", "sb", &json!({}), &ids[1..], true)
+                .unwrap()
+        );
+        assert!(
+            !db.create_submission("a", "lab", "sa", &json!({}), &ids, true)
+                .unwrap()
+        );
+        assert!(db.submission("a").unwrap().is_none());
+        let held: Vec<Value> = db
+            .query_json("SELECT status, submission FROM records ORDER BY id", [])
+            .unwrap();
+        assert_eq!(held[0]["status"], "pending");
+        assert_eq!(held[0]["submission"], Value::Null);
+        assert_eq!(held[1]["submission"], "b");
     }
 
     #[test]

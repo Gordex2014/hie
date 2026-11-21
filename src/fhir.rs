@@ -53,24 +53,36 @@ impl FhirClient {
     }
 
     pub async fn post_bundle(&self, bundle: &Value) -> Result<Value, SendError> {
-        self.post_bundle_with(bundle, || Ok(())).await
+        match self.post_bundle_with(bundle, || Ok(())).await {
+            Ok(sent) => sent,
+            Err(e) => unreachable!("nothing runs before the send: {e:#}"),
+        }
     }
 
     /// Posts a Bundle, running `before_send` once the request is authorized and
-    /// just before it leaves: an error there sends nothing and is transient.
+    /// just before it leaves. When `before_send` fails nothing is sent, and its
+    /// error comes back as the outer one: not a `SendError`, since HFS was not
+    /// asked anything.
     pub async fn post_bundle_with(
         &self,
         bundle: &Value,
         before_send: impl FnOnce() -> anyhow::Result<()>,
-    ) -> Result<Value, SendError> {
+    ) -> anyhow::Result<Result<Value, SendError>> {
         let request = self
             .http
             .post(&self.base)
             .header("Content-Type", "application/fhir+json")
             .header("Accept", "application/fhir+json")
             .json(bundle);
-        let request = authorize(request, &self.credentials).await?;
-        before_send().map_err(|e| SendError::Transient(format!("{e:#}")))?;
+        let request = match authorize(request, &self.credentials).await {
+            Ok(request) => request,
+            Err(e) => return Ok(Err(e)),
+        };
+        before_send()?;
+        Ok(self.send_bundle(request).await)
+    }
+
+    async fn send_bundle(&self, request: reqwest::RequestBuilder) -> Result<Value, SendError> {
         let resp = request
             .send()
             .await
