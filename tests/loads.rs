@@ -401,16 +401,27 @@ async fn rows_filtered_out_on_purpose_do_not_fail_a_load() {
             .unwrap()
             .clone()
     };
-    // `rejected` still counts every rejected row; `failed` leaves the filtered ones out.
-    for (id, rejected, failed) in [(early, 1, false), (mixed, 2, true), (kept, 1, false)] {
+    // `rejected` still counts every rejected row; `failing` and `failed` leave the
+    // filtered ones out, in every load answer.
+    for (id, rejected, failing, failed) in [
+        (early, 1, 0, false),
+        (mixed, 2, 1, true),
+        (kept, 1, 0, false),
+    ] {
         let l = load(id);
         assert_eq!(
-            (&l["rejected"], &l["failed"]),
-            (&json!(rejected), &json!(failed)),
+            (&l["rejected"], &l["failing"], &l["failed"]),
+            (&json!(rejected), &json!(failing), &json!(failed)),
             "load {id}"
         );
-        assert!(l.get("failing").is_none());
+        let (_, one) = e.get(&format!("/api/loads/{id}")).await;
+        assert_eq!(
+            (&one["failing"], &one["failed"]),
+            (&json!(failing), &json!(failed))
+        );
     }
+    let (_, own) = e.get("/api/sources/zeta/loads").await;
+    assert_eq!(own["loads"], page["loads"]);
     // Retrying the data rejection leaves only a filtered row: no longer failing.
     assert_eq!(
         e.db.reprocess_rejected(mixed, Some("value 'high' is not a number"))
@@ -418,6 +429,17 @@ async fn rows_filtered_out_on_purpose_do_not_fail_a_load() {
         1
     );
     assert_eq!(e.walk("status=failed&source=zeta").await, Vec::<i64>::new());
+    let after = e.page("source=zeta").await;
+    let mixed = after["loads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["id"] == mixed)
+        .unwrap();
+    assert_eq!(
+        (&mixed["rejected"], &mixed["failing"]),
+        (&json!(1), &json!(0))
+    );
 }
 
 #[tokio::test]

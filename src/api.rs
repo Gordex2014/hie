@@ -651,11 +651,7 @@ fn load_rows(
             .clone();
         // Failing now: the file could not be read, or some of its rows are
         // rejected for a reason other than their transform filtering them out.
-        let failing = row
-            .as_object_mut()
-            .and_then(|r| r.remove("failing"))
-            .and_then(|n| n.as_i64())
-            .unwrap_or(0);
+        let failing = row["failing"].as_i64().unwrap_or(0);
         row["failed"] = Value::Bool(row["status"] == "unreadable" || failing > 0);
     }
     Ok(rows)
