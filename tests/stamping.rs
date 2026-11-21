@@ -33,6 +33,11 @@ struct Hfs {
     fetched_raw: HashMap<String, String>,
     /// Statuses the next kick-offs answer with before taking anything.
     kickoff_answers: Vec<u16>,
+    /// The engine's store, when a test watches what it holds as requests arrive.
+    store: Option<Arc<hie::db::Db>>,
+    /// For each REST request: when it arrived, and the untagged bound the
+    /// store held for source `lab` at that moment.
+    bounds_at_arrival: Vec<(i64, Option<i64>)>,
     /// `$bulk-submit-status` is refused (`404`) after the kick-off was taken.
     refuse_status: bool,
     /// Polls answer "in progress" for ever.
@@ -46,6 +51,11 @@ type Shared = Arc<Mutex<Hfs>>;
 
 async fn rest(State(h): State<Shared>, Json(bundle): Json<Value>) -> Response {
     let mut h = h.lock().unwrap();
+    if let Some(store) = h.store.clone() {
+        let arrived = chrono::Utc::now().timestamp_millis();
+        let bound = store.stamping("lab", arrived).unwrap().untagged_until;
+        h.bounds_at_arrival.push((arrived, bound));
+    }
     h.bundles.push(bundle.clone());
     let entries = bundle["entry"].as_array().unwrap();
     if h.rest_down {
@@ -478,8 +488,10 @@ async fn switched_off_nothing_is_tagged_and_a_restart_with_it_on_tags_what_waite
     let (hfs_url, hfs) = hfs().await;
     let dir = root(REST_SOURCE);
     let off = Engine::start(dir.path(), &hfs_url, &python, false).await;
+    hfs.lock().unwrap().store = Some(off.state.db.clone());
 
-    // Delivered untagged: the bound covers the request and the margin after it.
+    // Delivered untagged: the bound is in the store before the request
+    // arrives, and covers it and the margin after it.
     drop_records(
         dir.path(),
         "a.ndjson",
@@ -494,6 +506,12 @@ async fn switched_off_nothing_is_tagged_and_a_restart_with_it_on_tags_what_waite
     assert_eq!(stamping["reason"], "off");
     assert_eq!(stamping["untagged"], "open", "the margin has not passed");
     assert!(instant(&stamping["untagged_until"]) >= before + MARGIN_MS);
+    let (arrived, bound) = hfs.lock().unwrap().bounds_at_arrival[0];
+    assert!(
+        bound.unwrap() >= arrived + 2 * hie::fhir::HTTP_TIMEOUT.as_millis() as i64,
+        "{bound:?} at {arrived}"
+    );
+    hfs.lock().unwrap().store = None;
 
     // HFS is down: the next record is tried, untagged, and waits.
     hfs.lock().unwrap().rest_down = true;

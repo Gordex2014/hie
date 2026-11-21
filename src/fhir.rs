@@ -53,10 +53,9 @@ impl FhirClient {
     }
 
     pub async fn post_bundle(&self, bundle: &Value) -> Result<Value, SendError> {
-        match self.post_bundle_with(bundle, || Ok(())).await {
-            Ok(sent) => sent,
-            Err(e) => unreachable!("nothing runs before the send: {e:#}"),
-        }
+        let request = self.bundle_request(bundle);
+        let request = authorize(request, &self.credentials).await?;
+        self.send_bundle(request).await
     }
 
     /// Posts a Bundle, running `before_send` once the request is authorized and
@@ -68,18 +67,21 @@ impl FhirClient {
         bundle: &Value,
         before_send: impl FnOnce() -> anyhow::Result<()>,
     ) -> anyhow::Result<Result<Value, SendError>> {
-        let request = self
-            .http
-            .post(&self.base)
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .json(bundle);
+        let request = self.bundle_request(bundle);
         let request = match authorize(request, &self.credentials).await {
             Ok(request) => request,
             Err(e) => return Ok(Err(e)),
         };
         before_send()?;
         Ok(self.send_bundle(request).await)
+    }
+
+    fn bundle_request(&self, bundle: &Value) -> reqwest::RequestBuilder {
+        self.http
+            .post(&self.base)
+            .header("Content-Type", "application/fhir+json")
+            .header("Accept", "application/fhir+json")
+            .json(bundle)
     }
 
     async fn send_bundle(&self, request: reqwest::RequestBuilder) -> Result<Value, SendError> {

@@ -130,7 +130,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("alerts", "notify", "TEXT"),
     ("alerts", "channels", "TEXT"),
     ("submissions", "stamped", "INTEGER NOT NULL DEFAULT 0"),
-    ("submissions", "accepted", "INTEGER NOT NULL DEFAULT 0"),
+    (
+        "submissions",
+        "kickoff_refused",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
 ];
 
 /// How long the store write before an untagged REST request may take: a
@@ -143,6 +147,9 @@ pub const UNTAGGED_WRITE_SLACK_MS: i64 = 10_000;
 /// engine stopped waiting.
 pub const UNTAGGED_MARGIN_MS: i64 =
     UNTAGGED_WRITE_SLACK_MS + 2 * crate::fhir::HTTP_TIMEOUT.as_millis() as i64;
+
+/// The PostgreSQL advisory lock that serializes schema changes ("hieschm").
+const SCHEMA_LOCK: i64 = 0x0068_6965_7363_686d;
 
 /// The store mark that says since when the store records untagged deliveries.
 const STAMPING_TRACKED: &str = "stamping_tracked";
@@ -749,18 +756,31 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
-        conn.execute_batch(SCHEMA)?;
-        for (table, column, kind) in ADDED_COLUMNS {
-            let exists = conn
-                .prepare(&format!("PRAGMA table_info({table})"))?
-                .query_map([], |r| r.get::<_, String>(1))?
-                .filter_map(Result::ok)
-                .any(|c| c == *column);
-            if !exists {
-                conn.execute(
-                    &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
-                    [],
-                )?;
+        // One opener at a time brings the schema up to date: two at once would
+        // otherwise both find a column missing and add it twice.
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let migrated = (|| {
+            conn.execute_batch(SCHEMA)?;
+            for (table, column, kind) in ADDED_COLUMNS {
+                let exists = conn
+                    .prepare(&format!("PRAGMA table_info({table})"))?
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .filter_map(Result::ok)
+                    .any(|c| c == *column);
+                if !exists {
+                    conn.execute(
+                        &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
+                        [],
+                    )?;
+                }
+            }
+            Ok::<_, rusqlite::Error>(())
+        })();
+        match migrated {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e.into());
             }
         }
         let db = Self {
@@ -793,18 +813,23 @@ impl Db {
                 test_schema = None;
             }
         }
-        let ddl = SCHEMA
+        let mut ddl = SCHEMA
             .replace("INTEGER PRIMARY KEY", "BIGSERIAL PRIMARY KEY")
             .replace("INTEGER", "BIGINT");
-        client
-            .batch(&ddl)
-            .context("creating the schema in PostgreSQL")?;
         for (table, column, kind) in ADDED_COLUMNS {
-            client.batch(&format!(
-                "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {}",
+            ddl.push_str(&format!(
+                "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {};\n",
                 kind.replace("INTEGER", "BIGINT")
-            ))?;
+            ));
         }
+        // One instance at a time brings the schema up to date: `IF NOT EXISTS`
+        // alone lets two that start together both create a new table, and one
+        // of them fail. The lock goes with the transaction.
+        client
+            .batch(&format!(
+                "BEGIN; SELECT pg_advisory_xact_lock({SCHEMA_LOCK}); {ddl} COMMIT;"
+            ))
+            .context("creating the schema in PostgreSQL")?;
         let db = Self {
             conn: Mutex::new(Conn::Postgres(client)),
             postgres: true,
@@ -1484,11 +1509,11 @@ impl Db {
         )
     }
 
-    /// HFS took the submission's kick-off (or already held it): from here on it
-    /// may be importing, whatever the engine hears next.
-    pub fn mark_submission_accepted(&self, token: &str) -> Result<()> {
+    /// HFS refused the submission's first kick-off, so it never took it: the
+    /// one failure that proves nothing was imported.
+    pub fn mark_kickoff_refused(&self, token: &str) -> Result<()> {
         self.execute(
-            "UPDATE submissions SET accepted = 1 WHERE token = $1",
+            "UPDATE submissions SET kickoff_refused = 1 WHERE token = $1",
             &params![token],
         )
         .map(drop)
@@ -1549,10 +1574,11 @@ impl Db {
 
     /// What the store knows about `feed`'s deliveries without the tag, read in
     /// one statement. Untagged submissions count whatever the source's path
-    /// is now: one nobody polls any more stays open. A failed one that HFS may
-    /// have accepted is open for good, however old: the server's import may
-    /// outlive the engine that started it. One refused at its first kick-off
-    /// is a bound.
+    /// is now: one nobody polls any more stays open. A failed one is a bound
+    /// only when HFS refused its first kick-off; any other failure may have
+    /// left HFS importing, and stays open. Submissions last touched before the
+    /// store began recording (`stamping_tracked`) are inside that mark's
+    /// bound: taking the mark assumes the server runs nothing they started.
     pub fn stamping(&self, feed: &str, now: i64) -> Result<Stamping> {
         let row = self
             .query_one(
@@ -1560,14 +1586,12 @@ impl Db {
                    (SELECT untagged_until FROM source_stamping WHERE feed_id = $1) AS rest,
                    (SELECT MAX(updated_at) FROM submissions
                      WHERE feed_id = $1 AND stamped = 0
-                       AND (status = 'done'
-                            OR (status = 'failed' AND accepted = 0 AND status_url IS NULL AND attempts = 0))) AS bulk,
+                       AND (status = 'done' OR (status = 'failed' AND kickoff_refused = 1))) AS bulk,
                    (SELECT COUNT(*) FROM submissions
                      WHERE feed_id = $1 AND stamped = 0
-                       AND (status IN ('kickoff', 'running')
-                            OR (status = 'failed'
-                                AND (accepted = 1 OR status_url IS NOT NULL OR attempts > 0)))) AS open",
-                &params![feed],
+                       AND (status IN ('kickoff', 'running') OR (status = 'failed' AND kickoff_refused = 0))
+                       AND updated_at >= (SELECT at FROM store_marks WHERE name = $2)) AS open",
+                &params![feed, STAMPING_TRACKED],
             )?
             .context("the stamping read returned no row")?;
         let rest = row.opt_i64(0);
@@ -2030,21 +2054,18 @@ mod tests {
     }
 
     /// A submission row as a pass would have left it.
-    #[allow(clippy::too_many_arguments)]
     fn submission_row(
         db: &Db,
         token: &str,
         status: &str,
         stamped: bool,
-        accepted: bool,
-        status_url: Option<&str>,
-        attempts: u32,
+        kickoff_refused: bool,
         at: i64,
     ) {
         db.execute(
-            "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, status_url, attempts, created_at, updated_at, stamped, accepted)
-             VALUES ($1, 'lab', $1, $2, '{}', $3, $4, $5, $5, $6, $7)",
-            &params![token, status, status_url, attempts, at, stamped, accepted],
+            "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, created_at, updated_at, stamped, kickoff_refused)
+             VALUES ($1, 'lab', $1, $2, '{}', $3, $3, $4, $5)",
+            &params![token, status, at, stamped, kickoff_refused],
         )
         .unwrap();
     }
@@ -2084,28 +2105,21 @@ mod tests {
         let db = Db::in_memory().unwrap();
         let now = now_ms();
         let read = |db: &Db| db.stamping("lab", now + 1_000).unwrap();
-        submission_row(&db, "tagged", "running", true, true, Some("u"), 0, now);
-        submission_row(
-            &db,
-            "tagged-failed",
-            "failed",
-            true,
-            true,
-            Some("u"),
-            3,
-            now,
-        );
+        submission_row(&db, "tagged", "running", true, false, now);
+        submission_row(&db, "tagged-failed", "failed", true, false, now);
         assert_eq!(read(&db).untagged_until, None);
         assert!(!read(&db).open);
 
-        for status in ["kickoff", "running"] {
-            submission_row(&db, status, status, false, false, None, 0, now);
+        // Running, or failed in any way but a refused first kick-off: HFS may
+        // be importing, so there is no date.
+        for status in ["kickoff", "running", "failed"] {
+            submission_row(&db, status, status, false, false, now);
             assert!(read(&db).open, "{status}");
             db.execute("DELETE FROM submissions WHERE token = $1", &params![status])
                 .unwrap();
         }
         // Done: HFS said so, so its writes ended before the engine recorded it.
-        submission_row(&db, "done", "done", false, true, Some("u"), 0, now + 5);
+        submission_row(&db, "done", "done", false, false, now + 5);
         assert_eq!(
             read(&db),
             Stamping {
@@ -2114,31 +2128,14 @@ mod tests {
             }
         );
         // Refused at its first kick-off: HFS never took it.
-        submission_row(&db, "refused", "failed", false, false, None, 0, now + 7);
-        assert_eq!(read(&db).untagged_until, Some(now + 7));
-        assert!(!read(&db).open);
-        // Failed after HFS may have taken it: accepted, a status URL, or an
-        // earlier kick-off whose answer never came back. Open for good.
-        for (token, accepted, url, attempts) in [
-            ("accepted", true, None, 0),
-            ("polled", false, Some("u"), 0),
-            ("retried", false, None, 2),
-        ] {
-            submission_row(
-                &db,
-                token,
-                "failed",
-                false,
-                accepted,
-                url,
-                attempts,
-                now + 9,
-            );
-            assert!(read(&db).open, "{token}");
-            db.execute("DELETE FROM submissions WHERE token = $1", &params![token])
-                .unwrap();
-        }
-        assert!(!read(&db).open);
+        submission_row(&db, "refused", "failed", false, true, now + 7);
+        assert_eq!(
+            read(&db),
+            Stamping {
+                open: false,
+                untagged_until: Some(now + 7)
+            }
+        );
     }
 
     #[test]
@@ -2148,37 +2145,41 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let now = now_ms();
         assert_eq!(db.stamping("lab", now).unwrap().untagged_until, None);
-        // As an earlier version leaves a store: files, a done submission, no mark.
+        // As the previous version leaves a store: files, a failed submission
+        // whose end it could not know, and none of this version's schema.
         db.insert_file("lab", "a.csv", "h", 1, "done", None, None, None)
             .unwrap();
-        db.insert_file("polled", "b.csv", "h", 1, "done", None, None, None)
-            .unwrap();
-        submission_row(&db, "old", "done", false, false, Some("u"), 0, now - 60_000);
-        db.execute("DELETE FROM store_marks", &[]).unwrap();
+        db.execute(
+            "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, status_url, created_at, updated_at)
+             VALUES ('old', 'lab', 'old', 'failed', '{}', 'u', $1, $1)",
+            &params![now - 86_400_000],
+        )
+        .unwrap();
+        for statement in [
+            "DROP TABLE source_stamping",
+            "DROP TABLE store_marks",
+            "ALTER TABLE submissions DROP COLUMN stamped",
+            "ALTER TABLE submissions DROP COLUMN kickoff_refused",
+        ] {
+            db.execute(statement, &[]).unwrap();
+        }
         let before = now_ms();
-        // Two instances open it at once: one backfills.
+        // Two instances upgrade it at once: both start, one takes the mark.
         let opened: Vec<Db> = std::thread::scope(|s| {
             let a = s.spawn(|| Db::open(&path).unwrap());
             let b = s.spawn(|| Db::open(&path).unwrap());
             vec![a.join().unwrap(), b.join().unwrap()]
         });
         let after = now_ms();
-        let bound = db.stamping("lab", after).unwrap();
-        let until = bound.untagged_until.unwrap();
-        assert!(until >= before + UNTAGGED_MARGIN_MS && until <= after + UNTAGGED_MARGIN_MS);
-        // The done submission is inside the upgrade's bound.
-        assert!(!db.stamping("lab", until + 1).unwrap().open);
-        // One that failed after the server may have taken it stays open,
-        // however long ago: the server's import may outlive the engine.
-        db.execute(
-            "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, status_url, created_at, updated_at)
-             VALUES ('older', 'polled', 'older', 'failed', '{}', 'u', $1, $1)",
-            &params![now - 86_400_000],
-        )
-        .unwrap();
-        assert!(db.stamping("polled", until + 1).unwrap().open);
-        let marks = db.query_json("SELECT name FROM store_marks", []).unwrap();
+        let marks = db.query_json("SELECT at FROM store_marks", []).unwrap();
         assert_eq!(marks.len(), 1);
+        let mark = marks[0]["at"].as_i64().unwrap();
+        assert!(mark >= before && mark <= after);
+        let until = db.stamping("lab", after).unwrap().untagged_until.unwrap();
+        assert_eq!(until, mark + UNTAGGED_MARGIN_MS, "taken from the mark");
+        // The old failure is inside the upgrade's bound: taking the mark
+        // assumes the server runs nothing the older version started.
+        assert!(!db.stamping("lab", until + 1).unwrap().open);
         drop(opened);
         // Opening again changes nothing.
         let again = Db::open(&path).unwrap();
@@ -2193,6 +2194,18 @@ mod tests {
                 .untagged_until,
             None
         );
+        // A failure after the mark keeps its source open, until the mark is
+        // taken again once the server is known to run nothing of it.
+        submission_row(&again, "later", "failed", false, false, now_ms());
+        assert!(again.stamping("lab", until + 1).unwrap().open);
+        again.execute("DELETE FROM store_marks", &[]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let reset = Db::open(&path).unwrap();
+        let later = reset
+            .stamping("lab", now_ms() + UNTAGGED_MARGIN_MS + 1)
+            .unwrap();
+        assert!(!later.open);
+        assert!(later.untagged_until.unwrap() > until);
     }
 
     #[test]

@@ -916,6 +916,8 @@ impl FeedRunner {
             return Ok(());
         };
         for sub in self.db.submissions_due(&self.feed.id)? {
+            // HFS refused this submission's very first kick-off: it never took it.
+            let mut refused_at_first_kickoff = false;
             let step = match sub.status.as_str() {
                 "kickoff" => {
                     match bulk
@@ -926,23 +928,22 @@ impl FeedRunner {
                         )
                         .await
                     {
-                        Ok(()) => {
-                            // HFS may import from here on, whatever it answers next.
-                            self.db.mark_submission_accepted(&sub.token)?;
-                            match bulk.status_url(&self.feed.id, &sub.submission_id).await {
-                                Ok(url) => Ok(Some(("running", Some(url)))),
-                                Err(e) => Err(e),
-                            }
-                        }
+                        Ok(()) => match bulk.status_url(&self.feed.id, &sub.submission_id).await {
+                            Ok(url) => Ok(Some(("running", Some(url)))),
+                            Err(e) => Err(e),
+                        },
                         // HFS already holds this drop: a repeat of the same files.
                         Err(SendError::Refused(409, _)) => {
-                            self.db.mark_submission_accepted(&sub.token)?;
                             match bulk.status_url(&self.feed.id, &sub.submission_id).await {
                                 Ok(url) => Ok(Some(("running", Some(url)))),
                                 Err(e) => Err(e),
                             }
                         }
-                        Err(e) => Err(e),
+                        Err(e) => {
+                            refused_at_first_kickoff =
+                                sub.attempts == 0 && matches!(e, SendError::Refused(..));
+                            Err(e)
+                        }
                     }
                 }
                 _ => match sub.status_url.as_deref() {
@@ -991,6 +992,11 @@ impl FeedRunner {
                         0,
                         Some(&reason),
                     )?;
+                    // Written after `failed`: a crash between leaves a failure
+                    // the store cannot place, which reads as open.
+                    if refused_at_first_kickoff {
+                        self.db.mark_kickoff_refused(&sub.token)?;
+                    }
                     self.archive_submission(&sub.token).await?;
                 }
                 Err(SendError::Transient(reason)) => {
@@ -1259,15 +1265,21 @@ impl FeedRunner {
             .fhir
             .post_bundle_with(&fhir::batch_bundle(&entries), || {
                 if untagged {
-                    let start = now_ms();
-                    self.db
-                        .mark_untagged(&self.feed.id, start + crate::db::UNTAGGED_MARGIN_MS)
-                        .context("recording an untagged delivery before sending it")?;
-                    if now_ms() - start > crate::db::UNTAGGED_WRITE_SLACK_MS {
-                        anyhow::bail!(
-                            "recording an untagged delivery took longer than its slack; not sent"
-                        );
+                    // A write slower than its slack (the store was held, by a
+                    // large file's rows, say) is taken again from a fresh instant:
+                    // the bound only grows, and the second write rarely waits.
+                    for _ in 0..2 {
+                        let start = now_ms();
+                        self.db
+                            .mark_untagged(&self.feed.id, start + crate::db::UNTAGGED_MARGIN_MS)
+                            .context("recording an untagged delivery before sending it")?;
+                        if now_ms() - start <= crate::db::UNTAGGED_WRITE_SLACK_MS {
+                            return Ok(());
+                        }
                     }
+                    anyhow::bail!(
+                        "recording an untagged delivery took longer than its slack twice; not sent"
+                    );
                 }
                 Ok(())
             })
