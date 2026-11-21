@@ -36,8 +36,6 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE INDEX IF NOT EXISTS files_feed_sha ON files(feed_id, sha256);
 CREATE INDEX IF NOT EXISTS files_feed_received ON files(feed_id, received_at);
 CREATE INDEX IF NOT EXISTS files_feed_id ON files(feed_id, id);
-CREATE INDEX IF NOT EXISTS files_status_id ON files(status, id);
-CREATE INDEX IF NOT EXISTS files_feed_status_id ON files(feed_id, status, id);
 CREATE TABLE IF NOT EXISTS records (
   id INTEGER PRIMARY KEY,
   file_id INTEGER NOT NULL REFERENCES files(id),
@@ -58,8 +56,6 @@ CREATE TABLE IF NOT EXISTS records (
 CREATE INDEX IF NOT EXISTS records_feed_status ON records(feed_id, status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS records_feed_status_id ON records(feed_id, status, id);
 CREATE INDEX IF NOT EXISTS records_file ON records(file_id);
-CREATE INDEX IF NOT EXISTS records_failing_file ON records(file_id) WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered';
-CREATE INDEX IF NOT EXISTS records_failing_feed_file ON records(feed_id, file_id) WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered';
 CREATE TABLE IF NOT EXISTS alerts (
   id INTEGER PRIMARY KEY,
   feed_id TEXT,
@@ -200,6 +196,17 @@ const ADDED_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS records_submission_id ON records(submission, id);
 CREATE INDEX IF NOT EXISTS events_source_kind_at ON events(source_id, kind, at);
 ";
+
+/// The indexes the loads list chooses its pages through, each built in a
+/// transaction of its own: a build over a large `records` locks that table
+/// alone, and never holds `files` while it waits for another instance's
+/// writes. The failing ones hold only the rows that make a load fail.
+const LOAD_INDEXES: [&str; 4] = [
+    "CREATE INDEX IF NOT EXISTS files_status_id ON files(status, id)",
+    "CREATE INDEX IF NOT EXISTS files_feed_status_id ON files(feed_id, status, id)",
+    "CREATE INDEX IF NOT EXISTS records_failing_file ON records(file_id) WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'",
+    "CREATE INDEX IF NOT EXISTS records_failing_feed_file ON records(feed_id, file_id) WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'",
+];
 
 /// On PostgreSQL only: on SQLite `records_file` already orders by id, the rowid.
 const ADDED_INDEXES_POSTGRES: &str = "
@@ -1270,6 +1277,9 @@ impl Db {
             }
         }
         conn.execute_batch(ADDED_INDEXES)?;
+        for index in LOAD_INDEXES {
+            conn.execute(index, [])?;
+        }
         never_reuse_rule_ids(&conn)?;
         conn.execute(
             &EVENTS_SINCE.replace('$', "?"),
@@ -1324,6 +1334,9 @@ impl Db {
             }
             client.batch(ADDED_INDEXES)?;
             client.batch(ADDED_INDEXES_POSTGRES)?;
+            for index in LOAD_INDEXES {
+                client.batch(index)?;
+            }
             client.execute(EVENTS_SINCE, &params![now_ms().to_string()])?;
             Ok::<_, anyhow::Error>(())
         })();

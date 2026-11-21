@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hie::db::{Db, Delivery, WorkItem};
+use hie::db::{Admission, Db, Delivery, NewFile, WorkItem};
 use serde_json::{Value, json};
 
 struct Engine {
@@ -655,9 +655,44 @@ async fn a_name_that_cannot_be_stored_is_not_kept() {
             None,
         )
         .unwrap();
+    // The ways the pipeline takes a file in: admitted with its rows, a
+    // duplicate, a zip.
+    let rows = [(1, json!({"a": 1}), None)];
+    let admitted = match e
+        .db
+        .admit_file(
+            &NewFile {
+                feed: "alpha",
+                source_name: "lab\0feed",
+                name: "y.csv",
+                sha: "sha-y",
+                size: 1,
+                source_key: None,
+                origin: None,
+            },
+            Ok(&rows),
+        )
+        .unwrap()
+    {
+        Admission::Admitted(id) => id,
+        other => panic!("{other:?}"),
+    };
+    let duplicate =
+        e.db.insert_duplicate("alpha", "lab\0feed", "y-again.csv", "sha-y", 1, admitted)
+            .unwrap();
+    let zip =
+        e.db.insert_container("alpha", "lab\0feed", "drop.zip", "sha-zip", 1)
+            .unwrap();
+    // And with a name it can hold, each keeps it.
+    let named =
+        e.db.insert_container("alpha", "Lab feed", "drop2.zip", "sha-zip2", 1)
+            .unwrap();
     let page = e.page("source=alpha").await;
-    assert_eq!(ids_of(&page), [id]);
-    assert_eq!(page["loads"][0]["source_name"], Value::Null);
+    assert_eq!(ids_of(&page), [named, zip, duplicate, admitted, id]);
+    for load in &page["loads"].as_array().unwrap()[1..] {
+        assert_eq!(load["source_name"], Value::Null, "{load}");
+    }
+    assert_eq!(page["loads"][0]["source_name"], "Lab feed");
 }
 
 /// A store made by an earlier version: its loads have no source name.
