@@ -363,6 +363,148 @@ async fn silence_fires_once_and_clears_when_data_arrives() {
     );
 }
 
+// ---- rule ids and when rules were made -------------------------------------
+
+fn new_rule(db: &hie::db::Db) -> i64 {
+    let rule: hie::db::Rule = serde_json::from_value(
+        json!({"source_id": "s", "condition": "silence", "threshold": "1h"}),
+    )
+    .unwrap();
+    db.insert_rule(&rule).unwrap()
+}
+
+#[test]
+fn a_rule_id_is_never_given_again_even_after_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hie.db");
+    let db = hie::db::Db::open(&path).unwrap();
+    let ids: Vec<i64> = (0..3).map(|_| new_rule(&db)).collect();
+    assert!(db.delete_rule(ids[2]).unwrap());
+    let next = new_rule(&db);
+    assert!(next > ids[2], "{next} after {ids:?}");
+    assert!(db.delete_rule(next).unwrap());
+    // Opened again: still past every id used. On PostgreSQL the first handle
+    // owns the test schema, so it stays open.
+    let keep = std::env::var("HIE_TEST_DATABASE_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .map(|_| db);
+    let again = hie::db::Db::open(&path).unwrap();
+    assert!(new_rule(&again) > next);
+    drop(keep);
+}
+
+#[test]
+fn a_store_whose_rules_table_was_made_the_old_way_stops_reusing_ids() {
+    if std::env::var("HIE_TEST_DATABASE_URL").is_ok_and(|u| !u.trim().is_empty()) {
+        eprintln!("skipping: the old table is SQLite's");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hie.db");
+    {
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE alert_rules (
+               id INTEGER PRIMARY KEY, source_id TEXT, condition TEXT NOT NULL, threshold TEXT NOT NULL,
+               notify TEXT NOT NULL DEFAULT '[]', channels TEXT NOT NULL DEFAULT '[\"app\"]',
+               enabled INTEGER NOT NULL DEFAULT 1, created_by TEXT, created_at INTEGER NOT NULL);
+             INSERT INTO alert_rules (id, condition, threshold, created_at) VALUES
+               (1, 'silence', '1h', 1000), (2, 'silence', '2h', 2000), (3, 'silence', '3h', 3000);",
+        )
+        .unwrap();
+    }
+    let db = hie::db::Db::open(&path).unwrap();
+    // The rows and ids are kept.
+    let rules = db.rules().unwrap();
+    assert_eq!(
+        rules
+            .iter()
+            .map(|r| (r.id, r.threshold.as_str()))
+            .collect::<Vec<_>>(),
+        [(1, "1h"), (2, "2h"), (3, "3h")]
+    );
+    assert_eq!(
+        rules[0].created_at.as_deref(),
+        Some("1970-01-01T00:00:01.000Z")
+    );
+    assert!(db.delete_rule(3).unwrap());
+    assert!(new_rule(&db) > 3);
+    drop(db);
+    let sql: String = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'alert_rules'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(sql.contains("AUTOINCREMENT"), "{sql}");
+}
+
+#[tokio::test]
+async fn a_rule_answer_says_when_it_was_made_and_a_body_cannot() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("hie.yaml"),
+        "fhir_base_url: http://127.0.0.1:9\ndatabase: data/hie.db\n",
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&dir.path().join("hie.yaml")).unwrap();
+    let (_manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let api = serve(hie::api::router(state)).await;
+    let http = reqwest::Client::new();
+    let body =
+        json!({"condition": "silence", "threshold": "1h", "created_at": "2001-01-01T00:00:00Z"});
+    let created: Value = http
+        .post(format!("{api}/api/alert-rules"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let made = created["created_at"].as_str().unwrap().to_string();
+    assert!(
+        made.ends_with('Z') && !made.starts_with("2001"),
+        "{created}"
+    );
+    let id = created["id"].as_i64().unwrap();
+    let replaced: Value = http
+        .put(format!("{api}/api/alert-rules/{id}"))
+        .json(&json!({"condition": "silence", "threshold": "2h", "created_at": "2001-01-01T00:00:00Z"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replaced["created_at"], made.as_str());
+    assert_eq!(replaced["threshold"], "2h");
+    let one: Value = reqwest::get(format!("{api}/api/alert-rules/{id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["created_at"], made.as_str());
+    let all: Value = reqwest::get(format!("{api}/api/alert-rules"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        all["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["created_at"].is_string())
+    );
+}
+
 // ---- Reading alerts by period and in pages ------------------------------------
 
 /// An engine with no source and no Python, whose alerts a test writes itself.
