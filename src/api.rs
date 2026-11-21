@@ -165,6 +165,11 @@ async fn bulk_file(
 
 const DAY_MS: i64 = 86_400_000;
 
+/// A record that fails: rejected for any reason but `filtered`, which a
+/// transform asks for on purpose by returning no resources. `rejected` counts
+/// both; `failing` only these.
+const FAILING: &str = "status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'";
+
 /// An error answer: `{"error": <sentence>}`, plus a stable `code` and other
 /// members when set, and any headers it needs.
 struct ApiError {
@@ -330,6 +335,11 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         "last_received_at": last.and_then(iso_ms),
         "records": db.feed_counts(&feed.id)?,
         "rejected_last_24h": rejected_24h,
+        "failing_last_24h": count(
+            db,
+            &format!("SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND {FAILING} AND updated_at >= $2"),
+            params![feed.id, since],
+        )?,
         "last_alert": last_alert.into_iter().next(),
         "definition": s.manager.definition(&feed.id)?,
     }))
@@ -474,7 +484,7 @@ fn daily_stats(
     let mut by_day: Vec<Value> = (0..local.len())
         .map(|i| {
             let day = local.date(i as i64).expect("a day of the window");
-            json!({"day": day.to_string(), "files": 0, "sent": 0, "rejected": 0})
+            json!({"day": day.to_string(), "files": 0, "sent": 0, "rejected": 0, "failing": 0})
         })
         .collect();
     let by_index = |row: &Value| -> Option<usize> {
@@ -497,7 +507,9 @@ fn daily_stats(
     }
     for row in db.query_json(
         &format!(
-            "SELECT {} AS day, status, COUNT(*) AS n FROM records
+            "SELECT {} AS day, status, COUNT(*) AS n,
+                    CAST(COALESCE(SUM(CASE WHEN {FAILING} THEN 1 ELSE 0 END), 0) AS BIGINT) AS failing
+             FROM records
              WHERE feed_id = $1 AND status IN ('sent', 'rejected') AND updated_at >= $2 AND updated_at < $3 GROUP BY 1, status",
             local.sql_index("updated_at")
         ),
@@ -505,6 +517,9 @@ fn daily_stats(
     )? {
         if let (Some(i), Some(status)) = (by_index(&row), row["status"].as_str()) {
             by_day[i][status] = row["n"].clone();
+            if status == "rejected" {
+                by_day[i]["failing"] = row["failing"].clone();
+            }
         }
     }
     let (today_since, today_until) = local.bounds(local.len() - 1);
@@ -515,6 +530,7 @@ fn daily_stats(
         "records": count(db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2 AND f.received_at < $3", params![id, today_since, today_until])?,
         "sent": last["sent"],
         "rejected": last["rejected"],
+        "failing": last["failing"],
         "pending": count(db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status IN ('received', 'pending')", params![id])?,
     });
     Ok(
@@ -580,7 +596,8 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
     let mut needs_you = Vec::new();
     for feed in s.manager.sources() {
         let status = source_status(&s, &feed)?;
-        let rejected = status["rejected_last_24h"].as_i64().unwrap_or(0);
+        // Rows a transform filtered out on purpose are not a reason to look.
+        let failing = status["failing_last_24h"].as_i64().unwrap_or(0);
         let reason = match status["state"].as_str() {
             Some("late") => Some(format!(
                 "nothing received since {}, expected at least every {}",
@@ -595,7 +612,7 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
                     .unwrap_or_default(),
                 status["paused"]["since"].as_str().unwrap_or("?")
             )),
-            _ if rejected > 0 => Some(format!("{rejected} records rejected in the last 24 hours")),
+            _ if failing > 0 => Some(format!("{failing} records rejected in the last 24 hours")),
             _ => None,
         };
         if let Some(reason) = reason {
@@ -608,6 +625,7 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
         "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE status <> 'duplicate' AND received_at >= $1", params![since])?,
         "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'sent' AND updated_at >= $1", params![since])?,
         "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'rejected' AND updated_at >= $1", params![since])?,
+        "failing": count(&s.db, &format!("SELECT COUNT(*) AS n FROM records WHERE {FAILING} AND updated_at >= $1"), params![since])?,
         "alerts": count(&s.db, "SELECT COUNT(*) AS n FROM alerts WHERE created_at >= $1", params![since])?,
     });
     Ok(Json(json!({
@@ -954,7 +972,8 @@ mod tests {
     use crate::zone::{Zone, utc};
 
     /// A store with one file and one record per instant: the file received and
-    /// the record `status` at that instant.
+    /// the record `status` at that instant (`filtered` is rejected as filtered,
+    /// `rejected` as a data error).
     fn store(rows: &[(&str, &str)]) -> Db {
         let db = Db::in_memory().unwrap();
         for (i, (at, status)) in rows.iter().enumerate() {
@@ -969,9 +988,14 @@ mod tests {
                 &params![file, ms],
             )
             .unwrap();
+            let (status, kind) = match *status {
+                "filtered" => ("rejected", Some("filtered")),
+                "rejected" => ("rejected", Some("data")),
+                other => (other, None),
+            };
             db.execute_for_test(
-                "UPDATE records SET status = $2, updated_at = $3 WHERE file_id = $1",
-                &params![file, *status, ms],
+                "UPDATE records SET status = $2, error_kind = $3, updated_at = $4 WHERE file_id = $1",
+                &params![file, status, kind, ms],
             )
             .unwrap();
         }
@@ -1054,18 +1078,40 @@ mod tests {
         let stats = daily_stats(&db, "lab", &ny, 2, utc("2026-11-21T04:00:00Z")).unwrap();
         assert_eq!(
             stats["today"],
-            json!({"day": "2026-11-20", "files": 2, "records": 2, "sent": 1, "rejected": 1, "pending": 0})
+            json!({"day": "2026-11-20", "files": 2, "records": 2, "sent": 1, "rejected": 1, "failing": 1, "pending": 0})
         );
         assert_eq!(
             stats["by_day"][0],
-            json!({"day": "2026-11-19", "files": 1, "sent": 1, "rejected": 0})
+            json!({"day": "2026-11-19", "files": 1, "sent": 1, "rejected": 0, "failing": 0})
         );
         assert_eq!(
             stats["by_day"][1],
-            json!({"day": "2026-11-20", "files": 2, "sent": 1, "rejected": 1})
+            json!({"day": "2026-11-20", "files": 2, "sent": 1, "rejected": 1, "failing": 1})
         );
         // Today's figures are the last day's.
         assert_eq!(stats["today"]["files"], stats["by_day"][1]["files"]);
+    }
+
+    #[test]
+    fn rows_filtered_out_are_rejected_but_not_failing() {
+        let db = store(&[
+            ("2026-11-20T01:00:00Z", "filtered"),
+            ("2026-11-20T02:00:00Z", "filtered"),
+            ("2026-11-20T03:00:00Z", "rejected"),
+            ("2026-11-19T03:00:00Z", "filtered"),
+        ]);
+        let stats = daily_stats(&db, "lab", &Zone::utc(), 2, utc("2026-11-20T12:00:00Z")).unwrap();
+        assert_eq!(
+            (&stats["today"]["rejected"], &stats["today"]["failing"]),
+            (&json!(3), &json!(1))
+        );
+        assert_eq!(
+            (
+                &stats["by_day"][0]["rejected"],
+                &stats["by_day"][0]["failing"]
+            ),
+            (&json!(1), &json!(0))
+        );
     }
 
     #[test]

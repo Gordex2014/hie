@@ -586,3 +586,77 @@ async fn stats_count_local_days_and_echo_the_zone() {
         );
     }
 }
+
+#[tokio::test]
+async fn rows_filtered_out_are_not_failures() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let lab = lab(&python).await;
+    let put_transform = |code: String| {
+        lab.http
+            .put(format!("{}/api/transforms/lab_results", lab.api))
+            .json(&json!({ "code": code }))
+            .send()
+    };
+    // A transform that keeps nothing: every row is rejected as `filtered`.
+    let r = put_transform("def transform(record, context):\n    return []\n".into())
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let rows = std::fs::read_to_string(repo().join("examples/data/labs.csv"))
+        .unwrap()
+        .lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .count() as i64;
+    lab.drop_file("labs.csv").await;
+    let stats = lab
+        .wait_until("/api/sources/lab-results/stats?days=1", |s| {
+            s["today"]["rejected"].as_i64() == Some(rows)
+        })
+        .await;
+    let filtered = rows;
+    assert_eq!(stats["today"]["failing"], 0, "{stats}");
+    assert_eq!(stats["by_day"][0]["failing"], 0, "{stats}");
+    let status = lab.get("/api/monitoring/status").await;
+    let source = &status["sources"][0];
+    assert_eq!(source["rejected_last_24h"], filtered, "{status}");
+    assert_eq!(source["failing_last_24h"], 0, "{status}");
+    assert_eq!(status["last_24h"]["rejected"], filtered);
+    assert_eq!(status["last_24h"]["failing"], 0);
+    assert_eq!(status["needs_you"], json!([]), "{status}");
+
+    // Rows that fail are a reason to look.
+    let code = std::fs::read_to_string(repo().join("transforms/lab_results.py")).unwrap();
+    assert!(put_transform(code).await.unwrap().status().is_success());
+    lab.drop_file("messy.csv").await;
+    lab.wait_until("/api/sources/lab-results/loads", |l| {
+        let loads = l["loads"].as_array().unwrap();
+        loads.len() == 2
+            && loads
+                .iter()
+                .all(|f| f["in_progress"] == 0 && f["status"] != "processing")
+    })
+    .await;
+    let status = lab.get("/api/monitoring/status").await;
+    assert!(
+        status["sources"][0]["failing_last_24h"].as_i64() > Some(0),
+        "{status}"
+    );
+    let source = &status["sources"][0];
+    let failing = source["failing_last_24h"].as_i64().unwrap();
+    assert_eq!(
+        source["rejected_last_24h"].as_i64().unwrap(),
+        filtered + failing,
+        "{status}"
+    );
+    assert_eq!(status["last_24h"]["failing"], failing);
+    assert_eq!(
+        status["needs_you"][0]["reason"],
+        format!("{failing} records rejected in the last 24 hours")
+    );
+    let stats = lab.get("/api/sources/lab-results/stats?days=1").await;
+    assert_eq!(stats["today"]["failing"], failing, "{stats}");
+}

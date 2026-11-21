@@ -457,6 +457,8 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - An older engine reading a store with zoned rules evaluates them in UTC without a warning, and one that edits such a rule leaves its zone in place, so the zone comes back after the next upgrade.
 - A stored zone that a later database no longer knows is skipped (logged at debug); the IANA database keeps old names as links, so this should not happen.
 
+*Also counted with these figures (2026-11-20):* rows a transform filtered out on purpose (rejected as `filtered`) are not failures. `rejected` keeps its meaning, every rejected row; `failing` beside it, on `stats` (per local day and today) and the monitoring status (`last_24h`, each source's `failing_last_24h`), leaves them out, and a source is listed under `needs_you` for its failing rows only, so a transform that drops rows by design raises nothing. The reason's sentence is unchanged; its number counts failing rows.
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.
