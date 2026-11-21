@@ -108,6 +108,14 @@ CREATE TABLE IF NOT EXISTS alert_rules (
   created_by TEXT,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS source_stamping (
+  feed_id TEXT PRIMARY KEY,
+  untagged_until INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS store_marks (
+  name TEXT PRIMARY KEY,
+  at INTEGER NOT NULL
+);
 ";
 
 /// Columns added after a store was first created; each is added when missing.
@@ -121,7 +129,28 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("alerts", "cleared_reason", "TEXT"),
     ("alerts", "notify", "TEXT"),
     ("alerts", "channels", "TEXT"),
+    ("submissions", "stamped", "INTEGER NOT NULL DEFAULT 0"),
+    ("submissions", "accepted", "INTEGER NOT NULL DEFAULT 0"),
 ];
+
+/// How long after the engine sends an untagged REST request HFS may still be
+/// writing it: the request's own timeout, and as long again for a server that
+/// keeps working after the engine stopped waiting.
+pub const UNTAGGED_MARGIN_MS: i64 = 2 * crate::fhir::HTTP_TIMEOUT.as_millis() as i64;
+
+/// The store mark that says since when the store records untagged deliveries.
+const STAMPING_TRACKED: &str = "stamping_tracked";
+
+/// What the store knows about a source's deliveries without the source tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamping {
+    /// A delivery without the tag is in progress, or how it ended is unknown:
+    /// there is no bound yet.
+    pub open: bool,
+    /// The latest instant up to which HFS may have written a resource of this
+    /// source without the tag; `None` when nothing was delivered without it.
+    pub untagged_until: Option<i64>,
+}
 
 /// A rule in words: "nothing arrives for 2 hours", "more than 1% of a load's rows
 /// fail", "the file is not there by 06:00", "HFS cannot be reached after 5 attempts".
@@ -161,6 +190,8 @@ pub struct Submission {
     pub manifest: Value,
     pub status_url: Option<String>,
     pub attempts: u32,
+    /// Its NDJSON carries the source tag (a transformed submission only).
+    pub stamped: bool,
 }
 
 /// A file with records waiting to be submitted, and what they are.
@@ -725,13 +756,15 @@ impl Db {
                 )?;
             }
         }
-        Ok(Self {
+        let db = Self {
             conn: Mutex::new(Conn::Sqlite(conn)),
             postgres: false,
             test_schema: None,
             #[cfg(all(test, feature = "secrets-native"))]
             pause: Mutex::new(None),
-        })
+        };
+        db.track_stamping()?;
+        Ok(db)
     }
 
     fn open_postgres(url: &str, test_schema: Option<String>) -> Result<Self> {
@@ -765,13 +798,15 @@ impl Db {
                 kind.replace("INTEGER", "BIGINT")
             ))?;
         }
-        Ok(Self {
+        let db = Self {
             conn: Mutex::new(Conn::Postgres(client)),
             postgres: true,
             test_schema,
             #[cfg(all(test, feature = "secrets-native"))]
             pause: Mutex::new(None),
-        })
+        };
+        db.track_stamping()?;
+        Ok(db)
     }
 
     /// How long a SQLite statement waits for another connection's write lock
@@ -1361,7 +1396,8 @@ impl Db {
         })
     }
 
-    /// Opens a submission over the given records, which move to `submitted`.
+    /// Opens a submission over the given records, which move to `submitted`;
+    /// `stamped` when its NDJSON carries the source tag.
     pub fn create_submission(
         &self,
         token: &str,
@@ -1369,15 +1405,16 @@ impl Db {
         submission_id: &str,
         manifest: &Value,
         record_ids: &[i64],
+        stamped: bool,
     ) -> Result<()> {
         self.with(|c| {
             c.batch("BEGIN")?;
             let now = now_ms();
             let result = (|| {
                 c.execute(
-                    "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, created_at, updated_at)
-                     VALUES ($1, $2, $3, 'kickoff', $4, $5, $6)",
-                    &params![token, feed, submission_id, manifest.to_string(), now, now],
+                    "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, created_at, updated_at, stamped)
+                     VALUES ($1, $2, $3, 'kickoff', $4, $5, $6, $7)",
+                    &params![token, feed, submission_id, manifest.to_string(), now, now, stamped],
                 )?;
                 for id in record_ids {
                     c.execute(
@@ -1409,6 +1446,7 @@ impl Db {
                 manifest: r.json(4).unwrap_or(Value::Null),
                 status_url: r.opt_string(5),
                 attempts: r.i64(6) as u32,
+                stamped: r.i64(7) != 0,
             })
             .collect())
     }
@@ -1416,7 +1454,7 @@ impl Db {
     pub fn submission(&self, token: &str) -> Result<Option<Submission>> {
         Ok(self
             .submissions(
-                "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts FROM submissions WHERE token = $1",
+                "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts, stamped FROM submissions WHERE token = $1",
                 &params![token],
             )?
             .into_iter()
@@ -1426,10 +1464,104 @@ impl Db {
     /// Open submissions of a feed whose next attempt is due.
     pub fn submissions_due(&self, feed: &str) -> Result<Vec<Submission>> {
         self.submissions(
-            "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts FROM submissions
+            "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts, stamped FROM submissions
              WHERE feed_id = $1 AND status IN ('kickoff', 'running') AND next_attempt_at <= $2 ORDER BY created_at",
             &params![feed, now_ms()],
         )
+    }
+
+    /// HFS took the submission's kick-off (or already held it): from here on it
+    /// may be importing, whatever the engine hears next.
+    pub fn mark_submission_accepted(&self, token: &str) -> Result<()> {
+        self.execute(
+            "UPDATE submissions SET accepted = 1 WHERE token = $1",
+            &params![token],
+        )
+        .map(drop)
+    }
+
+    // ---- source stamping ---------------------------------------------------
+
+    /// Starts recording untagged deliveries in a store that did not: every
+    /// delivery an earlier version made was untagged, so each source with a
+    /// file gets the bound `now` plus the margin. Done once per store, in one
+    /// transaction whose first write claims the mark, so instances opening the
+    /// store at once backfill it once.
+    fn track_stamping(&self) -> Result<()> {
+        let postgres = self.postgres;
+        self.with(|c| {
+            c.batch(if postgres { "BEGIN" } else { "BEGIN IMMEDIATE" })?;
+            let now = now_ms();
+            let result = (|| {
+                let claimed = c.execute(
+                    "INSERT INTO store_marks (name, at) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
+                    &params![STAMPING_TRACKED, now],
+                )?;
+                if claimed > 0 {
+                    c.execute(
+                        "INSERT INTO source_stamping (feed_id, untagged_until)
+                         SELECT DISTINCT feed_id, CAST($1 AS BIGINT) FROM files WHERE 1 = 1
+                         ON CONFLICT (feed_id) DO UPDATE SET untagged_until =
+                           CASE WHEN excluded.untagged_until > source_stamping.untagged_until
+                                THEN excluded.untagged_until ELSE source_stamping.untagged_until END",
+                        &params![now + UNTAGGED_MARGIN_MS],
+                    )?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })();
+            match result {
+                Ok(()) => c.batch("COMMIT"),
+                Err(e) => {
+                    let _ = c.batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    /// HFS may write resources of `feed` without the source tag until `until`.
+    /// The bound only ever moves later.
+    pub fn mark_untagged(&self, feed: &str, until: i64) -> Result<()> {
+        self.execute(
+            "INSERT INTO source_stamping (feed_id, untagged_until) VALUES ($1, $2)
+             ON CONFLICT (feed_id) DO UPDATE SET untagged_until =
+               CASE WHEN excluded.untagged_until > source_stamping.untagged_until
+                    THEN excluded.untagged_until ELSE source_stamping.untagged_until END",
+            &params![feed, until],
+        )
+        .map(drop)
+    }
+
+    /// What the store knows about `feed`'s deliveries without the tag, read in
+    /// one statement. Untagged submissions count whatever the source's path
+    /// is now: one nobody polls any more stays open. A failed one that HFS may
+    /// have accepted is open for good; one refused at its first kick-off
+    /// is a bound. Failed ones that ended before the store recorded stamping
+    /// are inside the upgrade's bound.
+    pub fn stamping(&self, feed: &str, now: i64) -> Result<Stamping> {
+        let row = self
+            .query_one(
+                "SELECT
+                   (SELECT untagged_until FROM source_stamping WHERE feed_id = $1) AS rest,
+                   (SELECT MAX(updated_at) FROM submissions
+                     WHERE feed_id = $1 AND stamped = 0
+                       AND (status = 'done'
+                            OR (status = 'failed' AND accepted = 0 AND status_url IS NULL AND attempts = 0))) AS bulk,
+                   (SELECT COUNT(*) FROM submissions
+                     WHERE feed_id = $1 AND stamped = 0
+                       AND (status IN ('kickoff', 'running')
+                            OR (status = 'failed'
+                                AND (accepted = 1 OR status_url IS NOT NULL OR attempts > 0)
+                                AND updated_at >= COALESCE((SELECT at FROM store_marks WHERE name = $2), 0)))) AS open",
+                &params![feed, STAMPING_TRACKED],
+            )?
+            .context("the stamping read returned no row")?;
+        let rest = row.opt_i64(0);
+        let untagged_until = rest.max(row.opt_i64(1));
+        Ok(Stamping {
+            open: row.i64(2) > 0 || rest.is_some_and(|r| r > now),
+            untagged_until,
+        })
     }
 
     pub fn update_submission(
@@ -1881,6 +2013,171 @@ mod tests {
         assert!(!db.acquire_lease("lab", "a", 60_000).unwrap());
         db.release_lease("lab", "b").unwrap();
         assert!(db.acquire_lease("lab", "a", 60_000).unwrap());
+    }
+
+    /// A submission row as a pass would have left it.
+    #[allow(clippy::too_many_arguments)]
+    fn submission_row(
+        db: &Db,
+        token: &str,
+        status: &str,
+        stamped: bool,
+        accepted: bool,
+        status_url: Option<&str>,
+        attempts: u32,
+        at: i64,
+    ) {
+        db.execute(
+            "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, status_url, attempts, created_at, updated_at, stamped, accepted)
+             VALUES ($1, 'lab', $1, $2, '{}', $3, $4, $5, $5, $6, $7)",
+            &params![token, status, status_url, attempts, at, stamped, accepted],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_rest_bound_only_moves_later_and_is_open_while_in_the_future() {
+        let db = Db::in_memory().unwrap();
+        let now = now_ms();
+        let none = Stamping {
+            open: false,
+            untagged_until: None,
+        };
+        assert_eq!(db.stamping("lab", now).unwrap(), none);
+        // Two requests in flight at once (two instances during a handover):
+        // whichever is recorded last, the later bound stays.
+        db.mark_untagged("lab", now + 200).unwrap();
+        db.mark_untagged("lab", now + 100).unwrap();
+        assert_eq!(
+            db.stamping("lab", now).unwrap(),
+            Stamping {
+                open: true,
+                untagged_until: Some(now + 200)
+            }
+        );
+        assert_eq!(
+            db.stamping("lab", now + 201).unwrap(),
+            Stamping {
+                open: false,
+                untagged_until: Some(now + 200)
+            }
+        );
+        assert_eq!(db.stamping("other", now).unwrap(), none);
+    }
+
+    #[test]
+    fn untagged_submissions_are_open_until_they_end_and_tagged_ones_never_count() {
+        let db = Db::in_memory().unwrap();
+        let now = now_ms();
+        let read = |db: &Db| db.stamping("lab", now + 1_000).unwrap();
+        submission_row(&db, "tagged", "running", true, true, Some("u"), 0, now);
+        submission_row(
+            &db,
+            "tagged-failed",
+            "failed",
+            true,
+            true,
+            Some("u"),
+            3,
+            now,
+        );
+        assert_eq!(read(&db).untagged_until, None);
+        assert!(!read(&db).open);
+
+        for status in ["kickoff", "running"] {
+            submission_row(&db, status, status, false, false, None, 0, now);
+            assert!(read(&db).open, "{status}");
+            db.execute("DELETE FROM submissions WHERE token = $1", &params![status])
+                .unwrap();
+        }
+        // Done: HFS said so, so its writes ended before the engine recorded it.
+        submission_row(&db, "done", "done", false, true, Some("u"), 0, now + 5);
+        assert_eq!(
+            read(&db),
+            Stamping {
+                open: false,
+                untagged_until: Some(now + 5)
+            }
+        );
+        // Refused at its first kick-off: HFS never took it.
+        submission_row(&db, "refused", "failed", false, false, None, 0, now + 7);
+        assert_eq!(read(&db).untagged_until, Some(now + 7));
+        assert!(!read(&db).open);
+        // Failed after HFS may have taken it: accepted, a status URL, or an
+        // earlier kick-off whose answer never came back. Open for good.
+        for (token, accepted, url, attempts) in [
+            ("accepted", true, None, 0),
+            ("polled", false, Some("u"), 0),
+            ("retried", false, None, 2),
+        ] {
+            submission_row(
+                &db,
+                token,
+                "failed",
+                false,
+                accepted,
+                url,
+                attempts,
+                now + 9,
+            );
+            assert!(read(&db).open, "{token}");
+            db.execute("DELETE FROM submissions WHERE token = $1", &params![token])
+                .unwrap();
+        }
+        assert!(!read(&db).open);
+    }
+
+    #[test]
+    fn an_existing_store_gets_one_bound_per_source_once_and_a_fresh_one_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hie.db");
+        let db = Db::open(&path).unwrap();
+        let now = now_ms();
+        assert_eq!(db.stamping("lab", now).unwrap().untagged_until, None);
+        // As an earlier version leaves a store: files, a failed submission, no mark.
+        db.insert_file("lab", "a.csv", "h", 1, "done", None, None, None)
+            .unwrap();
+        submission_row(
+            &db,
+            "old",
+            "failed",
+            false,
+            false,
+            Some("u"),
+            0,
+            now - 60_000,
+        );
+        db.execute("DELETE FROM store_marks", &[]).unwrap();
+        let before = now_ms();
+        // Two instances open it at once: one backfills.
+        let opened: Vec<Db> = std::thread::scope(|s| {
+            let a = s.spawn(|| Db::open(&path).unwrap());
+            let b = s.spawn(|| Db::open(&path).unwrap());
+            vec![a.join().unwrap(), b.join().unwrap()]
+        });
+        let after = now_ms();
+        let bound = db.stamping("lab", after).unwrap();
+        let until = bound.untagged_until.unwrap();
+        assert!(until >= before + UNTAGGED_MARGIN_MS && until <= after + UNTAGGED_MARGIN_MS);
+        // The failed submission ended before the store recorded stamping: inside
+        // the upgrade's bound, not open for good.
+        assert!(!db.stamping("lab", until + 1).unwrap().open);
+        let marks = db.query_json("SELECT name FROM store_marks", []).unwrap();
+        assert_eq!(marks.len(), 1);
+        drop(opened);
+        // Opening again changes nothing.
+        let again = Db::open(&path).unwrap();
+        assert_eq!(
+            again.stamping("lab", after).unwrap().untagged_until,
+            Some(until)
+        );
+        assert_eq!(
+            again
+                .stamping("never-delivered", after)
+                .unwrap()
+                .untagged_until,
+            None
+        );
     }
 
     #[test]

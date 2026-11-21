@@ -62,6 +62,8 @@ pub struct FeedRunner {
     bulk_dir: PathBuf,
     /// `$bulk-submit` over the engine's transformed NDJSON, not the source objects.
     bulk_transformed: bool,
+    /// Tag what this runner delivers with its source (`delivery.stamp_source`).
+    stamp_source: bool,
     /// How the manager drives this runner, once it runs: a halt is seen between records.
     control: std::sync::OnceLock<Arc<RunnerControl>>,
 }
@@ -151,6 +153,7 @@ impl FeedRunner {
             instance: instance_id().to_string(),
             bulk_dir: std::env::temp_dir().join("hie-bulk"),
             bulk_transformed: feed_bulk_transformed,
+            stamp_source: false,
             outage_alerted: AtomicBool::new(false),
             control: std::sync::OnceLock::new(),
         }
@@ -214,6 +217,30 @@ impl FeedRunner {
     pub fn with_worker_limits(mut self, limits: WorkerLimits) -> Self {
         self.transformer.set_limits(limits);
         self
+    }
+
+    /// Tags every resource this runner delivers by REST or in a transformed
+    /// submission with its source (`delivery.stamp_source` in `hie.yaml`).
+    pub fn with_stamp_source(mut self, on: bool) -> Self {
+        self.stamp_source = on;
+        self
+    }
+
+    /// The resources of one record as they are sent: tagged with the source
+    /// when stamping is on, as stored otherwise.
+    fn outgoing(&self, resources: Option<&Value>) -> Result<Vec<Value>, String> {
+        resources
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|r| {
+                if self.stamp_source {
+                    fhir::stamp_source(r, &self.feed.id)
+                } else {
+                    Ok(r.clone())
+                }
+            })
+            .collect()
     }
 
     fn halted(&self) -> bool {
@@ -895,12 +922,17 @@ impl FeedRunner {
                         )
                         .await
                     {
-                        Ok(()) => match bulk.status_url(&self.feed.id, &sub.submission_id).await {
-                            Ok(url) => Ok(Some(("running", Some(url)))),
-                            Err(e) => Err(e),
-                        },
+                        Ok(()) => {
+                            // HFS may import from here on, whatever it answers next.
+                            self.db.mark_submission_accepted(&sub.token)?;
+                            match bulk.status_url(&self.feed.id, &sub.submission_id).await {
+                                Ok(url) => Ok(Some(("running", Some(url)))),
+                                Err(e) => Err(e),
+                            }
+                        }
                         // HFS already holds this drop: a repeat of the same files.
                         Err(SendError::Refused(409, _)) => {
+                            self.db.mark_submission_accepted(&sub.token)?;
                             match bulk.status_url(&self.feed.id, &sub.submission_id).await {
                                 Ok(url) => Ok(Some(("running", Some(url)))),
                                 Err(e) => Err(e),
@@ -1056,12 +1088,24 @@ impl FeedRunner {
             if records.is_empty() {
                 return Ok(());
             }
+            // Tagged here, just before they are written: a record whose
+            // resources cannot carry the tag is rejected and left out.
+            let mut records_out = Vec::with_capacity(records.len());
+            for (id, resources) in &records {
+                match self.outgoing(Some(resources)) {
+                    Ok(resources) => records_out.push((*id, resources)),
+                    Err(msg) => self.db.mark_rejected(*id, "validation", &msg, None)?,
+                }
+            }
+            if records_out.is_empty() {
+                continue;
+            }
             let token = bulk::token();
             let ttl = Duration::from_secs(self.feed.delivery.url_ttl_seconds);
             let mut by_type: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
             let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-            for (_, resources) in &records {
-                for resource in resources.as_array().into_iter().flatten() {
+            for (_, resources) in &records_out {
+                for resource in resources {
                     let kind = resource["resourceType"]
                         .as_str()
                         .unwrap_or("Resource")
@@ -1097,13 +1141,13 @@ impl FeedRunner {
                 };
                 entries.push((kind.clone(), url, counts[&kind]));
             }
-            let record_ids: Vec<i64> = records.iter().map(|(id, _)| *id).collect();
-            let span = format!(
-                "records {}-{}",
+            let record_ids: Vec<i64> = records_out.iter().map(|(id, _)| *id).collect();
+            let submission_id = bulk::transformed_submission_id(
+                &self.feed.id,
                 record_ids[0],
-                record_ids[record_ids.len() - 1]
+                record_ids[record_ids.len() - 1],
+                self.stamp_source.then_some(token.as_str()),
             );
-            let submission_id = bulk::submission_id(&self.feed.id, &[span.as_str()]);
             let manifest = bulk.manifest(&entries);
             self.db.create_submission(
                 &token,
@@ -1111,6 +1155,7 @@ impl FeedRunner {
                 &submission_id,
                 &manifest,
                 &record_ids,
+                self.stamp_source,
             )?;
             tracing::info!(feed = %self.feed.id, submission = %submission_id, files = entries.len(), records = record_ids.len(), "submission opened (transformed)");
         }
@@ -1171,22 +1216,58 @@ impl FeedRunner {
     /// Sends `items` in one batch Bundle. Returns false when HFS is unavailable,
     /// so the caller stops until the next pass instead of hammering it.
     async fn deliver(&self, items: &[WorkItem]) -> Result<bool> {
+        // A record whose resources cannot carry the source tag is rejected as a
+        // whole and goes no further: not in the Bundle, not in what is settled.
+        let mut kept = Vec::with_capacity(items.len());
+        let mut outgoing = Vec::with_capacity(items.len());
+        for item in items {
+            match self.outgoing(item.resources.as_ref()) {
+                Ok(resources) => {
+                    kept.push(item.clone());
+                    outgoing.push(resources);
+                }
+                Err(msg) => self.db.mark_rejected(item.id, "validation", &msg, None)?,
+            }
+        }
+        if kept.is_empty() {
+            return Ok(true);
+        }
+        let items = &kept[..];
         let mut entries = Vec::new();
         let mut owner = Vec::new();
-        for (i, item) in items.iter().enumerate() {
-            for resource in item
-                .resources
-                .as_ref()
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let key = transform::check_resource(resource).map_err(anyhow::Error::msg)?;
-                entries.push((fhir::request_url(&key), resource.clone()));
+        for (i, resources) in outgoing.into_iter().enumerate() {
+            for resource in resources {
+                let key = transform::check_resource(&resource).map_err(anyhow::Error::msg)?;
+                entries.push((fhir::request_url(&key), resource));
                 owner.push(i);
             }
         }
-        match self.fhir.post_bundle(&fhir::batch_bundle(&entries)).await {
+        // Untagged, HFS may hold what this request writes until well after it
+        // was sent: the bound is stored before it leaves, once the token is in
+        // hand, and never cleared, so neither a crash nor another instance's
+        // request can make it earlier. A store that cannot take it fails the
+        // pass, as any store failure does: nothing was sent, HFS is not to blame.
+        let untagged = !self.stamp_source;
+        let mut not_recorded = None;
+        let sent = self
+            .fhir
+            .post_bundle_with(&fhir::batch_bundle(&entries), || {
+                if untagged
+                    && let Err(e) = self
+                        .db
+                        .mark_untagged(&self.feed.id, now_ms() + crate::db::UNTAGGED_MARGIN_MS)
+                {
+                    let refusal = anyhow::anyhow!("the untagged bound could not be stored");
+                    not_recorded = Some(e);
+                    return Err(refusal);
+                }
+                Ok(())
+            })
+            .await;
+        if let Some(e) = not_recorded {
+            return Err(e.context("recording an untagged delivery before sending it"));
+        }
+        match sent {
             Err(SendError::Transient(reason)) => {
                 for item in items {
                     self.defer(item, &reason)?;

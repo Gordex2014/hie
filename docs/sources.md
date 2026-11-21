@@ -69,6 +69,8 @@ An **MLLP** source (`type: mllp`, see `sources/adt-mllp.yaml.example`) listens o
 
 `public_url` in `hie.yaml` must be the URL HFS reaches the engine at.
 
+With `delivery.stamp_source` on in `hie.yaml`, the REST path and `bulk_from: transformed` tag every resource with its source (`meta.tag` `urn:helios:hie:source|<source id>`); `bulk_from: source_objects` hands the objects over untouched and cannot. See [Tagging delivered resources with their source](running.md#tagging-delivered-resources-with-their-source).
+
 The same document is what `POST /api/sources` takes. Before creating one, `POST /api/sources/test` with `{"source": {...}}` lists the connection once and answers with the evidence: reachable or not, in how many milliseconds, how many objects match, and the newest one.
 
 ### Alerts and rules

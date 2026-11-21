@@ -100,6 +100,42 @@ worker:
 
 Every value must be at least 1. A transform that imports a heavy library may need a larger `memory_mib`. A reply line is at most 32 MiB. Each worker process gets a fresh run directory under the system temporary directory, deleted when it ends.
 
+### Tagging delivered resources with their source
+
+A consumer that reads HFS can learn which engine source delivered a resource when the engine tags it. Off by default; for every source, in `hie.yaml`:
+
+```yaml
+delivery:
+  stamp_source: true
+```
+
+The block takes only `stamp_source`; any other key in it stops the engine at start (a source's own delivery settings live in its definition, and `stamp_source` there is refused). Every instance sharing a store should use the same value. A change needs a restart.
+
+With it on, every resource the engine sends carries `meta.tag` `{"system": "urn:helios:hie:source", "code": "<source id>"}`, added as the resource leaves, never stored with the record:
+
+- **Covered:** the REST path (each resource of the batch Bundle) and `$bulk-submit` with `bulk_from: transformed` (each line of the NDJSON the engine writes, served from `bulk_dir` or put in the source's store).
+- **Not covered:** `$bulk-submit` with `bulk_from: source_objects` (or `auto` resolving to it). HFS fetches those objects untouched, so the engine cannot tag them; tagging them needs an option on the server side. Such a source reports `reason: "direct_bulk"`.
+- The resource's other tags keep their order, and `meta.source`, `profile`, `security` and the rest of `meta` are kept; the engine's tag comes last, once. A tag of the same system that the transform set is replaced, whatever its code, so a resource carries one source tag. Sending a record again sends the same JSON. A resource whose `meta` is not an object, or whose `meta.tag` is not an array, cannot carry the tag: its record is rejected (`validation`) and the rest go on.
+- Try never writes, and shows resources without the tag.
+- With it off, the engine leaves tags as the transform wrote them: a tag of that system then proves nothing.
+- Turning it on makes resources that were delivered before differ once: the next delivery of an unchanged row sends a new `meta.tag`, so HFS writes a new version (HFS's bulk ingestion, which skips unchanged resources, compares `meta` tags included). Turning it off, the engine sends resources without the tag; whether the server keeps an earlier tag on update is the server's.
+
+**What was delivered without the tag.** Every source read (`GET /api/sources`, `GET /api/sources/{id}`, each source of `GET /api/monitoring/status`) carries `stamping`:
+
+```json
+"stamping": {"active": true, "reason": null, "untagged": "until", "untagged_until": "2026-11-21T09:14:02.120+00:00"}
+```
+
+- `active`: what this instance delivers for this source from now on carries the tag. `reason` says why not: `"off"` (the setting is off on this instance) or `"direct_bulk"`.
+- `untagged`: `"none"` when the store records no delivery of this source that could have reached HFS without the tag; `"until"` when deliveries up to `untagged_until` may lack it and every delivery recorded after it carried it; `"open"` when one without it is still in progress or how it ended cannot be known, so there is no date yet (`untagged_until` then holds the last known bound, which may lie a few minutes ahead, or `null`).
+- A consumer can say, for `active` with `none`, that nothing of the source is untagged; for `active` with `until`, that deliveries through that date may lack the tag; otherwise, that the source's data may lack it.
+
+How it is kept: before each untagged REST request leaves, the engine stores a bound of the send time plus four minutes (twice the request timeout: the request, and a server still writing after the engine stopped waiting); the bound only moves later. A `$bulk-submit` submission without the tag (every direct one, and transformed ones written with the setting off) keeps the source `open` while it runs and bounds it when HFS reports it done. One that failed after HFS may have accepted it (a refused status call or poll, or a kick-off retried after no answer) keeps the source `open` for good, as does one left unpolled because its source was deleted or replaced by a REST definition (until a bulk source with the same id polls it to its end). The facts are kept by source id and survive a restart, a change of the setting and the deletion of the source.
+
+On a store from an earlier version, every delivery was untagged: the first start of this version gives each source that has a load the bound of that start plus the margin. That holds when every older instance on the store was stopped before the first instance of this version started. After a rolling upgrade, or a downgrade and a new upgrade, delete the `stamping_tracked` row of the `store_marks` table once no older instance runs, and restart: the bounds are taken again, later.
+
+Out of the engine's knowledge: a server still writing a REST request more than four minutes after it was sent; another tool writing the same resources; a store that was wiped or replaced; earlier versions of a resource in HFS's history, which keep what they were sent with. A resource two sources both write carries what the last write sent. Instants come from each instance's clock, so instances on one store need synchronized clocks, and comparing with HFS's `meta.lastUpdated` (HFS's clock) needs a margin. While a source is replaced, its previous runner may finish its current step after the read already shows the new definition.
+
 ### Credentials and the secret key
 
 S3 sources sign with credentials stored in the engine (`/api/secrets`, see [Secrets](api.md#secrets)), sealed in its database with XChaCha20-Poly1305 under a key derived from one **secret key**. Only metadata is ever answered; values never leave the engine except to sign requests.

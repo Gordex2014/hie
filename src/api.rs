@@ -138,6 +138,11 @@ async fn bulk_file(
     let engine_file = s.bulk_dir.join(&token).join(format!("{file_id}.ndjson"));
     let path = if engine_file.is_file() {
         engine_file
+    } else if submission.stamped {
+        // A tagged submission is served only what the engine wrote for it:
+        // never a source file that happens to share the number.
+        tracing::warn!(feed = %submission.feed_id, file_id, "refused: the engine's file for this tagged submission is missing");
+        return Err(not_found("file"));
     } else {
         let (key, origin) =
             s.db.submission_file(&token, file_id)?
@@ -331,7 +336,34 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         "records": db.feed_counts(&feed.id)?,
         "rejected_last_24h": rejected_24h,
         "last_alert": last_alert.into_iter().next(),
+        "stamping": stamping(s, feed)?,
         "definition": s.manager.definition(&feed.id)?,
+    }))
+}
+
+/// Whether what this instance delivers for `feed` carries the source tag, and
+/// what the store knows about its deliveries without it.
+fn stamping(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
+    let direct_bulk = feed.delivery.method == crate::config::DeliveryMethod::BulkSubmit
+        && !feed.bulk_transformed();
+    let reason = if !s.manager.stamp_source() {
+        Some("off")
+    } else if direct_bulk {
+        Some("direct_bulk")
+    } else {
+        None
+    };
+    let known = s.db.stamping(&feed.id, now_ms())?;
+    let untagged = match (known.open, known.untagged_until) {
+        (true, _) => "open",
+        (false, Some(_)) => "until",
+        (false, None) => "none",
+    };
+    Ok(json!({
+        "active": reason.is_none(),
+        "reason": reason,
+        "untagged": untagged,
+        "untagged_until": known.untagged_until.and_then(iso_ms),
     }))
 }
 

@@ -1733,3 +1733,117 @@ async fn a_file_recorded_through_a_symlink_and_parent_is_served_as_the_filesyste
     assert!(!body.contains("DECOY"), "{status}: {body}");
     assert!(status == 404 || body == original, "{status}: {body}");
 }
+
+/// A signer whose URLs point at the stand-in that serves the store's objects.
+#[derive(Debug)]
+struct StoreSigner {
+    base: String,
+}
+
+impl object_store::signer::Signer for StoreSigner {
+    fn signed_url<'a, 'b, 'c>(
+        &'a self,
+        _method: http::Method,
+        path: &'b object_store::path::Path,
+        _expires_in: Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = object_store::Result<url::Url>> + Send + 'c>,
+    >
+    where
+        'a: 'c,
+        'b: 'c,
+        Self: 'c,
+    {
+        let url = format!("{}/objects/{path}", self.base);
+        Box::pin(async move { Ok(url::Url::parse(&url).unwrap()) })
+    }
+}
+
+/// With stamping on, the NDJSON a transformed submission writes into a signing
+/// store, which the FHIR server fetches from there, carries the source tag.
+#[tokio::test]
+async fn a_transformed_submission_written_to_the_store_carries_the_source_tag() {
+    use object_store::ObjectStore;
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let (consumer, hfs_url) = consumer().await;
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let db = Arc::new(hie::db::Db::in_memory().unwrap());
+    let (listener, served_url) = bind().await;
+    let app = Router::new()
+        .route("/objects/{*key}", get(served_object))
+        .route("/bulk/{token}/manifest.json", get(served_manifest))
+        .with_state(Served {
+            store: store.clone(),
+            db: db.clone(),
+        });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let dir = tempfile::tempdir().unwrap();
+    let transform = dir.path().join("emit.py");
+    std::fs::write(
+        &transform,
+        "def transform(record, context):\n    return record[\"out\"]\n",
+    )
+    .unwrap();
+    let feed: hie::config::FeedConfig = serde_yaml::from_str(&format!(
+        "id: drops\nname: Drops\nsource:\n  type: s3\n  bucket: unused\nformat: ndjson\ntransform: {}\n\
+         delivery:\n  method: bulk_submit\n  bulk_from: transformed\n  initial_backoff_ms: 10\n",
+        transform.display()
+    ))
+    .unwrap();
+    let source = hie::source::Source::Object(
+        hie::source::ObjectSource::new(store.clone(), "", "processed", "*.ndjson", Duration::ZERO)
+            .with_signer(Arc::new(StoreSigner {
+                base: served_url.clone(),
+            })),
+    );
+    let runner = hie::pipeline::FeedRunner::with_source(
+        feed,
+        source,
+        db.clone(),
+        Arc::new(hie::fhir::FhirClient::new(&hfs_url)),
+        Arc::new(hie::alerts::Alerter::new(db.clone(), None)),
+        &python,
+        &repo().join("hie_runtime"),
+        &hfs_url,
+        &served_url,
+    )
+    .with_stamp_source(true);
+    store
+        .put(
+            &object_store::path::Path::parse("a.ndjson").unwrap(),
+            "{\"out\": {\"resourceType\": \"Patient\", \"id\": \"p1\", \"meta\": {\"source\": \"urn:s\"}}}\n".into(),
+        )
+        .await
+        .unwrap();
+    runner.tick().await.unwrap();
+
+    // Handed over by the store's URL, not served by the engine.
+    let urls = manifest_urls(&db);
+    assert_eq!(urls.len(), 1);
+    assert!(
+        urls[0].starts_with(&format!("{served_url}/objects/processed/submissions/")),
+        "{urls:?}"
+    );
+    let key = urls[0]
+        .strip_prefix(&format!("{served_url}/objects/"))
+        .unwrap();
+    let written = store
+        .get(&object_store::path::Path::parse(key).unwrap())
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let resource: Value = serde_json::from_slice(&written).unwrap();
+    assert_eq!(resource["meta"]["source"], "urn:s");
+    assert_eq!(
+        resource["meta"]["tag"],
+        json!([{"system": "urn:helios:hie:source", "code": "drops"}])
+    );
+    assert_eq!(consumer.submissions.lock().unwrap().len(), 1);
+    settle_until_sent(&runner, &db, "drops", 1).await;
+}

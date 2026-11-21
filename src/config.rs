@@ -31,6 +31,9 @@ pub struct Config {
     pub transforms_dir: PathBuf,
     #[serde(default)]
     pub alerts: AlertConfig,
+    /// How the engine delivers, for every source.
+    #[serde(default)]
+    pub delivery: EngineDeliveryConfig,
     /// What each transform's worker process may use and how long it may take.
     #[serde(default)]
     pub worker: WorkerConfig,
@@ -84,6 +87,16 @@ pub struct SecretsConfig {
     /// A file holding the secret key (base64 of 32 bytes), relative to the
     /// directory holding `hie.yaml`; `HIE_SECRET_KEY_FILE` names one too.
     pub key_file: Option<PathBuf>,
+}
+
+/// The `delivery:` block of `hie.yaml`: delivery settings that apply to every
+/// source. A source's own `delivery:` is something else (`DeliveryConfig`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct EngineDeliveryConfig {
+    /// Tag every resource delivered by REST or by `$bulk-submit` from transformed
+    /// records with `meta.tag` `urn:helios:hie:source|<source id>`.
+    pub stamp_source: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -353,6 +366,22 @@ pub struct DeliveryConfig {
     /// Records per submission on the `transformed` path.
     #[serde(default = "default_bulk_records_max")]
     pub bulk_records_max: usize,
+    /// Whether the definition names `stamp_source`, whatever its value: that is
+    /// an engine setting (`delivery.stamp_source` in `hie.yaml`), refused here
+    /// rather than silently ignored. Never written back.
+    #[serde(
+        default,
+        rename = "stamp_source",
+        deserialize_with = "present",
+        skip_serializing
+    )]
+    pub misplaced_stamp_source: bool,
+}
+
+/// True for any value, `null` included: the key is there.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(d)?;
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -388,6 +417,7 @@ impl Default for DeliveryConfig {
             manifest_objects_max: default_manifest_objects_max(),
             bulk_from: BulkFrom::Auto,
             bulk_records_max: default_bulk_records_max(),
+            misplaced_stamp_source: false,
         }
     }
 }
@@ -619,6 +649,12 @@ impl FeedConfig {
         }
         if self.name.trim().is_empty() {
             bail!("source {}: name is required", self.id);
+        }
+        if self.delivery.misplaced_stamp_source {
+            bail!(
+                "source {}: delivery.stamp_source is an engine setting: set it in the delivery: block of hie.yaml, not in a source",
+                self.id
+            );
         }
         self.source.resolve(base);
         self.source
@@ -957,6 +993,48 @@ mod tests {
         let err =
             load_engine_yaml("fhir_base_url: http://hfs\nworker:\n  memroy_mib: 1\n").unwrap_err();
         assert!(format!("{err:#}").contains("memroy_mib"), "{err:#}");
+    }
+
+    #[test]
+    fn stamping_is_an_engine_setting_off_by_default() {
+        let (config, _) = load_engine_yaml("fhir_base_url: http://hfs\n").unwrap();
+        assert!(!config.delivery.stamp_source);
+        let (config, _) =
+            load_engine_yaml("fhir_base_url: http://hfs\ndelivery:\n  stamp_source: true\n")
+                .unwrap();
+        assert!(config.delivery.stamp_source);
+        // The block takes nothing else: a source's delivery keys there are refused.
+        let err =
+            load_engine_yaml("fhir_base_url: http://hfs\ndelivery:\n  method: rest\n").unwrap_err();
+        assert!(format!("{err:#}").contains("method"), "{err:#}");
+    }
+
+    #[test]
+    fn a_source_that_names_stamp_source_is_refused_whatever_its_value() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.py"), "def transform(r, c): return r\n").unwrap();
+        let base = "id: lab\nname: Lab\nsource:\n  type: folder\n  path: inbox\ntransform: t.py\n";
+        for value in ["true", "false", "null", ""] {
+            let yaml = format!("{base}delivery:\n  stamp_source: {value}\n");
+            let mut feed: FeedConfig = serde_yaml::from_str(&yaml).unwrap();
+            let err = feed.resolve(dir.path()).unwrap_err().to_string();
+            assert!(err.contains("engine setting"), "{value:?}: {err}");
+        }
+        let mut feed: FeedConfig = serde_json::from_value(serde_json::json!({
+            "id": "lab", "name": "Lab", "source": {"type": "folder", "path": "inbox"},
+            "transform": "t.py", "delivery": {"stamp_source": null}
+        }))
+        .unwrap();
+        assert!(feed.resolve(dir.path()).is_err());
+        // Without it, the definition loads and is written back without it.
+        let mut feed: FeedConfig = serde_yaml::from_str(base).unwrap();
+        feed.resolve(dir.path()).unwrap();
+        assert!(!feed.to_yaml().unwrap().contains("stamp_source"));
+        assert!(
+            !serde_json::to_string(&feed)
+                .unwrap()
+                .contains("stamp_source")
+        );
     }
 
     #[test]
