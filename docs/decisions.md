@@ -511,7 +511,7 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - A pass that outlives its lease (longer than three poll intervals, at least 30 s) can overlap another instance's pass, as before: a check is then answered by whichever finishes first, and both list real loads of the source, but on PostgreSQL a load the other instance commits late may be left out of the answer, or appear in an answered check's `files` after `file_count` was counted.
 - A delete fails the source's waiting checks unless another instance held the source at that moment; on PostgreSQL, an instance that takes the source over while the delete runs may find its checks already failed as deleted.
 - The `files(feed_id, id)` index is built at the first start of this version: on a large PostgreSQL store, other instances' new loads wait for it once.
-- A pass fails the waiting checks when the source is paused both before and after it reads them; a resume in between leaves them to the pass the resume starts. A pause that lands after the checks were read does not stop that pass's scan, which answers them.
+- A pass fails the waiting checks when the source is paused both before and after it reads them; a resume in between leaves them to the pass the resume starts. A pause that lands while the pass loads its credential fails the checks it reads and ends the pass; one that lands after the checks were read does not stop that pass's scan, which answers them.
 - No list of a source's checks; a caller keeps the ids it was given.
 
 ## Not in the prototype

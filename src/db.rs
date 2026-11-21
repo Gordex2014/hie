@@ -3486,10 +3486,16 @@ impl Db {
     /// given again (`AUTOINCREMENT`, a sequence on PostgreSQL).
     pub fn purge_checks(&self, cutoff_ms: i64, limit: usize) -> Result<usize> {
         self.transaction(|tx| {
+            // Locked as they are chosen: on PostgreSQL a purge running at the
+            // same time waits, then chooses the next rows instead of counting
+            // none and stopping early.
             Ok(tx
                 .query(
-                    "DELETE FROM checks WHERE id IN (SELECT id FROM checks WHERE requested_at < $1 ORDER BY id LIMIT $2)
-                     RETURNING id",
+                    &format!(
+                        "DELETE FROM checks WHERE id IN (SELECT id FROM checks WHERE requested_at < $1 ORDER BY id LIMIT $2{})
+                         RETURNING id",
+                        tx.for_update()
+                    ),
                     &params![cutoff_ms, limit],
                 )?
                 .len())

@@ -268,6 +268,12 @@ impl FeedRunner {
             // Read here, after the credential, so the snapshot is taken just
             // before the scan; `tick_with` directly keeps this future shallow.
             let snapshot = self.pending_checks();
+            // Paused while the credential was loaded: the checks read after
+            // the pause fail, and the pass stops here.
+            if !snapshot.is_empty() && self.db.is_paused(&self.feed.id)? {
+                self.answer_checks(&snapshot, Some(CheckFailure::Paused));
+                return Ok(true);
+            }
             self.tick_with(&snapshot).await?;
         }
         Ok(true)

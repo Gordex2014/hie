@@ -1526,6 +1526,43 @@ fn an_alert_cleared_while_the_purge_waits_for_it_is_kept_on_postgres() {
     assert_eq!(alert_ids(&db), [open, newest]);
 }
 
+/// A purge of checks that waits for another instance's purge chooses the next
+/// old rows once free, instead of counting none and stopping with old checks left.
+#[test]
+fn a_check_purge_waiting_for_another_moves_on_to_the_next_rows_on_postgres() {
+    if test_database_url().is_none() {
+        eprintln!("skipping: HIE_TEST_DATABASE_URL is not set");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open(&dir.path().join("hie.db")).unwrap());
+    let day = 86_400_000i64;
+    let now = hie::db::now_ms();
+    let first = db.insert_check("s").unwrap();
+    let second = db.insert_check("s").unwrap();
+    db.query_json(
+        "UPDATE checks SET requested_at = CAST($1 AS BIGINT)",
+        hie::db::params![now - 40 * day],
+    )
+    .unwrap();
+
+    // Another instance's purge holds the first, not committed yet.
+    let mut other = raw_client(&db).unwrap();
+    other.batch_execute("BEGIN").unwrap();
+    other
+        .execute("DELETE FROM checks WHERE id = $1", &[&first])
+        .unwrap();
+    let purger = {
+        let db = db.clone();
+        std::thread::spawn(move || db.purge_checks(now - 30 * day, 1))
+    };
+    wait_until_blocked_by(backend_pid(&mut other));
+    other.batch_execute("COMMIT").unwrap();
+
+    assert_eq!(purger.join().unwrap().unwrap(), 1);
+    assert!(db.check(second, 0, 10).unwrap().is_none());
+}
+
 #[test]
 fn set_writes_over_more_than_one_chunk_change_and_log_every_row_once() {
     let db = Db::in_memory().unwrap();
