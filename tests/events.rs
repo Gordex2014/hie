@@ -1960,12 +1960,15 @@ fn an_open_alert_is_not_kept_by_a_rule_made_after_it() {
         hie::db::params![now - 40 * day],
     )
     .unwrap();
-    // The rule goes; a new one is made, with the same id on SQLite.
+    // The rule goes; a new one is made, and the old alert names it, as it
+    // would on a store that gave a deleted rule's id again.
     db.delete_rule(first.id).unwrap();
     let second = db.insert_rule(&rule("s", true)).unwrap();
-    if !db.is_postgres() {
-        assert_eq!(second, first.id);
-    }
+    db.query_json(
+        "UPDATE alerts SET rule_id = CAST($1 AS BIGINT) WHERE id = CAST($2 AS BIGINT)",
+        hie::db::params![second, open],
+    )
+    .unwrap();
     let purged = hie::retention::purge(&db, now - 30 * day).unwrap();
     assert_eq!(purged.alerts, 1);
     assert_eq!(alert_ids(&db), [newest]);
@@ -2055,4 +2058,164 @@ async fn events_and_cursors_survive_a_restart_and_ids_are_never_given_again() {
     assert!(events(&third.state.db)[0]["id"].as_i64().unwrap() > highest);
     stop_engine(third).await;
     drop(seed);
+}
+
+// ---- rejected records over a period --------------------------------------------
+
+/// Stores `record.rejected` for `record` at `at`.
+fn rejected_at(db: &Db, record: i64, kind: &str, at: i64) {
+    db.mark_rejected(record, kind, "rejected", None).unwrap();
+    let last = events(db).pop().unwrap()["id"].as_i64().unwrap();
+    db.query_json(
+        "UPDATE events SET at = CAST($1 AS BIGINT) WHERE id = CAST($2 AS BIGINT)",
+        hie::db::params![at, last],
+    )
+    .unwrap();
+}
+
+fn set_events_since(db: &Db, at: i64) {
+    db.query_json(
+        "UPDATE store_meta SET value = CAST($1 AS TEXT) WHERE key = 'events_since'",
+        hie::db::params![at.to_string()],
+    )
+    .unwrap();
+}
+
+/// The window of a day in an answer, by its start.
+fn day_of(answer: &Value, from: i64) -> Value {
+    let iso = chrono::DateTime::from_timestamp_millis(from)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    answer["days"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["from"] == iso.as_str())
+        .unwrap_or_else(|| panic!("no day from {iso}: {answer}"))
+        .clone()
+}
+
+#[tokio::test]
+async fn rejected_records_are_counted_once_per_day_with_their_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_manager, state) = engine(
+        dir.path(),
+        "fhir_base_url: http://127.0.0.1:9\n",
+        &[("one", ndjson_source("one", ""))],
+    );
+    let db = state.db.clone();
+    let api = serve(hie::api::router(state.clone())).await;
+    let day = 86_400_000i64;
+    let today = hie::db::now_ms().div_euclid(day) * day;
+    load(&db, "one", "a", 0, 4);
+    let [a, b, c, d] = [1, 2, 3, 4].map(|line| record_id(&db, "one", line));
+    // Today, from its midnight: one record rejected twice, one filtered out.
+    rejected_at(&db, a, "data", today);
+    rejected_at(&db, a, "validation", today);
+    rejected_at(&db, c, "filtered", today);
+    // Yesterday, up to its last millisecond: two records.
+    rejected_at(&db, b, "server", today - 1);
+    rejected_at(&db, d, "parse", today - 1);
+    // Another source's rejection is not this one's.
+    load(&db, "two", "b", 1, 0);
+
+    let url = format!("{api}/api/sources/one/failures");
+    let (code, answer) = get_json(&url).await;
+    assert_eq!(code, 200, "{answer}");
+    assert_eq!(answer["source_id"], "one");
+    assert_eq!(answer["tz"], "UTC");
+    let days = answer["days"].as_array().unwrap();
+    assert_eq!(days.len(), 14);
+    let today_day = chrono::DateTime::from_timestamp_millis(today)
+        .unwrap()
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(days[13]["day"], today_day.as_str());
+    assert!(
+        days.windows(2)
+            .all(|w| w[0]["from"].as_str() < w[1]["from"].as_str())
+    );
+    let t = day_of(&answer, today);
+    assert_eq!(
+        (&t["records"], &t["filtered"]),
+        (&json!(1), &json!(1)),
+        "{t}"
+    );
+    let y = day_of(&answer, today - day);
+    assert_eq!(
+        (&y["records"], &y["filtered"]),
+        (&json!(2), &json!(0)),
+        "{y}"
+    );
+    assert_eq!(days[0]["records"], 0);
+    // The last 24 hours hold both: three records and the one filtered out.
+    let last = &answer["last_24h"];
+    assert_eq!(
+        (&last["records"], &last["filtered"]),
+        (&json!(3), &json!(1)),
+        "{last}"
+    );
+
+    // The log began on this store just now: no window is covered yet.
+    assert!(days.iter().all(|d| d["complete"] == false), "{answer}");
+    assert_eq!(last["complete"], false);
+
+    // Begun two days ago: covered from then.
+    set_events_since(&db, today - 2 * day);
+    let (_, answer) = get_json(&url).await;
+    assert_eq!(
+        answer["covered_from"],
+        day_of(&answer, today - 2 * day)["from"]
+    );
+    assert_eq!(day_of(&answer, today - 2 * day)["complete"], true);
+    assert_eq!(day_of(&answer, today - 3 * day)["complete"], false);
+    assert_eq!(day_of(&answer, today)["complete"], true);
+    assert_eq!(answer["last_24h"]["complete"], true);
+    // Begun long ago: the retention (30 days) is the limit. The counts are
+    // still given over what is kept.
+    set_events_since(&db, today - 60 * day);
+    let (_, answer) = get_json(&format!("{url}?days=40")).await;
+    assert_eq!(answer["days"].as_array().unwrap().len(), 40);
+    assert_eq!(day_of(&answer, today - 29 * day)["complete"], true);
+    assert_eq!(day_of(&answer, today - 31 * day)["complete"], false);
+    assert_eq!(day_of(&answer, today - 39 * day)["records"], 0);
+    let (_, answer) = get_json(&format!("{url}?days=90")).await;
+    assert_eq!(answer["days"].as_array().unwrap().len(), 90);
+
+    for (query, field) in [
+        ("days=0", "days"),
+        ("days=91", "days"),
+        ("days=ten", "days"),
+        ("days=+5", "days"),
+        ("days=1&days=2", "days"),
+        ("since=2026-11-20T00:00:00Z", "since"),
+    ] {
+        let (code, body) = get_json(&format!("{url}?{query}")).await;
+        assert_eq!(code, 400, "{query}: {body}");
+        assert_eq!(body["code"], "invalid_query", "{query}: {body}");
+        assert_eq!(body["field"], field, "{query}: {body}");
+    }
+    // As `/stats` answers an unknown source.
+    for path in ["failures", "stats"] {
+        let (code, body) = get_json(&format!("{api}/api/sources/nobody/{path}")).await;
+        assert_eq!(code, 404, "{body}");
+        assert_eq!(body["error"], "source nobody not found");
+    }
+}
+
+#[test]
+fn the_event_log_start_is_set_once_and_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hie.db");
+    let first = Db::open(&path).unwrap();
+    let since = first.events_since().unwrap().unwrap();
+    assert!((hie::db::now_ms() - since).abs() < 60_000, "{since}");
+    set_events_since(&first, since - 1000);
+    // Opened again, as at a restart (on PostgreSQL the first handle owns the
+    // schema, so it stays open).
+    let keep = test_database_url().map(|_| first);
+    std::thread::sleep(Duration::from_millis(5));
+    let again = Db::open(&path).unwrap();
+    assert_eq!(again.events_since().unwrap(), Some(since - 1000));
+    drop(keep);
 }

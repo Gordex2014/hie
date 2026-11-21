@@ -157,6 +157,7 @@ pub fn build_with(
             started: api::Started::now(),
             bulk_dir: config.bulk_dir(),
             secrets,
+            retention: retention::Retention::from_config(&config.retention),
         },
     ))
 }

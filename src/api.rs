@@ -26,6 +26,8 @@ pub struct AppState {
     pub bulk_dir: std::path::PathBuf,
     /// Connector credentials, or why there are none.
     pub secrets: crate::secrets::Secrets,
+    /// How long history is kept: what a report over a period can cover.
+    pub retention: crate::retention::Retention,
 }
 
 /// When the process came up, for the uptime that `/health` reports.
@@ -62,6 +64,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/loads/{file_id}", get(get_load))
         .route("/api/loads/{file_id}/retry", post(retry_load))
         .route("/api/sources/{id}/stats", get(source_stats))
+        .route("/api/sources/{id}/failures", get(source_failures))
         .route("/api/transforms", get(list_transforms))
         .route(
             "/api/transforms/{name}",
@@ -499,6 +502,91 @@ async fn source_stats(
     Ok(Json(
         json!({"source": id, "days": days, "today": today_json, "by_day": rows}),
     ))
+}
+
+/// Day windows of a report: `days` UTC calendar days, oldest first, the last
+/// one today, each `(day, from, to)` in epoch milliseconds. The one place a
+/// report's days are drawn: a time zone would change only this.
+fn day_windows(now_ms: i64, days: usize) -> Vec<(String, i64, i64)> {
+    let today = now_ms.div_euclid(DAY_MS) * DAY_MS;
+    (0..days as i64)
+        .rev()
+        .map(|back| {
+            let from = today - back * DAY_MS;
+            let day = chrono::DateTime::from_timestamp_millis(from)
+                .map(|t| t.format("%Y-%m-%d").to_string())
+                .unwrap_or_default();
+            (day, from, from + DAY_MS)
+        })
+        .collect()
+}
+
+/// An instant as the store's answers give one: RFC 3339, milliseconds, `Z`.
+fn instant(ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
+/// Distinct records a source rejected over the last 24 hours and each of the
+/// last `days` UTC days, from the event log, with how far the log covers them.
+async fn source_failures(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult {
+    s.manager
+        .source(&id)
+        .ok_or_else(|| not_found(&format!("source {id}")))?;
+    let mut days = 14usize;
+    let mut seen = false;
+    for (key, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        if key != "days" {
+            let shown: String = key.chars().take(64).collect();
+            return Err(invalid_query(
+                &shown,
+                format!("unknown parameter {shown:?} (use days)"),
+            ));
+        }
+        if std::mem::replace(&mut seen, true) {
+            return Err(invalid_query("days", "days is given more than once"));
+        }
+        days = Some(value.as_ref())
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| (1..=90).contains(n))
+            .ok_or_else(|| invalid_query("days", "days must be a whole number from 1 to 90"))?;
+    }
+    let now = now_ms();
+    // The log covers what it has recorded since it began here, within the
+    // retention.
+    let since = s.db.events_since()?.unwrap_or(now);
+    let covered_from = since.max(s.retention.cutoff(now));
+    let window = |from: i64, to: i64| -> anyhow::Result<Value> {
+        let (records, filtered) = s.db.rejected_records(&id, from, to)?;
+        Ok(json!({
+            "from": instant(from),
+            "to": instant(to),
+            "records": records,
+            "filtered": filtered,
+            "complete": covered_from <= from,
+        }))
+    };
+    let mut by_day = Vec::with_capacity(days);
+    for (day, from, to) in day_windows(now, days) {
+        let mut entry = Map::new();
+        entry.insert("day".into(), json!(day));
+        if let Value::Object(w) = window(from, to)? {
+            entry.extend(w);
+        }
+        by_day.push(Value::Object(entry));
+    }
+    Ok(Json(json!({
+        "source_id": id,
+        "tz": "UTC",
+        "covered_from": instant(covered_from),
+        "last_24h": window(now - DAY_MS, now)?,
+        "days": by_day,
+    })))
 }
 
 async fn list_transforms(State(s): State<AppState>) -> ApiResult {
@@ -953,8 +1041,12 @@ async fn create_rule(
     if rule.created_by.is_none() {
         rule.created_by = principal.map(|axum::Extension(p)| p.subject().to_string());
     }
-    rule.id = s.db.insert_rule(&rule)?;
-    Ok((StatusCode::CREATED, Json(json!(rule))))
+    let id = s.db.insert_rule(&rule)?;
+    // As stored: with its id and when it was made.
+    let stored =
+        s.db.rule(id)?
+            .ok_or_else(|| not_found(&format!("rule {id}")))?;
+    Ok((StatusCode::CREATED, Json(json!(stored))))
 }
 
 async fn replace_rule(
@@ -962,15 +1054,17 @@ async fn replace_rule(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> ApiResult {
-    let mut rule = parse_rule(&s, body)?;
+    let rule = parse_rule(&s, body)?;
     if !s.db.update_rule(id, &rule)? {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             format!("rule {id} not found"),
         ));
     }
-    rule.id = id;
-    Ok(Json(json!(rule)))
+    let stored =
+        s.db.rule(id)?
+            .ok_or_else(|| not_found(&format!("rule {id}")))?;
+    Ok(Json(json!(stored)))
 }
 
 async fn delete_rule(

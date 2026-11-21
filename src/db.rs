@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS submissions (
 );
 CREATE INDEX IF NOT EXISTS submissions_feed_status ON submissions(feed_id, status, next_attempt_at);
 CREATE TABLE IF NOT EXISTS alert_rules (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   source_id TEXT,
   condition TEXT NOT NULL,
   threshold TEXT NOT NULL,
@@ -110,6 +110,10 @@ CREATE TABLE IF NOT EXISTS alert_rules (
   enabled INTEGER NOT NULL DEFAULT 1,
   created_by TEXT,
   created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS store_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,12 +161,63 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
 /// Indexes made after the added columns, since they may name one.
 const ADDED_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS records_submission_id ON records(submission, id);
+CREATE INDEX IF NOT EXISTS events_source_kind_at ON events(source_id, kind, at);
 ";
 
 /// On PostgreSQL only: on SQLite `records_file` already orders by id, the rowid.
 const ADDED_INDEXES_POSTGRES: &str = "
 CREATE INDEX IF NOT EXISTS records_file_id ON records(file_id, id);
 ";
+
+/// When the event log began on this store: set once, at the first start of a
+/// version that keeps it, and kept.
+const EVENTS_SINCE: &str =
+    "INSERT INTO store_meta (key, value) VALUES ('events_since', $1) ON CONFLICT (key) DO NOTHING";
+
+/// A SQLite store made before rule ids came from `AUTOINCREMENT` would give a
+/// deleted rule's id again: its `alert_rules` is rebuilt once, in a
+/// transaction, with the same columns, rows and ids, and the sequence set past
+/// every rule id in use, alerts' included.
+fn never_reuse_rule_ids(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'alert_rules'",
+            [],
+            |r| r.get(0),
+        )?;
+        if sql.to_ascii_uppercase().contains("AUTOINCREMENT") {
+            return Ok(());
+        }
+        let start = SCHEMA
+            .find("CREATE TABLE IF NOT EXISTS alert_rules (")
+            .context("alert_rules in the schema")?;
+        let end = start + SCHEMA[start..].find(");").context("end of alert_rules")? + 2;
+        let ddl = SCHEMA[start..end].replace(
+            "CREATE TABLE IF NOT EXISTS alert_rules (",
+            "CREATE TABLE alert_rules_rebuilt (",
+        );
+        let columns = "id, source_id, condition, threshold, notify, channels, enabled, created_by, created_at";
+        conn.execute_batch(&format!(
+            "{ddl}
+             INSERT INTO alert_rules_rebuilt ({columns}) SELECT {columns} FROM alert_rules;
+             DROP TABLE alert_rules;
+             ALTER TABLE alert_rules_rebuilt RENAME TO alert_rules;
+             DELETE FROM sqlite_sequence WHERE name IN ('alert_rules', 'alert_rules_rebuilt');
+             INSERT INTO sqlite_sequence (name, seq) VALUES ('alert_rules', MAX(
+               COALESCE((SELECT MAX(id) FROM alert_rules), 0),
+               COALESCE((SELECT MAX(rule_id) FROM alerts), 0)));"
+        ))?;
+        Ok::<_, anyhow::Error>(())
+    })();
+    match result {
+        Ok(()) => Ok(conn.execute_batch("COMMIT")?),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
 
 /// A rule in words: "nothing arrives for 2 hours", "more than 1% of a load's rows
 /// fail", "the file is not there by 06:00", "HFS cannot be reached after 5 attempts".
@@ -183,6 +238,9 @@ pub struct Rule {
     pub enabled: bool,
     #[serde(default)]
     pub created_by: Option<String>,
+    /// When the rule was made, as an instant; never taken from a request.
+    #[serde(default, skip_deserializing)]
+    pub created_at: Option<String>,
 }
 
 fn default_channels() -> Vec<String> {
@@ -1085,6 +1143,11 @@ impl Db {
             }
         }
         conn.execute_batch(ADDED_INDEXES)?;
+        never_reuse_rule_ids(&conn)?;
+        conn.execute(
+            &EVENTS_SINCE.replace('$', "?"),
+            rusqlite::params![now_ms().to_string()],
+        )?;
         Ok(Self {
             conn: Mutex::new(Conn::Sqlite(conn)),
             postgres: false,
@@ -1134,6 +1197,7 @@ impl Db {
             }
             client.batch(ADDED_INDEXES)?;
             client.batch(ADDED_INDEXES_POSTGRES)?;
+            client.execute(EVENTS_SINCE, &params![now_ms().to_string()])?;
             Ok::<_, anyhow::Error>(())
         })();
         let unlocked = client
@@ -2697,6 +2761,31 @@ impl Db {
 
     // ---- history: events and their retention --------------------------------
 
+    /// When the event log began on this store, in epoch milliseconds.
+    pub fn events_since(&self) -> Result<Option<i64>> {
+        Ok(self
+            .query_one(
+                "SELECT value FROM store_meta WHERE key = 'events_since'",
+                &[],
+            )?
+            .and_then(|r| r.string(0).parse().ok()))
+    }
+
+    /// Distinct records of a source with a `record.rejected` event stored in
+    /// `[from, to)`: those rejected for any reason but `filtered`, and those
+    /// filtered out. A record rejected twice counts once.
+    pub fn rejected_records(&self, source: &str, from: i64, to: i64) -> Result<(i64, i64)> {
+        Ok(self
+            .query_one(
+                "SELECT COUNT(DISTINCT CASE WHEN COALESCE(error_kind, '') <> 'filtered' THEN record_id END),
+                        COUNT(DISTINCT CASE WHEN error_kind = 'filtered' THEN record_id END)
+                 FROM events
+                 WHERE source_id = $1 AND kind = 'record.rejected' AND at >= $2 AND at < $3",
+                &params![source, from, to],
+            )?
+            .map_or((0, 0), |r| (r.i64(0), r.i64(1))))
+    }
+
     /// A page of events, oldest first by id: see `docs/api.md` (Events). The
     /// newest id is read first and nothing past it is listed, so a page never
     /// skips an event that commits later with a lower id.
@@ -2847,7 +2936,7 @@ impl Db {
 
     // ---- alert rules -------------------------------------------------------
 
-    const RULE_SELECT: &'static str = "SELECT id, source_id, condition, threshold, notify, channels, enabled, created_by FROM alert_rules";
+    const RULE_SELECT: &'static str = "SELECT id, source_id, condition, threshold, notify, channels, enabled, created_by, created_at FROM alert_rules";
 
     fn rule_rows(&self, sql: &str, p: &[Param]) -> Result<Vec<Rule>> {
         Ok(self
@@ -2868,6 +2957,7 @@ impl Db {
                     .unwrap_or_default(),
                 enabled: r.i64(6) != 0,
                 created_by: r.opt_string(7),
+                created_at: r.opt_i64(8).and_then(iso_ms),
             })
             .collect())
     }

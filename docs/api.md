@@ -19,6 +19,7 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /api/loads/{id}` | One load with its **failures grouped by reason**: kind, reason, count, first line, and up to three sample rows each |
 | `POST /api/loads/{id}/retry` | Puts the load's rejected rows back at the start, all of them or those with one reason (`{"reason": "..."}`); the source passes at once |
 | `GET /api/sources/{id}/stats?days=14` | What a source's page draws: today (files, records, sent, rejected, pending) and one row per day |
+| `GET /api/sources/{id}/failures?days=14` | Distinct records the source rejected over the last 24 hours and each of the last `days` UTC days (1 to 90), from the event log, with how far the log covers each (see [Rejected records over a period](#rejected-records-over-a-period)) |
 | `GET /api/transforms` | Every transform file: name, path, size, modified, and the sources that use it |
 | `GET /api/transforms/{name}` | The transform's code |
 | `PUT /api/transforms/{name}` | Saves the code (`{"code": "..."}`); the sources using it restart their Python worker. `201` when new |
@@ -29,7 +30,7 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `POST /api/records/{id}/reprocess` | Runs a record again; body `{"raw": {...}}` replaces the row and keeps the original |
 | `GET /api/alerts?source=&open=true` | Alerts, newest first, each with its rule, recipients, channels, and when and why it cleared; `open=true` lists only those not cleared. Kept for `retention.history` (see [Alerts and retention](#alerts-and-retention)) |
 | `GET /api/events?source=&kind=&since=&cursor=&limit=` | The event log, oldest first: each record's attempts and outcomes, each load's steps, each submission's steps (see [Events](#events)) |
-| `GET /api/alert-rules?source=` | Every rule; `POST` creates one (`400` names what is wrong with it) |
+| `GET /api/alert-rules?source=` | Every rule, each with its `created_at`; `POST` creates one (`400` names what is wrong with it). `created_at` is set by the engine, never by the body. A rule id is never given again, like alert and event ids |
 | `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove |
 | `GET /api/secrets` | Every stored credential, by name, without its value |
 | `POST /api/secrets` | Stores a credential: `{"name", "kind": "aws", "value": {"access_key_id", "secret_access_key"}}`. `201` |
@@ -112,6 +113,22 @@ Every parameter that cannot be read is refused with `400`, `code: "invalid_query
 
 A poller pages with `cursor`: the first request may give `since`, and each next one the `next_cursor` it got (with the same filters). A `since` without a cursor reads a range of the log by time on every request, which costs more on a large log.
 
+### Rejected records over a period
+
+`GET /api/sources/{id}/failures?days=14` counts, from the event log, the distinct records a source rejected in each window: a record rejected more than once in a window counts once.
+
+```json
+{"source_id": "lab-results", "tz": "UTC", "covered_from": "2026-11-12T09:30:00.000Z",
+ "last_24h": {"from": "...", "to": "...", "records": 3, "filtered": 1, "complete": true},
+ "days": [{"day": "2026-11-07", "from": "2026-11-07T00:00:00.000Z", "to": "2026-11-08T00:00:00.000Z",
+           "records": 0, "filtered": 0, "complete": false}, ...]}
+```
+
+- `last_24h` is the 24 hours before the request; `days` are UTC calendar days, oldest first, the last one today (still running). A window holds what was stored from its `from`, included, to its `to`, left out: an event at midnight belongs to the day that starts then.
+- `records` counts records rejected as `parse`, `data`, `validation`, `transform` or `server`. Records a transform filtered out on purpose (`filtered`) are not failures and are counted apart, in `filtered`.
+- `covered_from` is where the log's history starts: when this store began recording events (its first start with a version that keeps them), or the retention's limit, whichever is later. A window is `complete` when `covered_from` is at or before its `from`. A window that is not complete is still counted over what is kept, and says `complete: false`.
+- `days` is a whole number from 1 to 90 (14 by default). A value that cannot be read, a second `days` or any other parameter answers `400 invalid_query` with `field`. An unknown source answers `404` with `{"error": "source <id> not found"}`, as `/stats` does.
+
 ### Alerts and retention
 
 Stored alerts follow `retention.history` too. An alert is purged that long after it cleared, or after it was raised if it is still open, except:
@@ -119,7 +136,7 @@ Stored alerts follow `retention.history` too. An alert is purged that long after
 - open `credential` and `definition` alerts, which the engine clears itself;
 - the alert with the highest id.
 
-Open alerts of a deleted or disabled rule, and other open alerts without a rule, are purged by age. An alert id is never given again after a purge: the newest alert is always kept, so a SQLite store never reuses one, and PostgreSQL ids come from a sequence. `hie_alerts_total` in `/metrics` adds the purged alerts to the stored ones, so it never goes down.
+Open alerts of a deleted or disabled rule, and other open alerts without a rule, are purged by age. An alert id is never given again after a purge: the newest alert is always kept, so a SQLite store never reuses one, and PostgreSQL ids come from a sequence. Rule ids are never given again either: SQLite rules take their ids from `AUTOINCREMENT` (a store made before is rebuilt to it once, at its first start with this version), PostgreSQL's from a sequence. `hie_alerts_total` in `/metrics` adds the purged alerts to the stored ones, so it never goes down.
 
 ### Secrets
 
