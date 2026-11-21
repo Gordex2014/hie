@@ -31,11 +31,13 @@ pub mod credentials;
 pub mod crypto;
 pub mod database;
 pub mod db;
+pub mod events;
 pub mod fhir;
 pub mod hl7;
 pub mod manager;
 pub mod pipeline;
 pub mod reader;
+pub mod retention;
 pub mod secrets;
 pub mod source;
 pub mod sqs;
@@ -142,6 +144,11 @@ pub fn build_with(
     // The manager owns the webhook sender: it stops when the engine goes.
     manager.keep_webhook_sender(alerts.start(alerts::SenderTuning::default()));
     manager.start_all(feeds)?;
+    // Events and alerts older than the retention go, at start and every hour.
+    retention::spawn(
+        Arc::downgrade(&db),
+        retention::Retention::from_config(&config.retention),
+    );
     Ok((
         manager.clone(),
         api::AppState {
@@ -152,6 +159,7 @@ pub fn build_with(
             bulk_dir: config.bulk_dir(),
             secrets,
             alerts,
+            retention: retention::Retention::from_config(&config.retention),
         },
     ))
 }

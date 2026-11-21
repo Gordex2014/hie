@@ -186,13 +186,15 @@ impl Alerter {
         let Some((id, _)) = self.db.open_alert(feed, kind, rule_id)? else {
             return Ok(false);
         };
-        let cleared = self.db.clear_alert(id, reason, now_ms(), |alert| {
-            let wanted = alert
-                .channels
-                .as_ref()
-                .is_none_or(|c| c.iter().any(|c| c == "webhook"));
-            self.event("cleared", alert, wanted)
-        })?;
+        let cleared = self
+            .db
+            .clear_alert_with_webhook(id, reason, now_ms(), |alert| {
+                let wanted = alert
+                    .channels
+                    .as_ref()
+                    .is_none_or(|c| c.iter().any(|c| c == "webhook"));
+                self.event("cleared", alert, wanted)
+            })?;
         if cleared.is_none() {
             return Ok(false);
         }
@@ -209,11 +211,11 @@ impl Alerter {
         rule: Option<&Rule>,
     ) -> Result<i64> {
         let wanted = rule.is_none_or(|r| r.channels.iter().any(|c| c == "webhook"));
-        let alert = self
-            .db
-            .insert_alert(feed, kind, message, rule, now_ms(), |alert| {
-                self.event("fired", alert, wanted)
-            })?;
+        let alert =
+            self.db
+                .insert_alert_with_webhook(feed, kind, message, rule, now_ms(), |alert| {
+                    self.event("fired", alert, wanted)
+                })?;
         tracing::warn!(alert = alert.id, feed, kind, "{message}");
         if rule.is_some_and(|r| r.channels.iter().any(|c| c == "email")) {
             tracing::info!(
@@ -539,6 +541,7 @@ mod tests {
             channels: vec!["app".into()],
             enabled: true,
             created_by: None,
+            created_at: None,
         }
     }
 

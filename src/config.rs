@@ -39,6 +39,9 @@ pub struct Config {
     /// not in the environment.
     #[serde(default)]
     pub secrets: SecretsConfig,
+    /// How long the engine keeps its history (events and alerts).
+    #[serde(default)]
+    pub retention: RetentionConfig,
     /// The directory holding `hie.yaml`; relative paths in source files resolve against it.
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -87,6 +90,48 @@ pub struct SecretsConfig {
     /// A file holding the secret key (base64 of 32 bytes), relative to the
     /// directory holding `hie.yaml`; `HIE_SECRET_KEY_FILE` names one too.
     pub key_file: Option<PathBuf>,
+}
+
+/// The `retention:` block: how long the engine keeps its history.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetentionConfig {
+    /// Events and stored alerts, from `1d` to `3650d`. Records, loads and
+    /// submissions are not purged.
+    pub history: String,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            history: "30d".into(),
+        }
+    }
+}
+
+impl RetentionConfig {
+    const MIN: Duration = Duration::from_secs(86_400);
+    const MAX: Duration = Duration::from_secs(3650 * 86_400);
+
+    pub fn check(&self) -> Result<()> {
+        let history = parse_duration(&self.history).context("retention.history")?;
+        if !(Self::MIN..=Self::MAX).contains(&history) {
+            bail!(
+                "retention.history must be from 1d to 3650d, not {:?}",
+                self.history
+            );
+        }
+        Ok(())
+    }
+
+    /// The history setting as a duration; the default when it does not parse,
+    /// which `check` refuses at load.
+    pub fn history(&self) -> Duration {
+        parse_duration(&self.history)
+            .ok()
+            .filter(|d| (Self::MIN..=Self::MAX).contains(d))
+            .unwrap_or(Duration::from_secs(30 * 86_400))
+    }
 }
 
 /// The `alerts:` block: where the alert webhook posts, the secret it signs
@@ -910,6 +955,10 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
         .worker
         .check()
         .with_context(|| format!("checking {}", path.display()))?;
+    config
+        .retention
+        .check()
+        .with_context(|| format!("checking {}", path.display()))?;
     let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
     config.base_dir = base.clone();
     config.path = path.to_path_buf();
@@ -1065,13 +1114,16 @@ pub fn parse_duration(text: &str) -> Result<Duration> {
     let n: u64 = number
         .parse()
         .with_context(|| format!("invalid duration {text:?}"))?;
-    let secs = match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86_400,
+    let unit = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
         _ => bail!("invalid duration unit in {text:?} (use s, m, h or d)"),
     };
+    let secs = n
+        .checked_mul(unit)
+        .with_context(|| format!("duration {text:?} is too long"))?;
     Ok(Duration::from_secs(secs))
 }
 
@@ -1340,6 +1392,32 @@ mod tests {
         let err =
             load_engine_yaml("fhir_base_url: http://hfs\nworker:\n  memroy_mib: 1\n").unwrap_err();
         assert!(format!("{err:#}").contains("memroy_mib"), "{err:#}");
+    }
+
+    #[test]
+    fn the_retention_block_has_a_default_and_is_checked() {
+        let (config, _) = load_engine_yaml("fhir_base_url: http://hfs\n").unwrap();
+        assert_eq!(config.retention.history(), Duration::from_secs(30 * 86_400));
+        let (config, _) =
+            load_engine_yaml("fhir_base_url: http://hfs\nretention:\n  history: 7d\n").unwrap();
+        assert_eq!(config.retention.history(), Duration::from_secs(7 * 86_400));
+        for (history, says) in [
+            ("12h", "from 1d to 3650d"),
+            ("0d", "from 1d to 3650d"),
+            ("3651d", "from 1d to 3650d"),
+            ("soon", "invalid duration"),
+            ("99999999999999999999d", "invalid duration"),
+            ("9999999999999999d", "too long"),
+        ] {
+            let err = load_engine_yaml(&format!(
+                "fhir_base_url: http://hfs\nretention:\n  history: {history}\n"
+            ))
+            .unwrap_err();
+            assert!(format!("{err:#}").contains(says), "{history}: {err:#}");
+        }
+        let err =
+            load_engine_yaml("fhir_base_url: http://hfs\nretention:\n  records: 7d\n").unwrap_err();
+        assert!(format!("{err:#}").contains("records"), "{err:#}");
     }
 
     #[test]
