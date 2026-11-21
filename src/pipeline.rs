@@ -976,8 +976,14 @@ impl FeedRunner {
                     Some(url) => match bulk.poll(url).await {
                         Ok(Poll::InProgress) => Ok(None),
                         Ok(Poll::Done { references, errors }) => {
-                            self.settle(&sub.token, &references, &errors).await?;
-                            Ok(Some(("done", None)))
+                            if self
+                                .settle(&sub.token, sub.attempts, &references, &errors)
+                                .await?
+                            {
+                                Ok(Some(("done", None)))
+                            } else {
+                                Ok(Some(("stale", None)))
+                            }
                         }
                         Err(e) => Err(e),
                     },
@@ -985,8 +991,10 @@ impl FeedRunner {
             };
             // Each write below holds only while the submission still has the
             // attempt count read before the request: an older runner's answer
-            // changes nothing.
+            // (a progress, a failure, a refusal or the receipts) changes nothing.
             match step {
+                // Answered for an older attempt: the current runner decides.
+                Ok(Some(("stale", _))) => {}
                 Ok(None) => {
                     self.db.progress_submission(
                         &sub.token,
@@ -999,8 +1007,9 @@ impl FeedRunner {
                     )?;
                 }
                 Ok(Some(("done", _))) => {
-                    self.db.settle_submission(&sub.token)?;
-                    self.recovered()?;
+                    if self.db.settle_submission(&sub.token, sub.attempts)? {
+                        self.recovered()?;
+                    }
                 }
                 Ok(Some((status, url))) => {
                     self.db.progress_submission(
@@ -1021,13 +1030,19 @@ impl FeedRunner {
                         &sub.token,
                     );
                     tracing::warn!(feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
-                    self.db.reject_submission(
-                        &sub.token,
-                        "server",
-                        &reason,
-                        &bulk::scrub_value(&body, &sub.token),
-                    )?;
-                    self.archive_submission(&sub.token).await?;
+                    if self
+                        .db
+                        .reject_submission(
+                            &sub.token,
+                            sub.attempts,
+                            "server",
+                            &reason,
+                            &bulk::scrub_value(&body, &sub.token),
+                        )?
+                        .is_some()
+                    {
+                        self.archive_submission(&sub.token).await?;
+                    }
                 }
                 Err(SendError::Transient(reason)) => {
                     let reason = bulk::scrub(&reason, &sub.token);
@@ -1052,13 +1067,17 @@ impl FeedRunner {
     }
 
     /// Gives every submitted record its disposition from the receipts, then archives
-    /// the objects HFS has read.
+    /// the objects HFS has read. Only while the submission is still at the
+    /// attempt count `captured` read before the poll: `false` when it moved, with
+    /// the pages already applied kept and the rest, and the archive, left to the
+    /// runner that moved it.
     async fn settle(
         &self,
         token: &str,
+        captured: u32,
         references: &std::collections::HashSet<String>,
         errors: &[String],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let hint = match errors.len() {
             0 => String::new(),
             n => format!(" HFS reported {n} error(s); the first: {}", errors[0]),
@@ -1093,12 +1112,20 @@ impl FeedRunner {
                 after_id = *record_id;
             }
             // The page's outcomes, its tallies and its events in one transaction.
-            self.db
-                .settle_page(token, &sent, &missing, &missing_reason)?;
+            if !self
+                .db
+                .settle_page(token, captured, &sent, &missing, &missing_reason)?
+            {
+                return Ok(false);
+            }
+        }
+        // Nothing is archived for an answer to an older poll.
+        if !self.db.submission_open_at(token, captured)? {
+            return Ok(false);
         }
         self.archive_submission(token).await?;
         self.remove_submission_files(token).await;
-        Ok(())
+        Ok(true)
     }
 
     /// Drops what the engine wrote for a transformed submission, now that HFS has

@@ -1580,7 +1580,7 @@ fn set_writes_over_more_than_one_chunk_change_and_log_every_row_once() {
     );
     let before = events(&db).len();
     assert_eq!(
-        db.reject_submission("t", "server", "HTTP 400", &json!({}))
+        db.reject_submission("t", 0, "server", "HTTP 400", &json!({}))
             .unwrap(),
         Some(450)
     );
@@ -2008,6 +2008,155 @@ fn an_older_poll_answer_cannot_move_a_submission() {
         db.progress_submission("t", Some(1), "running", None, 0, 0, None)
             .unwrap()
     );
+}
+
+/// A FHIR server whose status poll is held until released, then answers as
+/// `answer` says: a refusal, or done with no receipts.
+#[derive(Clone)]
+struct HeldPoll {
+    base: Arc<Mutex<String>>,
+    polled: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    refuse: bool,
+}
+
+async fn held_poll_server(refuse: bool) -> (String, HeldPoll) {
+    let held = HeldPoll {
+        base: Arc::default(),
+        polled: Arc::default(),
+        release: Arc::default(),
+        refuse,
+    };
+    let app = Router::new()
+        .route(
+            "/$bulk-submit",
+            post(|| async { Json(json!({"resourceType": "OperationOutcome", "issue": []})) }),
+        )
+        .route(
+            "/$bulk-submit-status",
+            post(|State(h): State<HeldPoll>| async move {
+                let base = h.base.lock().unwrap().clone();
+                (
+                    StatusCode::ACCEPTED,
+                    [("content-location", format!("{base}/status/1"))],
+                )
+            }),
+        )
+        .route(
+            "/status/1",
+            get(|State(h): State<HeldPoll>| async move {
+                h.polled.notify_one();
+                h.release.notified().await;
+                if h.refuse {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"resourceType": "OperationOutcome", "issue": []})),
+                    )
+                        .into_response()
+                } else {
+                    Json(json!({"output": [], "outcome": [], "link": []})).into_response()
+                }
+            }),
+        )
+        .with_state(held.clone());
+    let url = serve(app).await;
+    *held.base.lock().unwrap() = url.clone();
+    (url, held)
+}
+
+/// A poll made at attempt 0 is held; meanwhile a newer poll fails (attempt 1);
+/// then the old answer comes back: it changes nothing, writes no event, and
+/// archives nothing. The current runner's own next poll decides.
+async fn an_old_terminal_answer_changes_nothing(refuse: bool) {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let (hfs, held) = held_poll_server(refuse).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, state) = engine(
+        dir.path(),
+        &format!("fhir_base_url: {hfs}\npublic_url: http://engine.test\npython: {python}\n"),
+        &[("drops", bulk_source())],
+    );
+    std::fs::write(dir.path().join("inbox/a.ndjson"), patients(&["a"])).unwrap();
+    let runner = manager.runner("drops").unwrap();
+    // Opened and kicked off, at attempt 0.
+    runner.tick().await.unwrap();
+    let db = state.db.clone();
+    let token = token(&db);
+    let before = events(&db).len();
+
+    let polling = tokio::spawn({
+        let runner = runner.clone();
+        async move { runner.tick().await }
+    });
+    held.polled.notified().await;
+    assert!(
+        db.submission_attempt_failed(&token, 0, 0, "HTTP 503")
+            .unwrap()
+    );
+    held.release.notify_one();
+    polling.await.unwrap().unwrap();
+
+    let sub = db
+        .query_json("SELECT status, attempts FROM submissions", [])
+        .unwrap();
+    assert_eq!(sub[0], json!({"status": "running", "attempts": 1}));
+    assert_eq!(db.feed_counts("drops").unwrap()["submitted"], 1);
+    let after: Vec<String> = kinds(&events(&db)[before..]);
+    assert_eq!(
+        after,
+        ["submission.attempt_failed"],
+        "only the newer failure"
+    );
+    assert!(
+        dir.path().join("inbox/a.ndjson").exists(),
+        "nothing archived for an old answer"
+    );
+}
+
+#[tokio::test]
+async fn an_old_refusal_after_a_newer_failure_changes_nothing() {
+    an_old_terminal_answer_changes_nothing(true).await;
+}
+
+#[tokio::test]
+async fn an_old_empty_settlement_after_a_newer_failure_changes_nothing() {
+    an_old_terminal_answer_changes_nothing(false).await;
+}
+
+#[test]
+fn an_older_answer_cannot_settle_or_refuse_a_submission() {
+    let db = Db::in_memory().unwrap();
+    let file = load(&db, "s", "a", 0, 1);
+    let record = record_id(&db, "s", 1);
+    db.mark_passthrough(&[(record, 0)]).unwrap();
+    assert!(
+        db.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
+            .unwrap()
+    );
+    assert!(db.submission_attempt_failed("t", 0, 0, "HTTP 503").unwrap());
+    // Answers to the poll made at attempt 0.
+    assert_eq!(
+        db.reject_submission("t", 0, "server", "HTTP 400", &json!({}))
+            .unwrap(),
+        None
+    );
+    assert!(
+        !db.settle_page("t", 0, &[(record, json!([]))], &[], "")
+            .unwrap()
+    );
+    assert!(!db.settle_submission("t", 0).unwrap());
+    assert!(!db.submission_open_at("t", 0).unwrap());
+    assert_eq!(status(&db, record), "submitted");
+    // The current attempt's answer settles it.
+    assert!(
+        db.settle_page("t", 1, &[(record, json!([]))], &[], "")
+            .unwrap()
+    );
+    assert!(db.settle_submission("t", 1).unwrap());
+    assert_eq!(status(&db, record), "sent");
 }
 
 #[tokio::test]

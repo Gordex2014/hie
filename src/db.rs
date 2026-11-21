@@ -2331,24 +2331,27 @@ impl Db {
     /// `error`, each only while still `submitted` under this token; the rows
     /// that changed are added to the submission's tallies, and each gets
     /// `record.delivered` (`record.recovered` when the submission had failed
-    /// attempts) or `record.rejected`.
+    /// attempts) or `record.rejected`. Only while the submission is still open
+    /// at the attempt count `captured` read before the poll: otherwise nothing
+    /// changes and `false` comes back.
     pub fn settle_page(
         &self,
         token: &str,
+        captured: u32,
         sent: &[(i64, Value)],
         missing: &[i64],
         error: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.transaction(|tx| {
-            // The submission's row first, still open, as a refusal takes it: then
-            // its records.
+            // The submission's row first, still open at the attempt count read
+            // before the poll, as a refusal takes it: then its records.
             let lock = format!(
                 "SELECT feed_id, submission_id, failures FROM submissions
-                 WHERE token = $1 AND status IN ('kickoff', 'running'){}",
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $2{}",
                 tx.for_update()
             );
-            let Some(sub) = tx.query_one(&lock, &params![token])? else {
-                return Ok(());
+            let Some(sub) = tx.query_one(&lock, &params![token, captured])? else {
+                return Ok(false);
             };
             let (feed, submission_id, failures) = (sub.string(0), sub.string(1), sub.i64(2));
             let now = now_ms();
@@ -2425,20 +2428,24 @@ impl Db {
             }
             events.sort_by_key(|(id, _)| *id);
             let events: Vec<Event> = events.into_iter().map(|(_, e)| e).collect();
-            tx.insert_events(&events)
+            tx.insert_events(&events)?;
+            Ok(true)
         })
     }
 
     /// Closes a submission whose receipts are all applied, with
-    /// `submission.settled` and its tallies. Only an open submission moves, so
-    /// the event is written once. Returns whether it moved.
-    pub fn settle_submission(&self, token: &str) -> Result<bool> {
+    /// `submission.settled` and its tallies. Only a submission still open at the
+    /// attempt count `captured` read before the poll moves, so the event is
+    /// written once and an older poll's answer changes nothing. Returns whether
+    /// it moved.
+    pub fn settle_submission(&self, token: &str, captured: u32) -> Result<bool> {
         self.transaction(|tx| {
             let lock = format!(
-                "SELECT token FROM submissions WHERE token = $1 AND status IN ('kickoff', 'running'){}",
+                "SELECT token FROM submissions
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $2{}",
                 tx.for_update()
             );
-            if tx.query_one(&lock, &params![token])?.is_none() {
+            if tx.query_one(&lock, &params![token, captured])?.is_none() {
                 return Ok(false);
             }
             let Some(r) = tx.query_one(
@@ -2465,11 +2472,13 @@ impl Db {
     /// holds is rejected with `reason` and the server's `response`, in one
     /// transaction, with a `record.rejected` each and one `submission.refused`.
     /// `reason` and `response` are already scrubbed; the events never carry the
-    /// response. Nothing happens unless the submission is open. Returns how many
-    /// records were rejected, or `None`.
+    /// response. Nothing happens unless the submission is open at the attempt
+    /// count `captured` read before the request (an older request's answer
+    /// changes nothing). Returns how many records were rejected, or `None`.
     pub fn reject_submission(
         &self,
         token: &str,
+        captured: u32,
         kind: &str,
         reason: &str,
         response: &Value,
@@ -2478,9 +2487,9 @@ impl Db {
             let now = now_ms();
             let Some(sub) = tx.query_one(
                 "UPDATE submissions SET status = 'failed', next_attempt_at = 0, error = $2, updated_at = $3
-                 WHERE token = $1 AND status IN ('kickoff', 'running')
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $4
                  RETURNING feed_id, submission_id",
-                &params![token, reason, now],
+                &params![token, reason, now, captured],
             )?
             else {
                 return Ok(None);
@@ -2760,6 +2769,16 @@ impl Db {
     }
 
     // ---- history: events and their retention --------------------------------
+
+    /// Whether a submission is still open at the attempt count `captured`.
+    pub fn submission_open_at(&self, token: &str, captured: u32) -> Result<bool> {
+        Ok(self
+            .query_one(
+                "SELECT 1 FROM submissions WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $2",
+                &params![token, captured],
+            )?
+            .is_some())
+    }
 
     /// When the event log began on this store, in epoch milliseconds.
     pub fn events_since(&self) -> Result<Option<i64>> {
