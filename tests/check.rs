@@ -30,6 +30,143 @@ fn check_config(yaml: &str, runtime_url: Option<&std::ffi::OsStr>) -> Output {
     command.output().unwrap()
 }
 
+/// `hie check` on `yaml` with the alert webhook variables set as given.
+fn check_alerts(yaml: &str, env: &[(&str, &std::ffi::OsStr)]) -> Output {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("hie.yaml");
+    std::fs::write(&config, yaml).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hie"));
+    command
+        .arg("--config")
+        .arg(&config)
+        .arg("check")
+        .env_remove("HIE_CONFIG")
+        .env_remove("HIE_RUNTIME_URL")
+        .env_remove("HIE_ALERT_WEBHOOK_URL")
+        .env_remove("HIE_ALERT_WEBHOOK_SECRET");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.output().unwrap()
+}
+
+#[test]
+fn check_refuses_bad_alert_settings_without_printing_them() {
+    let base = "fhir_base_url: http://127.0.0.1:1/fhir\n";
+    let os = std::ffi::OsStr::new;
+    for (yaml, env) in [
+        (
+            format!("{base}alerts: https://urlcanary.example.org/hook\n"),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  webhook_url: ftp://urlcanary.example.org/hook\n"),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  webhook_secret: [secretcanary]\n"),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  webhook_secret: 987654321\n"),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  webhook_secret:\n    secretcanary: 1\n    secretcanary: 2\n"),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  https://urlcanary.example.org/hook: 1\n"),
+            vec![],
+        ),
+        (
+            format!("{base}\"alerts\":\n  webhook_secret: !!int secretcanary\n"),
+            vec![],
+        ),
+        (
+            format!("{base}\"alerts\":\n  webhook_secret:\n    secretcanary: 1\n    secretcanary: 2\n"),
+            vec![],
+        ),
+        (
+            format!("{base}? alerts\n: webhook_secret: !!int secretcanary\n"),
+            vec![],
+        ),
+        (
+            "{fhir_base_url: http://127.0.0.1:1/fhir, alerts: {webhook_secret: !!int secretcanary}}\n".to_string(),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  webhook_secret: &s secretcanary\nworker:\n  memory_mib: *s\n"),
+            vec![],
+        ),
+        (
+            base.to_string(),
+            vec![(
+                "HIE_ALERT_WEBHOOK_URL",
+                os("gopher://urlcanary.example.org/hook"),
+            )],
+        ),
+    ] {
+        let out = check_alerts(&yaml, &env);
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.status.success(), "{yaml}: {printed}");
+        assert!(printed.contains("alert"), "{printed}");
+        for canary in ["urlcanary", "secretcanary", "987654321"] {
+            assert!(!printed.contains(canary), "{canary} printed: {printed}");
+        }
+    }
+    // A malformed leftover `runtime:` is still refused.
+    let out = check_alerts(&format!("{base}runtime: a\nruntime: b\n"), &[]);
+    assert!(
+        !out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // Without webhook settings in the file, errors keep their names: the
+    // template's blank `webhook_url:` and a misspelt worker key.
+    let out = check_alerts(
+        &format!("{base}alerts:\n  webhook_url:\nworker:\n  memroy_mib: 5\n"),
+        &[],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("memroy_mib"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // An escaped key is the same key.
+    let out = check_alerts(
+        &format!(
+            "{base}alerts:\n  \"webhook_\\x73ecret\": &s secretcanary\nworker:\n  memory_mib: *s\n"
+        ),
+        &[],
+    );
+    let printed = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && !printed.contains("secretcanary"),
+        "{printed}"
+    );
+    // Good settings, from the file and from the environment, are not printed either.
+    let out = check_alerts(
+        &format!("{base}alerts:\n  webhook_url: https://urlcanary.example.org/hook\n"),
+        &[("HIE_ALERT_WEBHOOK_SECRET", os("secretcanary"))],
+    );
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{printed}");
+    assert!(
+        !printed.contains("urlcanary") && !printed.contains("secretcanary"),
+        "{printed}"
+    );
+}
+
 #[test]
 fn check_fails_while_hie_runtime_url_is_set() {
     let out = check(Some("http://127.0.0.1:8790"));

@@ -1,9 +1,11 @@
+mod paging;
 mod secrets;
 
 use std::sync::Arc;
 
 use crate::db::{Param, params};
-use axum::extract::{Path, Query, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -26,6 +28,10 @@ pub struct AppState {
     pub bulk_dir: std::path::PathBuf,
     /// Connector credentials, or why there are none.
     pub secrets: crate::secrets::Secrets,
+    /// Alerts and their webhook: whether one is configured, and for which URL.
+    pub alerts: Arc<crate::alerts::Alerter>,
+    /// How long history is kept: what a report over a period can cover.
+    pub retention: crate::retention::Retention,
 }
 
 /// When the process came up, for the uptime that `/health` reports.
@@ -63,6 +69,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/loads/{file_id}", get(get_load))
         .route("/api/loads/{file_id}/retry", post(retry_load))
         .route("/api/sources/{id}/stats", get(source_stats))
+        .route("/api/sources/{id}/failures", get(source_failures))
         .route("/api/transforms", get(list_transforms))
         .route(
             "/api/transforms/{name}",
@@ -74,6 +81,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/records/{id}", get(get_record))
         .route("/api/records/{id}/reprocess", post(reprocess))
         .route("/api/alerts", get(list_alerts))
+        .route("/api/events", get(list_events))
         .route(
             "/api/secrets",
             get(secrets::list_secrets).post(secrets::create_secret),
@@ -420,25 +428,73 @@ async fn check_now(
         .into_response())
 }
 
-#[derive(Deserialize)]
-struct CheckQuery {
-    /// Lists the check's loads after this load id: the previous answer's `next_after`.
-    after: Option<i64>,
-    limit: Option<i64>,
-}
-
 /// Loads listed per answer of `GET /api/checks/{id}` unless `limit` asks for fewer.
 const CHECK_FILES: i64 = 1000;
+
+/// The text of a check's cursor: opaque to clients, the position after a load's id.
+const CHECK_CURSOR_PREFIX: &str = "l1.";
+
+/// Reads `GET /api/checks/{id}` parameters as `GET /api/events` does: every
+/// refusal is a `400 invalid_query` naming the parameter. The load to list
+/// after, and how many.
+fn check_query(raw: Option<&str>) -> Result<(i64, i64), ApiError> {
+    let (mut after, mut limit) = (None, None);
+    for (key, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        let slot = match key.as_ref() {
+            "cursor" => &mut after,
+            "limit" => &mut limit,
+            other => {
+                let shown: String = other.chars().take(64).collect();
+                return Err(invalid_query(
+                    &shown,
+                    format!("unknown parameter {shown:?} (use cursor or limit)"),
+                ));
+            }
+        };
+        if slot.replace(value.into_owned()).is_some() {
+            return Err(invalid_query(
+                &key,
+                format!("{key} is given more than once"),
+            ));
+        }
+    }
+    let after = match after {
+        None => 0,
+        Some(cursor) => cursor
+            .strip_prefix(CHECK_CURSOR_PREFIX)
+            .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|id| id.parse::<i64>().ok())
+            .ok_or_else(|| {
+                invalid_query("cursor", "cursor is not one this API gave as next_cursor")
+            })?,
+    };
+    let limit = match limit {
+        None => CHECK_FILES,
+        // Digits only: `parse` would take a sign.
+        Some(l) => Some(l.as_str())
+            .filter(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|l| l.parse::<i64>().ok())
+            .filter(|n| (1..=CHECK_FILES).contains(n))
+            .ok_or_else(|| invalid_query("limit", "limit must be a whole number from 1 to 1000"))?,
+    };
+    Ok((after, limit))
+}
 
 async fn get_check(
     State(s): State<AppState>,
     Path(id): Path<i64>,
-    Query(q): Query<CheckQuery>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Response, ApiError> {
-    let limit = q.limit.unwrap_or(CHECK_FILES).clamp(1, CHECK_FILES);
-    let check =
-        s.db.check(id, q.after.unwrap_or(0), limit)?
+    let (after, limit) = check_query(raw.as_deref())?;
+    let mut check =
+        s.db.check(id, after, limit)?
             .ok_or_else(|| not_found(&format!("check {id}")))?;
+    let next = check
+        .as_object_mut()
+        .and_then(|c| c.remove("next_after"))
+        .and_then(|n| n.as_i64());
+    check["next_cursor"] = json!(next.map(|id| format!("{CHECK_CURSOR_PREFIX}{id}")));
+    check["has_more"] = json!(next.is_some());
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(check)).into_response())
 }
 
@@ -525,6 +581,91 @@ async fn source_stats(
     Ok(Json(
         json!({"source": id, "days": days, "today": today_json, "by_day": rows}),
     ))
+}
+
+/// Day windows of a report: `days` UTC calendar days, oldest first, the last
+/// one today, each `(day, from, to)` in epoch milliseconds. The one place a
+/// report's days are drawn: a time zone would change only this.
+fn day_windows(now_ms: i64, days: usize) -> Vec<(String, i64, i64)> {
+    let today = now_ms.div_euclid(DAY_MS) * DAY_MS;
+    (0..days as i64)
+        .rev()
+        .map(|back| {
+            let from = today - back * DAY_MS;
+            let day = chrono::DateTime::from_timestamp_millis(from)
+                .map(|t| t.format("%Y-%m-%d").to_string())
+                .unwrap_or_default();
+            (day, from, from + DAY_MS)
+        })
+        .collect()
+}
+
+/// An instant as the store's answers give one: RFC 3339, milliseconds, `Z`.
+fn instant(ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
+/// Distinct records a source rejected over the last 24 hours and each of the
+/// last `days` UTC days, from the event log, with how far the log covers them.
+async fn source_failures(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> ApiResult {
+    s.manager
+        .source(&id)
+        .ok_or_else(|| not_found(&format!("source {id}")))?;
+    let mut days = 14usize;
+    let mut seen = false;
+    for (key, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        if key != "days" {
+            let shown: String = key.chars().take(64).collect();
+            return Err(invalid_query(
+                &shown,
+                format!("unknown parameter {shown:?} (use days)"),
+            ));
+        }
+        if std::mem::replace(&mut seen, true) {
+            return Err(invalid_query("days", "days is given more than once"));
+        }
+        days = Some(value.as_ref())
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| (1..=90).contains(n))
+            .ok_or_else(|| invalid_query("days", "days must be a whole number from 1 to 90"))?;
+    }
+    let now = now_ms();
+    // The log covers what it has recorded since it began here, within the
+    // retention.
+    let since = s.db.events_since()?.unwrap_or(now);
+    let covered_from = since.max(s.retention.cutoff(now));
+    let window = |from: i64, to: i64| -> anyhow::Result<Value> {
+        let (records, filtered) = s.db.rejected_records(&id, from, to)?;
+        Ok(json!({
+            "from": instant(from),
+            "to": instant(to),
+            "records": records,
+            "filtered": filtered,
+            "complete": covered_from <= from,
+        }))
+    };
+    let mut by_day = Vec::with_capacity(days);
+    for (day, from, to) in day_windows(now, days) {
+        let mut entry = Map::new();
+        entry.insert("day".into(), json!(day));
+        if let Value::Object(w) = window(from, to)? {
+            entry.extend(w);
+        }
+        by_day.push(Value::Object(entry));
+    }
+    Ok(Json(json!({
+        "source_id": id,
+        "tz": "UTC",
+        "covered_from": instant(covered_from),
+        "last_24h": window(now - DAY_MS, now)?,
+        "days": by_day,
+    })))
 }
 
 async fn list_transforms(State(s): State<AppState>) -> ApiResult {
@@ -782,46 +923,257 @@ async fn reprocess(
     ))
 }
 
+/// What `GET /api/alert-rules` takes. `limit` and `open` mean nothing here,
+/// but are still checked as they always were.
 #[derive(Deserialize)]
-struct AlertQuery {
+struct RuleQuery {
+    source: Option<String>,
+    #[serde(rename = "limit")]
+    _limit: Option<i64>,
+    #[serde(rename = "open")]
+    _open: Option<bool>,
+}
+
+/// What `GET /api/alerts` takes: today's filters, a period and a page.
+#[derive(Deserialize)]
+struct AlertListQuery {
     source: Option<String>,
     limit: Option<i64>,
     /// `true` lists only alerts that have not cleared.
     open: Option<bool>,
+    /// Only alerts created at or after this RFC 3339 instant.
+    since: Option<String>,
+    /// The previous page's `next_cursor`.
+    cursor: Option<String>,
 }
 
-async fn list_alerts(State(s): State<AppState>, Query(q): Query<AlertQuery>) -> ApiResult {
-    let rows = s.db.query_json(
+/// Newest first, a page at a time: `next_cursor` is set only when more alerts
+/// match, and the next page holds those older (by id) than the last one here.
+/// Each alert comes with its latest webhook event, read in the same statement;
+/// a pending event written for another URL than this instance's is `parked`.
+async fn list_alerts(
+    State(s): State<AppState>,
+    q: Result<Query<AlertListQuery>, QueryRejection>,
+) -> ApiResult {
+    let Query(q) = q.map_err(paging::rejected)?;
+    let since = paging::since_ms(q.since.as_deref())?;
+    let after = paging::cursor_id(q.cursor.as_deref())?;
+    let (configured, signed) = s.alerts.webhook_status();
+    let webhook = json!({"configured": configured, "signed": signed});
+    // A negative limit has always meant every alert on SQLite; so it does on both stores.
+    let limit = match q.limit {
+        Some(n) if n < 0 => i64::MAX,
+        Some(n) => n,
+        None => 100,
+    };
+    if limit == 0 {
+        return Ok(Json(
+            json!({"alerts": [], "next_cursor": null, "webhook": webhook}),
+        ));
+    }
+    let mut rows = s.db.query_json(
         &format!(
-            "SELECT id, feed_id AS source_id, kind, message, rule_id, notify, channels,
-                    {} AS created_at, {} AS cleared_at, cleared_reason
+            "SELECT alerts.id, alerts.feed_id AS source_id, alerts.kind, alerts.message, alerts.rule_id,
+                    alerts.notify, alerts.channels,
+                    {} AS created_at, {} AS cleared_at, alerts.cleared_reason,
+                    w.event AS webhook_event, w.event_id AS webhook_event_id,
+                    CASE WHEN w.state = 'pending' AND w.destination <> CAST($6 AS TEXT) THEN 'parked' ELSE w.state END AS webhook_state,
+                    w.attempts AS webhook_attempts, w.last_error AS webhook_last_error,
+                    w.last_status AS webhook_last_status,
+                    {} AS webhook_delivered_at
              FROM alerts
-             WHERE (CAST($1 AS TEXT) IS NULL OR feed_id = CAST($1 AS TEXT)) AND (CAST($3 AS BIGINT) = 0 OR cleared_at IS NULL)
-             ORDER BY id DESC LIMIT $2",
-            s.db.iso("created_at"),
-            s.db.iso("cleared_at")
+             LEFT JOIN alert_webhooks w
+               ON w.id = (SELECT MAX(x.id) FROM alert_webhooks x WHERE x.alert_id = alerts.id)
+             WHERE (CAST($1 AS TEXT) IS NULL OR alerts.feed_id = CAST($1 AS TEXT))
+               AND (CAST($3 AS BIGINT) = 0 OR alerts.cleared_at IS NULL)
+               AND (CAST($4 AS BIGINT) IS NULL OR alerts.created_at >= CAST($4 AS BIGINT)) AND alerts.id <= $5
+             ORDER BY alerts.id DESC LIMIT $2",
+            s.db.iso("alerts.created_at"),
+            s.db.iso("alerts.cleared_at"),
+            s.db.iso("w.delivered_at")
         ),
-        params![q.source, q.limit.unwrap_or(100), q.open.unwrap_or(false)],
+        params![
+            q.source,
+            limit.saturating_add(1),
+            q.open.unwrap_or(false),
+            since,
+            // A bound SQLite seeks on, where `IS NULL OR` would scan.
+            after.map_or(i64::MAX, |id| id - 1),
+            s.alerts.destination()
+        ],
     )?;
-    let rows: Vec<Value> = rows
-        .into_iter()
-        .map(|mut row| {
-            for key in ["notify", "channels"] {
-                if let Some(Value::String(text)) = row.get(key) {
-                    let parsed =
-                        serde_json::from_str::<Value>(text).unwrap_or(Value::Array(vec![]));
-                    row[key] = parsed;
-                }
+    let page = usize::try_from(limit).unwrap_or(usize::MAX);
+    let next_cursor = if rows.len() > page {
+        rows.truncate(page);
+        let last = rows.last().and_then(|row| row["id"].as_i64());
+        Some(paging::next_cursor(last.ok_or_else(|| {
+            anyhow::anyhow!("an alert row without an id")
+        })?))
+    } else {
+        None
+    };
+    let rows: Vec<Value> = rows.into_iter().map(alert_json).collect();
+    Ok(Json(json!({
+        "alerts": rows,
+        "next_cursor": next_cursor,
+        "webhook": webhook,
+    })))
+}
+
+/// An alert row as the API answers it: the stored lists parsed, and the
+/// `webhook_*` columns folded into `webhook` (`null` for an alert recorded
+/// before events were).
+fn alert_json(mut row: Value) -> Value {
+    for key in ["notify", "channels"] {
+        if let Some(Value::String(text)) = row.get(key) {
+            let parsed = serde_json::from_str::<Value>(text).unwrap_or(Value::Array(vec![]));
+            row[key] = parsed;
+        }
+    }
+    let Some(obj) = row.as_object_mut() else {
+        return row;
+    };
+    let mut webhook = serde_json::Map::new();
+    for key in [
+        "event",
+        "event_id",
+        "state",
+        "attempts",
+        "last_error",
+        "last_status",
+        "delivered_at",
+    ] {
+        let value = obj.remove(&format!("webhook_{key}")).unwrap_or(Value::Null);
+        webhook.insert(key.to_string(), value);
+    }
+    let recorded = !webhook["event_id"].is_null();
+    obj.insert(
+        "webhook".into(),
+        if recorded {
+            Value::Object(webhook)
+        } else {
+            Value::Null
+        },
+    );
+    row
+}
+
+// ---- Events -----------------------------------------------------------------
+
+/// The text of a cursor: opaque to clients, the position after an event's id.
+const CURSOR_PREFIX: &str = "e1.";
+
+fn invalid_query(field: &str, error: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, error)
+        .code("invalid_query")
+        .with("field", field)
+}
+
+/// Reads `GET /api/events` parameters by hand, so that every refusal is a JSON
+/// `400 invalid_query` naming the parameter: an unknown one, a known one given
+/// twice, or a value that cannot be read.
+fn event_query(raw: Option<&str>) -> Result<crate::db::EventQuery, ApiError> {
+    let mut given: std::collections::HashMap<&'static str, String> = Default::default();
+    for (key, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        let Some(field) = ["source", "kind", "since", "cursor", "limit"]
+            .into_iter()
+            .find(|f| *f == key)
+        else {
+            let shown: String = key.chars().take(64).collect();
+            return Err(invalid_query(
+                &shown,
+                format!("unknown parameter {shown:?} (use source, kind, since, cursor or limit)"),
+            ));
+        };
+        if given.insert(field, value.into_owned()).is_some() {
+            return Err(invalid_query(
+                field,
+                format!("{field} is given more than once"),
+            ));
+        }
+    }
+    let mut q = crate::db::EventQuery {
+        limit: 100,
+        ..Default::default()
+    };
+    if let Some(source) = given.remove("source") {
+        if source.is_empty() {
+            return Err(invalid_query("source", "source must name a source"));
+        }
+        q.source = Some(source);
+    }
+    if let Some(kinds) = given.remove("kind") {
+        for kind in kinds.split(',').map(str::trim) {
+            if !crate::events::is_known(kind) {
+                return Err(invalid_query(
+                    "kind",
+                    format!(
+                        "unknown event kind {kind:?} (use record, load, submission or an exact kind)"
+                    ),
+                ));
             }
-            row
-        })
-        .collect();
-    Ok(Json(json!({"alerts": rows})))
+            if !q.kinds.iter().any(|k| k == kind) {
+                q.kinds.push(kind.to_string());
+            }
+        }
+    }
+    if let Some(since) = given.remove("since") {
+        let at = chrono::DateTime::parse_from_rfc3339(&since).map_err(|_| {
+            invalid_query(
+                "since",
+                "since must be an RFC 3339 instant, such as 2026-11-20T08:00:00Z",
+            )
+        })?;
+        // Events are stored to the millisecond: a finer instant starts at the
+        // next one, so nothing before it is listed. The digits are read from the
+        // text, which may give more than a parser keeps.
+        let finer = since
+            .split_once('.')
+            .map(|(_, fraction)| {
+                fraction
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .skip(3)
+                    .any(|d| d != '0')
+            })
+            .unwrap_or(false);
+        q.since = Some(at.timestamp_millis() + i64::from(finer));
+    }
+    if let Some(cursor) = given.remove("cursor") {
+        let id = cursor
+            .strip_prefix(CURSOR_PREFIX)
+            .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|id| id.parse::<i64>().ok())
+            .ok_or_else(|| {
+                invalid_query("cursor", "cursor is not one this API gave as next_cursor")
+            })?;
+        q.cursor = Some(id);
+    }
+    if let Some(limit) = given.remove("limit") {
+        // Digits only: `parse` would take a sign.
+        q.limit = Some(limit.as_str())
+            .filter(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|l| l.parse::<usize>().ok())
+            .filter(|n| (1..=1000).contains(n))
+            .ok_or_else(|| invalid_query("limit", "limit must be a whole number from 1 to 1000"))?;
+    }
+    Ok(q)
+}
+
+/// The event log, oldest first: see `docs/api.md` (Events).
+async fn list_events(State(s): State<AppState>, RawQuery(raw): RawQuery) -> ApiResult {
+    let q = event_query(raw.as_deref())?;
+    let page = s.db.list_events(&q)?;
+    Ok(Json(json!({
+        "events": page.events,
+        "next_cursor": page.next.map(|id| format!("{CURSOR_PREFIX}{id}")),
+        "has_more": page.has_more,
+    })))
 }
 
 // ---- Alert rules --------------------------------------------------------------
 
-async fn list_rules(State(s): State<AppState>, Query(q): Query<AlertQuery>) -> ApiResult {
+async fn list_rules(State(s): State<AppState>, Query(q): Query<RuleQuery>) -> ApiResult {
     let rules: Vec<Rule> =
         s.db.rules()?
             .into_iter()
@@ -866,8 +1218,12 @@ async fn create_rule(
     if rule.created_by.is_none() {
         rule.created_by = principal.map(|axum::Extension(p)| p.subject().to_string());
     }
-    rule.id = s.db.insert_rule(&rule)?;
-    Ok((StatusCode::CREATED, Json(json!(rule))))
+    let id = s.db.insert_rule(&rule)?;
+    // As stored: with its id and when it was made.
+    let stored =
+        s.db.rule(id)?
+            .ok_or_else(|| not_found(&format!("rule {id}")))?;
+    Ok((StatusCode::CREATED, Json(json!(stored))))
 }
 
 async fn replace_rule(
@@ -875,15 +1231,17 @@ async fn replace_rule(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> ApiResult {
-    let mut rule = parse_rule(&s, body)?;
+    let rule = parse_rule(&s, body)?;
     if !s.db.update_rule(id, &rule)? {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             format!("rule {id} not found"),
         ));
     }
-    rule.id = id;
-    Ok(Json(json!(rule)))
+    let stored =
+        s.db.rule(id)?
+            .ok_or_else(|| not_found(&format!("rule {id}")))?;
+    Ok(Json(json!(stored)))
 }
 
 async fn delete_rule(
@@ -933,13 +1291,11 @@ async fn metrics(State(s): State<AppState>) -> Result<Response, ApiError> {
             u8::from(s.db.is_paused(&f.id)?)
         ));
     }
+    // Alerts purged by the retention still count: the counter never goes down.
     out.push_str("# TYPE hie_alerts_total counter\n");
-    for row in s.db.query_json("SELECT COALESCE(feed_id, '') AS source, kind, COUNT(*) AS n FROM alerts GROUP BY feed_id, kind", [])? {
+    for (source, kind, n) in s.db.alert_totals()? {
         out.push_str(&format!(
-            "hie_alerts_total{{source=\"{}\",kind=\"{}\"}} {}\n",
-            row["source"].as_str().unwrap_or_default(),
-            row["kind"].as_str().unwrap_or_default(),
-            row["n"]
+            "hie_alerts_total{{source=\"{source}\",kind=\"{kind}\"}} {n}\n"
         ));
     }
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response())

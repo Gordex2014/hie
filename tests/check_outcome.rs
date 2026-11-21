@@ -283,6 +283,37 @@ async fn each_check_answers_what_the_scan_after_it_found() {
     assert_eq!(found["files"][0]["status"], "duplicate");
     assert_eq!(found["files"][0]["duplicate_of"], load);
 
+    // Two loads, read a page at a time with the cursor the answer gives.
+    let paged = engine.check_now(SOURCE).await;
+    engine.drop_file("two-a.csv");
+    engine.drop_file("two-b.csv");
+    engine.tick(SOURCE).await;
+    let whole = engine.check(paged).await;
+    assert_eq!(
+        (whole["file_count"].clone(), whole["has_more"].clone()),
+        (json!(2), json!(false))
+    );
+    assert!(whole["next_cursor"].is_null());
+    let page = |query: String| {
+        let (api, http) = (engine.api.clone(), engine.http.clone());
+        async move {
+            http.get(format!("{api}/api/checks/{paged}?{query}"))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let first_page = page("limit=1".into()).await;
+    assert_eq!(first_page["has_more"], true);
+    assert_eq!(load_ids(&first_page), load_ids(&whole)[..1]);
+    let cursor = first_page["next_cursor"].as_str().unwrap().to_string();
+    let second_page = page(format!("cursor={cursor}&limit=1")).await;
+    assert_eq!(load_ids(&second_page), load_ids(&whole)[1..]);
+    assert_eq!(second_page["has_more"], false);
+
     // Nothing new.
     let empty = engine.check_now(SOURCE).await;
     engine.tick(SOURCE).await;
@@ -333,6 +364,27 @@ async fn unknown_checks_and_sources_are_not_found() {
         .await
         .unwrap();
     assert_eq!(not_a_number.status(), 400);
+    for (query, field) in [
+        ("limit=0", "limit"),
+        ("limit=-1", "limit"),
+        ("cursor=31", "cursor"),
+        ("after=31", "after"),
+        ("limit=1&limit=2", "limit"),
+    ] {
+        let refused = engine
+            .http
+            .get(format!("{}/api/checks/1?{query}", engine.api))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 400, "{query}");
+        let body: Value = refused.json().await.unwrap();
+        assert_eq!(
+            (body["code"].as_str(), body["field"].as_str()),
+            (Some("invalid_query"), Some(field)),
+            "{query}: {body}"
+        );
+    }
     let no_source = engine
         .http
         .post(format!("{}/api/sources/nope/check-now", engine.api))
@@ -420,4 +472,35 @@ async fn a_deleted_source_another_instance_holds_keeps_its_checks_for_it() {
         .unwrap();
     assert!(deleted.status().is_success());
     assert_eq!(engine.check(check).await["status"], "pending");
+}
+
+/// The engine's retention purge removes checks older than its cutoff, answered
+/// or not, and keeps the newer ones.
+#[test]
+fn the_retention_purge_removes_old_checks() {
+    let db = hie::db::Db::in_memory().unwrap();
+    let day = 86_400_000i64;
+    let now = hie::db::now_ms();
+    let answered = db.insert_check(SOURCE).unwrap();
+    db.answer_checks(SOURCE, &[answered], None).unwrap();
+    let pending = db.insert_check(SOURCE).unwrap();
+    let recent = db.insert_check(SOURCE).unwrap();
+    db.query_json(
+        "UPDATE checks SET requested_at = CAST($1 AS BIGINT) WHERE id <> CAST($2 AS BIGINT)",
+        hie::db::params![now - 40 * day, recent],
+    )
+    .unwrap();
+    let purged = hie::retention::purge(&db, now - 30 * day).unwrap();
+    assert_eq!(purged.checks, 2);
+    for gone in [answered, pending] {
+        assert!(db.check(gone, 0, 10).unwrap().is_none());
+    }
+    assert_eq!(
+        db.check(recent, 0, 10).unwrap().unwrap()["status"],
+        "pending"
+    );
+    assert_eq!(
+        hie::retention::purge(&db, now - 30 * day).unwrap().checks,
+        0
+    );
 }

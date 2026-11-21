@@ -142,6 +142,8 @@ pub struct SourceManager {
     /// still run, deleted sources included. Locked only inside `sources`.
     runners: Mutex<HashMap<String, Vec<RunnerTask>>>,
     handover_grace_ms: AtomicU64,
+    /// The alert webhook's sender task, stopped when the manager is dropped.
+    webhook_sender: Mutex<Option<crate::alerts::SenderGuard>>,
     /// Per source id, held across a change of the source: checking its
     /// credential, registering it, publishing the definition, starting it, and
     /// cleaning up the registrations it no longer needs.
@@ -185,6 +187,7 @@ impl SourceManager {
             sources: Mutex::new(BTreeMap::new()),
             runners: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
+            webhook_sender: Mutex::new(None),
             #[cfg(all(test, feature = "secrets-native"))]
             pause: Mutex::new(None),
             #[cfg(all(test, feature = "secrets-native"))]
@@ -259,6 +262,11 @@ impl SourceManager {
         if let Some(hook) = hook {
             hook(name).await;
         }
+    }
+
+    /// Keeps the alert webhook's sender for as long as the manager lives.
+    pub fn keep_webhook_sender(&self, sender: Option<crate::alerts::SenderGuard>) {
+        *self.webhook_sender.lock().expect("manager mutex") = sender;
     }
 
     /// Builds and spawns the runner for a resolved definition, replacing a running one.
@@ -576,6 +584,7 @@ impl SourceManager {
             channels: vec!["app".into(), "webhook".into()],
             enabled: true,
             created_by: by.map(str::to_string),
+            created_at: None,
         };
         self.db.insert_rule(&rule).map(drop)
     }
