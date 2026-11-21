@@ -31,11 +31,13 @@ pub mod credentials;
 pub mod crypto;
 pub mod database;
 pub mod db;
+pub mod events;
 pub mod fhir;
 pub mod hl7;
 pub mod manager;
 pub mod pipeline;
 pub mod reader;
+pub mod retention;
 pub mod secrets;
 pub mod source;
 pub mod sqs;
@@ -105,18 +107,17 @@ pub fn build_with(
     credentials: credentials::Credentials,
     keys: secrets::KeySettings,
 ) -> Result<(Arc<manager::SourceManager>, api::AppState)> {
+    config.alerts.validate()?;
     let db = Arc::new(db::Db::connect(&config.database.to_string_lossy())?);
     let secrets = secrets::open(config, &db, keys)?;
     let fhir = Arc::new(fhir::FhirClient::with_credentials(
         &config.fhir_base_url,
         credentials,
     ));
-    let alerts = Arc::new(alerts::Alerter::new(
-        db.clone(),
-        config.alerts.webhook_url.clone(),
-    ));
+    let alerts = Arc::new(alerts::Alerter::from_config(db.clone(), &config.alerts));
     // Source files this build could not load: each stays visible as an alert.
     for skipped in &config.skipped {
+        alerts.know_source(&skipped.source_id, &skipped.source_name);
         if db
             .open_alert(&skipped.source_id, "definition", None)?
             .is_none()
@@ -137,10 +138,17 @@ pub fn build_with(
         runtime_dir,
         db.clone(),
         fhir,
-        alerts,
+        alerts.clone(),
         secrets.clone(),
     );
+    // The manager owns the webhook sender: it stops when the engine goes.
+    manager.keep_webhook_sender(alerts.start(alerts::SenderTuning::default()));
     manager.start_all(feeds)?;
+    // Events and alerts older than the retention go, at start and every hour.
+    retention::spawn(
+        Arc::downgrade(&db),
+        retention::Retention::from_config(&config.retention),
+    );
     Ok((
         manager.clone(),
         api::AppState {
@@ -150,6 +158,8 @@ pub fn build_with(
             started: api::Started::now(),
             bulk_dir: config.bulk_dir(),
             secrets,
+            alerts,
+            retention: retention::Retention::from_config(&config.retention),
         },
     ))
 }

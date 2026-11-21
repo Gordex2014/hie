@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hie::db::Db;
+use hie::db::{Db, Delivery, WorkItem};
 use serde_json::{Value, json};
 
 struct Engine {
@@ -123,10 +123,40 @@ impl Engine {
             .unwrap()
     }
 
-    fn send(&self, file: i64, line: i64) {
+    /// The record at `line` of load `file` as the pipeline selects it, among
+    /// those of its source that are `received` or due for delivery.
+    fn item(&self, file: i64, line: i64, received: bool) -> WorkItem {
         let id = self.record(file, line);
-        self.db.mark_transformed(id, &json!([])).unwrap();
-        self.db.mark_sent(id, &json!({"status": "201"})).unwrap();
+        let source = self
+            .db
+            .query_json(
+                "SELECT feed_id FROM records WHERE id = $1",
+                hie::db::params![id],
+            )
+            .unwrap()[0]["feed_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let items = if received {
+            self.db.received_records(&source, 10_000)
+        } else {
+            self.db.due_records(&source, 10_000)
+        };
+        items.unwrap().into_iter().find(|i| i.id == id).unwrap()
+    }
+
+    /// Transformed, through the same guarded write the pipeline makes.
+    fn transform(&self, file: i64, line: i64) {
+        let item = self.item(file, line, true);
+        assert!(self.db.mark_transformed(&item, &json!([])).unwrap());
+    }
+
+    fn send(&self, file: i64, line: i64) {
+        self.transform(file, line);
+        let item = self.item(file, line, false);
+        self.db
+            .delivered(&[(&item, Delivery::Sent(&json!({"status": "201"})))])
+            .unwrap();
     }
 
     fn reject(&self, file: i64, line: i64, reason: &str) {
@@ -136,10 +166,17 @@ impl Engine {
 
     /// Waiting for another attempt after a delivery that may yet pass.
     fn defer(&self, file: i64, line: i64) {
-        let id = self.record(file, line);
-        self.db.mark_transformed(id, &json!([])).unwrap();
+        self.transform(file, line);
+        let item = self.item(file, line, false);
         self.db
-            .defer(id, 1, i64::MAX, "503 from the server")
+            .delivered(&[(
+                &item,
+                Delivery::Deferred {
+                    attempts: 1,
+                    next_attempt_at: i64::MAX,
+                    error: "503 from the server",
+                },
+            )])
             .unwrap();
     }
 
@@ -264,8 +301,7 @@ async fn loads_are_filtered_by_source_status_and_failing_now() {
     let duplicate = e.duplicate("alpha", "rejected-again.csv", rejected);
     // A bulk load whose rows were refused before submission.
     let refused = e.load("beta", "refused.ndjson", 1, &[]);
-    e.db.mark_transformed(e.record(refused, 1), &json!([]))
-        .unwrap();
+    e.transform(refused, 1);
     e.db.reject_unsubmitted(refused, "server", "the server refused the submission")
         .unwrap();
     // A zip: recorded as unpacked, done once a pass finishes it.

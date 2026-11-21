@@ -179,6 +179,7 @@ async fn a_canary_secret_appears_nowhere() {
         "/api/sources",
         "/api/sources/lab-s3",
         "/api/alerts",
+        "/api/events",
         "/health",
         "/metrics",
     ] {
