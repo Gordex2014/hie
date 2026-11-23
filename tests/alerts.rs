@@ -243,6 +243,28 @@ async fn a_source_is_born_with_a_silence_rule_and_rules_are_managed() {
         .await
         .unwrap();
     assert_eq!(gone.status(), 404);
+
+    // The default rule, once deleted, stays deleted: a replace of the whole
+    // definition, as a client saving one member sends it, adds none.
+    let deleted = lab
+        .http
+        .delete(format!("{}/api/alert-rules/{default_id}", lab.api))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 204);
+    let mut definition = lab.get("/api/sources/lab-results").await["definition"].clone();
+    definition["contact"] = json!("Lab IT on-call");
+    let replaced = lab
+        .http
+        .put(format!("{}/api/sources/lab-results", lab.api))
+        .json(&definition)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), 200);
+    let rules = lab.get("/api/alert-rules?source=lab-results").await;
+    assert_eq!(rules["rules"], json!([]), "{rules}");
 }
 
 #[tokio::test]

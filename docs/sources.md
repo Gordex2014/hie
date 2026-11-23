@@ -76,7 +76,7 @@ The same document is what `POST /api/sources` takes. Before creating one, `POST 
 
 ### Alerts and rules
 
-Alerts are governed by **rules**: data, created and edited over the API, each naming a source (or every source), a condition with its threshold, who to notify, and the channels (`app`, `webhook`, `email`). Every source is born with one `silence` rule set to its `expect_every` (two hours when it has none), so nobody has to remember to watch it.
+Alerts are governed by **rules**: data, created and edited over the API, each naming a source (or every source), a condition with its threshold, who to notify, and the channels (`app`, `webhook`, `email`). Every source is born with one `silence` rule set to its `expect_every` (two hours when it has none), so nobody has to remember to watch it. It is given only when the source is created: the first time the store sees it at a start, or by `POST /api/sources`. A replace or a restart never adds it back, so a deleted default rule stays deleted. A source deleted through the API and created again with `POST` gets it again (unless its old `silence` rule is still there); one whose file is put back is the source the store knew and does not.
 
 | Condition | Threshold | Fires when | Clears when |
 |-----------|-----------|------------|-------------|

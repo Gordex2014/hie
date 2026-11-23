@@ -108,6 +108,10 @@ CREATE TABLE IF NOT EXISTS alert_rules (
   created_by TEXT,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS source_births (
+  feed_id TEXT PRIMARY KEY,
+  born_at INTEGER NOT NULL
+);
 ";
 
 /// Columns added after a store was first created; each is added when missing.
@@ -1767,6 +1771,94 @@ impl Db {
         Ok(self.execute("DELETE FROM alert_rules WHERE id = $1", &params![id])? > 0)
     }
 
+    /// Records the birth of source `rule.source_id` and gives it `rule`, its
+    /// default rule, when this is its first appearance in the store: returns the
+    /// rule's id when one was added. An id the store has seen before gets
+    /// nothing, whatever its rules are now. An id it has no birth of but holds
+    /// something of (a rule, an alert, a file, a pause, a cursor) is a source
+    /// from before births were recorded: it is marked born and gets nothing.
+    /// `force` (a create through the API) gives the rule whatever the store
+    /// remembers, unless the source has a `silence` rule. One transaction: on a
+    /// failure nothing is recorded. Two instances giving the same source at once
+    /// add one rule: the second waits on the first's birth row.
+    pub fn give_default_rule(&self, rule: &Rule, force: bool) -> Result<Option<i64>> {
+        let feed = rule
+            .source_id
+            .as_deref()
+            .context("a default rule names its source")?;
+        self.with(|c| {
+            c.batch("BEGIN")?;
+            let result = (|| {
+                let conflict = if force {
+                    "DO UPDATE SET born_at = excluded.born_at"
+                } else {
+                    "DO NOTHING"
+                };
+                let born = c.execute(
+                    &format!(
+                        "INSERT INTO source_births (feed_id, born_at) VALUES ($1, $2)
+                         ON CONFLICT (feed_id) {conflict}"
+                    ),
+                    &params![feed, now_ms()],
+                )? == 1;
+                let new = if force {
+                    c.query(
+                        "SELECT 1 FROM alert_rules WHERE source_id = $1 AND condition = 'silence' LIMIT 1",
+                        &params![feed],
+                    )?
+                    .is_empty()
+                } else {
+                    born && c
+                        .query(
+                            "SELECT 1 FROM alert_rules WHERE source_id = $1
+                             UNION ALL SELECT 1 FROM alerts WHERE feed_id = $1
+                             UNION ALL SELECT 1 FROM files WHERE feed_id = $1
+                             UNION ALL SELECT 1 FROM source_state WHERE feed_id = $1
+                             UNION ALL SELECT 1 FROM source_cursors WHERE feed_id = $1
+                             LIMIT 1",
+                            &params![feed],
+                        )?
+                        .is_empty()
+                };
+                if !new {
+                    return Ok(None);
+                }
+                let id = c
+                    .query(
+                        "INSERT INTO alert_rules (source_id, condition, threshold, notify, channels, enabled, created_by, created_at)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+                        &params![
+                            feed,
+                            rule.condition,
+                            rule.threshold,
+                            serde_json::to_string(&rule.notify).unwrap_or_default(),
+                            serde_json::to_string(&rule.channels).unwrap_or_default(),
+                            rule.enabled,
+                            rule.created_by,
+                            now_ms()
+                        ],
+                    )?
+                    .first()
+                    .map(|r| r.i64(0))
+                    .context("INSERT returned no id")?;
+                Ok::<_, anyhow::Error>(Some(id))
+            })();
+            match result {
+                Ok(v) => match c.batch("COMMIT") {
+                    Ok(()) => Ok(v),
+                    Err(e) => {
+                        let _ = c.batch("ROLLBACK");
+                        Err(e)
+                    }
+                },
+                Err(e) => {
+                    let _ = c.batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
     // ---- counts and free queries -------------------------------------------------
 
     pub fn feed_counts(&self, feed: &str) -> Result<Value> {
@@ -1845,6 +1937,8 @@ fn redact(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -1881,6 +1975,158 @@ mod tests {
         assert!(!db.acquire_lease("lab", "a", 60_000).unwrap());
         db.release_lease("lab", "b").unwrap();
         assert!(db.acquire_lease("lab", "a", 60_000).unwrap());
+    }
+
+    fn default_rule(feed: &str) -> Rule {
+        Rule {
+            id: 0,
+            source_id: Some(feed.into()),
+            condition: "silence".into(),
+            threshold: "2h".into(),
+            notify: vec![],
+            channels: vec!["app".into()],
+            enabled: true,
+            created_by: None,
+        }
+    }
+
+    fn silence_rules(db: &Db, feed: &str) -> Vec<i64> {
+        db.rules()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.source_id.as_deref() == Some(feed) && r.condition == "silence")
+            .map(|r| r.id)
+            .collect()
+    }
+
+    fn born(db: &Db, feed: &str) -> bool {
+        db.query_one(
+            "SELECT 1 FROM source_births WHERE feed_id = $1",
+            &params![feed],
+        )
+        .unwrap()
+        .is_some()
+    }
+
+    #[test]
+    fn a_source_gets_its_default_rule_at_its_birth_only() {
+        let db = Db::in_memory().unwrap();
+        let first = db.give_default_rule(&default_rule("lab"), false).unwrap();
+        assert!(first.is_some());
+        assert_eq!(silence_rules(&db, "lab"), [first.unwrap()]);
+        // Seen before: nothing, even once its rule is deleted.
+        assert_eq!(
+            db.give_default_rule(&default_rule("lab"), false).unwrap(),
+            None
+        );
+        db.delete_rule(first.unwrap()).unwrap();
+        assert_eq!(
+            db.give_default_rule(&default_rule("lab"), false).unwrap(),
+            None
+        );
+        assert!(silence_rules(&db, "lab").is_empty());
+        // A create gets it again, and never a second one.
+        let again = db.give_default_rule(&default_rule("lab"), true).unwrap();
+        assert!(again.is_some());
+        assert_eq!(
+            db.give_default_rule(&default_rule("lab"), true).unwrap(),
+            None
+        );
+        assert_eq!(silence_rules(&db, "lab"), [again.unwrap()]);
+        // A forced birth of a source never seen records it.
+        assert!(
+            db.give_default_rule(&default_rule("new"), true)
+                .unwrap()
+                .is_some()
+        );
+        assert!(born(&db, "new"));
+        assert_eq!(
+            db.give_default_rule(&default_rule("new"), false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_source_from_before_births_were_recorded_gets_no_rule() {
+        let db = Db::in_memory().unwrap();
+        // What an earlier version left: a source whose silence rule was deleted
+        // but that has another rule, one with a file, one paused, one with a
+        // cursor, one with an alert.
+        let mut other = default_rule("ruled");
+        other.condition = "rejected_share".into();
+        other.threshold = "10%".into();
+        db.insert_rule(&other).unwrap();
+        db.insert_file("filed", "a.csv", "00", 1, "done", None, None, None)
+            .unwrap();
+        db.set_paused("paused", true, None).unwrap();
+        db.set_cursor("cursored", "k", "1").unwrap();
+        db.execute(
+            "INSERT INTO alerts (feed_id, kind, message, created_at) VALUES ($1, 'silence', 'm', 0)",
+            &params!["alerted"],
+        )
+        .unwrap();
+        for feed in ["ruled", "filed", "paused", "cursored", "alerted"] {
+            assert_eq!(
+                db.give_default_rule(&default_rule(feed), false).unwrap(),
+                None,
+                "{feed}"
+            );
+            assert!(born(&db, feed), "{feed}");
+            assert!(silence_rules(&db, feed).is_empty(), "{feed}");
+        }
+        // A source the store holds nothing of is new.
+        assert!(
+            db.give_default_rule(&default_rule("fresh"), false)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_failed_birth_records_nothing() {
+        let db = Db::in_memory().unwrap();
+        db.execute("DROP TABLE alert_rules", &[]).unwrap();
+        for force in [false, true] {
+            assert!(db.give_default_rule(&default_rule("lab"), force).is_err());
+            assert!(!born(&db, "lab"), "force {force}");
+        }
+    }
+
+    #[test]
+    fn two_handles_on_one_store_give_one_default_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hie.db");
+        let keeper = Arc::new(Db::open(&path).unwrap());
+        let other = Arc::new(Db::open(&path).unwrap());
+        for (round, force) in [(0, false), (1, true), (2, true)] {
+            let feed = format!("s{round}");
+            if round == 2 {
+                // Known already, its rule gone: two creates at once add one.
+                keeper
+                    .give_default_rule(&default_rule(&feed), false)
+                    .unwrap();
+                for id in silence_rules(&keeper, &feed) {
+                    keeper.delete_rule(id).unwrap();
+                }
+            }
+            let threads: Vec<_> = (0..8)
+                .map(|i| {
+                    let db = if i % 2 == 0 {
+                        keeper.clone()
+                    } else {
+                        other.clone()
+                    };
+                    let rule = default_rule(&feed);
+                    std::thread::spawn(move || db.give_default_rule(&rule, force).unwrap())
+                })
+                .collect();
+            let added = threads
+                .into_iter()
+                .filter_map(|t| t.join().unwrap())
+                .count();
+            assert_eq!(added, 1, "round {round}");
+            assert_eq!(silence_rules(&keeper, &feed).len(), 1, "round {round}");
+        }
     }
 
     #[test]

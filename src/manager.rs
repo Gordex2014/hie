@@ -341,7 +341,8 @@ impl SourceManager {
         // Before any runner: what an earlier run of this instance left behind.
         self.reconcile_refs(&feeds);
         for feed in feeds {
-            self.ensure_default_rule(&feed, None)?;
+            // Only a source this store has never seen gets the default rule.
+            self.give_default_rule(&feed, None, false)?;
             self.start(feed)?;
         }
         Ok(())
@@ -469,13 +470,9 @@ impl SourceManager {
         self.db.secret_release(id, self.secrets.owner(), keep)
     }
 
-    /// The default rule and the runner of a definition that was just published:
-    /// a failure here leaves the definition saved and the registrations kept.
-    fn start_published(
-        self: &Arc<Self>,
-        feed: &FeedConfig,
-        by: Option<&str>,
-    ) -> Result<(), ManagerError> {
+    /// The runner of a definition that was just published: a failure here
+    /// leaves the definition saved and the registrations kept.
+    fn start_published(self: &Arc<Self>, feed: &FeedConfig) -> Result<(), ManagerError> {
         #[cfg(all(test, feature = "secrets-native"))]
         if self
             .fail_next_start
@@ -485,9 +482,7 @@ impl SourceManager {
                 "the definition was saved, but the source could not be started: a test made the start fail; it starts with this definition at the next start of the engine".into(),
             ));
         }
-        self.ensure_default_rule(feed, by)
-            .and_then(|()| self.start(feed.clone()))
-            .map_err(|e| {
+        self.start(feed.clone()).map_err(|e| {
                 tracing::error!(feed = %feed.id, "the definition was saved, but the source did not start: {e:#}");
                 ManagerError::NotStarted(format!(
                     "the definition was saved, but the source could not be started: {e:#}; it starts with this definition at the next start of the engine"
@@ -549,21 +544,39 @@ impl SourceManager {
             None => false,
         };
         pause_point!(await self, "manager:after-hold");
+        // A create is always a creation: the default rule comes before the
+        // definition is published, so a start that fails cannot lose it.
+        let rule = match self.give_default_rule(&resolved, by, true) {
+            Ok(rule) => rule,
+            Err(e) => {
+                self.take_back(&submitted.id, secret.as_deref(), made);
+                return Err(e.into());
+            }
+        };
         if let Err(e) = self.write(&submitted) {
             self.take_back(&submitted.id, secret.as_deref(), made);
+            if let Some(rule) = rule
+                && let Err(e) = self.db.delete_rule(rule)
+            {
+                tracing::warn!(feed = %submitted.id, "the default rule of a source that was not created stays: {e:#}");
+            }
             return Err(e.into());
         }
         pause_point!(await self, "manager:after-publish");
-        self.start_published(&resolved, by)?;
+        self.start_published(&resolved)?;
         Ok(resolved)
     }
 
-    /// Every source is born with one silence rule, so nobody has to remember to
-    /// watch it: `expect_every` when the definition says so, two hours otherwise.
-    fn ensure_default_rule(&self, feed: &FeedConfig, by: Option<&str>) -> Result<()> {
-        if self.db.has_rule(&feed.id, "silence")? {
-            return Ok(());
-        }
+    /// A source is born with one silence rule, so nobody has to remember to
+    /// watch it: `expect_every` when the definition says so, two hours
+    /// otherwise. Only at its birth (`Db::give_default_rule`): a replace, a
+    /// restart or a re-read never brings back a rule someone deleted.
+    fn give_default_rule(
+        &self,
+        feed: &FeedConfig,
+        by: Option<&str>,
+        force: bool,
+    ) -> Result<Option<i64>> {
         let rule = Rule {
             id: 0,
             source_id: Some(feed.id.clone()),
@@ -577,7 +590,7 @@ impl SourceManager {
             enabled: true,
             created_by: by.map(str::to_string),
         };
-        self.db.insert_rule(&rule).map(drop)
+        self.db.give_default_rule(&rule, force)
     }
 
     pub async fn replace(
@@ -612,7 +625,7 @@ impl SourceManager {
         pause_point!(await self, "manager:after-publish");
         // The old credential's registration goes once the new runner has taken
         // over (`cleanup_refs`).
-        self.start_published(&resolved, None)?;
+        self.start_published(&resolved)?;
         Ok(resolved)
     }
 

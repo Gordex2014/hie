@@ -251,7 +251,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 ## 22. Alert rules are data, and an alert clears itself
 
-**Chosen:** A rule names a source (or all of them), one of four conditions with its threshold — `silence` (duration), `missing_by` (time of day, UTC), `rejected_share` (percentage of a load), `unreachable` (failed delivery attempts) — who to notify, and the channels (`app`, `webhook`, `email`). Rules are rows in the engine's database with a CRUD under `/api/alert-rules`. A condition raises **one** alert per rule and source, and the engine closes it when the condition goes away: data arrives, the file arrives, a later load is within the limit, delivery succeeds. The alert keeps its rule, the recipients, the channels, and when and why it cleared. Every source gets a `silence` rule at birth, set to its `expect_every` or two hours. Without a `rejected_share` or `unreachable` rule the fixed behaviour of decision 12 stays.
+**Chosen:** A rule names a source (or all of them), one of four conditions with its threshold — `silence` (duration), `missing_by` (time of day, UTC), `rejected_share` (percentage of a load), `unreachable` (failed delivery attempts) — who to notify, and the channels (`app`, `webhook`, `email`). Rules are rows in the engine's database with a CRUD under `/api/alert-rules`. A condition raises **one** alert per rule and source, and the engine closes it when the condition goes away: data arrives, the file arrives, a later load is within the limit, delivery succeeds. The alert keeps its rule, the recipients, the channels, and when and why it cleared. Every source gets a `silence` rule at birth, set to its `expect_every` or two hours (amended by decision 45: only when the source is created, never again on a replace or a restart). Without a `rejected_share` or `unreachable` rule the fixed behaviour of decision 12 stays.
 
 **Why:**
 - The four conditions are the ones the monitoring brief asks the UI to offer, with the thresholds in the units a person would type.
@@ -438,7 +438,7 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - Plaintext copies outside the engine's wiped types: the S3 client's own credential strings for the client's lifetime, HTTP and JSON parser buffers. HMAC pad blocks and HKDF temporaries made once at start are not wiped.
 - Registrations belong to an instance (`HIE_INSTANCE_ID`, or an id kept in the sources directory). After a failure they err on keeping: a start that fails after a definition was published keeps both credentials registered until the next start or replace, a cleanup that keeps failing leaves a row until the next start, and a changed instance id leaves its old rows behind. Each only makes a delete answer `409`. A crash while the key file is created can leave a temporary copy of the key next to it.
 
-## 45. A source's contact: one line of display text on its definition
+## 45. A source's contact: one line of display text on its definition; its default rule only at its creation
 
 **Chosen:** A source definition may carry `contact`: free text saying whom to call about the source, with no directory behind it. It is optional, at most 500 characters, one line without control, line-separator or text-direction characters, and must be text (in YAML, a bare number or boolean is refused). Absent, `null` and blank mean none; a blank one is not written. Otherwise it is stored and returned exactly as given. It is answered as `contact` by every source read and write, by each source of `GET /api/monitoring/status` and by each of its `needs_you` entries, and printed by `hie check`; it is checked wherever a definition is (at start, by `hie check`, on `POST` and `PUT`), before anything that can skip a file. `PUT` stays a whole replace: a definition without `contact` has none, and a client that changes one member sends back the `definition` it read.
 
@@ -450,6 +450,21 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - A whole replace rather than "absent keeps it": a client that reads and writes back the whole definition, as one changing a transform does, keeps the contact without knowing about it; a merge for one member would make `PUT` partial, need a special value to clear, and let the file differ from the body sent.
 
 **Cost / not yet:** a contact-only `PUT` restarts the source, as any replace does. The top-level `contact` (what runs, normalised) and `definition.contact` (the file as saved) can differ: after `500 source_not_started` until the saved definition starts, after a hand edit of the file until the next start, and for a blank contact written by hand. An engine before this one drops the member from a definition without a word, so a client checks the version before offering it. It is not in alerts or the webhook body; a receiver reads the source by its id. A source file not named `{id}.yaml` has no `definition` in the answer, so its contact is read from the top-level member only.
+
+**Chosen (the default rule, amending decision 22):** A source gets its default `silence` rule when it is created, and at no other time. Up to 0.2.0 every start and every replace added one to a source that had none, so a whole `PUT` (a contact or transform save) or a restart brought back a rule someone had deleted. The store now records each source's birth (`source_births`, one row per id, shared by every instance on the store):
+- A source found at a start that the store has never seen is created there and gets the rule. One it has seen gets nothing, whatever its rules are now.
+- `POST /api/sources` is always a creation: the source gets the rule unless its id still has a `silence` rule (rules outlive a deleted source), so it never has two. The rule is added before the file is written; a failed write takes it back, and a failed start keeps it.
+- `PUT`, pause, resume and every restart of a runner add none.
+- A source deleted through the API keeps its birth: created again with `POST`, it gets the rule as above; put back as a file, it is the source the store knew, and gets none.
+- Upgrade: the first time this version meets a source with no birth row, a source the store already holds something of (a rule, an alert, a file, a pause, a cursor) is marked born without a rule; one it holds nothing of is new and gets the rule.
+
+**Why:**
+- Deleting the default rule is a decision; a save of another member, or a restart, must not undo it.
+- A record per store, not per file or per instance, so the answer is the same on every instance sharing a store and whatever the file is named; one transaction records the birth and adds the rule, so two instances starting the same new source add one rule.
+- Keeping the birth on delete avoids a reset that another instance still running the source, or a crash between removing the file and the record, would turn into a restored rule; a `POST` is an explicit creation, so it still gets the rule.
+- Upgrade by evidence rather than a step at open: every release gave each source it started a `silence` rule, so a source that exists at the upgrade has left at least that rule, or an alert, a file, a pause or a cursor, and nothing has to run once, or can be lost, when the store is opened.
+
+**Cost / not yet:** a source that existed before the upgrade but has left nothing in the store (started, its rules all deleted, nothing received, never alerted, paused or given a cursor) gets the rule once more at the first start of this version. A new source whose id an old, deleted source used gets no rule when it appears as a file (its earlier rows count as evidence); created with `POST` it does. While instances of an earlier version share the store, their starts and replaces keep adding the rule back. A file-defined source whose rule should return is created again with `POST`, or given the rule over `/api/alert-rules`.
 
 ## Not in the prototype
 
