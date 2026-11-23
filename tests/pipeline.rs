@@ -115,6 +115,49 @@ fn alert_kinds(state: &hie::api::AppState) -> Vec<String> {
         .collect()
 }
 
+/// The event log, oldest first.
+fn events(state: &hie::api::AppState) -> Vec<Value> {
+    state
+        .db
+        .query_json(
+            "SELECT kind, load_id, record_id, attempt, error_kind, detail FROM events ORDER BY id",
+            [],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|mut e| {
+            if let Some(Value::String(text)) = e.get("detail") {
+                e["detail"] = serde_json::from_str(text).unwrap();
+            }
+            e
+        })
+        .collect()
+}
+
+/// One record's events, as (kind, attempt).
+fn record_events(log: &[Value], record: &Value) -> Vec<(String, Value)> {
+    log.iter()
+        .filter(|e| e["record_id"] == *record)
+        .map(|e| {
+            (
+                e["kind"].as_str().unwrap().to_string(),
+                e["attempt"].clone(),
+            )
+        })
+        .collect()
+}
+
+fn file_id(state: &hie::api::AppState, name: &str) -> Value {
+    state
+        .db
+        .query_json(
+            "SELECT id FROM files WHERE name = $1 AND status <> 'duplicate'",
+            hie::db::params![name],
+        )
+        .unwrap()[0]["id"]
+        .clone()
+}
+
 #[tokio::test]
 async fn a_feed_survives_an_outage_bad_rows_and_resends() {
     let Some(python) = python() else {
@@ -166,7 +209,42 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
     runner.tick().await.unwrap();
     assert_eq!(count(&state, "sent"), 3);
     assert_eq!(fhir.lock().unwrap().versions.len(), 3);
-    assert_eq!(alert_kinds(&state), ["delivery", "delivery_recovered"]);
+    // The outage alert is cleared by the recovery; no second alert is raised.
+    assert_eq!(alert_kinds(&state), ["delivery"]);
+    let outage = &state
+        .db
+        .query_json("SELECT cleared_at, cleared_reason FROM alerts", [])
+        .unwrap()[0];
+    assert!(outage["cleared_at"].as_i64().is_some(), "{outage}");
+    assert_eq!(
+        outage["cleared_reason"],
+        "Lab results: delivery to HFS recovered"
+    );
+    // Each row's failed attempts and its recovery are in the event log.
+    let log = events(&state);
+    for record in state
+        .db
+        .query_json("SELECT id FROM records", [])
+        .unwrap()
+        .iter()
+        .map(|r| &r["id"])
+    {
+        // As many failed attempts as the passes made (a pass may try a due
+        // batch twice), numbered from 1, then the recovery as the next attempt.
+        let mine = record_events(&log, record);
+        let (last, failed) = mine.split_last().unwrap();
+        assert!(failed.len() >= 2, "{mine:?}");
+        for (n, (kind, attempt)) in failed.iter().enumerate() {
+            assert_eq!(
+                (kind.as_str(), attempt),
+                ("record.attempt_failed", &json!(n + 1))
+            );
+        }
+        assert_eq!(
+            (last.0.as_str(), &last.1),
+            ("record.recovered", &json!(failed.len() + 1))
+        );
+    }
 
     // The identical file again: recognized by its hash and not reprocessed.
     let before = fhir.lock().unwrap().requests;
@@ -176,6 +254,12 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
     assert_eq!(
         state.db.feed_counts("lab-results").unwrap()["duplicate_files"],
         1
+    );
+    let duplicate = events(&state).pop().unwrap();
+    assert_eq!(duplicate["kind"], "load.duplicate");
+    assert_eq!(
+        duplicate["detail"],
+        json!({"name": "labs.csv", "duplicate_of": file_id(&state, "labs.csv")})
     );
 
     // The same rows in a different file: delivered again, but as updates, not new resources.
@@ -241,6 +325,49 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
         "the GLU local code row is mapped to LOINC and sent"
     );
     assert_eq!(alert_kinds(&state).last().unwrap(), "rejected_records");
+    // The messy load in the event log: received, each row's outcome, finished.
+    let messy_id = file_id(&state, "messy.csv");
+    let messy_log: Vec<Value> = events(&state)
+        .into_iter()
+        .filter(|e| e["load_id"] == messy_id)
+        .collect();
+    assert_eq!(messy_log[0]["kind"], "load.received");
+    assert_eq!(messy_log.last().unwrap()["kind"], "load.finished");
+    let lines: HashMap<i64, i64> = state
+        .db
+        .query_json(
+            "SELECT id, line FROM records WHERE file_id = $1",
+            hie::db::params![messy_id.as_i64().unwrap()],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| (r["id"].as_i64().unwrap(), r["line"].as_i64().unwrap()))
+        .collect();
+    let mut outcomes: Vec<(i64, String, String)> = messy_log[1..messy_log.len() - 1]
+        .iter()
+        .map(|e| {
+            (
+                lines[&e["record_id"].as_i64().unwrap()],
+                e["kind"].as_str().unwrap().to_string(),
+                e["error_kind"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    outcomes.sort();
+    let rejected = |line, kind: &str| (line, "record.rejected".to_string(), kind.to_string());
+    let delivered = |line| (line, "record.delivered".to_string(), String::new());
+    assert_eq!(
+        outcomes,
+        [
+            delivered(2),
+            rejected(3, "data"),
+            rejected(4, "parse"),
+            rejected(5, "data"),
+            rejected(6, "data"),
+            rejected(7, "data"),
+            rejected(8, "server")
+        ]
+    );
 
     // Someone fixes the value and reprocesses that one row.
     let alto = state
@@ -281,6 +408,23 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
         1,
         "reprocessing a row does not repeat the file's alert"
     );
+    // The corrected row keeps its id: put back, then delivered.
+    let fixed_log = record_events(&events(&state), &alto[0]["id"]);
+    assert_eq!(
+        fixed_log
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>(),
+        ["record.rejected", "record.retried", "record.delivered"]
+    );
+    let retried = events(&state)
+        .into_iter()
+        .find(|e| e["kind"] == "record.retried")
+        .unwrap();
+    assert_eq!(
+        retried["detail"],
+        json!({"from_status": "rejected", "corrected": true})
+    );
 
     // Nothing arrives for longer than `expect_every`: one silence alert, not one per pass.
     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -293,6 +437,31 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
             .count(),
         1
     );
+
+    // A Retry of the messy load: the load and each row put back, and the load
+    // finishes again (a third time: the reprocessed row finished it a second).
+    let before = events(&state).len();
+    let retried = state
+        .db
+        .reprocess_rejected(messy_id.as_i64().unwrap(), None)
+        .unwrap();
+    assert_eq!(retried, 5);
+    let log = events(&state);
+    assert_eq!(log[before]["kind"], "load.retried");
+    assert_eq!(log[before]["detail"], json!({"retried": 5}));
+    assert!(
+        log[before + 1..]
+            .iter()
+            .all(|e| e["kind"] == "record.retried"
+                && e["detail"] == json!({"from_status": "rejected", "corrected": false}))
+    );
+    assert_eq!(log.len(), before + 6);
+    runner.tick().await.unwrap();
+    let finished = events(&state)
+        .into_iter()
+        .filter(|e| e["kind"] == "load.finished" && e["load_id"] == messy_id)
+        .count();
+    assert_eq!(finished, 3);
 }
 
 // ---- the transform worker's failures, as the pipeline sees them ----------

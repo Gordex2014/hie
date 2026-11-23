@@ -79,6 +79,8 @@ To build the image yourself: `docker build -t hie .`
 | `HIE_LOG` | `info` | Log filter (`debug`, `hie=debug`, ...). Whatever it says, `tokio_postgres` never logs below `info`: at `debug` and `trace` it would log the values bound to every statement (record data, status URLs, tokens) |
 | `HIE_DATABASE_URL` | | The store, overriding `database:` in `hie.yaml`: a `postgres://user:password@host/db` URL. Set it here so the password is not in the file |
 | `HIE_INSTANCE_ID` | host, pid and a random tail | This instance's name in the leases, when several share one store; also the owner of its credential registrations (otherwise an id kept in `sources/.hie-instance-id`) |
+| `HIE_ALERT_WEBHOOK_URL` | `alerts.webhook_url` in `hie.yaml` | Where [alert events](sources.md#the-alert-webhook) are posted, `http` or `https`. A chat webhook's URL is itself a credential: set it here rather than in the file |
+| `HIE_ALERT_WEBHOOK_SECRET` | `alerts.webhook_secret` in `hie.yaml` | The secret that signs alert events (`X-HIE-Signature`); unsigned without one |
 | `HIE_TERMINOLOGY_SERVER` | `terminology_url` in `hie.yaml` | The HTS transforms may ask through `lookup` and `translate` |
 | `HIE_TERMINOLOGY_TOKEN` | | A bearer token for that HTS, when it requires one |
 | `HIE_SECRET_KEY` | | The secret key that seals stored credentials: 32 random bytes in base64, e.g. from `openssl rand -base64 32`. See [Credentials and the secret key](#credentials-and-the-secret-key) |
@@ -99,6 +101,30 @@ worker:
 ```
 
 Every value must be at least 1. A transform that imports a heavy library may need a larger `memory_mib`. A reply line is at most 32 MiB. Each worker process gets a fresh run directory under the system temporary directory, deleted when it ends.
+
+### The destination probe
+
+The engine reports whether the FHIR server answers (`destination` in `GET /api/monitoring/status`, see [The destination](api.md#the-destination)) from its deliveries, and probes `{fhir_base_url}/metadata` once nothing has reached the server for a while, so the report does not go stale when nothing arrives:
+
+```yaml
+destination:
+  probe_seconds: 60   # seconds of quiet before a probe; 0 turns the probe off
+```
+
+`probe_seconds` is at most 86400. The probe is a plain `GET` with a 10-second limit and no token: a running engine keeps probing while its token endpoint is down, and an answer such as `401` still means the server answers. With the probe off, the members of `destination` stay `null` (and `consecutive_failures` `0`) until the first delivery.
+
+### Retention
+
+The engine keeps an event log (see [Events](api.md#events)), its alerts and the checks `check-now` records (see [Checks](api.md#checks)) for a time set by the `retention:` block in `hie.yaml`:
+
+```yaml
+retention:
+  history: 30d   # events, stored alerts and checks; from 1d to 3650d
+```
+
+Older events, alerts and checks are purged at start and every hour after, in chunks of 5,000 rows; a check counts from when it was asked for, answered or not. The alerts the engine still tracks stay whatever their age: open alerts of an enabled rule, open `credential` and `definition` alerts, and open outage (`delivery`) alerts without a rule (see [Alerts and retention](api.md#alerts-and-retention)). An open alert of a rule whose source was deleted while it was open stays until the rule is turned off, deleted or changed in what it watches, which clears it. Records, loads and submissions are not purged: `history` covers what the engine logs about them, not the data. Instances sharing one store each purge with their own setting, so the shortest one applies. A value outside 1d to 3650d, or a key other than `history`, is refused at start and by `hie check`.
+
+The first start after the upgrade that brings the event log builds new indexes on `records` (one on SQLite, two on PostgreSQL), and the one that brings checks an index on `files`; each blocks writes to its table while it runs: on a large store, plan for it. Instances starting together on one PostgreSQL schema build it in turn.
 
 ### Credentials and the secret key
 
@@ -133,6 +159,8 @@ A build without the `secrets-native` feature has no secret store: it skips sourc
 
 ### The store, and more than one instance
 
-`database:` in `hie.yaml` is where the engine keeps files, records, alerts, rules, cursors and leases: a SQLite file (the default, `data/hie.db`, no setup) or a `postgres://` URL. The SQL is the same on both; the test suite runs on either (`HIE_TEST_DATABASE_URL=postgres://... cargo test` runs every test on PostgreSQL, each in a schema of its own).
+`database:` in `hie.yaml` is where the engine keeps files, records, events, alerts, rules, checks, cursors and leases: a SQLite file (the default, `data/hie.db`, no setup) or a `postgres://` URL. The SQL is the same on both; the test suite runs on either (`HIE_TEST_DATABASE_URL=postgres://... cargo test` runs every test on PostgreSQL, each in a schema of its own).
 
-With PostgreSQL, several instances may share one store. A source is run by the instance that holds its **lease**: each pass takes or renews it for three poll intervals (at least 30 s); another instance that finds it held stands by; when the holder dies, its lease lapses and the next pass elsewhere takes the source over, with the cursors, pause state and rules it left in the store. Whether a source was created, which decides its default rule, is recorded in the store too, so it is the same on every instance. A clean stop releases the lease at once. `GET /api/sources/{id}` shows `lease` (owner, until, whether it is this instance's) and `instance`, and reports a source held elsewhere as `standby`. `POST .../check-now` reaches the instance it was sent to, so send it to the holder.
+With PostgreSQL, several instances may share one store, with the same `alerts:` settings: any of them sends any waiting alert event. A source is run by the instance that holds its **lease**: each pass takes or renews it for three poll intervals (at least 30 s); another instance that finds it held stands by; when the holder dies, its lease lapses and the next pass elsewhere takes the source over, with the cursors, pause state and rules it left in the store. Whether a source was created, which decides its default rule, is recorded in the store too, so it is the same on every instance. A clean stop releases the lease at once. `GET /api/sources/{id}` shows `lease` (owner, until, whether it is this instance's) and `instance`, and reports a source held elsewhere as `standby`. `POST .../check-now` makes a pass only on the instance it was sent to, so send it to the holder; the check it records is in the store, and is answered by the holder's next scan wherever it was sent.
+
+A PostgreSQL store must use the `UTF8` encoding: names, files and rows are stored as text. The engine creates its tables and indexes, and adds new columns, when it starts. An upgrade can add an index over a large table: the first start of a version that lists loads across sources builds two partial indexes over `records`, each read in full, and two over `files`, each in a transaction of its own, during which SQLite holds its write lock and PostgreSQL blocks writes to the table being indexed. On a large store, plan for that pause. Instances that start together on one PostgreSQL store build the schema in turn, so the others wait for the first to finish. On PostgreSQL every index, old or new, is checked or built in a transaction of its own after the tables: `CREATE INDEX IF NOT EXISTS` locks its table even when the index exists, so a start that waits for another instance's write to one table holds no other table meanwhile, and a rolling start cannot deadlock with a running instance. Each start also checks every added column with `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, which takes an exclusive lock on its table even when the column exists: a start waits behind a running instance's longest transaction on that table, and that instance's next statements on it wait for the start.

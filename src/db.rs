@@ -6,6 +6,7 @@
 #[cfg(feature = "secrets-native")]
 pub mod secrets;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -13,6 +14,8 @@ use anyhow::{Context, Result};
 use postgres::types::{IsNull, ToSql, Type};
 use rusqlite::types::ValueRef;
 use serde_json::{Map, Value, json};
+
+use crate::events::Event;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS files (
@@ -32,6 +35,7 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS files_feed_sha ON files(feed_id, sha256);
 CREATE INDEX IF NOT EXISTS files_feed_received ON files(feed_id, received_at);
+CREATE INDEX IF NOT EXISTS files_feed_id ON files(feed_id, id);
 CREATE TABLE IF NOT EXISTS records (
   id INTEGER PRIMARY KEY,
   file_id INTEGER NOT NULL REFERENCES files(id),
@@ -98,7 +102,7 @@ CREATE TABLE IF NOT EXISTS submissions (
 );
 CREATE INDEX IF NOT EXISTS submissions_feed_status ON submissions(feed_id, status, next_attempt_at);
 CREATE TABLE IF NOT EXISTS alert_rules (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   source_id TEXT,
   condition TEXT NOT NULL,
   threshold TEXT NOT NULL,
@@ -106,12 +110,69 @@ CREATE TABLE IF NOT EXISTS alert_rules (
   channels TEXT NOT NULL DEFAULT '[\"app\"]',
   enabled INTEGER NOT NULL DEFAULT 1,
   created_by TEXT,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  tz TEXT
 );
 CREATE TABLE IF NOT EXISTS source_births (
   feed_id TEXT PRIMARY KEY,
   born_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS store_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at INTEGER NOT NULL,
+  source_id TEXT,
+  kind TEXT NOT NULL,
+  load_id INTEGER,
+  record_id INTEGER,
+  attempt INTEGER,
+  error_kind TEXT,
+  reason TEXT,
+  detail TEXT
+);
+CREATE INDEX IF NOT EXISTS events_at ON events(at);
+CREATE INDEX IF NOT EXISTS events_source ON events(source_id, id);
+CREATE INDEX IF NOT EXISTS events_kind ON events(kind, id);
+CREATE TABLE IF NOT EXISTS alert_counts_purged (
+  feed_id TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL,
+  n INTEGER NOT NULL,
+  PRIMARY KEY (feed_id, kind)
+);
+CREATE TABLE IF NOT EXISTS alert_webhooks (
+  id INTEGER PRIMARY KEY,
+  event_id TEXT NOT NULL UNIQUE,
+  alert_id INTEGER NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
+  event TEXT NOT NULL,
+  destination TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  state TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  last_status INTEGER,
+  delivered_at INTEGER,
+  created_at INTEGER NOT NULL,
+  UNIQUE (alert_id, event)
+);
+CREATE INDEX IF NOT EXISTS alert_webhooks_due ON alert_webhooks(state, destination, next_attempt_at);
+CREATE INDEX IF NOT EXISTS alert_webhooks_alert ON alert_webhooks(alert_id, id);
+CREATE TABLE IF NOT EXISTS checks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  feed_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  requested_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  after_file INTEGER NOT NULL,
+  upto_file INTEGER,
+  file_count INTEGER,
+  reason TEXT
+);
+CREATE INDEX IF NOT EXISTS checks_feed_status ON checks(feed_id, status);
+CREATE INDEX IF NOT EXISTS checks_requested ON checks(requested_at);
 ";
 
 /// Columns added after a store was first created; each is added when missing.
@@ -119,13 +180,117 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("files", "source_key", "TEXT"),
     ("files", "archived", "INTEGER NOT NULL DEFAULT 0"),
     ("files", "origin", "TEXT"),
+    ("files", "source_name", "TEXT"),
     ("records", "submission", "TEXT"),
+    // Bumped when a person puts a record back: an outcome computed for an older
+    // revision changes nothing.
+    ("records", "revision", "INTEGER NOT NULL DEFAULT 0"),
+    // A submission's failed attempts and its settled rows, counted per page.
+    ("submissions", "failures", "INTEGER NOT NULL DEFAULT 0"),
+    ("submissions", "sent", "INTEGER NOT NULL DEFAULT 0"),
+    ("submissions", "rejected", "INTEGER NOT NULL DEFAULT 0"),
     ("alerts", "rule_id", "INTEGER"),
     ("alerts", "cleared_at", "INTEGER"),
     ("alerts", "cleared_reason", "TEXT"),
     ("alerts", "notify", "TEXT"),
     ("alerts", "channels", "TEXT"),
+    ("alert_rules", "tz", "TEXT"),
 ];
+
+/// Indexes made after the added columns, since they may name one.
+const ADDED_INDEXES: [&str; 2] = [
+    "CREATE INDEX IF NOT EXISTS records_submission_id ON records(submission, id)",
+    "CREATE INDEX IF NOT EXISTS events_source_kind_at ON events(source_id, kind, at)",
+];
+
+/// The indexes the loads list chooses its pages through, each built in a
+/// transaction of its own: a build over a large `records` locks that table
+/// alone, and never holds `files` while it waits for another instance's
+/// writes. The failing ones hold only the rows that make a load fail.
+const LOAD_INDEXES: [&str; 4] = [
+    "CREATE INDEX IF NOT EXISTS files_status_id ON files(status, id)",
+    "CREATE INDEX IF NOT EXISTS files_feed_status_id ON files(feed_id, status, id)",
+    "CREATE INDEX IF NOT EXISTS records_failing_file ON records(file_id) WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'",
+    "CREATE INDEX IF NOT EXISTS records_failing_feed_file ON records(feed_id, file_id) WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'",
+];
+
+/// On PostgreSQL only: on SQLite `records_file` already orders by id, the rowid.
+const ADDED_INDEXES_POSTGRES: [&str; 1] =
+    ["CREATE INDEX IF NOT EXISTS records_file_id ON records(file_id, id)"];
+
+/// `SCHEMA`'s statements, its tables apart from its indexes.
+fn schema_statements() -> impl Iterator<Item = &'static str> {
+    SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn is_index(statement: &str) -> bool {
+    statement.starts_with("CREATE INDEX")
+}
+
+/// Every index of a PostgreSQL store, in the order they are built: `SCHEMA`'s,
+/// then the ones added since. Each is built in a transaction of its own, after
+/// the tables and their added columns: `CREATE INDEX IF NOT EXISTS` takes a
+/// `SHARE` lock on its table even when the index exists, and a start holding
+/// that lock on one table while it waits for another instance's write to a
+/// second table, which that write holds while it waits for the first, would
+/// deadlock with it.
+fn postgres_indexes() -> Vec<&'static str> {
+    let mut all: Vec<&'static str> = schema_statements().filter(|s| is_index(s)).collect();
+    all.extend(ADDED_INDEXES);
+    all.extend(LOAD_INDEXES);
+    all.extend(ADDED_INDEXES_POSTGRES);
+    all
+}
+
+/// When the event log began on this store: set once, at the first start of a
+/// version that keeps it, and kept.
+const EVENTS_SINCE: &str =
+    "INSERT INTO store_meta (key, value) VALUES ('events_since', $1) ON CONFLICT (key) DO NOTHING";
+
+/// A SQLite store made before rule ids came from `AUTOINCREMENT` would give a
+/// deleted rule's id again: its `alert_rules` is rebuilt once, in a
+/// transaction, with the same columns, rows and ids, and the sequence set past
+/// every rule id in use, alerts' included.
+fn never_reuse_rule_ids(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'alert_rules'",
+            [],
+            |r| r.get(0),
+        )?;
+        if sql.to_ascii_uppercase().contains("AUTOINCREMENT") {
+            return Ok(());
+        }
+        let start = SCHEMA
+            .find("CREATE TABLE IF NOT EXISTS alert_rules (")
+            .context("alert_rules in the schema")?;
+        let end = start + SCHEMA[start..].find(");").context("end of alert_rules")? + 2;
+        let ddl = SCHEMA[start..end].replace(
+            "CREATE TABLE IF NOT EXISTS alert_rules (",
+            "CREATE TABLE alert_rules_rebuilt (",
+        );
+        let columns = "id, source_id, condition, threshold, notify, channels, enabled, created_by, created_at, tz";
+        conn.execute_batch(&format!(
+            "{ddl}
+             INSERT INTO alert_rules_rebuilt ({columns}) SELECT {columns} FROM alert_rules;
+             DROP TABLE alert_rules;
+             ALTER TABLE alert_rules_rebuilt RENAME TO alert_rules;
+             DELETE FROM sqlite_sequence WHERE name IN ('alert_rules', 'alert_rules_rebuilt');
+             INSERT INTO sqlite_sequence (name, seq) VALUES ('alert_rules', MAX(
+               COALESCE((SELECT MAX(id) FROM alert_rules), 0),
+               COALESCE((SELECT MAX(rule_id) FROM alerts), 0)));"
+        ))?;
+        Ok::<_, anyhow::Error>(())
+    })();
+    match result {
+        Ok(()) => Ok(conn.execute_batch("COMMIT")?),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
 
 /// A rule in words: "nothing arrives for 2 hours", "more than 1% of a load's rows
 /// fail", "the file is not there by 06:00", "HFS cannot be reached after 5 attempts".
@@ -146,6 +311,12 @@ pub struct Rule {
     pub enabled: bool,
     #[serde(default)]
     pub created_by: Option<String>,
+    /// The IANA time zone a `missing_by` time of day is in; `None` is UTC.
+    #[serde(default)]
+    pub tz: Option<String>,
+    /// When the rule was made, as an instant; never taken from a request.
+    #[serde(default, skip_deserializing)]
+    pub created_at: Option<String>,
 }
 
 fn default_channels() -> Vec<String> {
@@ -153,6 +324,42 @@ fn default_channels() -> Vec<String> {
 }
 fn default_enabled() -> bool {
     true
+}
+
+/// Why a check failed. Only these fixed sentences are stored and answered: the
+/// error behind one, which may carry a URL, a query or a server's answer, goes
+/// to the engine log only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckFailure {
+    Paused,
+    CredentialNotLoaded,
+    Listing,
+    Fetching,
+    Taking,
+    Notifications,
+    Deleted,
+}
+
+impl CheckFailure {
+    pub fn reason(self) -> &'static str {
+        match self {
+            CheckFailure::Paused => "the source is paused",
+            CheckFailure::CredentialNotLoaded => {
+                "the source's credential is not loaded; see its credential alert"
+            }
+            CheckFailure::Listing => "listing the source failed; the engine log has the details",
+            CheckFailure::Fetching => {
+                "reading an object from the source failed; the engine log has the details"
+            }
+            CheckFailure::Taking => {
+                "taking an object in (recording, unpacking or acknowledging it) failed; the engine log has the details"
+            }
+            CheckFailure::Notifications => {
+                "acknowledging the source's notifications failed; the engine log has the details"
+            }
+            CheckFailure::Deleted => "the source was deleted",
+        }
+    }
 }
 
 /// A `$bulk-submit` submission the engine handed to HFS and is waiting on.
@@ -181,6 +388,35 @@ pub struct SubmittableFile {
     pub count: usize,
 }
 
+/// An open alert whose rule no longer watches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnwatchedAlert {
+    pub id: i64,
+    pub feed: Option<String>,
+    pub kind: String,
+    pub why: RuleGone,
+}
+
+/// Why a rule no longer watches an alert it raised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleGone {
+    Deleted,
+    TurnedOff,
+    /// Changed in what it watches: its condition, threshold, time zone or source.
+    Changed,
+}
+
+impl RuleGone {
+    /// The alert's clearing reason: a fixed sentence.
+    pub fn reason(self) -> &'static str {
+        match self {
+            RuleGone::Deleted => "its rule was deleted",
+            RuleGone::TurnedOff => "its rule was turned off",
+            RuleGone::Changed => "its rule was changed",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkItem {
     pub id: i64,
@@ -190,6 +426,82 @@ pub struct WorkItem {
     pub raw: Value,
     pub resources: Option<Value>,
     pub attempts: u32,
+    /// The record's revision when it was selected: its outcome is stored only
+    /// while the record is still at it.
+    pub revision: i64,
+}
+
+/// A row as read from a file: its line, its data, and why it could not be
+/// parsed, if it could not.
+pub type ReadRow = (i64, Value, Option<String>);
+
+/// A source's name as a load keeps it: a name PostgreSQL cannot hold as text
+/// (with a NUL) is not kept, so that it never stops a load.
+fn storable_name(name: &str) -> Option<&str> {
+    Some(name).filter(|n| !n.contains('\0'))
+}
+
+/// A file as it is recorded on arrival: see `Db::insert_file` for `source_key`
+/// and `origin`.
+#[derive(Debug, Clone, Copy)]
+pub struct NewFile<'a> {
+    pub feed: &'a str,
+    /// The source's name as the load is recorded: see `Db::insert_file`.
+    pub source_name: &'a str,
+    pub name: &'a str,
+    pub sha: &'a str,
+    pub size: u64,
+    pub source_key: Option<&'a str>,
+    pub origin: Option<&'a str>,
+}
+
+/// What `Db::admit_file` did with a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Recorded, with this id.
+    Admitted(i64),
+    /// Its content was already taken, into this file: nothing was written.
+    AlreadyTaken(i64),
+}
+
+/// What became of one record of a batch sent to the FHIR server.
+#[derive(Debug, Clone, Copy)]
+pub enum Delivery<'a> {
+    Sent(&'a Value),
+    Rejected {
+        kind: &'a str,
+        error: &'a str,
+        response: Option<&'a Value>,
+    },
+    /// Tried again from `next_attempt_at`, as attempt `attempts`.
+    Deferred {
+        attempts: u32,
+        next_attempt_at: i64,
+        error: &'a str,
+    },
+}
+
+/// What `GET /api/events` asks for.
+#[derive(Debug, Clone, Default)]
+pub struct EventQuery {
+    pub source: Option<String>,
+    /// Exact kinds and families (`record`, `load`, `submission`); any of them.
+    pub kinds: Vec<String>,
+    /// Epoch milliseconds: events at or after it.
+    pub since: Option<i64>,
+    /// Events after this id.
+    pub cursor: Option<i64>,
+    pub limit: usize,
+}
+
+/// A page of events, oldest first, and where the next poll starts.
+#[derive(Debug, Clone)]
+pub struct EventPage {
+    pub events: Vec<Value>,
+    /// The id the next poll continues after; `None` when the log is empty and
+    /// no cursor was given.
+    pub next: Option<i64>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +521,52 @@ pub struct Lease {
     pub owner: String,
     pub until: i64,
 }
+
+/// An alert as stored, with its times as the API formats them, for the webhook
+/// event written with it.
+#[derive(Debug, Clone)]
+pub struct AlertRow {
+    pub id: i64,
+    pub feed_id: Option<String>,
+    pub kind: String,
+    pub message: String,
+    pub rule_id: Option<i64>,
+    pub notify: Vec<String>,
+    /// The rule's channels when it fired; `None` for an alert without a rule.
+    pub channels: Option<Vec<String>>,
+    pub created_at: String,
+    pub cleared_at: Option<String>,
+    pub cleared_reason: Option<String>,
+}
+
+/// The webhook event written in the same transaction as an alert's change.
+#[derive(Debug, Clone)]
+pub struct NewWebhook {
+    pub event_id: String,
+    pub event: &'static str,
+    /// Which webhook URL the event is for (a fingerprint, never the URL), or
+    /// `""` when nothing is to be sent.
+    pub destination: String,
+    pub payload: String,
+    pub state: &'static str,
+}
+
+/// A webhook attempt this instance claimed: `attempt` fences its outcome.
+#[derive(Debug, Clone)]
+pub struct WebhookClaim {
+    pub event_id: String,
+    pub alert_id: i64,
+    pub event: String,
+    pub attempt: u32,
+    pub payload: String,
+}
+
+/// A `cleared` event waits while the `fired` event of its alert for the same
+/// destination is still pending. Written against the unaliased table.
+const WEBHOOK_UNBLOCKED: &str = "NOT (alert_webhooks.event = 'cleared' AND EXISTS (
+    SELECT 1 FROM alert_webhooks f
+    WHERE f.alert_id = alert_webhooks.alert_id AND f.event = 'fired'
+      AND f.state = 'pending' AND f.destination = alert_webhooks.destination))";
 
 /// Rows per multi-row statement: well under both engines' parameter limits.
 const INSERT_ROWS_PER_STATEMENT: usize = 200;
@@ -632,6 +990,256 @@ fn pg_value(row: &postgres::Row, i: usize, kind: &Type) -> Value {
     }
 }
 
+// ---- transactions and events ------------------------------------------------
+
+/// One transaction on the store, under the connection's lock: see
+/// `Db::transaction`. Events are written only through `insert_events`.
+struct Tx<'a> {
+    conn: &'a mut Conn,
+    postgres: bool,
+    /// Whether this transaction holds the event lock (PostgreSQL).
+    events_locked: bool,
+    /// Ends the transaction with a rollback even when it succeeds.
+    rollback: bool,
+}
+
+impl Tx<'_> {
+    fn execute(&mut self, sql: &str, params: &[Param]) -> Result<u64> {
+        self.conn.execute(sql, params)
+    }
+
+    fn query(&mut self, sql: &str, params: &[Param]) -> Result<Vec<Row>> {
+        self.conn.query(sql, params)
+    }
+
+    fn query_one(&mut self, sql: &str, params: &[Param]) -> Result<Option<Row>> {
+        Ok(self.query(sql, params)?.into_iter().next())
+    }
+
+    /// ` FOR UPDATE` on PostgreSQL. On SQLite `BEGIN IMMEDIATE` already holds
+    /// the store's only write lock.
+    fn for_update(&self) -> &'static str {
+        if self.postgres { " FOR UPDATE" } else { "" }
+    }
+
+    /// Appends events. On PostgreSQL the first call takes the event lock, held
+    /// until the transaction ends, so ids are given in commit order: a reader
+    /// that sees an id knows every lower id is committed or gone. Callers make
+    /// every other change of the transaction before the first call, so a holder
+    /// of the lock never waits for a row lock.
+    fn insert_events(&mut self, events: &[Event]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        if self.postgres && !self.events_locked {
+            // Keyed by schema: stores in other schemas of one database do not
+            // wait on each other.
+            self.conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('hie.events'), hashtext(current_schema()))",
+                &[],
+            )?;
+            self.events_locked = true;
+        }
+        let at = now_ms();
+        for chunk in events.chunks(INSERT_ROWS_PER_STATEMENT) {
+            let mut sql = String::from(
+                "INSERT INTO events (at, source_id, kind, load_id, record_id, attempt, error_kind, reason, detail) VALUES ",
+            );
+            let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 9);
+            for (i, e) in chunk.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                let b = i * 9;
+                sql.push_str(&format!(
+                    "(CAST(${} AS BIGINT), CAST(${} AS TEXT), CAST(${} AS TEXT), CAST(${} AS BIGINT), CAST(${} AS BIGINT), \
+                     CAST(${} AS BIGINT), CAST(${} AS TEXT), CAST(${} AS TEXT), CAST(${} AS TEXT))",
+                    b + 1, b + 2, b + 3, b + 4, b + 5, b + 6, b + 7, b + 8, b + 9
+                ));
+                values.extend(params![
+                    at,
+                    e.source_id,
+                    e.kind,
+                    e.load_id,
+                    e.record_id,
+                    e.attempt,
+                    e.error_kind,
+                    e.reason,
+                    e.detail.as_ref().map(Value::to_string)
+                ]);
+            }
+            self.conn.execute(&sql, &values)?;
+        }
+        Ok(())
+    }
+}
+
+impl Tx<'_> {
+    /// Appends one event per item, built and written a chunk at a time, so a
+    /// large set never holds all its events at once.
+    fn insert_each<T>(&mut self, items: &[T], event: impl Fn(&T) -> Event) -> Result<()> {
+        for chunk in items.chunks(INSERT_ROWS_PER_STATEMENT) {
+            let events: Vec<Event> = chunk.iter().map(&event).collect();
+            self.insert_events(&events)?;
+        }
+        Ok(())
+    }
+}
+
+/// Stores a file's records, by the hundred per statement: one round trip each
+/// over a million rows is an hour; this is minutes. Returns the rows stored as
+/// rejected because they could not be parsed: (record id, index in `rows`).
+fn insert_record_rows(
+    tx: &mut Tx,
+    file_id: i64,
+    feed: &str,
+    rows: &[ReadRow],
+) -> Result<Vec<(i64, usize)>> {
+    let now = now_ms();
+    let mut rejected = Vec::new();
+    for (n, chunk) in rows.chunks(INSERT_ROWS_PER_STATEMENT).enumerate() {
+        let first = n * INSERT_ROWS_PER_STATEMENT;
+        let mut sql = String::from(
+            "INSERT INTO records (file_id, feed_id, line, raw, status, error_kind, error, updated_at) VALUES ",
+        );
+        let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 8);
+        for (i, (line, raw, parse_error)) in chunk.iter().enumerate() {
+            let (status, kind) = match parse_error {
+                Some(_) => ("rejected", Some("parse")),
+                None => ("received", None),
+            };
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("({})", marks(i * 8 + 1, 8)));
+            values.extend(params![
+                file_id,
+                feed,
+                line,
+                raw.to_string(),
+                status,
+                kind,
+                parse_error,
+                now
+            ]);
+        }
+        // The line tells the rows of one statement apart; the id is the store's.
+        sql.push_str(" RETURNING id, line, status");
+        let mut by_line: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (i, (line, _, parse_error)) in chunk.iter().enumerate() {
+            if parse_error.is_some() {
+                by_line.entry(*line).or_default().push(first + i);
+            }
+        }
+        let mut stored = tx.query(&sql, &values)?;
+        stored.sort_by_key(|r| r.i64(0));
+        for r in stored {
+            if r.string(2) == "rejected"
+                && let Some(indexes) = by_line.get_mut(&r.i64(1))
+                && !indexes.is_empty()
+            {
+                rejected.push((r.i64(0), indexes.remove(0)));
+            }
+        }
+    }
+    Ok(rejected)
+}
+
+/// Updates the records that match `guard`, `INSERT_ROWS_PER_STATEMENT` at a
+/// time, paged by id: each step selects the next ids that match (locked on
+/// PostgreSQL), then updates exactly those, with the guard checked again on
+/// each row, so a record changed meanwhile is left alone. `guard` uses the
+/// parameters `$1..$g` (`guard_params`), `set` the ones after (`set_params`).
+/// Only the ids changed are kept, with the second column `returning` names
+/// (or 0): never the rows.
+fn update_records_paged(
+    tx: &mut Tx,
+    guard: &str,
+    guard_params: &[Param],
+    set: &str,
+    set_params: &[Param],
+    returning: &str,
+) -> Result<Vec<(i64, i64)>> {
+    let g = guard_params.len();
+    let select = format!(
+        "SELECT id FROM records WHERE {guard} AND id > ${} ORDER BY id LIMIT {INSERT_ROWS_PER_STATEMENT}{}",
+        g + 1,
+        tx.for_update()
+    );
+    let mut changed = Vec::new();
+    let mut last = 0i64;
+    loop {
+        let mut values = guard_params.to_vec();
+        values.push(Param::Int(last));
+        let ids: Vec<i64> = tx
+            .query(&select, &values)?
+            .iter()
+            .map(|r| r.i64(0))
+            .collect();
+        let Some(&end) = ids.last() else {
+            break;
+        };
+        let mut values = guard_params.to_vec();
+        values.extend_from_slice(set_params);
+        values.extend(ids.iter().map(|id| Param::Int(*id)));
+        let rows = tx.query(
+            &format!(
+                "UPDATE records SET {set} WHERE id IN ({}) AND {guard} RETURNING {returning}",
+                marks(g + set_params.len() + 1, ids.len())
+            ),
+            &values,
+        )?;
+        changed.extend(rows.iter().map(|r| (r.i64(0), r.opt_i64(1).unwrap_or(0))));
+        last = end;
+        if ids.len() < INSERT_ROWS_PER_STATEMENT {
+            break;
+        }
+    }
+    changed.sort_unstable();
+    Ok(changed)
+}
+
+/// A new submission's row, waiting for its kick-off.
+fn insert_submission(
+    tx: &mut Tx,
+    token: &str,
+    feed: &str,
+    submission_id: &str,
+    manifest: &Value,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, created_at, updated_at)
+         VALUES ($1, $2, $3, 'kickoff', $4, $5, $6)",
+        &params![token, feed, submission_id, manifest.to_string(), now, now],
+    )
+    .map(drop)
+}
+
+/// `submission.opened`: the run's public key, never its token.
+fn opened(feed: &str, token: &str, submission_id: &str, records: usize, files: usize) -> Event {
+    Event::new("submission.opened", feed).detail(json!({
+        "submission": submission_id,
+        "run": crate::bulk::run_key(token),
+        "records": records,
+        "files": files,
+    }))
+}
+
+/// `$first, $first+1, ...` for `n` values.
+fn marks(first: usize, n: usize) -> String {
+    (first..first + n)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// An instant in epoch milliseconds as RFC 3339, for an event's detail.
+fn iso_ms(ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
 // ---- the store ----------------------------------------------------------------
 
 pub struct Db {
@@ -729,6 +1337,15 @@ impl Db {
                 )?;
             }
         }
+        // SCHEMA made its own indexes; SQLite has one writer at a time.
+        for index in ADDED_INDEXES.into_iter().chain(LOAD_INDEXES) {
+            conn.execute(index, [])?;
+        }
+        never_reuse_rule_ids(&conn)?;
+        conn.execute(
+            &EVENTS_SINCE.replace('$', "?"),
+            rusqlite::params![now_ms().to_string()],
+        )?;
         Ok(Self {
             conn: Mutex::new(Conn::Sqlite(conn)),
             postgres: false,
@@ -757,18 +1374,39 @@ impl Db {
                 test_schema = None;
             }
         }
-        let ddl = SCHEMA
-            .replace("INTEGER PRIMARY KEY", "BIGSERIAL PRIMARY KEY")
-            .replace("INTEGER", "BIGINT");
+        // Instances starting together on one schema build it in turn: two
+        // `CREATE INDEX IF NOT EXISTS` at once may both try to build it.
         client
-            .batch(&ddl)
-            .context("creating the schema in PostgreSQL")?;
-        for (table, column, kind) in ADDED_COLUMNS {
-            client.batch(&format!(
-                "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {}",
-                kind.replace("INTEGER", "BIGINT")
-            ))?;
-        }
+            .batch("SELECT pg_advisory_lock(hashtext('hie.schema'), hashtext(current_schema()))")?;
+        let built = (|| {
+            // A sequence never gives an id twice, as SQLite's AUTOINCREMENT does not.
+            // The tables only: the indexes come after, one at a time (`postgres_indexes`).
+            let ddl = schema_statements()
+                .filter(|s| !is_index(s))
+                .collect::<Vec<_>>()
+                .join(";\n")
+                .replace(" AUTOINCREMENT", "")
+                .replace("INTEGER PRIMARY KEY", "BIGSERIAL PRIMARY KEY")
+                .replace("INTEGER", "BIGINT");
+            client
+                .batch(&ddl)
+                .context("creating the schema in PostgreSQL")?;
+            for (table, column, kind) in ADDED_COLUMNS {
+                client.batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {}",
+                    kind.replace("INTEGER", "BIGINT")
+                ))?;
+            }
+            for index in postgres_indexes() {
+                client.batch(index)?;
+            }
+            client.execute(EVENTS_SINCE, &params![now_ms().to_string()])?;
+            Ok::<_, anyhow::Error>(())
+        })();
+        let unlocked = client
+            .batch("SELECT pg_advisory_unlock(hashtext('hie.schema'), hashtext(current_schema()))");
+        built?;
+        unlocked?;
         Ok(Self {
             conn: Mutex::new(Conn::Postgres(client)),
             postgres: true,
@@ -805,6 +1443,50 @@ impl Db {
         f(&mut conn)
     }
 
+    /// Runs `f` in one transaction: `BEGIN IMMEDIATE` on SQLite (the write lock
+    /// at once, so one writer at a time), `BEGIN` on PostgreSQL. Committed when
+    /// `f` succeeds, unless it asked for a rollback; rolled back on any error.
+    fn transaction<T>(&self, f: impl FnOnce(&mut Tx) -> Result<T>) -> Result<T> {
+        let postgres = self.postgres;
+        self.with(|c| {
+            c.batch(if postgres { "BEGIN" } else { "BEGIN IMMEDIATE" })?;
+            let (result, rollback) = {
+                let mut tx = Tx {
+                    conn: c,
+                    postgres,
+                    events_locked: false,
+                    rollback: false,
+                };
+                let result = f(&mut tx);
+                (result, tx.rollback)
+            };
+            match result {
+                Ok(value) if !rollback => match c.batch("COMMIT") {
+                    Ok(()) => Ok(value),
+                    Err(e) => {
+                        let _ = c.batch("ROLLBACK");
+                        Err(e)
+                    }
+                },
+                Ok(value) => c.batch("ROLLBACK").map(|()| value),
+                Err(e) => {
+                    let _ = c.batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    /// The schema the store's tables are in, on PostgreSQL.
+    pub fn schema(&self) -> Result<Option<String>> {
+        if !self.postgres {
+            return Ok(None);
+        }
+        Ok(self
+            .query_one("SELECT current_schema()", &[])?
+            .and_then(|r| r.opt_string(0)))
+    }
+
     fn execute(&self, sql: &str, params: &[Param]) -> Result<u64> {
         self.with(|c| c.execute(sql, params))
     }
@@ -832,15 +1514,6 @@ impl Db {
             )
         } else {
             format!("strftime('%Y-%m-%dT%H:%M:%fZ', {col} / 1000.0, 'unixepoch')")
-        }
-    }
-
-    /// The SQL that formats an epoch-milliseconds column as a UTC calendar day.
-    pub fn day(&self, col: &str) -> String {
-        if self.postgres {
-            format!("to_char(to_timestamp({col} / 1000.0) AT TIME ZONE 'UTC', 'YYYY-MM-DD')")
-        } else {
-            format!("date({col} / 1000, 'unixepoch')")
         }
     }
 
@@ -876,11 +1549,14 @@ impl Db {
     ///   by the engine and removed once settled.
     ///
     /// A row without one (written by an earlier version and not backfilled) is
-    /// never served by the engine.
+    /// never served by the engine. `source_name` is the source's name as the
+    /// load is recorded, kept with it after the source is renamed or deleted
+    /// (see `storable_name`).
     #[allow(clippy::too_many_arguments)]
     pub fn insert_file(
         &self,
         feed: &str,
+        source_name: &str,
         name: &str,
         sha: &str,
         size: u64,
@@ -890,15 +1566,16 @@ impl Db {
         origin: Option<&str>,
     ) -> Result<i64> {
         let now = now_ms();
+        let source_name = storable_name(source_name);
         let finished_at = if status == "processing" {
             None
         } else {
             Some(now)
         };
         self.insert_returning_id(
-            "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at, source_key, origin)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-            &params![feed, name, sha, size, status, duplicate_of, now, finished_at, source_key, origin],
+            "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at, source_key, origin, source_name)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            &params![feed, name, sha, size, status, duplicate_of, now, finished_at, source_key, origin, source_name],
         )
     }
 
@@ -1001,121 +1678,311 @@ impl Db {
         Ok(out)
     }
 
+    /// Records a file and admits what was read from it, in one transaction: its
+    /// records, or its unreadable state (`read` is the reason); then
+    /// `load.received` (or `load.unreadable`) and a `record.rejected` for each row
+    /// that could not be parsed. A failure leaves no file row, so the next scan
+    /// takes the object again.
+    ///
+    /// The source's admissions take turns (on PostgreSQL, a lock per source), and
+    /// the content is looked up again under that lock: an instance that took the
+    /// source over after a lease lapsed may be reading the same object. When the
+    /// content was taken meanwhile nothing is written and the file it went into
+    /// comes back, to be handled as a duplicate.
+    pub fn admit_file(
+        &self,
+        file: &NewFile,
+        read: std::result::Result<&[ReadRow], &str>,
+    ) -> Result<Admission> {
+        self.transaction(|tx| {
+            if tx.postgres {
+                tx.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext('hie.admit'), hashtext(current_schema() || ':' || $1))",
+                    &params![file.feed],
+                )?;
+            }
+            if let Some(original) = tx
+                .query_one(
+                    "SELECT id FROM files WHERE feed_id = $1 AND sha256 = $2 AND status <> 'duplicate' ORDER BY id LIMIT 1",
+                    &params![file.feed, file.sha],
+                )?
+                .map(|r| r.i64(0))
+            {
+                tx.rollback = true;
+                return Ok(Admission::AlreadyTaken(original));
+            }
+            let now = now_ms();
+            let (status, finished_at, error) = match read {
+                Ok(_) => ("processing", None, None),
+                Err(reason) => ("unreadable", Some(now), Some(reason)),
+            };
+            let file_id = tx
+                .query_one(
+                    "INSERT INTO files (feed_id, name, sha256, size, status, received_at, finished_at, error, source_key, origin, source_name)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
+                    &params![
+                        file.feed,
+                        file.name,
+                        file.sha,
+                        file.size,
+                        status,
+                        now,
+                        finished_at,
+                        error,
+                        file.source_key,
+                        file.origin,
+                        storable_name(file.source_name)
+                    ],
+                )?
+                .map(|r| r.i64(0))
+                .context("INSERT returned no id")?;
+            match read {
+                Ok(rows) => {
+                    let mut rejected = insert_record_rows(tx, file_id, file.feed, rows)?;
+                    rejected.sort_unstable_by_key(|(id, _)| *id);
+                    tx.insert_events(&[Event::new("load.received", file.feed)
+                        .load(file_id)
+                        .detail(json!({"name": file.name, "size": file.size, "records": rows.len()}))])?;
+                    // Each row's own reason; the events go in a chunk at a time.
+                    tx.insert_each(&rejected, |(id, row)| {
+                        Event::new("record.rejected", file.feed)
+                            .load(file_id)
+                            .record(*id)
+                            .error_kind("parse")
+                            .reason(rows[*row].2.as_deref().unwrap_or_default())
+                    })?;
+                }
+                Err(reason) => tx.insert_events(&[Event::new("load.unreadable", file.feed)
+                    .load(file_id)
+                    .reason(reason)
+                    .detail(json!({"name": file.name, "size": file.size}))])?,
+            }
+            Ok(Admission::Admitted(file_id))
+        })
+    }
+
+    /// Records a file whose content was already received, with `load.duplicate`.
+    pub fn insert_duplicate(
+        &self,
+        feed: &str,
+        source_name: &str,
+        name: &str,
+        sha: &str,
+        size: u64,
+        original: i64,
+    ) -> Result<i64> {
+        self.transaction(|tx| {
+            let now = now_ms();
+            let id = tx
+                .query_one(
+                    "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at, source_name)
+                     VALUES ($1, $2, $3, $4, 'duplicate', $5, $6, $7, $8) RETURNING id",
+                    &params![feed, name, sha, size, original, now, now, storable_name(source_name)],
+                )?
+                .map(|r| r.i64(0))
+                .context("INSERT returned no id")?;
+            tx.insert_events(&[Event::new("load.duplicate", feed)
+                .load(id)
+                .detail(json!({"name": name, "duplicate_of": original}))])?;
+            Ok(id)
+        })
+    }
+
+    /// Records a zip as `unpacked`, with `load.received` marked as a container;
+    /// its entries are loads of their own.
+    pub fn insert_container(
+        &self,
+        feed: &str,
+        source_name: &str,
+        name: &str,
+        sha: &str,
+        size: u64,
+    ) -> Result<i64> {
+        self.transaction(|tx| {
+            let now = now_ms();
+            let id = tx
+                .query_one(
+                    "INSERT INTO files (feed_id, name, sha256, size, status, received_at, finished_at, source_name)
+                     VALUES ($1, $2, $3, $4, 'unpacked', $5, $6, $7) RETURNING id",
+                    &params![feed, name, sha, size, now, now, storable_name(source_name)],
+                )?
+                .map(|r| r.i64(0))
+                .context("INSERT returned no id")?;
+            tx.insert_events(&[Event::new("load.received", feed).load(id).detail(
+                json!({"name": name, "size": size, "records": 0, "container": true}),
+            )])?;
+            Ok(id)
+        })
+    }
+
     /// Puts a file's rejected records back at the start, all of them or those with
-    /// one reason. Returns how many.
+    /// one reason, with `load.retried` and a `record.retried` per record. The
+    /// file's row is locked first, so a finish of the same file waits or is seen
+    /// waiting. Returns how many; with none, nothing changes.
     pub fn reprocess_rejected(&self, file_id: i64, reason: Option<&str>) -> Result<usize> {
-        let n = self.execute(
-            "UPDATE records SET status = 'received', resources = NULL, error_kind = NULL, error = NULL,
-                    response = NULL, attempts = 0, next_attempt_at = 0, submission = NULL, updated_at = $3
-             WHERE file_id = $1 AND status = 'rejected' AND (CAST($2 AS TEXT) IS NULL OR error = CAST($2 AS TEXT))",
-            &params![file_id, reason, now_ms()],
-        )?;
-        if n > 0 {
-            self.execute(
+        self.transaction(|tx| {
+            let lock = format!(
+                "SELECT feed_id FROM files WHERE id = $1{}",
+                tx.for_update()
+            );
+            let Some(feed) = tx.query_one(&lock, &params![file_id])?.map(|r| r.string(0)) else {
+                return Ok(0);
+            };
+            let ids = update_records_paged(
+                tx,
+                "file_id = $1 AND status = 'rejected' AND (CAST($2 AS TEXT) IS NULL OR error = CAST($2 AS TEXT))",
+                &params![file_id, reason],
+                "status = 'received', resources = NULL, error_kind = NULL, error = NULL,
+                 response = NULL, attempts = 0, next_attempt_at = 0, submission = NULL,
+                 revision = revision + 1, updated_at = $3",
+                &params![now_ms()],
+                "id",
+            )?;
+            if ids.is_empty() {
+                tx.rollback = true;
+                return Ok(0);
+            }
+            tx.execute(
                 "UPDATE files SET status = 'processing', finished_at = NULL WHERE id = $1",
                 &params![file_id],
             )?;
-        }
-        Ok(n as usize)
+            let mut retried = Event::new("load.retried", &feed)
+                .load(file_id)
+                .detail(json!({"retried": ids.len()}));
+            if let Some(reason) = reason {
+                retried = retried.reason(reason);
+            }
+            tx.insert_events(&[retried])?;
+            let detail = json!({"from_status": "rejected", "corrected": false});
+            tx.insert_each(&ids, |(id, _)| {
+                Event::new("record.retried", &feed)
+                    .load(file_id)
+                    .record(*id)
+                    .detail(detail.clone())
+            })?;
+            Ok(ids.len())
+        })
     }
 
+    /// A file that could not be read after it was recorded (a zip that does not
+    /// open), with `load.unreadable`.
     pub fn fail_file(&self, file_id: i64, error: &str) -> Result<()> {
-        self.execute(
-            "UPDATE files SET status = 'unreadable', error = $2, finished_at = $3 WHERE id = $1",
-            &params![file_id, error, now_ms()],
-        )
-        .map(drop)
+        self.transaction(|tx| {
+            let row = tx.query_one(
+                "UPDATE files SET status = 'unreadable', error = $2, finished_at = $3 WHERE id = $1
+                 RETURNING feed_id, name, size",
+                &params![file_id, error, now_ms()],
+            )?;
+            if let Some(r) = row {
+                tx.insert_events(&[Event::new("load.unreadable", &r.string(0))
+                    .load(file_id)
+                    .reason(error)
+                    .detail(json!({"name": r.string(1), "size": r.i64(2)}))])?;
+            }
+            Ok(())
+        })
     }
 
-    /// Marks files whose records have all reached `sent` or `rejected` as done and returns them.
+    /// Marks files whose records have all reached `sent` or `rejected` as done and
+    /// returns them: `finish_candidates`, then `finish_file` for each.
     pub fn finish_files(&self, feed: &str) -> Result<Vec<FinishedFile>> {
-        let rows = self.query(
-            "SELECT f.id, f.name,
-                    COUNT(r.id),
-                    CAST(COALESCE(SUM(CASE WHEN r.status = 'sent' THEN 1 ELSE 0 END), 0) AS BIGINT),
-                    CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT),
-                    f.rejected_reported
-             FROM files f LEFT JOIN records r ON r.file_id = f.id
-             WHERE f.feed_id = $1 AND f.status IN ('processing', 'unpacked')
-             GROUP BY f.id, f.name, f.rejected_reported
-             HAVING COALESCE(SUM(CASE WHEN r.status IN ('received', 'pending', 'submitted') THEN 1 ELSE 0 END), 0) = 0",
-            &params![feed],
-        )?;
-        let mut done: Vec<FinishedFile> = rows
-            .iter()
-            .map(|r| FinishedFile {
-                id: r.i64(0),
-                name: r.string(1),
-                total: r.i64(2),
-                sent: r.i64(3),
-                rejected: r.i64(4),
-                newly_rejected: r.i64(4) - r.i64(5),
-                first_rejection: None,
-            })
-            .collect();
-        for f in &mut done {
-            self.execute(
-                "UPDATE files SET status = 'done', finished_at = $2,
-                        rejected_reported = CASE WHEN rejected_reported > $3 THEN rejected_reported ELSE $3 END
-                 WHERE id = $1",
-                &params![f.id, now_ms(), f.rejected],
-            )?;
-            f.first_rejection = self
-                .query_one(
-                    "SELECT line, error FROM records WHERE file_id = $1 AND status = 'rejected' ORDER BY line LIMIT 1",
-                    &params![f.id],
-                )?
-                .map(|r| (r.i64(0), r.string(1)));
+        let mut done = Vec::new();
+        for candidate in self.finish_candidates(feed)? {
+            done.extend(self.finish_file(feed, candidate)?);
         }
         Ok(done)
     }
 
+    /// The files of a feed that look finished: every record sent or rejected.
+    pub fn finish_candidates(&self, feed: &str) -> Result<Vec<i64>> {
+        Ok(self
+            .query(
+            "SELECT f.id FROM files f
+             WHERE f.feed_id = $1 AND f.status IN ('processing', 'unpacked')
+               AND NOT EXISTS (SELECT 1 FROM records r WHERE r.file_id = f.id AND r.status IN ('received', 'pending', 'submitted'))
+             ORDER BY f.id",
+                &params![feed],
+            )?
+            .iter()
+            .map(|r| r.i64(0))
+            .collect())
+    }
+
+    /// Finishes one file, with `load.finished`, in a transaction of its own: its
+    /// row is locked, then moved to `done` only if no record is in progress, read
+    /// after the lock; the counts are read after that. A Retry that put records
+    /// back first is seen; one that comes after waits. `None` when the file is
+    /// not finished.
+    pub fn finish_file(&self, feed: &str, candidate: i64) -> Result<Option<FinishedFile>> {
+        self.transaction(|tx| {
+                let lock = format!(
+                    "SELECT name, status, rejected_reported FROM files
+                     WHERE id = $1 AND status IN ('processing', 'unpacked'){}",
+                    tx.for_update()
+                );
+                let Some(file) = tx.query_one(&lock, &params![candidate])? else {
+                    return Ok(None);
+                };
+                let moved = tx.query_one(
+                    "UPDATE files SET status = 'done', finished_at = $2,
+                            rejected_reported = CASE
+                              WHEN rejected_reported > (SELECT COUNT(*) FROM records WHERE file_id = $1 AND status = 'rejected')
+                              THEN rejected_reported
+                              ELSE (SELECT COUNT(*) FROM records WHERE file_id = $1 AND status = 'rejected') END
+                     WHERE id = $1 AND status IN ('processing', 'unpacked')
+                       AND NOT EXISTS (SELECT 1 FROM records WHERE file_id = $1 AND status IN ('received', 'pending', 'submitted'))
+                     RETURNING id",
+                    &params![candidate, now_ms()],
+                )?;
+                if moved.is_none() {
+                    return Ok(None);
+                }
+                let counts = tx
+                    .query_one(
+                        "SELECT COUNT(id),
+                                CAST(COALESCE(SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END), 0) AS BIGINT),
+                                CAST(COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT)
+                         FROM records WHERE file_id = $1",
+                        &params![candidate],
+                    )?
+                    .context("no counts")?;
+                let (total, sent, rejected) = (counts.i64(0), counts.i64(1), counts.i64(2));
+                let first_rejection = tx
+                    .query_one(
+                        "SELECT line, error FROM records WHERE file_id = $1 AND status = 'rejected' ORDER BY line LIMIT 1",
+                        &params![candidate],
+                    )?
+                    .map(|r| (r.i64(0), r.string(1)));
+                let mut detail = json!({"records": total, "sent": sent, "rejected": rejected});
+                if file.string(1) == "unpacked" {
+                    detail["container"] = json!(true);
+                }
+                tx.insert_events(&[Event::new("load.finished", feed)
+                    .load(candidate)
+                    .detail(detail)])?;
+                Ok(Some(FinishedFile {
+                    id: candidate,
+                    name: file.string(0),
+                    total,
+                    sent,
+                    rejected,
+                    newly_rejected: rejected - file.i64(2),
+                    first_rejection,
+                }))
+            })
+    }
+
     // ---- records -----------------------------------------------------------
 
+    /// Stores a file's records (rows that could not be parsed as rejected), with
+    /// no events: the pipeline admits files with `admit_file`.
     pub fn insert_records(
         &self,
         file_id: i64,
         feed: &str,
         rows: &[(i64, Value, Option<String>)],
     ) -> Result<()> {
-        self.with(|c| {
-            c.batch("BEGIN")?;
-            let now = now_ms();
-            let result = (|| {
-                // Rows go in by the hundred per statement: one round trip each
-                // over a million rows is an hour; this is minutes.
-                for chunk in rows.chunks(INSERT_ROWS_PER_STATEMENT) {
-                    let mut sql = String::from(
-                        "INSERT INTO records (file_id, feed_id, line, raw, status, error_kind, error, updated_at) VALUES ",
-                    );
-                    let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 8);
-                    for (i, (line, raw, parse_error)) in chunk.iter().enumerate() {
-                        let (status, kind) = match parse_error {
-                            Some(_) => ("rejected", Some("parse")),
-                            None => ("received", None),
-                        };
-                        if i > 0 {
-                            sql.push_str(", ");
-                        }
-                        let b = i * 8;
-                        sql.push_str(&format!(
-                            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                            b + 1, b + 2, b + 3, b + 4, b + 5, b + 6, b + 7, b + 8
-                        ));
-                        values.extend(params![file_id, feed, line, raw.to_string(), status, kind, parse_error, now]);
-                    }
-                    c.execute(&sql, &values)?;
-                }
-                Ok::<_, anyhow::Error>(())
-            })();
-            match result {
-                Ok(()) => c.batch("COMMIT"),
-                Err(e) => {
-                    let _ = c.batch("ROLLBACK");
-                    Err(e)
-                }
-            }
-        })
+        self.transaction(|tx| insert_record_rows(tx, file_id, feed, rows).map(drop))
     }
 
     fn work_items(&self, sql: &str, p: &[Param]) -> Result<Vec<WorkItem>> {
@@ -1130,13 +1997,14 @@ impl Db {
                 raw: r.json(4).unwrap_or(Value::Null),
                 resources: r.json(5),
                 attempts: r.i64(6) as u32,
+                revision: r.i64(7),
             })
             .collect())
     }
 
     pub fn received_records(&self, feed: &str, limit: usize) -> Result<Vec<WorkItem>> {
         self.work_items(
-            "SELECT r.id, r.file_id, r.line, f.name, r.raw, r.resources, r.attempts
+            "SELECT r.id, r.file_id, r.line, f.name, r.raw, r.resources, r.attempts, r.revision
              FROM records r JOIN files f ON f.id = r.file_id
              WHERE r.feed_id = $1 AND r.status = 'received' ORDER BY r.id LIMIT $2",
             &params![feed, limit],
@@ -1145,7 +2013,7 @@ impl Db {
 
     pub fn due_records(&self, feed: &str, limit: usize) -> Result<Vec<WorkItem>> {
         self.work_items(
-            "SELECT r.id, r.file_id, r.line, f.name, r.raw, r.resources, r.attempts
+            "SELECT r.id, r.file_id, r.line, f.name, r.raw, r.resources, r.attempts, r.revision
              FROM records r JOIN files f ON f.id = r.file_id
              WHERE r.feed_id = $1 AND r.status = 'pending' AND r.next_attempt_at <= $2
              ORDER BY r.id LIMIT $3",
@@ -1154,60 +2022,16 @@ impl Db {
     }
 
     /// Marks records whose source row is the resource to deliver as transformed,
-    /// in one statement per hundreds of ids: the resource list is built from the
-    /// row in the store, so no payload travels.
-    pub fn mark_passthrough(&self, ids: &[i64]) -> Result<()> {
-        let now = now_ms();
-        for chunk in ids.chunks(INSERT_ROWS_PER_STATEMENT) {
-            let marks: Vec<String> = (0..chunk.len()).map(|i| format!("${}", i + 2)).collect();
-            let mut values: Vec<Param> = Vec::with_capacity(chunk.len() + 1);
-            values.push(Param::Int(now));
-            values.extend(chunk.iter().map(|id| Param::Int(*id)));
-            self.execute(
-                &format!(
-                    "UPDATE records SET status = 'pending', resources = '[' || raw || ']', error_kind = NULL, error = NULL,
-                            attempts = 0, next_attempt_at = 0, updated_at = $1 WHERE id IN ({})",
-                    marks.join(", ")
-                ),
-                &values,
-            )?;
-        }
-        Ok(())
-    }
-
-    pub fn mark_transformed(&self, id: i64, resources: &Value) -> Result<()> {
-        self.execute(
-            "UPDATE records SET status = 'pending', resources = $2, error_kind = NULL, error = NULL,
-                    attempts = 0, next_attempt_at = 0, updated_at = $3 WHERE id = $1",
-            &params![id, resources.to_string(), now_ms()],
-        )
-        .map(drop)
-    }
-
-    pub fn mark_rejected(
-        &self,
-        id: i64,
-        kind: &str,
-        error: &str,
-        response: Option<&Value>,
-    ) -> Result<()> {
-        self.execute(
-            "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, response = $4, updated_at = $5 WHERE id = $1",
-            &params![id, kind, error, response.map(Value::to_string), now_ms()],
-        )
-        .map(drop)
-    }
-
-    /// Marks many records sent, each with its own response, in one statement per
-    /// hundreds of records: `UPDATE ... FROM (VALUES ...)`, which both engines
-    /// take with the columns named `column1` and `column2`.
-    pub fn mark_sent_many(&self, items: &[(i64, Value)]) -> Result<()> {
+    /// in one statement per hundreds of records: the resource list is built from
+    /// the row in the store, so no payload travels. Each is given as (id,
+    /// revision) and changes only while still `received` at that revision.
+    pub fn mark_passthrough(&self, items: &[(i64, i64)]) -> Result<()> {
         let now = now_ms();
         for chunk in items.chunks(INSERT_ROWS_PER_STATEMENT) {
             let rows: Vec<String> = (0..chunk.len())
                 .map(|i| {
                     format!(
-                        "(CAST(${} AS BIGINT), CAST(${} AS TEXT))",
+                        "(CAST(${} AS BIGINT), CAST(${} AS BIGINT))",
                         i * 2 + 2,
                         i * 2 + 3
                     )
@@ -1215,14 +2039,16 @@ impl Db {
                 .collect();
             let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 2 + 1);
             values.push(Param::Int(now));
-            for (id, response) in chunk {
+            for (id, revision) in chunk {
                 values.push(Param::Int(*id));
-                values.push(Param::Text(response.to_string()));
+                values.push(Param::Int(*revision));
             }
             self.execute(
                 &format!(
-                    "UPDATE records SET status = 'sent', response = v.column2, error_kind = NULL, error = NULL, updated_at = $1
-                     FROM (VALUES {}) AS v WHERE records.id = v.column1",
+                    "UPDATE records SET status = 'pending', resources = '[' || raw || ']', error_kind = NULL, error = NULL,
+                            attempts = 0, next_attempt_at = 0, updated_at = $1
+                     FROM (VALUES {}) AS v
+                     WHERE records.id = v.column1 AND records.revision = v.column2 AND records.status = 'received'",
                     rows.join(", ")
                 ),
                 &values,
@@ -1231,43 +2057,205 @@ impl Db {
         Ok(())
     }
 
-    pub fn mark_sent(&self, id: i64, response: &Value) -> Result<()> {
-        self.execute(
-            "UPDATE records SET status = 'sent', response = $2, error_kind = NULL, error = NULL, updated_at = $3 WHERE id = $1",
-            &params![id, response.to_string(), now_ms()],
-        )
-        .map(drop)
+    /// The transform's resources for a record still `received` at the item's
+    /// revision. Returns whether it changed. The transform step writes no event.
+    pub fn mark_transformed(&self, item: &WorkItem, resources: &Value) -> Result<bool> {
+        Ok(self.execute(
+            "UPDATE records SET status = 'pending', resources = $2, error_kind = NULL, error = NULL,
+                    attempts = 0, next_attempt_at = 0, updated_at = $3
+             WHERE id = $1 AND status = 'received' AND revision = $4",
+            &params![item.id, resources.to_string(), now_ms(), item.revision],
+        )? > 0)
     }
 
-    pub fn defer(&self, id: i64, attempts: u32, next_attempt_at: i64, error: &str) -> Result<()> {
-        self.execute(
-            "UPDATE records SET attempts = $2, next_attempt_at = $3, error_kind = 'transient', error = $4, updated_at = $5 WHERE id = $1",
-            &params![id, attempts, next_attempt_at, error, now_ms()],
-        )
-        .map(drop)
+    /// Rejects a record still in `from` at the item's revision (`received` for the
+    /// transform and the bulk preflight), with `record.rejected`. Returns whether
+    /// it changed: an outcome for a superseded revision changes nothing.
+    pub fn reject_item(
+        &self,
+        item: &WorkItem,
+        from: &str,
+        kind: &str,
+        error: &str,
+    ) -> Result<bool> {
+        self.transaction(|tx| {
+            let Some(r) = tx.query_one(
+                "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, updated_at = $4
+                 WHERE id = $1 AND status = $5 AND revision = $6
+                 RETURNING feed_id, file_id",
+                &params![item.id, kind, error, now_ms(), from, item.revision],
+            )?
+            else {
+                return Ok(false);
+            };
+            tx.insert_events(&[Event::new("record.rejected", &r.string(0))
+                .load(r.i64(1))
+                .record(item.id)
+                .error_kind(kind)
+                .reason(error)])?;
+            Ok(true)
+        })
     }
 
-    /// Puts a record back at the start of the pipeline, optionally with corrected source data.
+    /// The transform could not finish a record now and it stays `received`:
+    /// `record.attempt_failed`, while the record is still at the item's revision.
+    pub fn transform_deferred(&self, item: &WorkItem, reason: &str) -> Result<bool> {
+        self.transaction(|tx| {
+            let sql = format!(
+                "SELECT feed_id, file_id FROM records WHERE id = $1 AND status = 'received' AND revision = $2{}",
+                tx.for_update()
+            );
+            let Some(r) = tx.query_one(&sql, &params![item.id, item.revision])? else {
+                return Ok(false);
+            };
+            tx.insert_events(&[Event::new("record.attempt_failed", &r.string(0))
+                .load(r.i64(1))
+                .record(item.id)
+                .reason(reason)
+                .detail(json!({"phase": "transform"}))])?;
+            Ok(true)
+        })
+    }
+
+    /// Rejects a record whatever its state, with `record.rejected`: an
+    /// unguarded helper for tests that seed a store. The pipeline never uses it;
+    /// its outcomes go through the guarded writes.
+    #[doc(hidden)]
+    pub fn mark_rejected(
+        &self,
+        id: i64,
+        kind: &str,
+        error: &str,
+        response: Option<&Value>,
+    ) -> Result<()> {
+        self.transaction(|tx| {
+            let Some(r) = tx.query_one(
+                "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, response = $4, updated_at = $5
+                 WHERE id = $1 RETURNING feed_id, file_id",
+                &params![id, kind, error, response.map(Value::to_string), now_ms()],
+            )?
+            else {
+                return Ok(());
+            };
+            tx.insert_events(&[Event::new("record.rejected", &r.string(0))
+                .load(r.i64(1))
+                .record(id)
+                .error_kind(kind)
+                .reason(error)])
+        })
+    }
+
+    /// Stores what one batch's answer decided for each of its records, in one
+    /// transaction, with their events: `record.delivered` (or `record.recovered`
+    /// after failed attempts), `record.rejected`, `record.attempt_failed`. Each
+    /// changes only while its record is still `pending` at the item's revision
+    /// and attempt count, so an older runner's answer can neither roll the count
+    /// back nor log an attempt twice.
+    pub fn delivered(&self, outcomes: &[(&WorkItem, Delivery)]) -> Result<()> {
+        self.transaction(|tx| {
+            let now = now_ms();
+            let mut events = Vec::with_capacity(outcomes.len());
+            for (item, outcome) in outcomes {
+                let row = match outcome {
+                    Delivery::Sent(response) => tx.query_one(
+                        "UPDATE records SET status = 'sent', response = $2, error_kind = NULL, error = NULL, updated_at = $3
+                         WHERE id = $1 AND status = 'pending' AND revision = $4 AND attempts = $5
+                         RETURNING feed_id, file_id, attempts",
+                        &params![item.id, response.to_string(), now, item.revision, item.attempts],
+                    )?,
+                    Delivery::Rejected {
+                        kind,
+                        error,
+                        response,
+                    } => tx.query_one(
+                        "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, response = $4, updated_at = $5
+                         WHERE id = $1 AND status = 'pending' AND revision = $6 AND attempts = $7
+                         RETURNING feed_id, file_id, attempts",
+                        &params![item.id, kind, error, response.map(Value::to_string), now, item.revision, item.attempts],
+                    )?,
+                    Delivery::Deferred {
+                        attempts,
+                        next_attempt_at,
+                        error,
+                    } => tx.query_one(
+                        "UPDATE records SET attempts = $2, next_attempt_at = $3, error_kind = 'transient', error = $4, updated_at = $5
+                         WHERE id = $1 AND status = 'pending' AND revision = $6 AND attempts = $7
+                         RETURNING feed_id, file_id, attempts",
+                        &params![item.id, attempts, next_attempt_at, error, now, item.revision, item.attempts],
+                    )?,
+                };
+                let Some(r) = row else {
+                    continue;
+                };
+                let (feed, file_id, attempts) = (r.string(0), r.i64(1), r.i64(2));
+                let base = |kind| Event::new(kind, &feed).load(file_id).record(item.id);
+                events.push(match outcome {
+                    Delivery::Sent(_) if attempts > 0 => base("record.recovered").attempt(attempts + 1),
+                    Delivery::Sent(_) => base("record.delivered").attempt(attempts + 1),
+                    Delivery::Rejected { kind, error, .. } => base("record.rejected")
+                        .attempt(attempts + 1)
+                        .error_kind(kind)
+                        .reason(error),
+                    Delivery::Deferred {
+                        next_attempt_at,
+                        error,
+                        ..
+                    } => base("record.attempt_failed")
+                        .attempt(attempts)
+                        .reason(error)
+                        .detail(json!({"phase": "delivery", "next_attempt_at": iso_ms(*next_attempt_at)})),
+                });
+            }
+            tx.insert_events(&events)
+        })
+    }
+
+    /// Puts a record back at the start of the pipeline, optionally with corrected
+    /// source data, with `record.retried`. Its file's row is locked first, as a
+    /// Retry does. The record keeps the submission it was in, if any.
     pub fn reprocess(&self, id: i64, raw: Option<&Value>) -> Result<bool> {
-        let n = match raw {
-            Some(raw) => self.execute(
-                "UPDATE records SET status = 'received', original_raw = COALESCE(original_raw, raw), raw = $2, resources = NULL, error_kind = NULL, error = NULL,
-                        response = NULL, attempts = 0, next_attempt_at = 0, updated_at = $3 WHERE id = $1",
-                &params![id, raw.to_string(), now_ms()],
-            )?,
-            None => self.execute(
-                "UPDATE records SET status = 'received', resources = NULL, error_kind = NULL, error = NULL,
-                        response = NULL, attempts = 0, next_attempt_at = 0, updated_at = $2 WHERE id = $1",
-                &params![id, now_ms()],
-            )?,
-        };
-        if n > 0 {
-            self.execute(
-                "UPDATE files SET status = 'processing', finished_at = NULL WHERE id = (SELECT file_id FROM records WHERE id = $1)",
-                &params![id],
+        self.transaction(|tx| {
+            let Some(file_id) = tx
+                .query_one("SELECT file_id FROM records WHERE id = $1", &params![id])?
+                .map(|r| r.i64(0))
+            else {
+                return Ok(false);
+            };
+            let lock_file = format!("SELECT id FROM files WHERE id = $1{}", tx.for_update());
+            tx.query(&lock_file, &params![file_id])?;
+            let lock_record = format!(
+                "SELECT status, feed_id FROM records WHERE id = $1{}",
+                tx.for_update()
+            );
+            let Some(before) = tx.query_one(&lock_record, &params![id])? else {
+                return Ok(false);
+            };
+            let now = now_ms();
+            match raw {
+                Some(raw) => tx.execute(
+                    "UPDATE records SET status = 'received', original_raw = COALESCE(original_raw, raw), raw = $2, resources = NULL,
+                            error_kind = NULL, error = NULL, response = NULL, attempts = 0, next_attempt_at = 0,
+                            revision = revision + 1, updated_at = $3
+                     WHERE id = $1",
+                    &params![id, raw.to_string(), now],
+                )?,
+                None => tx.execute(
+                    "UPDATE records SET status = 'received', resources = NULL, error_kind = NULL, error = NULL,
+                            response = NULL, attempts = 0, next_attempt_at = 0, revision = revision + 1, updated_at = $2
+                     WHERE id = $1",
+                    &params![id, now],
+                )?,
+            };
+            tx.execute(
+                "UPDATE files SET status = 'processing', finished_at = NULL WHERE id = $1",
+                &params![file_id],
             )?;
-        }
-        Ok(n > 0)
+            tx.insert_events(&[Event::new("record.retried", &before.string(1))
+                .load(file_id)
+                .record(id)
+                .detail(json!({"from_status": before.string(0), "corrected": raw.is_some()}))])?;
+            Ok(true)
+        })
     }
 
     // ---- submissions ($bulk-submit) ------------------------------------------
@@ -1313,91 +2301,111 @@ impl Db {
     }
 
     /// Pending records of a feed that no submission holds yet, with their
-    /// resources: what the engine writes out itself on the transformed bulk path.
-    pub fn submittable_records(&self, feed: &str, limit: usize) -> Result<Vec<(i64, Value)>> {
+    /// revision and resources: what the engine writes out itself on the
+    /// transformed bulk path.
+    pub fn submittable_records(&self, feed: &str, limit: usize) -> Result<Vec<(i64, i64, Value)>> {
         Ok(self
             .query(
-                "SELECT id, resources FROM records
+                "SELECT id, revision, resources FROM records
                  WHERE feed_id = $1 AND status = 'pending' AND submission IS NULL
                  ORDER BY id LIMIT $2",
                 &params![feed, limit],
             )?
             .iter()
-            .map(|r| (r.i64(0), r.json(1).unwrap_or(Value::Null)))
+            .map(|r| (r.i64(0), r.i64(1), r.json(2).unwrap_or(Value::Null)))
             .collect())
     }
 
-    /// Opens a submission over every pending record of the given files, which move
-    /// to `submitted` in one statement per file.
+    /// Opens a submission over every pending record of the given files that no
+    /// submission holds, which move to `submitted` in one statement per file,
+    /// with `submission.opened`. `files` names each file with the number of
+    /// records its manifest entry was built for; if any file's claim differs
+    /// (a record changed meanwhile), nothing is written and `false` comes back,
+    /// so the caller builds the submission again from what is pending now.
     pub fn create_submission_for_files(
         &self,
         token: &str,
         feed: &str,
         submission_id: &str,
         manifest: &Value,
-        file_ids: &[i64],
-    ) -> Result<()> {
-        self.with(|c| {
-            c.batch("BEGIN")?;
+        files: &[(i64, usize)],
+    ) -> Result<bool> {
+        self.transaction(|tx| {
             let now = now_ms();
-            let result = (|| {
-                c.execute(
-                    "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, created_at, updated_at)
-                     VALUES ($1, $2, $3, 'kickoff', $4, $5, $6)",
-                    &params![token, feed, submission_id, manifest.to_string(), now, now],
-                )?;
-                for file_id in file_ids {
-                    c.execute(
-                        "UPDATE records SET status = 'submitted', submission = $1, updated_at = $2
-                         WHERE file_id = $3 AND feed_id = $4 AND status = 'pending' AND submission IS NULL",
-                        &params![token, now, file_id, feed],
-                    )?;
+            insert_submission(tx, token, feed, submission_id, manifest, now)?;
+            let mut records = 0;
+            for (file_id, expected) in files {
+                let claimed = tx.execute(
+                    "UPDATE records SET status = 'submitted', submission = $1, updated_at = $2
+                     WHERE file_id = $3 AND feed_id = $4 AND status = 'pending' AND submission IS NULL",
+                    &params![token, now, file_id, feed],
+                )? as usize;
+                if claimed != *expected {
+                    tx.rollback = true;
+                    return Ok(false);
                 }
-                Ok::<_, anyhow::Error>(())
-            })();
-            match result {
-                Ok(()) => c.batch("COMMIT"),
-                Err(e) => {
-                    let _ = c.batch("ROLLBACK");
-                    Err(e)
-                }
+                records += claimed;
             }
+            tx.insert_events(&[opened(feed, token, submission_id, records, files.len())])?;
+            Ok(true)
         })
     }
 
-    /// Opens a submission over the given records, which move to `submitted`.
+    /// Opens a submission over the given records, given as (id, revision), which
+    /// move to `submitted`, with `submission.opened`. Each is claimed only while
+    /// still pending at that revision and held by no submission; if any is not,
+    /// nothing is written and `false` comes back, so the caller builds the
+    /// submission again from what is pending now.
     pub fn create_submission(
         &self,
         token: &str,
         feed: &str,
         submission_id: &str,
         manifest: &Value,
-        record_ids: &[i64],
-    ) -> Result<()> {
-        self.with(|c| {
-            c.batch("BEGIN")?;
+        records: &[(i64, i64)],
+    ) -> Result<bool> {
+        self.transaction(|tx| {
             let now = now_ms();
-            let result = (|| {
-                c.execute(
-                    "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, created_at, updated_at)
-                     VALUES ($1, $2, $3, 'kickoff', $4, $5, $6)",
-                    &params![token, feed, submission_id, manifest.to_string(), now, now],
+            insert_submission(tx, token, feed, submission_id, manifest, now)?;
+            let mut claimed = 0;
+            let mut files = std::collections::BTreeSet::new();
+            for chunk in records.chunks(INSERT_ROWS_PER_STATEMENT) {
+                let rows: Vec<String> = (0..chunk.len())
+                    .map(|i| {
+                        format!(
+                            "(CAST(${} AS BIGINT), CAST(${} AS BIGINT))",
+                            i * 2 + 3,
+                            i * 2 + 4
+                        )
+                    })
+                    .collect();
+                let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 2 + 2);
+                values.push(Param::Text(token.to_string()));
+                values.push(Param::Int(now));
+                for (id, revision) in chunk {
+                    values.push(Param::Int(*id));
+                    values.push(Param::Int(*revision));
+                }
+                let taken = tx.query(
+                    &format!(
+                        "UPDATE records SET status = 'submitted', submission = $1, updated_at = $2
+                         FROM (VALUES {}) AS v
+                         WHERE records.id = v.column1 AND records.revision = v.column2
+                           AND records.status = 'pending' AND records.submission IS NULL
+                         RETURNING file_id",
+                        rows.join(", ")
+                    ),
+                    &values,
                 )?;
-                for id in record_ids {
-                    c.execute(
-                        "UPDATE records SET status = 'submitted', submission = $2, updated_at = $3 WHERE id = $1",
-                        &params![id, token, now],
-                    )?;
-                }
-                Ok::<_, anyhow::Error>(())
-            })();
-            match result {
-                Ok(()) => c.batch("COMMIT"),
-                Err(e) => {
-                    let _ = c.batch("ROLLBACK");
-                    Err(e)
-                }
+                claimed += taken.len();
+                files.extend(taken.iter().map(|r| r.i64(0)));
             }
+            if claimed < records.len() {
+                tx.rollback = true;
+                return Ok(false);
+            }
+            tx.insert_events(&[opened(feed, token, submission_id, claimed, files.len())])?;
+            Ok(true)
         })
     }
 
@@ -1436,6 +2444,8 @@ impl Db {
         )
     }
 
+    /// Moves an open submission on (kicked off, polled, still running). These
+    /// steps write no event.
     pub fn update_submission(
         &self,
         token: &str,
@@ -1445,11 +2455,39 @@ impl Db {
         next_attempt_at: i64,
         error: Option<&str>,
     ) -> Result<()> {
-        self.execute(
+        self.progress_submission(
+            token,
+            None,
+            status,
+            status_url,
+            attempts,
+            next_attempt_at,
+            error,
+        )
+        .map(drop)
+    }
+
+    /// `update_submission`, only while the submission still has the attempt
+    /// count `captured` read before its request: the answer to an older request
+    /// (a runner that held the source before a lease lapsed) changes nothing.
+    /// Returns whether it changed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn progress_submission(
+        &self,
+        token: &str,
+        captured: Option<u32>,
+        status: &str,
+        status_url: Option<&str>,
+        attempts: u32,
+        next_attempt_at: i64,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self.execute(
             "UPDATE submissions SET status = $2,
                     status_url = COALESCE(CAST($3 AS TEXT), status_url),
                     attempts = $4, next_attempt_at = $5, error = $6, updated_at = $7
-             WHERE token = $1",
+             WHERE token = $1 AND status IN ('kickoff', 'running')
+               AND (CAST($8 AS BIGINT) IS NULL OR attempts = CAST($8 AS BIGINT))",
             &params![
                 token,
                 status,
@@ -1457,10 +2495,238 @@ impl Db {
                 attempts,
                 next_attempt_at,
                 error,
-                now_ms()
+                now_ms(),
+                captured
             ],
-        )
-        .map(drop)
+        )? > 0)
+    }
+
+    /// A kick-off or status poll failed for a reason that may pass: the next
+    /// attempt is due at `next_attempt_at`, with `submission.attempt_failed`.
+    /// `reason` is already scrubbed of URLs and the token. Only while the
+    /// submission still has the attempt count `captured` read before the
+    /// request; returns whether it changed.
+    pub fn submission_attempt_failed(
+        &self,
+        token: &str,
+        captured: u32,
+        next_attempt_at: i64,
+        reason: &str,
+    ) -> Result<bool> {
+        let attempts = captured + 1;
+        self.transaction(|tx| {
+            let Some(r) = tx.query_one(
+                "UPDATE submissions SET attempts = $2, next_attempt_at = $3, error = $4, failures = failures + 1, updated_at = $5
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $6
+                 RETURNING feed_id, submission_id",
+                &params![token, attempts, next_attempt_at, reason, now_ms(), captured],
+            )?
+            else {
+                return Ok(false);
+            };
+            tx.insert_events(&[Event::new("submission.attempt_failed", &r.string(0))
+                .attempt(attempts as i64)
+                .reason(reason)
+                .detail(json!({"submission": r.string(1), "run": crate::bulk::run_key(token),
+                               "next_attempt_at": iso_ms(next_attempt_at)}))])?;
+            Ok(true)
+        })
+    }
+
+    /// Settles one page of a submission's records from the receipts, in one
+    /// transaction: `sent` with their responses, `missing` rejected with
+    /// `error`, each only while still `submitted` under this token; the rows
+    /// that changed are added to the submission's tallies, and each gets
+    /// `record.delivered` (`record.recovered` when the submission had failed
+    /// attempts) or `record.rejected`. Only while the submission is still open
+    /// at the attempt count `captured` read before the poll: otherwise nothing
+    /// changes and `false` comes back.
+    pub fn settle_page(
+        &self,
+        token: &str,
+        captured: u32,
+        sent: &[(i64, Value)],
+        missing: &[i64],
+        error: &str,
+    ) -> Result<bool> {
+        self.transaction(|tx| {
+            // The submission's row first, still open at the attempt count read
+            // before the poll, as a refusal takes it: then its records.
+            let lock = format!(
+                "SELECT feed_id, submission_id, failures FROM submissions
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $2{}",
+                tx.for_update()
+            );
+            let Some(sub) = tx.query_one(&lock, &params![token, captured])? else {
+                return Ok(false);
+            };
+            let (feed, submission_id, failures) = (sub.string(0), sub.string(1), sub.i64(2));
+            let now = now_ms();
+            let mut delivered = Vec::new();
+            for chunk in sent.chunks(INSERT_ROWS_PER_STATEMENT) {
+                let rows: Vec<String> = (0..chunk.len())
+                    .map(|i| {
+                        format!(
+                            "(CAST(${} AS BIGINT), CAST(${} AS TEXT))",
+                            i * 2 + 3,
+                            i * 2 + 4
+                        )
+                    })
+                    .collect();
+                let mut values: Vec<Param> = Vec::with_capacity(chunk.len() * 2 + 2);
+                values.push(Param::Int(now));
+                values.push(Param::Text(token.to_string()));
+                for (id, response) in chunk {
+                    values.push(Param::Int(*id));
+                    values.push(Param::Text(response.to_string()));
+                }
+                delivered.extend(tx.query(
+                    &format!(
+                        "UPDATE records SET status = 'sent', response = v.column2, error_kind = NULL, error = NULL, updated_at = $1
+                         FROM (VALUES {}) AS v
+                         WHERE records.id = v.column1 AND records.status = 'submitted' AND records.submission = $2
+                         RETURNING id, file_id",
+                        rows.join(", ")
+                    ),
+                    &values,
+                )?);
+            }
+            let mut rejected = Vec::new();
+            for chunk in missing.chunks(INSERT_ROWS_PER_STATEMENT) {
+                let mut values = params![now, token, error].to_vec();
+                values.extend(chunk.iter().map(|id| Param::Int(*id)));
+                rejected.extend(tx.query(
+                    &format!(
+                        "UPDATE records SET status = 'rejected', error_kind = 'server', error = $3, updated_at = $1
+                         WHERE status = 'submitted' AND submission = $2 AND id IN ({})
+                         RETURNING id, file_id",
+                        marks(4, chunk.len())
+                    ),
+                    &values,
+                )?);
+            }
+            tx.execute(
+                "UPDATE submissions SET sent = sent + $2, rejected = rejected + $3 WHERE token = $1",
+                &params![token, delivered.len(), rejected.len()],
+            )?;
+            let run = crate::bulk::run_key(token);
+            let mut events: Vec<(i64, Event)> = Vec::with_capacity(delivered.len() + rejected.len());
+            for r in &delivered {
+                let event = if failures > 0 {
+                    Event::new("record.recovered", &feed).detail(
+                        json!({"submission": submission_id, "run": run, "failures": failures}),
+                    )
+                } else {
+                    Event::new("record.delivered", &feed)
+                        .detail(json!({"submission": submission_id, "run": run}))
+                };
+                events.push((r.i64(0), event.load(r.i64(1)).record(r.i64(0))));
+            }
+            for r in &rejected {
+                events.push((
+                    r.i64(0),
+                    Event::new("record.rejected", &feed)
+                        .load(r.i64(1))
+                        .record(r.i64(0))
+                        .error_kind("server")
+                        .reason(error)
+                        .detail(json!({"submission": submission_id, "run": run})),
+                ));
+            }
+            events.sort_by_key(|(id, _)| *id);
+            let events: Vec<Event> = events.into_iter().map(|(_, e)| e).collect();
+            tx.insert_events(&events)?;
+            Ok(true)
+        })
+    }
+
+    /// Closes a submission whose receipts are all applied, with
+    /// `submission.settled` and its tallies. Only a submission still open at the
+    /// attempt count `captured` read before the poll moves, so the event is
+    /// written once and an older poll's answer changes nothing. Returns whether
+    /// it moved.
+    pub fn settle_submission(&self, token: &str, captured: u32) -> Result<bool> {
+        self.transaction(|tx| {
+            let lock = format!(
+                "SELECT token FROM submissions
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $2{}",
+                tx.for_update()
+            );
+            if tx.query_one(&lock, &params![token, captured])?.is_none() {
+                return Ok(false);
+            }
+            let Some(r) = tx.query_one(
+                "UPDATE submissions SET status = 'done', attempts = 0, next_attempt_at = 0, error = NULL, updated_at = $2
+                 WHERE token = $1 AND status IN ('kickoff', 'running')
+                 RETURNING feed_id, submission_id, sent, rejected, failures",
+                &params![token, now_ms()],
+            )?
+            else {
+                return Ok(false);
+            };
+            tx.insert_events(&[Event::new("submission.settled", &r.string(0)).detail(json!({
+                "submission": r.string(1),
+                "run": crate::bulk::run_key(token),
+                "sent": r.i64(2),
+                "rejected": r.i64(3),
+                "failures": r.i64(4),
+            }))])?;
+            Ok(true)
+        })
+    }
+
+    /// The server refused a submission: it fails, and every record it still
+    /// holds is rejected with `reason` and the server's `response`, in one
+    /// transaction, with a `record.rejected` each and one `submission.refused`.
+    /// `reason` and `response` are already scrubbed; the events never carry the
+    /// response. Nothing happens unless the submission is open at the attempt
+    /// count `captured` read before the request (an older request's answer
+    /// changes nothing). Returns how many records were rejected, or `None`.
+    pub fn reject_submission(
+        &self,
+        token: &str,
+        captured: u32,
+        kind: &str,
+        reason: &str,
+        response: &Value,
+    ) -> Result<Option<usize>> {
+        self.transaction(|tx| {
+            let now = now_ms();
+            let Some(sub) = tx.query_one(
+                "UPDATE submissions SET status = 'failed', next_attempt_at = 0, error = $2, updated_at = $3
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $4
+                 RETURNING feed_id, submission_id",
+                &params![token, reason, now, captured],
+            )?
+            else {
+                return Ok(None);
+            };
+            let (feed, submission_id) = (sub.string(0), sub.string(1));
+            let rows = update_records_paged(
+                tx,
+                "submission = $1 AND status = 'submitted'",
+                &params![token],
+                "status = 'rejected', error_kind = $2, error = $3, response = $4, updated_at = $5",
+                &params![kind, reason, response.to_string(), now],
+                "id, file_id",
+            )?;
+            let text = crate::events::reason_text(reason);
+            let detail = json!({"submission": submission_id, "run": crate::bulk::run_key(token)});
+            tx.insert_each(&rows, |(id, file_id)| {
+                Event::new("record.rejected", &feed)
+                    .load(*file_id)
+                    .record(*id)
+                    .error_kind(kind)
+                    .prepared_reason(&text)
+                    .detail(detail.clone())
+            })?;
+            let mut refused = detail.clone();
+            refused["records"] = json!(rows.len());
+            tx.insert_events(&[Event::new("submission.refused", &feed)
+                .prepared_reason(&text)
+                .detail(refused)])?;
+            Ok(Some(rows.len()))
+        })
     }
 
     /// The records a submission holds: (record id, file id, resources).
@@ -1504,13 +2770,33 @@ impl Db {
     }
 
     /// Rejects a file's pending records that no submission holds: the file cannot
-    /// be handed over at all. Returns how many.
+    /// be handed over at all. Each gets `record.rejected`. Returns how many.
     pub fn reject_unsubmitted(&self, file_id: i64, kind: &str, error: &str) -> Result<usize> {
-        Ok(self.execute(
-            "UPDATE records SET status = 'rejected', error_kind = $2, error = $3, updated_at = $4
-             WHERE file_id = $1 AND status = 'pending' AND submission IS NULL",
-            &params![file_id, kind, error, now_ms()],
-        )? as usize)
+        self.transaction(|tx| {
+            let Some(feed) = tx
+                .query_one("SELECT feed_id FROM files WHERE id = $1", &params![file_id])?
+                .map(|r| r.string(0))
+            else {
+                return Ok(0);
+            };
+            let ids = update_records_paged(
+                tx,
+                "file_id = $1 AND status = 'pending' AND submission IS NULL",
+                &params![file_id],
+                "status = 'rejected', error_kind = $2, error = $3, updated_at = $4",
+                &params![kind, error, now_ms()],
+                "id",
+            )?;
+            let text = crate::events::reason_text(error);
+            tx.insert_each(&ids, |(id, _)| {
+                Event::new("record.rejected", &feed)
+                    .load(file_id)
+                    .record(*id)
+                    .error_kind(kind)
+                    .prepared_reason(&text)
+            })?;
+            Ok(ids.len())
+        })
     }
 
     // ---- source state, cursors, leases ------------------------------------------
@@ -1614,6 +2900,51 @@ impl Db {
             .and_then(|r| r.opt_i64(0)))
     }
 
+    /// Whether a file (not a duplicate) was received in `[from, to)`, epoch ms.
+    pub fn received_between(&self, feed: &str, from: i64, to: i64) -> Result<bool> {
+        Ok(self
+            .query_one(
+                "SELECT 1 FROM files WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2 AND received_at < $3 LIMIT 1",
+                &params![feed, from, to],
+            )?
+            .is_some())
+    }
+
+    /// Whether an alert of a rule was open at `at` (epoch ms) or raised since.
+    /// One the rule's own change, turning off or deletion cleared does not
+    /// count: it watched the rule as it was.
+    pub fn rule_alert_alive_since(
+        &self,
+        feed: &str,
+        kind: &str,
+        rule_id: i64,
+        at: i64,
+    ) -> Result<bool> {
+        Ok(self
+            .query_one(
+                "SELECT 1 FROM alerts WHERE feed_id = $1 AND kind = $2 AND rule_id = $3
+                   AND (cleared_at IS NULL
+                        OR (cleared_at >= $4 AND COALESCE(cleared_reason, '') NOT IN ($5, $6, $7)))
+                 LIMIT 1",
+                &params![
+                    feed,
+                    kind,
+                    rule_id,
+                    at,
+                    RuleGone::Changed.reason(),
+                    RuleGone::TurnedOff.reason(),
+                    RuleGone::Deleted.reason()
+                ],
+            )?
+            .is_some())
+    }
+
+    /// Any statement, for tests that set up rows by hand.
+    #[cfg(test)]
+    pub(crate) fn execute_for_test(&self, sql: &str, params: &[Param]) -> Result<u64> {
+        self.execute(sql, params)
+    }
+
     pub fn last_alert_at(&self, feed: &str, kind: &str) -> Result<Option<i64>> {
         Ok(self
             .query_one(
@@ -1625,6 +2956,44 @@ impl Db {
 
     // ---- alerts ----------------------------------------------------------------
 
+    /// The columns `AlertRow` is read from, as a `RETURNING` or `SELECT` list.
+    fn alert_columns(&self) -> String {
+        format!(
+            "id, feed_id, kind, message, rule_id, notify, channels, {} AS created_at, {} AS cleared_at, cleared_reason",
+            self.iso("created_at"),
+            self.iso("cleared_at")
+        )
+    }
+
+    fn alert_row(r: &Row) -> AlertRow {
+        let list = |i: usize| -> Option<Vec<String>> {
+            r.json(i).and_then(|v| serde_json::from_value(v).ok())
+        };
+        AlertRow {
+            id: r.i64(0),
+            feed_id: r.opt_string(1),
+            kind: r.string(2),
+            message: r.string(3),
+            rule_id: r.opt_i64(4),
+            notify: list(5).unwrap_or_default(),
+            channels: list(6),
+            created_at: r.string(7),
+            cleared_at: r.opt_string(8),
+            cleared_reason: r.opt_string(9),
+        }
+    }
+
+    fn insert_webhook(c: &mut Conn, alert_id: i64, w: &NewWebhook, now: i64) -> Result<()> {
+        c.execute(
+            "INSERT INTO alert_webhooks (event_id, alert_id, event, destination, payload, state, attempts, next_attempt_at, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $7)",
+            &params![w.event_id, alert_id, w.event, w.destination, w.payload, w.state, now],
+        )
+        .map(drop)
+    }
+
+    /// Records an alert with no webhook event, as alerts were before events
+    /// were: for tests and imports. The engine raises alerts through `Alerter`.
     pub fn insert_alert(
         &self,
         feed: Option<&str>,
@@ -1647,6 +3016,91 @@ impl Db {
         )
     }
 
+    /// Clears an open alert with no webhook event: for tests and imports, like
+    /// `insert_alert`.
+    pub fn clear_alert(&self, id: i64, reason: &str) -> Result<()> {
+        self.execute(
+            "UPDATE alerts SET cleared_at = $2, cleared_reason = $3 WHERE id = $1 AND cleared_at IS NULL",
+            &params![id, now_ms(), reason],
+        )
+        .map(drop)
+    }
+
+    /// Records an alert and, in the same transaction, the webhook event `webhook`
+    /// builds from the stored row. An alert of a rule is recorded only while
+    /// the rule is still on and watches what it did when it was read (its
+    /// condition, threshold, time zone and source): `None` when it does not
+    /// any more. On
+    /// PostgreSQL the rule's row stays locked to the commit, so a change of the
+    /// rule waits for the alert and then clears it.
+    pub fn insert_alert_with_webhook(
+        &self,
+        feed: Option<&str>,
+        kind: &str,
+        message: &str,
+        rule: Option<&Rule>,
+        now: i64,
+        webhook: impl FnOnce(&AlertRow) -> NewWebhook,
+    ) -> Result<Option<AlertRow>> {
+        let columns = self.alert_columns();
+        let postgres = self.postgres;
+        self.with(|c| {
+            // Immediate on SQLite: the rule is read under the write lock.
+            c.batch(if postgres { "BEGIN" } else { "BEGIN IMMEDIATE" })?;
+            let result = (|| {
+                if let Some(rule) = rule {
+                    let lock = if postgres { " FOR SHARE" } else { "" };
+                    let current = c.query(
+                        &format!(
+                            "SELECT 1 FROM alert_rules
+                             WHERE id = $1 AND enabled = 1 AND condition = $2 AND threshold = $3
+                               AND source_id IS NOT DISTINCT FROM $4
+                               AND tz IS NOT DISTINCT FROM $5{lock}"
+                        ),
+                        &params![rule.id, rule.condition, rule.threshold, rule.source_id, rule.tz],
+                    )?;
+                    if current.is_empty() {
+                        return Ok(None);
+                    }
+                }
+                let row = c
+                    .query(
+                        &format!(
+                            "INSERT INTO alerts (feed_id, kind, message, created_at, rule_id, notify, channels)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {columns}"
+                        ),
+                        &params![
+                            feed,
+                            kind,
+                            message,
+                            now,
+                            rule.map(|r| r.id),
+                            rule.map(|r| serde_json::to_string(&r.notify).unwrap_or_default()),
+                            rule.map(|r| serde_json::to_string(&r.channels).unwrap_or_default()),
+                        ],
+                    )?
+                    .first()
+                    .map(Self::alert_row)
+                    .context("INSERT returned no alert")?;
+                Self::insert_webhook(c, row.id, &webhook(&row), now)?;
+                Ok::<_, anyhow::Error>(Some(row))
+            })();
+            match result {
+                Ok(row) => match c.batch("COMMIT") {
+                    Ok(()) => Ok(row),
+                    Err(e) => {
+                        let _ = c.batch("ROLLBACK");
+                        Err(e)
+                    }
+                },
+                Err(e) => {
+                    let _ = c.batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
     /// The open alert (not cleared) of this kind for a source and rule, if any.
     pub fn open_alert(
         &self,
@@ -1664,39 +3118,774 @@ impl Db {
             .map(|r| (r.i64(0), r.i64(1))))
     }
 
-    pub fn clear_alert(&self, id: i64, reason: &str) -> Result<()> {
+    /// Clears an open alert and, in the same transaction, records the webhook
+    /// event `webhook` builds from the cleared row. `None` when the alert was
+    /// already cleared (by another instance, say): then nothing is written.
+    pub fn clear_alert_with_webhook(
+        &self,
+        id: i64,
+        reason: &str,
+        now: i64,
+        webhook: impl FnOnce(&AlertRow) -> NewWebhook,
+    ) -> Result<Option<AlertRow>> {
+        let columns = self.alert_columns();
+        self.with(|c| {
+            c.batch("BEGIN")?;
+            let result = (|| {
+                let Some(row) = c
+                    .query(
+                        &format!(
+                            "UPDATE alerts SET cleared_at = $2, cleared_reason = $3
+                             WHERE id = $1 AND cleared_at IS NULL RETURNING {columns}"
+                        ),
+                        &params![id, now, reason],
+                    )?
+                    .first()
+                    .map(Self::alert_row)
+                else {
+                    return Ok(None);
+                };
+                Self::insert_webhook(c, row.id, &webhook(&row), now)?;
+                Ok::<_, anyhow::Error>(Some(row))
+            })();
+            match result {
+                Ok(row) => match c.batch("COMMIT") {
+                    Ok(()) => Ok(row),
+                    Err(e) => {
+                        let _ = c.batch("ROLLBACK");
+                        Err(e)
+                    }
+                },
+                Err(e) => {
+                    let _ = c.batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    /// The open alerts a rule raised, oldest first: (id, source, kind).
+    pub fn open_alerts_of_rule(&self, rule_id: i64) -> Result<Vec<(i64, Option<String>, String)>> {
+        Ok(self
+            .query(
+                "SELECT id, feed_id, kind FROM alerts WHERE rule_id = $1 AND cleared_at IS NULL ORDER BY id",
+                &params![rule_id],
+            )?
+            .iter()
+            .map(|r| (r.i64(0), r.opt_string(1), r.string(2)))
+            .collect())
+    }
+
+    /// The open alerts whose rule no longer watches them, oldest first, each
+    /// with why: the rule was deleted, turned off, or changed to another
+    /// condition or to a source that is not the alert's, alerts about no
+    /// source included. A rule made after the alert is another rule given the
+    /// deleted one's id (a SQLite store before ids came from `AUTOINCREMENT`),
+    /// as retention reads it. A change of threshold alone cannot be told from
+    /// here.
+    pub fn unwatched_alerts(&self) -> Result<Vec<UnwatchedAlert>> {
+        Ok(self
+            .query(
+                "SELECT a.id, a.feed_id, a.kind,
+                    CASE WHEN r.id IS NULL OR r.created_at > a.created_at THEN 'deleted'
+                         WHEN r.enabled = 0 THEN 'off' ELSE 'changed' END
+             FROM alerts a LEFT JOIN alert_rules r ON r.id = a.rule_id
+             WHERE a.cleared_at IS NULL AND a.rule_id IS NOT NULL
+               AND (r.id IS NULL OR r.created_at > a.created_at OR r.enabled = 0
+                    OR (r.source_id IS NOT NULL AND (a.feed_id IS NULL OR r.source_id <> a.feed_id))
+                    OR a.kind <> CASE r.condition WHEN 'unreachable' THEN 'delivery'
+                                                  WHEN 'missing_by' THEN 'missing'
+                                                  ELSE r.condition END)
+             ORDER BY a.id",
+                &[],
+            )?
+            .iter()
+            .map(|r| UnwatchedAlert {
+                id: r.i64(0),
+                feed: r.opt_string(1),
+                kind: r.string(2),
+                why: match r.string(3).as_str() {
+                    "deleted" => RuleGone::Deleted,
+                    "off" => RuleGone::TurnedOff,
+                    _ => RuleGone::Changed,
+                },
+            })
+            .collect())
+    }
+
+    /// The open alerts of a kind for a source, with a rule or without, oldest first.
+    pub fn open_alert_ids(&self, feed: &str, kind: &str) -> Result<Vec<i64>> {
+        Ok(self
+            .query(
+                "SELECT id FROM alerts WHERE feed_id = $1 AND kind = $2 AND cleared_at IS NULL ORDER BY id",
+                &params![feed, kind],
+            )?
+            .iter()
+            .map(|r| r.i64(0))
+            .collect())
+    }
+
+    /// Closes what versions before recovery cleared the `delivery` alert left
+    /// open, once per store: every `delivery_recovered` alert (a notice, never
+    /// a condition), and every rule-less `delivery` alert shown to be over, by
+    /// a later `delivery_recovered` of its source or by a record of the source
+    /// delivered after it. A rule-less `delivery` alert with neither may be an
+    /// outage still going on: it stays, for the next successful delivery to
+    /// clear. Later starts change nothing, so an outage alert this version
+    /// raised is cleared only by its recovery. Only the store changes. Returns
+    /// how many alerts were closed.
+    pub fn close_legacy_recoveries(&self) -> Result<u64> {
+        let now = now_ms();
+        self.transaction(|tx| {
+            let first = tx.execute(
+                "INSERT INTO store_meta (key, value) VALUES ('delivery_alerts_reconciled', $1)
+                 ON CONFLICT (key) DO NOTHING",
+                &params![now.to_string()],
+            )?;
+            if first == 0 {
+                return Ok(0);
+            }
+            let over = tx.execute(
+                "UPDATE alerts SET cleared_at = $1, cleared_reason = $2
+                 WHERE kind = 'delivery' AND rule_id IS NULL AND cleared_at IS NULL AND feed_id IS NOT NULL
+                   AND (EXISTS (SELECT 1 FROM alerts later WHERE later.feed_id = alerts.feed_id
+                                AND later.kind = 'delivery_recovered' AND later.id > alerts.id)
+                        OR EXISTS (SELECT 1 FROM records r WHERE r.feed_id = alerts.feed_id
+                                   AND r.status = 'sent' AND r.updated_at > alerts.created_at))",
+                &params![
+                    now,
+                    "delivery to HFS recovered (recorded before recovery cleared this alert)"
+                ],
+            )?;
+            let notices = tx.execute(
+                "UPDATE alerts SET cleared_at = $1, cleared_reason = $2
+                 WHERE kind = 'delivery_recovered' AND cleared_at IS NULL",
+                &params![
+                    now,
+                    "a recovery notice; recovery now clears the delivery alert instead"
+                ],
+            )?;
+            Ok(over + notices)
+        })
+    }
+
+    // ---- alert webhook deliveries --------------------------------------------
+
+    /// Ends the rows whose last allowed attempt was claimed and never recorded
+    /// (the process died during it): `failed`, never sent again. Returns how many.
+    pub fn webhook_expire_exhausted(&self, now: i64, max_attempts: u32) -> Result<u64> {
         self.execute(
-            "UPDATE alerts SET cleared_at = $2, cleared_reason = $3 WHERE id = $1 AND cleared_at IS NULL",
-            &params![id, now_ms(), reason],
+            "UPDATE alert_webhooks SET state = 'failed', last_error = $1, last_status = NULL
+             WHERE state = 'pending' AND attempts >= $2 AND next_attempt_at <= $3",
+            &params![
+                "no outcome recorded for the last attempt",
+                max_attempts,
+                now
+            ],
         )
-        .map(drop)
+    }
+
+    /// The events for `destination` that may be attempted now, oldest first.
+    pub fn webhook_due(
+        &self,
+        destination: &str,
+        now: i64,
+        max_attempts: u32,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .query(
+                &format!(
+                    "SELECT event_id FROM alert_webhooks
+                     WHERE state = 'pending' AND destination = $1 AND next_attempt_at <= $2
+                       AND attempts < $3 AND {WEBHOOK_UNBLOCKED}
+                     ORDER BY id LIMIT $4"
+                ),
+                &params![destination, now, max_attempts, limit],
+            )?
+            .iter()
+            .map(|r| r.string(0))
+            .collect())
+    }
+
+    /// When the next event for `destination` falls due (or a claim on one runs
+    /// out), counting only events the ordering rule does not hold back.
+    pub fn webhook_next_due(&self, destination: &str) -> Result<Option<i64>> {
+        Ok(self
+            .query_one(
+                &format!(
+                    "SELECT MIN(next_attempt_at) FROM alert_webhooks
+                     WHERE state = 'pending' AND destination = $1 AND {WEBHOOK_UNBLOCKED}"
+                ),
+                &params![destination],
+            )?
+            .and_then(|r| r.opt_i64(0)))
+    }
+
+    /// Claims the next attempt of an event until `lease_until`: one statement,
+    /// so of several instances on the store only one gets it. `None` when the
+    /// event is not due (any more), is held back, or belongs to another
+    /// destination.
+    pub fn webhook_claim(
+        &self,
+        event_id: &str,
+        destination: &str,
+        now: i64,
+        lease_until: i64,
+        max_attempts: u32,
+    ) -> Result<Option<WebhookClaim>> {
+        Ok(self
+            .query_one(
+                &format!(
+                    "UPDATE alert_webhooks SET attempts = attempts + 1, next_attempt_at = $3, last_status = NULL
+                     WHERE event_id = $1 AND destination = $2 AND state = 'pending'
+                       AND next_attempt_at <= $4 AND attempts < $5 AND {WEBHOOK_UNBLOCKED}
+                     RETURNING event_id, alert_id, event, attempts, payload"
+                ),
+                &params![event_id, destination, lease_until, now, max_attempts],
+            )?
+            .map(|r| WebhookClaim {
+                event_id: r.string(0),
+                alert_id: r.i64(1),
+                event: r.string(2),
+                attempt: r.i64(3) as u32,
+                payload: r.string(4),
+            }))
+    }
+
+    /// Records that a claimed attempt was delivered. `false` when the claim is
+    /// no longer this attempt's (it ran out and was taken again, or the alert
+    /// was removed): nothing changes.
+    pub fn webhook_delivered(
+        &self,
+        event_id: &str,
+        attempt: u32,
+        status: u16,
+        now: i64,
+    ) -> Result<bool> {
+        Ok(self.execute(
+            "UPDATE alert_webhooks SET state = 'delivered', delivered_at = $3, last_status = $4
+             WHERE event_id = $1 AND state = 'pending' AND attempts = $2",
+            &params![event_id, attempt, now, status as i64],
+        )? > 0)
+    }
+
+    /// Records a failed claimed attempt, with the receiver's HTTP status when
+    /// it answered: due again at `retry_at`, or `failed` for good when there is
+    /// none. Fenced like `webhook_delivered`.
+    pub fn webhook_attempt_failed(
+        &self,
+        event_id: &str,
+        attempt: u32,
+        error: &str,
+        status: Option<u16>,
+        retry_at: Option<i64>,
+    ) -> Result<bool> {
+        let status = status.map(i64::from);
+        let n = match retry_at {
+            Some(at) => self.execute(
+                "UPDATE alert_webhooks SET last_error = $3, last_status = $4, next_attempt_at = $5
+                 WHERE event_id = $1 AND state = 'pending' AND attempts = $2",
+                &params![event_id, attempt, error, status, at],
+            )?,
+            None => self.execute(
+                "UPDATE alert_webhooks SET state = 'failed', last_error = $3, last_status = $4
+                 WHERE event_id = $1 AND state = 'pending' AND attempts = $2",
+                &params![event_id, attempt, error, status],
+            )?,
+        };
+        Ok(n > 0)
+    }
+
+    /// Alerts raised so far, by source and kind, the purged ones included, so
+    /// the totals never go down: (source or "", kind, count).
+    pub fn alert_totals(&self) -> Result<Vec<(String, String, i64)>> {
+        Ok(self
+            .query(
+                "SELECT source, kind, CAST(SUM(n) AS BIGINT) FROM (
+                   SELECT COALESCE(feed_id, '') AS source, kind, COUNT(*) AS n FROM alerts GROUP BY feed_id, kind
+                   UNION ALL
+                   SELECT feed_id AS source, kind, n FROM alert_counts_purged
+                 ) t GROUP BY source, kind ORDER BY source, kind",
+                &[],
+            )?
+            .iter()
+            .map(|r| (r.string(0), r.string(1), r.i64(2)))
+            .collect())
+    }
+
+    // ---- history: events and their retention --------------------------------
+
+    /// Whether a submission is still open at the attempt count `captured`.
+    pub fn submission_open_at(&self, token: &str, captured: u32) -> Result<bool> {
+        Ok(self
+            .query_one(
+                "SELECT 1 FROM submissions WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $2",
+                &params![token, captured],
+            )?
+            .is_some())
+    }
+
+    /// When the event log began on this store, in epoch milliseconds.
+    pub fn events_since(&self) -> Result<Option<i64>> {
+        Ok(self
+            .query_one(
+                "SELECT value FROM store_meta WHERE key = 'events_since'",
+                &[],
+            )?
+            .and_then(|r| r.string(0).parse().ok()))
+    }
+
+    /// Distinct records of a source with a `record.rejected` event stored in
+    /// `[from, to)`: those rejected for any reason but `filtered`, and those
+    /// filtered out. A record rejected twice counts once.
+    pub fn rejected_records(&self, source: &str, from: i64, to: i64) -> Result<(i64, i64)> {
+        Ok(self
+            .query_one(
+                "SELECT COUNT(DISTINCT CASE WHEN COALESCE(error_kind, '') <> 'filtered' THEN record_id END),
+                        COUNT(DISTINCT CASE WHEN error_kind = 'filtered' THEN record_id END)
+                 FROM events
+                 WHERE source_id = $1 AND kind = 'record.rejected' AND at >= $2 AND at < $3",
+                &params![source, from, to],
+            )?
+            .map_or((0, 0), |r| (r.i64(0), r.i64(1))))
+    }
+
+    /// A page of events, oldest first by id: see `docs/api.md` (Events). The
+    /// newest id is read first and nothing past it is listed, so a page never
+    /// skips an event that commits later with a lower id.
+    pub fn list_events(&self, q: &EventQuery) -> Result<EventPage> {
+        let mark = self
+            .query_one("SELECT MAX(id) FROM events", &[])?
+            .and_then(|r| r.opt_i64(0));
+        let Some(mark) = mark else {
+            return Ok(EventPage {
+                events: vec![],
+                next: q.cursor,
+                has_more: false,
+            });
+        };
+        let forward = |next: i64| Some(q.cursor.map_or(next, |c| c.max(next)));
+        // Without a cursor, `since` gives where to start, itself included.
+        let (start, inclusive) = match (q.cursor, q.since) {
+            (Some(cursor), _) => (cursor, false),
+            (None, Some(since)) => match self
+                .query_one("SELECT MIN(id) FROM events WHERE at >= $1", &params![since])?
+                .and_then(|r| r.opt_i64(0))
+            {
+                Some(first) => (first, true),
+                None => {
+                    return Ok(EventPage {
+                        events: vec![],
+                        next: forward(mark),
+                        has_more: false,
+                    });
+                }
+            },
+            (None, None) => (0, false),
+        };
+        let mut sql = format!(
+            "SELECT id, {} AS at, source_id, kind, load_id, record_id, attempt, error_kind, reason, detail
+             FROM events WHERE id {} $1 AND id <= $2",
+            self.iso("at"),
+            if inclusive { ">=" } else { ">" }
+        );
+        let mut values = params![start, mark].to_vec();
+        if let Some(source) = &q.source {
+            values.push(Param::Text(source.clone()));
+            sql.push_str(&format!(" AND source_id = ${}", values.len()));
+        }
+        if let Some(since) = q.since {
+            values.push(Param::Int(since));
+            sql.push_str(&format!(" AND at >= ${}", values.len()));
+        }
+        if !q.kinds.is_empty() {
+            let mut any = Vec::new();
+            for kind in &q.kinds {
+                if crate::events::FAMILIES.contains(&kind.as_str()) {
+                    any.push(format!("kind LIKE '{kind}.%'"));
+                } else {
+                    values.push(Param::Text(kind.clone()));
+                    any.push(format!("kind = ${}", values.len()));
+                }
+            }
+            sql.push_str(&format!(" AND ({})", any.join(" OR ")));
+        }
+        values.push(Param::Int(q.limit as i64 + 1));
+        sql.push_str(&format!(" ORDER BY id LIMIT ${}", values.len()));
+        let mut events: Vec<Value> = self
+            .query(&sql, &values)?
+            .iter()
+            .map(|r| {
+                let mut e = r.object();
+                if let Some(Value::String(text)) = e.get("detail") {
+                    e["detail"] = serde_json::from_str(text).unwrap_or(Value::Null);
+                }
+                e
+            })
+            .collect();
+        let has_more = events.len() > q.limit;
+        events.truncate(q.limit);
+        let next = match events.last() {
+            Some(last) if has_more => last["id"].as_i64(),
+            _ => forward(mark),
+        };
+        Ok(EventPage {
+            events,
+            next,
+            has_more,
+        })
+    }
+
+    /// Removes up to `limit` events older than `cutoff_ms` in one transaction.
+    /// Returns how many went.
+    pub fn purge_events(&self, cutoff_ms: i64, limit: usize) -> Result<usize> {
+        self.transaction(|tx| {
+            Ok(tx
+                .query(
+                    "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE at < $1 ORDER BY id LIMIT $2)
+                     RETURNING id",
+                    &params![cutoff_ms, limit],
+                )?
+                .len())
+        })
+    }
+
+    /// Removes up to `limit` alerts older than `cutoff_ms` (since they cleared, or
+    /// since they were raised while open) in one transaction, and adds what went
+    /// to the purged tallies `/metrics` counts. Kept at any age: open alerts of a
+    /// rule that exists, is enabled and is older than the alert (a SQLite rule id
+    /// may be given again after a rule is deleted), open `credential` and `definition`
+    /// alerts, and the alert with the highest id, so no alert id is ever given
+    /// again. Returns how many went.
+    pub fn purge_alerts(&self, cutoff_ms: i64, limit: usize) -> Result<usize> {
+        self.transaction(|tx| {
+            // The predicate is checked again on the row deleted: on PostgreSQL an
+            // alert cleared meanwhile is read again once its lock is free.
+            let eligible = |a: &str| {
+                format!(
+                    "COALESCE({a}.cleared_at, {a}.created_at) < $1
+                     AND {a}.id < (SELECT MAX(id) FROM alerts)
+                     AND NOT ({a}.cleared_at IS NULL AND (
+                           {a}.kind IN ('credential', 'definition')
+                           OR ({a}.kind = 'delivery' AND {a}.rule_id IS NULL)
+                           OR EXISTS (SELECT 1 FROM alert_rules r
+                                      WHERE r.id = {a}.rule_id AND r.enabled = 1
+                                        AND r.created_at <= {a}.created_at)))"
+                )
+            };
+            let gone = tx.query(
+                &format!(
+                    "DELETE FROM alerts WHERE id IN (
+                       SELECT a.id FROM alerts a WHERE {} ORDER BY a.id LIMIT $2)
+                     AND {}
+                     RETURNING feed_id, kind",
+                    eligible("a"),
+                    eligible("alerts")
+                ),
+                &params![cutoff_ms, limit],
+            )?;
+            let mut tallies: std::collections::BTreeMap<(String, String), i64> = Default::default();
+            for r in &gone {
+                *tallies.entry((r.string(0), r.string(1))).or_default() += 1;
+            }
+            for ((feed, kind), n) in tallies {
+                tx.execute(
+                    "INSERT INTO alert_counts_purged (feed_id, kind, n) VALUES ($1, $2, $3)
+                     ON CONFLICT(feed_id, kind) DO UPDATE SET n = alert_counts_purged.n + excluded.n",
+                    &params![feed, kind, n],
+                )?;
+            }
+            Ok(gone.len())
+        })
+    }
+
+    // ---- checks ------------------------------------------------------------
+
+    /// Records a check of a source, pending, with its baseline: the source's
+    /// newest load when it was asked for.
+    pub fn insert_check(&self, feed: &str) -> Result<i64> {
+        // One statement: no load can be recorded between the baseline and the check.
+        self.insert_returning_id(
+            "INSERT INTO checks (feed_id, status, requested_at, after_file)
+             VALUES ($1, 'pending', $2, (SELECT COALESCE(MAX(id), 0) FROM files WHERE feed_id = $1))",
+            &params![feed, now_ms()],
+        )
+    }
+
+    fn max_file_id(&self, feed: &str) -> Result<i64> {
+        Ok(self
+            .query_one(
+                "SELECT MAX(id) FROM files WHERE feed_id = $1",
+                &params![feed],
+            )?
+            .and_then(|r| r.opt_i64(0))
+            .unwrap_or(0))
+    }
+
+    /// The source's checks waiting for an answer, as they are now: what the scan
+    /// about to start answers. Checks recorded after this wait for the next one.
+    pub fn pending_checks(&self, feed: &str) -> Result<Vec<i64>> {
+        Ok(self
+            .query(
+                "SELECT id FROM checks WHERE feed_id = $1 AND status = 'pending' ORDER BY id",
+                &params![feed],
+            )?
+            .iter()
+            .map(|r| r.i64(0))
+            .collect())
+    }
+
+    /// Answers the checks of `snapshot` still pending: `failed` with the
+    /// failure's fixed reason, or else `found` or `nothing_new` by the loads the
+    /// source recorded after each check's baseline, up to now. A check another
+    /// pass answered first keeps that answer.
+    pub fn answer_checks(
+        &self,
+        feed: &str,
+        snapshot: &[i64],
+        failure: Option<CheckFailure>,
+    ) -> Result<()> {
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        const COUNT: &str = "(SELECT COUNT(*) FROM files WHERE files.feed_id = checks.feed_id
+                               AND files.id > checks.after_file AND files.id <= $3)";
+        let upto = self.max_file_id(feed)?;
+        let now = now_ms();
+        let status = match failure {
+            Some(_) => "'failed'".to_string(),
+            None => format!("CASE WHEN {COUNT} > 0 THEN 'found' ELSE 'nothing_new' END"),
+        };
+        let sql = format!(
+            "UPDATE checks SET status = {status}, file_count = {COUNT}, upto_file = $3,
+               finished_at = CASE WHEN requested_at > $4 THEN requested_at ELSE $4 END,
+               reason = $5
+             WHERE id = $1 AND feed_id = $2 AND status = 'pending'"
+        );
+        for &id in snapshot {
+            self.execute(
+                &sql,
+                &params![id, feed, upto, now, failure.map(CheckFailure::reason)],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Fails every pending check of the source with the failure's fixed reason,
+    /// with the loads since each was asked for, unless an instance other than
+    /// `owner` held the source when the statement ran: that one may still answer
+    /// them.
+    pub fn fail_pending_checks(
+        &self,
+        feed: &str,
+        owner: &str,
+        failure: CheckFailure,
+    ) -> Result<u64> {
+        self.execute(
+            "UPDATE checks SET status = 'failed',
+               file_count = (SELECT COUNT(*) FROM files
+                             WHERE files.feed_id = checks.feed_id AND files.id > checks.after_file),
+               upto_file = (SELECT COALESCE(MAX(id), 0) FROM files WHERE feed_id = $1),
+               finished_at = CASE WHEN requested_at > $4 THEN requested_at ELSE $4 END,
+               reason = $2
+             WHERE feed_id = $1 AND status = 'pending'
+               AND NOT EXISTS (SELECT 1 FROM source_leases
+                               WHERE feed_id = $1 AND owner <> $3 AND until >= $4)",
+            &params![feed, failure.reason(), owner, now_ms()],
+        )
+    }
+
+    /// One check, with up to `limit` of its loads after load `after` (each with
+    /// its current status), or `None` when there is no such check.
+    pub fn check(&self, id: i64, after: i64, limit: i64) -> Result<Option<Value>> {
+        let Some(mut check) = self
+            .query_json(
+                &format!(
+                    "SELECT id AS check_id, feed_id AS source, status, {} AS requested_at, {} AS finished_at,
+                            file_count, reason, after_file, upto_file
+                     FROM checks WHERE id = $1",
+                    self.iso("requested_at"),
+                    self.iso("finished_at")
+                ),
+                params![id],
+            )?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let from = check["after_file"].as_i64().unwrap_or(0).max(after);
+        let files = match check["upto_file"].as_i64() {
+            Some(upto) => self.query_json(
+                "SELECT id, name, status, duplicate_of FROM files
+                 WHERE feed_id = $1 AND id > $2 AND id <= $3 ORDER BY id LIMIT $4",
+                params![
+                    check["source"].as_str().unwrap_or(""),
+                    from,
+                    upto,
+                    limit + 1
+                ],
+            )?,
+            None => Vec::new(),
+        };
+        let more = files.len() as i64 > limit;
+        let files: Vec<Value> = files.into_iter().take(limit as usize).collect();
+        let next = if more {
+            files.last().and_then(|f| f["id"].as_i64())
+        } else {
+            None
+        };
+        let object = check.as_object_mut().expect("a row is an object");
+        object.remove("after_file");
+        object.remove("upto_file");
+        if object["file_count"].is_null() {
+            object.insert("file_count".into(), json!(0));
+        }
+        object.insert("files".into(), Value::Array(files));
+        object.insert("next_after".into(), json!(next));
+        Ok(Some(check))
+    }
+
+    /// Removes up to `limit` checks asked for before `cutoff_ms`, answered or
+    /// not, in one transaction; returns how many went. Their ids are never
+    /// given again (`AUTOINCREMENT`, a sequence on PostgreSQL).
+    pub fn purge_checks(&self, cutoff_ms: i64, limit: usize) -> Result<usize> {
+        self.transaction(|tx| {
+            // Locked as they are chosen: on PostgreSQL a purge running at the
+            // same time waits, then chooses the next rows instead of counting
+            // none and stopping early.
+            Ok(tx
+                .query(
+                    &format!(
+                        "DELETE FROM checks WHERE id IN (SELECT id FROM checks WHERE requested_at < $1 ORDER BY id LIMIT $2{})
+                         RETURNING id",
+                        tx.for_update()
+                    ),
+                    &params![cutoff_ms, limit],
+                )?
+                .len())
+        })
     }
 
     // ---- alert rules -------------------------------------------------------
 
-    const RULE_SELECT: &'static str = "SELECT id, source_id, condition, threshold, notify, channels, enabled, created_by FROM alert_rules";
+    const RULE_SELECT: &'static str = "SELECT id, source_id, condition, threshold, notify, channels, enabled, created_by, created_at, tz FROM alert_rules";
+
+    fn rule_from(r: &Row) -> Rule {
+        Rule {
+            id: r.i64(0),
+            source_id: r.opt_string(1),
+            condition: r.string(2),
+            threshold: r.string(3),
+            notify: r
+                .json(4)
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            channels: r
+                .json(5)
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            enabled: r.i64(6) != 0,
+            created_by: r.opt_string(7),
+            created_at: r.opt_i64(8).and_then(iso_ms),
+            tz: r.opt_string(9),
+        }
+    }
 
     fn rule_rows(&self, sql: &str, p: &[Param]) -> Result<Vec<Rule>> {
-        Ok(self
-            .query(sql, p)?
+        Ok(self.query(sql, p)?.iter().map(Self::rule_from).collect())
+    }
+
+    /// Replaces a rule and, in the same transaction, clears its open alerts
+    /// with the reason `ends` gives from the rule as it was (`None`: they stay),
+    /// each with the webhook event `webhook` builds from the cleared row. `None`
+    /// when there is no such rule. The rule's row is locked first, so an alert
+    /// being raised under it (`insert_alert_with_webhook`) is either committed
+    /// before, and cleared here, or checked against the rule as replaced.
+    pub fn update_rule_ending_alerts(
+        &self,
+        id: i64,
+        rule: &Rule,
+        now: i64,
+        ends: impl FnOnce(&Rule) -> Option<&'static str>,
+        webhook: impl FnMut(&AlertRow) -> NewWebhook,
+    ) -> Result<Option<Vec<AlertRow>>> {
+        let columns = self.alert_columns();
+        self.transaction(|tx| {
+            let lock = tx.for_update();
+            let Some(before) = tx
+                .query_one(
+                    &format!("{} WHERE id = $1{lock}", Self::RULE_SELECT),
+                    &params![id],
+                )?
+                .map(|r| Self::rule_from(&r))
+            else {
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE alert_rules SET source_id = $2, condition = $3, threshold = $4, notify = $5, channels = $6, enabled = $7, tz = $8
+                 WHERE id = $1",
+                &params![
+                    id,
+                    rule.source_id,
+                    rule.condition,
+                    rule.threshold,
+                    serde_json::to_string(&rule.notify).unwrap_or_default(),
+                    serde_json::to_string(&rule.channels).unwrap_or_default(),
+                    rule.enabled,
+                    rule.tz
+                ],
+            )?;
+            match ends(&before) {
+                Some(reason) => Self::clear_rule_alerts(tx, &columns, id, reason, now, webhook).map(Some),
+                None => Ok(Some(vec![])),
+            }
+        })
+    }
+
+    /// Deletes a rule and, in the same transaction, clears its open alerts
+    /// with `reason`, as `update_rule_ending_alerts` does. `None` when there is
+    /// no such rule.
+    pub fn delete_rule_ending_alerts(
+        &self,
+        id: i64,
+        reason: &str,
+        now: i64,
+        webhook: impl FnMut(&AlertRow) -> NewWebhook,
+    ) -> Result<Option<Vec<AlertRow>>> {
+        let columns = self.alert_columns();
+        self.transaction(|tx| {
+            if tx.execute("DELETE FROM alert_rules WHERE id = $1", &params![id])? == 0 {
+                return Ok(None);
+            }
+            Self::clear_rule_alerts(tx, &columns, id, reason, now, webhook).map(Some)
+        })
+    }
+
+    fn clear_rule_alerts(
+        tx: &mut Tx,
+        columns: &str,
+        rule_id: i64,
+        reason: &str,
+        now: i64,
+        mut webhook: impl FnMut(&AlertRow) -> NewWebhook,
+    ) -> Result<Vec<AlertRow>> {
+        let cleared: Vec<AlertRow> = tx
+            .query(
+                &format!(
+                    "UPDATE alerts SET cleared_at = $2, cleared_reason = $3
+                     WHERE rule_id = $1 AND cleared_at IS NULL RETURNING {columns}"
+                ),
+                &params![rule_id, now, reason],
+            )?
             .iter()
-            .map(|r| Rule {
-                id: r.i64(0),
-                source_id: r.opt_string(1),
-                condition: r.string(2),
-                threshold: r.string(3),
-                notify: r
-                    .json(4)
-                    .and_then(|v| serde_json::from_value(v).ok())
-                    .unwrap_or_default(),
-                channels: r
-                    .json(5)
-                    .and_then(|v| serde_json::from_value(v).ok())
-                    .unwrap_or_default(),
-                enabled: r.i64(6) != 0,
-                created_by: r.opt_string(7),
-            })
-            .collect())
+            .map(Self::alert_row)
+            .collect();
+        for row in &cleared {
+            Self::insert_webhook(tx.conn, row.id, &webhook(row), now)?;
+        }
+        Ok(cleared)
     }
 
     pub fn rules(&self) -> Result<Vec<Rule>> {
@@ -1730,8 +3919,8 @@ impl Db {
 
     fn insert_rule_in(c: &mut Conn, rule: &Rule) -> Result<i64> {
         c.query(
-            "INSERT INTO alert_rules (source_id, condition, threshold, notify, channels, enabled, created_by, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+            "INSERT INTO alert_rules (source_id, condition, threshold, notify, channels, enabled, created_by, created_at, tz)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
             &params![
                 rule.source_id,
                 rule.condition,
@@ -1740,7 +3929,8 @@ impl Db {
                 serde_json::to_string(&rule.channels).unwrap_or_default(),
                 rule.enabled,
                 rule.created_by,
-                now_ms()
+                now_ms(),
+                rule.tz
             ],
         )?
         .first()
@@ -1750,7 +3940,7 @@ impl Db {
 
     pub fn update_rule(&self, id: i64, rule: &Rule) -> Result<bool> {
         let n = self.execute(
-            "UPDATE alert_rules SET source_id = $2, condition = $3, threshold = $4, notify = $5, channels = $6, enabled = $7
+            "UPDATE alert_rules SET source_id = $2, condition = $3, threshold = $4, notify = $5, channels = $6, enabled = $7, tz = $8
              WHERE id = $1",
             &params![
                 id,
@@ -1759,7 +3949,8 @@ impl Db {
                 rule.threshold,
                 serde_json::to_string(&rule.notify).unwrap_or_default(),
                 serde_json::to_string(&rule.channels).unwrap_or_default(),
-                rule.enabled
+                rule.enabled,
+                rule.tz
             ],
         )?;
         Ok(n > 0)
@@ -1924,6 +4115,315 @@ fn redact(url: &str) -> String {
 mod tests {
     use super::*;
 
+    // ---- alert webhook events: the store's side, with time passed in -------
+
+    fn hook(event_id: &str, event: &'static str, destination: &str) -> NewWebhook {
+        NewWebhook {
+            event_id: event_id.into(),
+            event,
+            destination: destination.into(),
+            payload: format!("{{\"event_id\":\"{event_id}\"}}"),
+            state: "pending",
+        }
+    }
+
+    /// Two handles on one store, as two engine instances have.
+    fn two_handles() -> (tempfile::TempDir, Db, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hie.db");
+        let (a, b) = (Db::open(&path).unwrap(), Db::open(&path).unwrap());
+        (dir, a, b)
+    }
+
+    fn fire(db: &Db, event_id: &str, destination: &str) -> i64 {
+        db.insert_alert_with_webhook(Some("src"), "silence", "quiet", None, 1_000, |_| {
+            hook(event_id, "fired", destination)
+        })
+        .unwrap()
+        .unwrap()
+        .id
+    }
+
+    fn state(db: &Db, event_id: &str) -> (String, i64, Option<String>) {
+        let r = db
+            .query_one(
+                "SELECT state, attempts, last_error FROM alert_webhooks WHERE event_id = $1",
+                &params![event_id],
+            )
+            .unwrap()
+            .unwrap();
+        (r.string(0), r.i64(1), r.opt_string(2))
+    }
+
+    #[test]
+    fn one_instance_wins_a_claim() {
+        let (_dir, a, b) = two_handles();
+        fire(&a, "e1", "d");
+        let first = a.webhook_claim("e1", "d", 2_000, 62_000, 6).unwrap();
+        let second = b.webhook_claim("e1", "d", 2_000, 62_000, 6).unwrap();
+        assert_eq!(first.as_ref().map(|c| c.attempt), Some(1));
+        assert!(second.is_none());
+        assert!(b.webhook_due("d", 2_000, 6, 10).unwrap().is_empty());
+        // Another destination's sender never takes it.
+        assert!(
+            b.webhook_claim("e1", "other", 70_000, 130_000, 6)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_claims_on_two_connections_have_one_winner() {
+        let (_dir, a, b) = two_handles();
+        let (a, b) = (std::sync::Arc::new(a), std::sync::Arc::new(b));
+        for round in 0..40 {
+            let event_id = format!("race-{round}");
+            fire(&a, &event_id, "d");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let contenders: Vec<_> = [a.clone(), b.clone()]
+                .into_iter()
+                .map(|db| {
+                    let (barrier, event_id) = (barrier.clone(), event_id.clone());
+                    // Both see the event due before either claims it.
+                    assert_eq!(
+                        db.webhook_due("d", 2_000, 6, 100).unwrap(),
+                        std::slice::from_ref(&event_id)
+                    );
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        db.webhook_claim(&event_id, "d", 2_000, 62_000, 6).unwrap()
+                    })
+                })
+                .collect();
+            let won: Vec<_> = contenders
+                .into_iter()
+                .filter_map(|t| t.join().unwrap())
+                .collect();
+            assert_eq!(won.len(), 1, "round {round}");
+            assert_eq!(state(&a, &event_id).1, 1);
+            a.webhook_delivered(&event_id, 1, 200, 3_000).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_claimed_attempt_has_no_status_until_it_is_answered() {
+        let (_dir, a, _b) = two_handles();
+        fire(&a, "e1", "d");
+        a.webhook_claim("e1", "d", 2_000, 62_000, 6)
+            .unwrap()
+            .unwrap();
+        a.webhook_attempt_failed(
+            "e1",
+            1,
+            "HTTP 503 Service Unavailable",
+            Some(503),
+            Some(2_100),
+        )
+        .unwrap();
+        a.webhook_claim("e1", "d", 2_200, 62_200, 6)
+            .unwrap()
+            .unwrap();
+        let r = a
+            .query_one(
+                "SELECT last_status, last_error FROM alert_webhooks WHERE event_id = 'e1'",
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.opt_i64(0), None, "the running attempt has no answer yet");
+        assert_eq!(
+            r.opt_string(1).as_deref(),
+            Some("HTTP 503 Service Unavailable")
+        );
+    }
+
+    #[test]
+    fn a_late_outcome_after_the_claim_ran_out_changes_nothing() {
+        let (_dir, a, b) = two_handles();
+        fire(&a, "e1", "d");
+        let stale = a
+            .webhook_claim("e1", "d", 2_000, 62_000, 6)
+            .unwrap()
+            .unwrap();
+        // The lease runs out; the other instance takes the next attempt.
+        let fresh = b
+            .webhook_claim("e1", "d", 63_000, 123_000, 6)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.attempt, 2);
+        // While that attempt runs, the stale one's outcomes change nothing.
+        assert!(
+            !a.webhook_delivered("e1", stale.attempt, 200, 64_000)
+                .unwrap()
+        );
+        assert!(
+            !a.webhook_attempt_failed("e1", stale.attempt, "timeout", None, Some(70_000))
+                .unwrap()
+        );
+        assert!(
+            !a.webhook_attempt_failed("e1", stale.attempt, "timeout", None, None)
+                .unwrap()
+        );
+        let r = a
+            .query_one(
+                "SELECT state, attempts, next_attempt_at, delivered_at, last_error FROM alert_webhooks WHERE event_id = 'e1'",
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                r.string(0),
+                r.i64(1),
+                r.i64(2),
+                r.opt_i64(3),
+                r.opt_string(4)
+            ),
+            ("pending".to_string(), 2, 123_000, None, None)
+        );
+        assert!(
+            b.webhook_delivered("e1", fresh.attempt, 200, 65_000)
+                .unwrap()
+        );
+        assert_eq!(state(&a, "e1").0, "delivered");
+    }
+
+    #[test]
+    fn a_late_outcome_never_touches_a_replacement_event() {
+        let (_dir, a, _b) = two_handles();
+        let alert = fire(&a, "old", "d");
+        let stale = a
+            .webhook_claim("old", "d", 2_000, 62_000, 6)
+            .unwrap()
+            .unwrap();
+        a.execute("DELETE FROM alerts WHERE id = $1", &params![alert])
+            .unwrap();
+        assert!(state_missing(&a, "old"), "the event goes with its alert");
+        fire(&a, "new", "d");
+        let fresh = a
+            .webhook_claim("new", "d", 3_000, 63_000, 6)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.attempt, stale.attempt);
+        assert!(
+            !a.webhook_delivered("old", stale.attempt, 200, 4_000)
+                .unwrap()
+        );
+        assert_eq!(state(&a, "new").0, "pending");
+    }
+
+    fn state_missing(db: &Db, event_id: &str) -> bool {
+        db.query_one(
+            "SELECT 1 FROM alert_webhooks WHERE event_id = $1",
+            &params![event_id],
+        )
+        .unwrap()
+        .is_none()
+    }
+
+    #[test]
+    fn a_last_attempt_with_no_outcome_ends_failed_and_frees_the_clear() {
+        let (_dir, a, _b) = two_handles();
+        let alert = fire(&a, "f", "d");
+        let mut now = 2_000;
+        for attempt in 1..=5 {
+            let c = a
+                .webhook_claim("f", "d", now, now + 60_000, 6)
+                .unwrap()
+                .unwrap();
+            assert_eq!(c.attempt, attempt);
+            a.webhook_attempt_failed(
+                "f",
+                attempt,
+                "HTTP 500 Internal Server Error",
+                Some(500),
+                Some(now + 1),
+            )
+            .unwrap();
+            now += 10;
+        }
+        a.clear_alert_with_webhook(alert, "back", now, |_| hook("c", "cleared", "d"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            a.webhook_due("d", now, 6, 10).unwrap(),
+            ["f"],
+            "the clear waits"
+        );
+        // The sixth attempt is claimed and the process dies before recording it.
+        a.webhook_claim("f", "d", now, now + 60_000, 6)
+            .unwrap()
+            .unwrap();
+        assert!(a.webhook_due("d", now + 61_000, 6, 10).unwrap().is_empty());
+        assert_eq!(a.webhook_expire_exhausted(now + 61_000, 6).unwrap(), 1);
+        let (st, attempts, error) = state(&a, "f");
+        assert_eq!((st.as_str(), attempts), ("failed", 6));
+        assert_eq!(
+            error.as_deref(),
+            Some("no outcome recorded for the last attempt")
+        );
+        assert!(
+            a.webhook_claim("f", "d", now + 62_000, now + 122_000, 6)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(a.webhook_due("d", now + 62_000, 6, 10).unwrap(), ["c"]);
+    }
+
+    #[test]
+    fn a_clear_waits_only_for_its_fire_at_the_same_destination() {
+        let (_dir, a, _b) = two_handles();
+        let one = fire(&a, "f1", "d");
+        a.clear_alert_with_webhook(one, "back", 2_000, |_| hook("c1", "cleared", "d"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            a.webhook_claim("c1", "d", 3_000, 63_000, 6)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            a.webhook_next_due("d").unwrap(),
+            Some(1_000),
+            "only the fire counts"
+        );
+        // Fired for an earlier URL, parked; cleared for the current one: not held back.
+        let two = fire(&a, "f2", "old");
+        a.clear_alert_with_webhook(two, "back", 2_000, |_| hook("c2", "cleared", "new"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.webhook_due("new", 3_000, 6, 10).unwrap(), ["c2"]);
+    }
+
+    #[test]
+    fn an_alert_clears_once_and_rolls_back_whole() {
+        let (_dir, a, b) = two_handles();
+        let id = fire(&a, "f", "");
+        let cleared = a
+            .clear_alert_with_webhook(id, "back", 2_000, |row| {
+                assert_eq!(row.cleared_reason.as_deref(), Some("back"));
+                assert!(row.cleared_at.is_some());
+                hook("c", "cleared", "")
+            })
+            .unwrap();
+        assert!(cleared.is_some());
+        assert!(
+            b.clear_alert_with_webhook(id, "again", 3_000, |_| hook("c2", "cleared", ""))
+                .unwrap()
+                .is_none()
+        );
+        assert!(state_missing(&a, "c2"));
+        // An event that cannot be written (its id is taken) leaves no alert behind.
+        let before = a.query("SELECT id FROM alerts", &[]).unwrap().len();
+        assert!(
+            a.insert_alert_with_webhook(Some("src"), "silence", "quiet", None, 4_000, |_| hook(
+                "f", "fired", ""
+            ))
+            .is_err()
+        );
+        assert_eq!(a.query("SELECT id FROM alerts", &[]).unwrap().len(), before);
+    }
+
     #[test]
     fn params_take_the_usual_values() {
         let p = params![
@@ -1942,6 +4442,69 @@ mod tests {
         assert!(matches!(p[4], Param::Null));
         assert!(matches!(p[5], Param::Int(1)));
         assert!(matches!(p[6], Param::Int(3)));
+    }
+
+    #[test]
+    fn a_receipt_counts_in_its_half_open_interval() {
+        let db = Db::in_memory().unwrap();
+        let at = |id: i64, ms: i64| {
+            db.execute(
+                "UPDATE files SET received_at = $2 WHERE id = $1",
+                &params![id, ms],
+            )
+            .unwrap();
+        };
+        let file = db
+            .insert_file("lab", "lab", "a.csv", "sha-a", 1, "done", None, None, None)
+            .unwrap();
+        at(file, 1_000);
+        assert!(db.received_between("lab", 1_000, 2_000).unwrap());
+        assert!(!db.received_between("lab", 0, 1_000).unwrap());
+        assert!(!db.received_between("lab", 1_001, 2_000).unwrap());
+        assert!(!db.received_between("other", 0, 2_000).unwrap());
+        let duplicate = db
+            .insert_file(
+                "lab",
+                "lab",
+                "b.csv",
+                "sha-a",
+                1,
+                "duplicate",
+                Some(file),
+                None,
+                None,
+            )
+            .unwrap();
+        at(duplicate, 5_000);
+        assert!(!db.received_between("lab", 5_000, 6_000).unwrap());
+    }
+
+    #[test]
+    fn rules_of_an_older_store_read_back_without_a_zone() {
+        // A store made before rules had a zone: its rule is read as UTC.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE alert_rules (id INTEGER PRIMARY KEY, source_id TEXT, condition TEXT NOT NULL,
+               threshold TEXT NOT NULL, notify TEXT NOT NULL DEFAULT '[]', channels TEXT NOT NULL DEFAULT '[\"app\"]',
+               enabled INTEGER NOT NULL DEFAULT 1, created_by TEXT, created_at INTEGER NOT NULL);
+             INSERT INTO alert_rules (source_id, condition, threshold, created_at) VALUES ('lab', 'missing_by', '06:00', 0);",
+        )
+        .unwrap();
+        let db = Db::init_sqlite(conn).unwrap();
+        let rules = db.rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tz, None);
+        // And a zone written now reads back.
+        let mut rule = rules[0].clone();
+        rule.tz = Some("Europe/Madrid".into());
+        assert!(db.update_rule(rule.id, &rule).unwrap());
+        assert_eq!(
+            db.rule(rule.id).unwrap().unwrap().tz.as_deref(),
+            Some("Europe/Madrid")
+        );
+        rule.tz = None;
+        assert!(db.update_rule(rule.id, &rule).unwrap());
+        assert_eq!(db.rule(rule.id).unwrap().unwrap().tz, None);
     }
 
     #[test]
@@ -1970,6 +4533,8 @@ mod tests {
             channels: vec!["app".into()],
             enabled: true,
             created_by: None,
+            tz: None,
+            created_at: None,
         }
     }
 
@@ -2039,7 +4604,7 @@ mod tests {
         other.condition = "rejected_share".into();
         other.threshold = "10%".into();
         db.insert_rule(&other).unwrap();
-        db.insert_file("filed", "a.csv", "00", 1, "done", None, None, None)
+        db.insert_file("filed", "filed", "a.csv", "00", 1, "done", None, None, None)
             .unwrap();
         db.set_paused("paused", true, None).unwrap();
         db.set_cursor("cursored", "k", "1").unwrap();
@@ -2134,11 +4699,241 @@ mod tests {
         }
     }
 
+    fn file(db: &Db, feed: &str, name: &str) -> i64 {
+        db.insert_file(feed, feed, name, name, 1, "processing", None, None, None)
+            .unwrap()
+    }
+
+    fn status(db: &Db, check: i64) -> Value {
+        db.check(check, 0, 1000).unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_check_is_answered_by_the_scan_whose_snapshot_holds_it() {
+        let db = Db::in_memory().unwrap();
+        file(&db, "lab", "old.csv");
+        let first = db.insert_check("lab").unwrap();
+        let snapshot = db.pending_checks("lab").unwrap();
+        assert_eq!(snapshot, vec![first]);
+        // Asked for while that scan runs: not in its snapshot.
+        let second = db.insert_check("lab").unwrap();
+        let new = file(&db, "lab", "new.csv");
+        file(&db, "other", "elsewhere.csv");
+        db.answer_checks("lab", &snapshot, None).unwrap();
+
+        let answered = status(&db, first);
+        assert_eq!(answered["status"], "found");
+        assert_eq!(answered["source"], "lab");
+        assert_eq!(answered["file_count"], 1);
+        assert_eq!(answered["files"][0]["id"], new);
+        assert_eq!(answered["files"][0]["name"], "new.csv");
+        assert_eq!(answered["files"][0]["status"], "processing");
+        assert!(answered["reason"].is_null());
+        assert!(
+            answered["finished_at"].as_str().unwrap() >= answered["requested_at"].as_str().unwrap()
+        );
+        assert!(answered["next_after"].is_null());
+
+        let waiting = status(&db, second);
+        assert_eq!(waiting["status"], "pending");
+        assert!(waiting["finished_at"].is_null());
+        assert_eq!(waiting["files"], json!([]));
+        assert_eq!(waiting["file_count"], 0);
+
+        // The next scan answers it with the load taken after it was asked for,
+        // though an earlier scan recorded that load.
+        let snapshot = db.pending_checks("lab").unwrap();
+        assert_eq!(snapshot, vec![second]);
+        db.answer_checks("lab", &snapshot, None).unwrap();
+        assert_eq!(status(&db, second)["status"], "found");
+        assert_eq!(status(&db, second)["files"][0]["id"], new);
+
+        // Nothing since.
+        let third = db.insert_check("lab").unwrap();
+        db.answer_checks("lab", &[third], None).unwrap();
+        let empty = status(&db, third);
+        assert_eq!(empty["status"], "nothing_new");
+        assert_eq!(empty["files"], json!([]));
+    }
+
+    #[test]
+    fn the_first_answer_stays_and_a_failure_keeps_what_was_taken() {
+        let db = Db::in_memory().unwrap();
+        let check = db.insert_check("lab").unwrap();
+        let taken = file(&db, "lab", "a.csv");
+        db.answer_checks("lab", &[check], Some(CheckFailure::Listing))
+            .unwrap();
+        db.answer_checks("lab", &[check], None).unwrap();
+        db.fail_pending_checks("lab", "me", CheckFailure::Deleted)
+            .unwrap();
+        let answered = status(&db, check);
+        assert_eq!(answered["status"], "failed");
+        assert_eq!(answered["reason"], CheckFailure::Listing.reason());
+        assert_eq!(answered["files"][0]["id"], taken);
+
+        // Another instance holding the source keeps its checks; once nobody
+        // else holds it, they fail with the loads since they were asked for.
+        let deleted = db.insert_check("lab").unwrap();
+        let since = file(&db, "lab", "b.csv");
+        assert!(db.acquire_lease("lab", "other", 60_000).unwrap());
+        assert_eq!(
+            db.fail_pending_checks("lab", "me", CheckFailure::Deleted)
+                .unwrap(),
+            0
+        );
+        assert_eq!(status(&db, deleted)["status"], "pending");
+        db.release_lease("lab", "other").unwrap();
+        assert!(db.acquire_lease("lab", "me", 60_000).unwrap());
+        assert_eq!(
+            db.fail_pending_checks("lab", "me", CheckFailure::Deleted)
+                .unwrap(),
+            1
+        );
+        let failed = status(&db, deleted);
+        assert_eq!(failed["reason"], "the source was deleted");
+        assert_eq!(failed["file_count"], 1);
+        assert_eq!(failed["files"][0]["id"], since);
+        // An unknown check.
+        assert!(db.check(deleted + 100, 0, 10).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_check_with_many_loads_lists_them_in_pages() {
+        let db = Db::in_memory().unwrap();
+        let check = db.insert_check("lab").unwrap();
+        let ids: Vec<i64> = (0..5)
+            .map(|i| file(&db, "lab", &format!("{i}.csv")))
+            .collect();
+        db.answer_checks("lab", &[check], None).unwrap();
+        // Recorded after the answer: never part of it.
+        file(&db, "lab", "later.csv");
+        let page = db.check(check, 0, 2).unwrap().unwrap();
+        assert_eq!(page["file_count"], 5);
+        assert_eq!(page["files"].as_array().unwrap().len(), 2);
+        assert_eq!(page["next_after"], ids[1]);
+        let rest = db.check(check, ids[1], 10).unwrap().unwrap();
+        let rest: Vec<i64> = rest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(rest, ids[2..]);
+    }
+
+    #[test]
+    fn checks_are_purged_by_age_and_their_ids_never_come_back() {
+        let db = Db::in_memory().unwrap();
+        let old = db.insert_check("lab").unwrap();
+        let newest = db.insert_check("lab").unwrap();
+        db.execute(
+            "UPDATE checks SET requested_at = 1000 WHERE id = $1",
+            &params![old],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE checks SET requested_at = 2000 WHERE id = $1",
+            &params![newest],
+        )
+        .unwrap();
+        // The cutoff itself is kept.
+        assert_eq!(db.purge_checks(1000, 10).unwrap(), 0);
+        assert_eq!(db.purge_checks(1001, 10).unwrap(), 1);
+        assert!(db.check(old, 0, 10).unwrap().is_none());
+        assert_eq!(status(&db, newest)["status"], "pending");
+        // Purging the newest does not hand its id to the next check.
+        assert_eq!(db.purge_checks(i64::MAX, 10).unwrap(), 1);
+        assert!(db.insert_check("lab").unwrap() > newest);
+    }
+
     #[test]
     fn urls_are_redacted() {
         assert_eq!(
             redact("postgres://hie:secret@db:5432/hie"),
             "postgres://hie:***@db:5432/hie"
         );
+    }
+
+    // ---- starting on a store in use ------------------------------------------
+
+    /// The tables `postgres_indexes` builds an index on.
+    fn indexed_tables() -> Vec<&'static str> {
+        let mut tables: Vec<&'static str> = postgres_indexes()
+            .into_iter()
+            .filter_map(|i| i.split(" ON ").nth(1)?.split('(').next())
+            .collect();
+        tables.sort_unstable();
+        tables.dedup();
+        tables
+    }
+
+    /// A second instance starts while a write on another holds one table and
+    /// then takes every other one, as a write spanning tables does. The start
+    /// waits for the held table without holding any other, so the write goes
+    /// through and neither is ended as a deadlock. Once for each indexed table.
+    /// A table with added columns stops the start at its `ALTER TABLE`; the
+    /// others stop it at an index, which the test checks by the lock awaited.
+    #[test]
+    fn a_start_on_postgres_waits_for_a_write_without_holding_what_it_needs() {
+        let Some(url) = test_database_url() else {
+            return;
+        };
+        let schema = test_schema_name();
+        let _first = Db::open_postgres(&url, Some(schema.clone())).unwrap();
+        let tables = indexed_tables();
+        assert!(tables.len() >= 7, "{tables:?}");
+        let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        for held in &tables {
+            let mut write = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            write
+                .batch_execute(&format!("SET search_path TO {schema}"))
+                .unwrap();
+            write.batch_execute("BEGIN").unwrap();
+            write
+                .batch_execute(&format!("LOCK TABLE {held} IN ROW EXCLUSIVE MODE"))
+                .unwrap();
+            let start = {
+                let (url, schema) = (url.clone(), schema.clone());
+                std::thread::spawn(move || Db::open_postgres(&url, Some(schema)).map(drop))
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let waiting = watch
+                    .query(
+                        "SELECT l.mode FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+                           JOIN pg_namespace n ON n.oid = c.relnamespace
+                         WHERE NOT l.granted AND n.nspname = $1 AND c.relname = $2",
+                        &[&schema, held],
+                    )
+                    .unwrap();
+                if let Some(row) = waiting.first() {
+                    let mode: String = row.get(0);
+                    let altered = ADDED_COLUMNS.iter().any(|(table, ..)| table == held);
+                    let expected = if altered {
+                        "AccessExclusiveLock"
+                    } else {
+                        "ShareLock"
+                    };
+                    assert_eq!(mode, expected, "{held}");
+                    break;
+                }
+                assert!(!start.is_finished(), "the start did not wait for {held}");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the start never reached {held}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            for other in tables.iter().filter(|t| *t != held) {
+                write
+                    .batch_execute(&format!("LOCK TABLE {other} IN ROW EXCLUSIVE MODE"))
+                    .unwrap_or_else(|e| panic!("holding {held}, taking {other}: {e}"));
+            }
+            write.batch_execute("COMMIT").unwrap();
+            start
+                .join()
+                .unwrap()
+                .unwrap_or_else(|e| panic!("starting while {held} was held: {e:#}"));
+        }
     }
 }

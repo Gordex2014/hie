@@ -17,7 +17,7 @@ path = "src/main.rs"
 [features]
 default = ["secrets-native"]
 # Connector credentials encrypted in the engine's own store (SQLite or PostgreSQL).
-secrets-native = ["dep:chacha20poly1305", "dep:hkdf", "dep:hmac", "dep:getrandom", "dep:base64"]
+secrets-native = ["dep:chacha20poly1305", "dep:hkdf", "dep:getrandom", "dep:base64"]
 # secrets-aws: reserved for a backend on AWS Secrets Manager; not built yet.
 
 [dependencies]
@@ -34,9 +34,12 @@ getrandom = { version = "0.4", optional = true }
 helios-auth = "0.2"
 hex = "0.4.3"
 hkdf = { version = "0.13", optional = true }
-# Only to wipe HMAC state: hkdf already depends on it.
-hmac = { version = "0.13", default-features = false, features = ["zeroize"], optional = true }
+# Signs the alert webhook; hkdf already depends on it, and its zeroize feature
+# wipes the HMAC state the secret store derives keys with.
+hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
 http = "1"
+# Time zones, from the IANA database built into the engine (jiff-tzdb), never the host's.
+jiff = { version = "1.0.1", default-features = false, features = ["std", "tzdb-bundle-always"] }
 object_store = { version = "0.11", features = ["aws"] }
 percent-encoding = "2"
 postgres = "0.19"
