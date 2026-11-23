@@ -504,6 +504,10 @@ impl FeedRunner {
             self.transform_and_deliver().await?;
         }
         self.finish()?;
+        // An alert whose rule was turned off, deleted or changed is cleared
+        // when that happens; this catches one raised by a pass that read the
+        // rule just before.
+        self.alerts.clear_unwatched(Some(&self.feed.id))?;
         self.check_silence()?;
         Ok(())
     }

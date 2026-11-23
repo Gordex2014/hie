@@ -1262,11 +1262,20 @@ async fn replace_rule(
     Json(body): Json<Value>,
 ) -> ApiResult {
     let rule = parse_rule(&s, body)?;
+    let before = s.db.rule(id)?;
     if !s.db.update_rule(id, &rule)? {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             format!("rule {id} not found"),
         ));
+    }
+    // An alert says what its rule watched when it fired: turned off, or
+    // watching something else now, the rule ends it.
+    if let Some(why) = before
+        .as_ref()
+        .and_then(|before| crate::alerts::Alerter::rule_update_ends_alerts(before, &rule))
+    {
+        s.alerts.clear_rule(id, why)?;
     }
     let stored =
         s.db.rule(id)?
@@ -1284,6 +1293,7 @@ async fn delete_rule(
             format!("rule {id} not found"),
         ));
     }
+    s.alerts.clear_rule(id, crate::db::RuleGone::Deleted)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -379,6 +379,35 @@ pub struct SubmittableFile {
     pub count: usize,
 }
 
+/// An open alert whose rule no longer watches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnwatchedAlert {
+    pub id: i64,
+    pub feed: Option<String>,
+    pub kind: String,
+    pub why: RuleGone,
+}
+
+/// Why a rule no longer watches an alert it raised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleGone {
+    Deleted,
+    TurnedOff,
+    /// Changed in what it watches: its condition, threshold or source.
+    Changed,
+}
+
+impl RuleGone {
+    /// The alert's clearing reason: a fixed sentence.
+    pub fn reason(self) -> &'static str {
+        match self {
+            RuleGone::Deleted => "its rule was deleted",
+            RuleGone::TurnedOff => "its rule was turned off",
+            RuleGone::Changed => "its rule was changed",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkItem {
     pub id: i64,
@@ -3066,6 +3095,56 @@ impl Db {
                 }
             }
         })
+    }
+
+    /// The open alerts a rule raised, oldest first: (id, source, kind).
+    pub fn open_alerts_of_rule(&self, rule_id: i64) -> Result<Vec<(i64, Option<String>, String)>> {
+        Ok(self
+            .query(
+                "SELECT id, feed_id, kind FROM alerts WHERE rule_id = $1 AND cleared_at IS NULL ORDER BY id",
+                &params![rule_id],
+            )?
+            .iter()
+            .map(|r| (r.i64(0), r.opt_string(1), r.string(2)))
+            .collect())
+    }
+
+    /// The open alerts whose rule no longer watches them, oldest first, each
+    /// with why: the rule was deleted, turned off, or changed to another
+    /// condition or to a source that is not the alert's. Of one source, or of
+    /// every source (alerts about no source included).
+    pub fn unwatched_alerts(&self, feed: Option<&str>) -> Result<Vec<UnwatchedAlert>> {
+        let mut sql = String::from(
+            "SELECT a.id, a.feed_id, a.kind,
+                    CASE WHEN r.id IS NULL THEN 'deleted' WHEN r.enabled = 0 THEN 'off' ELSE 'changed' END
+             FROM alerts a LEFT JOIN alert_rules r ON r.id = a.rule_id
+             WHERE a.cleared_at IS NULL AND a.rule_id IS NOT NULL
+               AND (r.id IS NULL OR r.enabled = 0
+                    OR (r.source_id IS NOT NULL AND (a.feed_id IS NULL OR r.source_id <> a.feed_id))
+                    OR a.kind <> CASE r.condition WHEN 'unreachable' THEN 'delivery'
+                                                  WHEN 'missing_by' THEN 'missing'
+                                                  ELSE r.condition END)",
+        );
+        let mut values = Vec::new();
+        if let Some(feed) = feed {
+            values.push(Param::Text(feed.to_string()));
+            sql.push_str(" AND a.feed_id = $1");
+        }
+        sql.push_str(" ORDER BY a.id");
+        Ok(self
+            .query(&sql, &values)?
+            .iter()
+            .map(|r| UnwatchedAlert {
+                id: r.i64(0),
+                feed: r.opt_string(1),
+                kind: r.string(2),
+                why: match r.string(3).as_str() {
+                    "deleted" => RuleGone::Deleted,
+                    "off" => RuleGone::TurnedOff,
+                    _ => RuleGone::Changed,
+                },
+            })
+            .collect())
     }
 
     /// The open alerts of a kind for a source, with a rule or without, oldest first.

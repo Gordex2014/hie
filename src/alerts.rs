@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use crate::config::AlertConfig;
-use crate::db::{AlertRow, Db, NewWebhook, Rule, WebhookClaim, now_ms};
+use crate::db::{AlertRow, Db, NewWebhook, Rule, RuleGone, WebhookClaim, now_ms};
 
 /// One attempt and up to five retries.
 pub const MAX_ATTEMPTS: u32 = 6;
@@ -207,6 +207,57 @@ impl Alerter {
         tracing::info!(alert = id, feed, kind, "cleared: {reason}");
         self.wake.notify_one();
         Ok(true)
+    }
+
+    /// Clears every open alert of a rule, for `why`: the rule was deleted,
+    /// turned off, or changed in what it watches. Each clear writes the
+    /// alert's `cleared` event for the channels recorded when it fired. If the
+    /// condition still holds under a rule that is still on, the next
+    /// evaluation raises a new alert, with its own id. Returns how many this
+    /// call cleared.
+    pub fn clear_rule(&self, rule_id: i64, why: RuleGone) -> Result<usize> {
+        let mut cleared = 0;
+        for (id, feed, kind) in self.db.open_alerts_of_rule(rule_id)? {
+            if self.clear(id, feed.as_deref().unwrap_or(""), &kind, why.reason())? {
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
+    }
+
+    /// When an update of a rule ends its open alerts: turned off, or changed
+    /// in its condition, threshold or source. Recipients and channels are not
+    /// part of what an alert describes.
+    pub fn rule_update_ends_alerts(old: &Rule, new: &Rule) -> Option<RuleGone> {
+        if !new.enabled {
+            Some(RuleGone::TurnedOff)
+        } else if old.condition != new.condition
+            || old.threshold.trim() != new.threshold.trim()
+            || old.source_id != new.source_id
+        {
+            Some(RuleGone::Changed)
+        } else {
+            None
+        }
+    }
+
+    /// Clears the open alerts whose rule no longer watches them (deleted,
+    /// turned off, or changed to another condition or source), of one source
+    /// or of all. Each clear writes the alert's `cleared` event for the
+    /// channels recorded when it fired. Returns how many this call cleared.
+    pub fn clear_unwatched(&self, feed: Option<&str>) -> Result<usize> {
+        let mut cleared = 0;
+        for alert in self.db.unwatched_alerts(feed)? {
+            if self.clear(
+                alert.id,
+                alert.feed.as_deref().unwrap_or(""),
+                &alert.kind,
+                alert.why.reason(),
+            )? {
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
     }
 
     fn fire(
