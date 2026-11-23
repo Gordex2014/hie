@@ -189,6 +189,7 @@ impl Engine {
         let file = db
             .insert_file(
                 "lab-results",
+                "Lab results",
                 &format!("seed-{n}.csv"),
                 &format!("sha-{n}"),
                 1,
@@ -200,13 +201,10 @@ impl Engine {
             .unwrap();
         db.insert_records(file, "lab-results", &[(1, json!({"row": n}), None)])
             .unwrap();
-        for row in db
-            .query_json("SELECT id FROM records WHERE status = 'received'", [])
-            .unwrap()
-        {
-            let id = row["id"].as_i64().unwrap();
+        for item in db.received_records("lab-results", 100).unwrap() {
+            let id = item.id;
             db.mark_transformed(
-                id,
+                &item,
                 &json!([{"resourceType": "Observation", "id": format!("o{id}"), "status": "final"}]),
             )
             .unwrap();
@@ -536,6 +534,7 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
         let file = db
             .insert_file(
                 "sent-source",
+                "Sent source",
                 "a.csv",
                 "sha-a",
                 1,
@@ -547,13 +546,11 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
             .unwrap();
         db.insert_records(file, "sent-source", &[(1, json!({}), None)])
             .unwrap();
-        db.mark_sent(
-            db.query_json("SELECT id FROM records", []).unwrap()[0]["id"]
-                .as_i64()
-                .unwrap(),
-            &json!([]),
-        )
-        .unwrap();
+        let item = db.received_records("sent-source", 1).unwrap().remove(0);
+        db.mark_transformed(&item, &json!([])).unwrap();
+        let item = db.due_records("sent-source", 1).unwrap().remove(0);
+        db.delivered(&[(&item, hie::db::Delivery::Sent(&json!([])))])
+            .unwrap();
         db
     };
     let e = start(root, None).await;
@@ -611,6 +608,7 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
         channels: vec!["app".into()],
         enabled: true,
         created_by: None,
+        created_at: None,
     };
     e.state
         .db
@@ -721,10 +719,11 @@ async fn the_webhook_hears_one_clear_per_recovered_outage_and_nothing_at_start()
     tokio::time::sleep(Duration::from_millis(200)).await;
     let hooks = hfs.lock().unwrap().hooks.clone();
     assert_eq!(hooks.len(), 2, "{hooks:?}");
-    assert_eq!(hooks[0]["kind"], "delivery");
-    assert!(hooks[0]["cleared"].is_null(), "{hooks:?}");
-    assert_eq!(hooks[1]["cleared"], true, "{hooks:?}");
-    assert_eq!(hooks[1]["kind"], "delivery");
+    assert_eq!(hooks[0]["event"], "fired", "{hooks:?}");
+    assert_eq!(hooks[0]["alert"]["kind"], "delivery");
+    assert_eq!(hooks[1]["event"], "cleared", "{hooks:?}");
+    assert_eq!(hooks[1]["alert"]["kind"], "delivery");
+    assert_eq!(hooks[1]["alert"]["cleared_reason"], RECOVERED);
     // Both name the new outage's alert.
     let outage = e
         .state
@@ -735,8 +734,8 @@ async fn the_webhook_hears_one_clear_per_recovered_outage_and_nothing_at_start()
         )
         .unwrap();
     assert_eq!(outage.len(), 1, "{outage:?}");
-    assert_eq!(hooks[0]["alert_id"], outage[0]["id"]);
-    assert_eq!(hooks[1]["alert_id"], outage[0]["id"]);
+    assert_eq!(hooks[0]["alert"]["id"], outage[0]["id"]);
+    assert_eq!(hooks[1]["alert"]["id"], outage[0]["id"]);
     drop(e);
     drop(legacy);
 }

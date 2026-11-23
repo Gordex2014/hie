@@ -11,14 +11,17 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `POST /api/sources/test` | Tests a connection: `{"source": {...}}` or a full definition. Answers `reachable`, `elapsed_ms`, `objects`, `newest`, `newest_at`. An S3 source with a `credential` is tested with the credential's current revision; with no secret store, whether the key is missing or unusable or the build has no secret backend, it answers `503 secrets_unavailable` |
 | `GET /api/sources/{id}` | One source, as above |
 | `PUT /api/sources/{id}` | Replaces the definition and restarts the source. A definition is refused as `POST` refuses it: `400 invalid_definition` (in a build without a secret backend too, when it names a credential), or `503 secrets_unavailable` when it names a credential and the store has no usable key |
-| `DELETE /api/sources/{id}` | Stops the source and removes its file; its records and alerts stay |
+| `DELETE /api/sources/{id}` | Stops the source and removes its file `sources/{id}.yaml`; its loads, records and alerts stay (see [Loads](#loads) for a source created again with the same id). Its checks still pending fail (unless another instance holds the source); `503 store_busy` when the store's lock was not free, and the source is left as it was |
 | `POST /api/sources/{id}/pause` | Stops polling and delivery until resumed; body `{"by": "..."}` is kept with the time |
 | `POST /api/sources/{id}/resume` | Resumes and passes at once |
-| `POST /api/sources/{id}/check-now` | Passes now instead of at the next poll |
-| `GET /api/sources/{id}/loads` (also `/files`) | Every load: the file, its method, records read, sent, rejected, in progress, how long it took, where it is archived |
-| `GET /api/loads/{id}` | One load with its **failures grouped by reason**: kind, reason, count, first line, and up to three sample rows each |
+| `POST /api/sources/{id}/check-now` | Passes now instead of at the next poll, and records a check of the source: `202 {"id", "checking": true, "check_id"}` with `Location: /api/checks/{check_id}`. `503 store_busy` when the store's lock was not free. See [checks](#checks) |
+| `GET /api/checks/{id}?cursor=&limit=` | What a check found: `pending`, `found` (with the loads), `nothing_new` or `failed` (with the reason), and when it was asked for and answered. `404` for an unknown or purged check; an id that is not an integer answers `400`, a parameter that cannot be read `400 invalid_query` |
+| `GET /api/sources/{id}/loads` (also `/files`) | Every load: the file, its method, records read, sent, rejected (and `failing`, those that fail it), in progress, how long it took, where it is archived, whether it is `failed` and the `source_name` it was recorded under ([below](#loads)) |
+| `GET /api/loads?status=&source=&limit=50&cursor=` | The loads of every source, newest first, a page at a time, with the same fields; `status=failed` keeps the loads failing now ([below](#loads)) |
+| `GET /api/loads/{id}` | One load, with the same fields, and its **failures grouped by reason**: kind, reason, count, first line, and up to three sample rows each |
 | `POST /api/loads/{id}/retry` | Puts the load's rejected rows back at the start, all of them or those with one reason (`{"reason": "..."}`); the source passes at once |
 | `GET /api/sources/{id}/stats?days=14` | What a source's page draws: today (files, records, sent, rejected, pending) and one row per day |
+| `GET /api/sources/{id}/failures?days=14` | Distinct records the source rejected over the last 24 hours and each of the last `days` UTC days (1 to 90), from the event log, with how far the log covers each (see [Rejected records over a period](#rejected-records-over-a-period)) |
 | `GET /api/transforms` | Every transform file: name, path, size, modified, and the sources that use it |
 | `GET /api/transforms/{name}` | The transform's code |
 | `PUT /api/transforms/{name}` | Saves the code (`{"code": "..."}`); the sources using it restart their Python worker. `201` when new |
@@ -27,18 +30,204 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /api/records?source=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
 | `GET /api/records/{id}` | One record: file, line, original and corrected row, resources sent, HFS response |
 | `POST /api/records/{id}/reprocess` | Runs a record again; body `{"raw": {...}}` replaces the row and keeps the original |
-| `GET /api/alerts?source=&open=true` | Alerts, newest first, each with its rule, recipients, channels, and when and why it cleared; `open=true` lists only those not cleared |
-| `GET /api/alert-rules?source=` | Every rule; `POST` creates one (`400` names what is wrong with it) |
+| `GET /api/alerts?source=&open=true&since=&limit=100&cursor=` | Alerts, newest first, each with its rule, recipients, channels, when and why it cleared, and `webhook`: the delivery of its latest webhook event (`event`, `event_id`, `state`, `attempts`, `last_error`, `last_status`, `delivered_at`; null for alerts from before events were recorded); `open=true` lists only those not cleared. `since` and `cursor` read a period page by page (see [Reading alerts by period](#reading-alerts-by-period)). Kept for `retention.history` (see [Alerts and retention](#alerts-and-retention)). Also `webhook: {configured, signed}`, this instance's webhook settings (see [the alert webhook](sources.md#the-alert-webhook)) |
+| `GET /api/events?source=&kind=&since=&cursor=&limit=` | The event log, oldest first: each record's attempts and outcomes, each load's steps, each submission's steps (see [Events](#events)) |
+| `GET /api/alert-rules?source=` | Every rule, each with its `created_at`; `POST` creates one (`400` names what is wrong with it). `created_at` is set by the engine, never by the body. A rule id is never given again, like alert and event ids |
 | `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove |
 | `GET /api/secrets` | Every stored credential, by name, without its value |
 | `POST /api/secrets` | Stores a credential: `{"name", "kind": "aws", "value": {"access_key_id", "secret_access_key"}}`. `201` |
 | `GET /api/secrets/{id}` | One credential, without its value |
 | `PUT /api/secrets/{id}` | Replaces its value with a new revision: `{"value": {...}}`. Sources use it from their next pass |
 | `DELETE /api/secrets/{id}` | Removes it. `409` with `sources` while a source is registered for it |
-| `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind |
+| `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind (`hie_alerts_total`, which counts purged alerts too and never goes down) |
 | `GET /health` | `{"status": "ok", "service": "hie", "version", "uptime_seconds", "started_at", "timestamp", "secrets"}`; `secrets` is `{"backend": "native"\|"none", "available", "key_id"}`, the key id being a one-way 16-hex fingerprint of the key in use, or `null` |
 
-Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), and the codes of the credential routes below.
+Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), `invalid_query` (`400`: a query parameter of `/api/events`, `/api/alerts`, `/api/checks/{id}` or `/api/loads` that cannot be read, with `field` as their sections say), and the codes of the credential routes below.
+
+### Events
+
+The engine appends an event for each attempt and outcome of a record, each step of a load and each step of a `$bulk-submit` submission. An event is written in the same transaction as the change it reports: when a record's outcome is stored, so is its event, before the next record is sent or transformed. If the event cannot be stored, neither is the outcome. Events are never changed; the retention purge removes those older than `retention.history` (see [Retention](running.md#retention)).
+
+```json
+{"id": 41, "at": "2026-11-20T08:00:03.120Z", "source_id": "lab-results", "kind": "record.rejected",
+ "load_id": 7, "record_id": 912, "attempt": null, "error_kind": "data",
+ "reason": "value 'alto' is not a number", "detail": null}
+```
+
+- `id` orders the log: ids are given in commit order and never given twice, even after a purge or a restart.
+- `at` is when the writing instance stored it, by its own clock. Across instances, or after a clock step, it may be out of order with `id`.
+- `load_id` is the load (`/api/loads/{id}`), `record_id` the record (`/api/records/{id}`). `detail` is an object or `null`.
+
+Record events carry `load_id` and `record_id`:
+
+| `kind` | When | Also |
+|---|---|---|
+| `record.delivered` | The FHIR server took the record (its batch entry answered 2xx, or a bulk receipt named it) with no failed attempt since it was received or put back | `attempt` (REST); `detail.submission`, `detail.run` (bulk) |
+| `record.recovered` | The same, after failed attempts: on REST the record's own; on the bulk path its submission's | `attempt` (REST); `detail.failures` (bulk) |
+| `record.attempt_failed` | An attempt failed for a reason that may pass; the record is kept and tried again. A delivery (`detail.phase: "delivery"`, `attempt`, `detail.next_attempt_at`), or a transform that could not finish now (`detail.phase: "transform"`, no `attempt`; one for a record and reason while the source's runner runs, and again when the reason changes, the record is put back or the runner starts again) | `reason` |
+| `record.rejected` | The record is rejected: `error_kind` is `parse`, `data`, `validation`, `filtered`, `transform` or `server`, including a file that can no longer be handed over and a refused submission | `error_kind`, `reason`; `attempt` when the FHIR server refused it on REST |
+| `record.retried` | A person put the record back: a load's Retry or a record's reprocess | `detail.from_status`, `detail.corrected` |
+
+Load events carry `load_id`:
+
+| `kind` | When | `detail` |
+|---|---|---|
+| `load.received` | A file, object or zip entry was recorded and its records stored, or a zip was recorded | `name`, `size`, `records`; `container: true` for a zip |
+| `load.duplicate` | The same content was already received | `name`, `duplicate_of` |
+| `load.unreadable` | The file could not be read (`reason` says why) | `name`, `size` |
+| `load.finished` | Every record of the load is sent or rejected | `records`, `sent`, `rejected`; `container: true` for a zip |
+| `load.retried` | A person retried the load's rejected rows and at least one was put back (`reason` is the reason it was limited to, if any) | `retried` |
+
+Submission events (the bulk path) carry `detail.submission`, the id the FHIR server sees (the same for a repeated drop), and `detail.run`, a 16-hex key of this run that grants nothing:
+
+| `kind` | When | Also |
+|---|---|---|
+| `submission.opened` | The engine opened a submission | `detail.records`, `detail.files` |
+| `submission.attempt_failed` | A kick-off or status poll failed for a reason that may pass | `attempt`, `reason`, `detail.next_attempt_at` |
+| `submission.refused` | The FHIR server refused the submission; each of its records gets `record.rejected` | `reason`, `detail.records` |
+| `submission.settled` | The receipts were applied and the submission closed, once | `detail.sent`, `detail.rejected`, `detail.failures` |
+
+Nothing else is an event: a Try, a worker that cannot start (no record is involved; the log says why), changes to sources, the transform step itself, archiving a file, and alerts (which have their own list).
+
+- Deliveries in a period are `kind=record.delivered,record.recovered` (the two never describe the same delivery). The `record` family also holds rejections, put-backs and failed attempts.
+- An attempt is a delivery attempt that ended, for this record, in a delivery, a rejection or a failure that may pass. A batch the server refused as a whole is sent again record by record, and that whole refusal is not counted as an attempt.
+- A load finishes again after a Retry or a reprocess put some of its records back: there is one `load.finished` each time.
+- An outcome worked out for a record that a person put back meanwhile (a Retry or a reprocess while it was being transformed or sent) changes nothing and writes no event; the record goes through again.
+- On a store upgraded from an earlier version, a submission that was partly settled before the upgrade counts in `submission.settled` only the records settled after it.
+
+**Text.** A `reason` is the engine's own text for the fact (the stored error), with every URL cut to its origin followed by `/…` (a signed URL's path and query never appear), and at most 500 characters. A request target the engine names in a failure (a status, manifest or receipt URL, absolute or relative) is only ever its origin, or `<URL>`. Any other word (up to whitespace, a quote, `<` or `>`) that has a `?` followed later in the word by `=` keeps what comes before the `?` and loses the rest, so a relative target a server echoes, such as `/receipts/1?X-Amz-Signature=…`, becomes `/receipts/1?…`. On the bulk path the submission's token is replaced by `<token>` wherever it would appear, in the records' stored errors and answers too. No event carries a submission's token, its status URL or a server's full answer.
+
+**Reading.** `GET /api/events` lists events oldest first, by `id`:
+
+- `source`: one source id.
+- `kind`: one or more kinds or families (`record`, `load`, `submission`), separated by commas.
+- `since`: an RFC 3339 instant (`2026-11-20T08:00:00Z`). Only events stored at or after it (`at >= since`) are listed, with or without a cursor. Events are stored to the millisecond, so a finer instant counts from the next millisecond. Without a cursor it also sets where the page starts: at the first event, by id, stored at or after it.
+- `cursor`: the `next_cursor` of an earlier answer, to continue after it. Its text is opaque (today `e1.` and a number). Give the same filters again with it. A cursor stays valid after its event is purged.
+- `limit`: 1 to 1000, 100 by default.
+
+```json
+{"events": [ ... ], "next_cursor": "e1.41", "has_more": false}
+```
+
+`has_more` says another page is ready now. `next_cursor` is where the next request continues: after the last event listed when `has_more`, otherwise the newest position of the log when the request was read, or the cursor given if that is later. A poller whose filters matched nothing still moves forward, and a cursor never moves back, even after a purge. It is `null` only when the log is empty and no cursor was given. Ids are given in commit order (on PostgreSQL every instance writes events under one lock, in turn), and a page never lists past the newest id committed when it was read, so polling from `next_cursor` never skips an event.
+
+Every parameter that cannot be read is refused with `400`, `code: "invalid_query"` and `field` naming it: a value that does not parse (`limit` is digits only), a parameter given twice, or one that is not `source`, `kind`, `since`, `cursor` or `limit`.
+
+A poller pages with `cursor`: the first request may give `since`, and each next one the `next_cursor` it got (with the same filters). A `since` without a cursor reads a range of the log by time on every request, which costs more on a large log.
+
+### Rejected records over a period
+
+`GET /api/sources/{id}/failures?days=14` counts, from the event log, the distinct records a source rejected in each window: a record rejected more than once in a window counts once.
+
+```json
+{"source_id": "lab-results", "tz": "UTC", "covered_from": "2026-11-12T09:30:00.000Z",
+ "last_24h": {"from": "...", "to": "...", "records": 3, "filtered": 1, "complete": true},
+ "days": [{"day": "2026-11-07", "from": "2026-11-07T00:00:00.000Z", "to": "2026-11-08T00:00:00.000Z",
+           "records": 0, "filtered": 0, "complete": false}, ...]}
+```
+
+- `last_24h` is the 24 hours before the request; `days` are UTC calendar days, oldest first, the last one today (still running). A window holds what was stored from its `from`, included, to its `to`, left out: an event at midnight belongs to the day that starts then.
+- `records` counts records rejected as `parse`, `data`, `validation`, `transform` or `server`. Records a transform filtered out on purpose (`filtered`) are not failures and are counted apart, in `filtered`.
+- `covered_from` is where the log's history starts: when this store began recording events (its first start with a version that keeps them), or the retention's limit, whichever is later. A window is `complete` when `covered_from` is at or before its `from`. A window that is not complete is still counted over what is kept, and says `complete: false`.
+- `days` is a whole number from 1 to 90 (14 by default). A value that cannot be read, a second `days` or any other parameter answers `400 invalid_query` with `field`. An unknown source answers `404` with `{"error": "source <id> not found"}`, as `/stats` does.
+
+### Alerts and retention
+
+Stored alerts follow `retention.history` too. An alert is purged that long after it cleared, or after it was raised if it is still open, except:
+- open alerts of a rule that exists, is enabled and was created before the alert (on SQLite a deleted rule's id may be given to a new rule);
+- open `credential` and `definition` alerts, which the engine clears itself;
+- the alert with the highest id.
+
+Open alerts of a deleted or disabled rule, and other open alerts without a rule, are purged by age. An alert id is never given again after a purge: the newest alert is always kept, so a SQLite store never reuses one, and PostgreSQL ids come from a sequence. Rule ids are never given again either: SQLite rules take their ids from `AUTOINCREMENT` (a store made before is rebuilt to it once, at its first start with this version), PostgreSQL's from a sequence. `hie_alerts_total` in `/metrics` adds the purged alerts to the stored ones, so it never goes down. A purged alert's [webhook events](sources.md#the-alert-webhook) go with it, any still waiting included.
+
+### Reading alerts by period
+
+`GET /api/alerts` reads every alert of a period by following a cursor:
+
+```
+GET /api/alerts?since=2026-11-13T00:00:00Z&limit=100
+→ {"alerts": [...], "next_cursor": "a1.8421", "webhook": {...}}
+GET /api/alerts?since=2026-11-13T00:00:00Z&limit=100&cursor=a1.8421
+→ {"alerts": [...], "next_cursor": null, "webhook": {...}}
+```
+
+- **`since`** keeps the alerts created at or after an RFC 3339 instant (`Z` or an offset, with `+` sent as `%2B`). Alerts are stored to the millisecond, so a finer instant counts from the next millisecond; more than nine fraction digits and leap seconds (`:60`) are refused. Alerts purged by `retention.history` are no longer listed.
+- **`next_cursor`** is set when more alerts match, and `null` on the last page, so a reader stops there without asking again. It is opaque: pass it back as `cursor` with the same `source`, `open`, `since` and `limit`; it does not carry them. Empty `since=` and `cursor=` are the same as leaving them out.
+- **`webhook`** (`configured`, `signed`) is on every page, the empty one included: this instance's [webhook](sources.md#the-alert-webhook) settings, not part of the paging.
+- **`limit`** is 100 by default. `0` answers an empty page with `next_cursor: null`, whatever matches, and a negative value every matching alert (as SQLite always did; PostgreSQL used to answer `500`).
+- **While a reader pages**, the order holds: a walk returns, once each and newest first, every alert that existed when it began and still matches when its page is read. An alert created meanwhile may or may not appear; a new walk finds it. An alert that clears, or is removed, between two pages leaves the others where they were: with `open=true` it simply no longer appears, and the alert a cursor points after need not exist any more. So a page after a cursor can be empty, when the alerts it would have held left in the meantime: stop on `null`, not on an empty page.
+- **Refused** with `400 invalid_query`: a `since` that is not such an instant (`field: since`), a malformed `cursor` (`field: cursor`), and values of the wrong type or given twice (`limit=abc`, `open=yes`, `limit=1&limit=2`, without `field`). The sentence never repeats what was sent.
+
+### Checks
+
+`POST /api/sources/{id}/check-now` records a check and answers its `check_id`; `GET /api/checks/{id}` says what it found (sent with `Cache-Control: no-store`):
+
+```json
+{"check_id": 7, "source": "lab-results", "status": "found",
+ "requested_at": "2026-11-20T10:00:00.000Z", "finished_at": "2026-11-20T10:00:00.412Z",
+ "file_count": 1, "files": [{"id": 31, "name": "labs.csv", "status": "processing", "duplicate_of": null}],
+ "next_cursor": null, "has_more": false, "reason": null}
+```
+
+- **Who answers it.** The first scan of the source that starts after the check was recorded, on whichever instance holds the source. A pass reads the waiting checks just before its scan; a check asked for after that is answered by the next pass, which the request starts at once on that instance once the current pass, delivery included, has finished. Sent to an instance that stands by, the check waits for the holder's next poll.
+- **`found`** lists the loads the source recorded from the moment the check was asked for until the end of the scan that answered it: duplicates (with `duplicate_of`), a zip and its entries, and files that could not be read are loads too. Each comes with its current `status`; `GET /api/loads/{id}` has the rest. A check covers taking files in, not delivering them: delivery is on the loads.
+- **`nothing_new`**: the source recorded no load from the moment the check was asked for until the end of the scan that answered it. Files younger than the source's `min_file_age_ms` are not new, nor are objects a read-only source took before, copies of content a read-only source already took, or a copy whose original still waits for the FHIR server on the bulk path.
+- **`failed`**, with a fixed `reason`: the source is paused; its credential is not loaded; listing it, reading an object, taking one in or acknowledging its notifications failed; or it was deleted. The reason never carries the error itself (it can hold a URL, a query or a server's answer); the engine log does. Loads taken before the failure are still listed.
+- **`pending`**: not answered yet; `finished_at` is `null` and `files` empty. A check whose source was removed from disk while the engine was down, or sent to an instance whose holder never scans it, stays pending until the retention purge.
+- **More than 1000 loads**: `files` holds the first `limit` (1 to 1000, by default 1000), `has_more` says whether there are more, and `?cursor=<next_cursor>` lists the following ones; the cursor is opaque. `file_count` counts them all. An unknown parameter, one given twice, or a value that cannot be read answers `400 invalid_query` with `field`.
+- **Timestamps**: `requested_at` is taken by the instance that recorded the check, `finished_at` by the one that answered it (never before `requested_at`); with several instances their clocks may differ.
+- **Retention**: checks are kept for `retention.history` (see [Retention](running.md#retention)), purged with events and alerts, from when they were asked for, answered or not, then purged; a purged check answers `404`, and its id is never given to another check. Only loads still stored are listed.
+
+### Loads
+
+A load is one file, object or zip entry a source took, and what became of its rows. `GET /api/loads` lists the loads of every source; `GET /api/sources/{id}/loads` and `GET /api/loads/{id}` answer the same fields:
+
+```json
+{"id": 812, "source_id": "lab-results", "source_name": "Lab results", "name": "labs-2026-11-20.csv",
+ "status": "done", "failed": true, "records": 120, "sent": 117, "rejected": 3, "failing": 2, "in_progress": 0,
+ "received_at": "2026-11-20T08:00:01.120Z", "finished_at": "2026-11-20T08:00:04.870Z", "took_ms": 3750,
+ "duplicate_of": null, "size": 8812, "error": null, "source_key": null, "archived": 1, "method": "rest"}
+```
+
+- **`status`** is how the engine stores the load: `processing` (rows still to transform or deliver), `done` (every row sent or rejected), `unreadable` (the file could not be read; `error` says why), `duplicate` (the same content was already taken; `duplicate_of` names that load; no rows), or `unpacked` (a zip, while its entries are taken; each entry is a load of its own named `drop.zip!/path`, and the zip becomes `done` with no rows at a later pass).
+- **`failed`** is `true` while the load fails now: it is `unreadable`, or at least one of its rows is rejected for a reason other than `filtered`, whatever its `status`, so a load still `processing` fails as soon as one row fails. A `filtered` row is one its transform turned into no resources, on purpose: it counts in `rejected` but does not make the load fail, so a load whose only rejected rows are filtered has `rejected > 0` and `failed: false`. Every other kind fails it (`parse`, `data`, `validation`, `transform`, `server`, or any other). Rows put back by a Retry or a reprocess are not rejected any more: the load stops failing until a row fails again; a Retry limited to one reason leaves it failing while failing rows with another reason remain. Rows waiting for another delivery attempt (the FHIR server could not be reached) are not rejected. A duplicate does not fail because the load it repeats does, and a zip fails only when it could not be read: the failures of its entries are on the entries. A source that cannot be listed or read records no load: it is logged, and the alerts that may follow are those of a listener that cannot start, a credential that cannot be used, and, later, a `silence` or `missing_by` rule.
+- **`records`**, **`sent`**, **`rejected`** and **`in_progress`** count its rows by what became of them; **`failing`** counts the rejected rows that fail it, every rejected row but the `filtered` ones, so `failed` is `true` exactly when `failing > 0` or the load is `unreadable`. A load whose only rejected rows are filtered shows `rejected > 0` and `failing: 0`.
+- **`source_name`** is the name the source had when the load was recorded, kept with the load: it stays after the source is deleted and does not follow a later rename. `null` when it was not recorded: loads recorded before this field existed, or by an instance of an earlier version sharing the store, and a name with a NUL character, which a PostgreSQL store cannot hold.
+- **`method`** is the delivery method of the source now registered under `source_id` on the instance that answers, `null` when there is none.
+- **Kept:** loads and their rows are never purged; `retention.history` (see [Retention](running.md#retention)) applies to events, alerts and checks only, so a load stays listed after the events that tell its story are gone.
+
+`GET /api/loads` takes:
+
+| Parameter | |
+|---|---|
+| `status` | One of `processing`, `unpacked`, `done`, `unreadable`, `duplicate`, or `failed` (the loads whose `failed` is `true`) |
+| `source` | One source id, whether or not a source is registered under it now |
+| `limit` | The loads per page, from 1 to 200; 50 by default |
+| `cursor` | The previous page's `next_cursor` |
+
+```
+GET /api/loads?status=failed&limit=50
+→ {"loads": [...], "next_cursor": "a1.812"}
+GET /api/loads?status=failed&limit=50&cursor=a1.812
+→ {"loads": [...], "next_cursor": null}
+```
+
+- **Order:** newest first by `id`, the order the engine recorded the loads. `received_at` normally agrees; between instances whose clocks differ, the id decides.
+- **`next_cursor`** is set when more loads matched as the page was read, and `null` on the last page. It is opaque: pass it back as `cursor` with the same `status`, `source` and `limit`; it does not carry them. An empty `status=`, `source=` or `cursor=` is the same as leaving it out (an empty `limit=` is refused); other parameters are ignored, so there is no `since` here.
+- **While a reader pages**, each page holds the matching loads with an id below the cursor, read in one statement, so its fields, counts and `next_cursor` agree with each other. Following the cursors never returns a load twice, and returns every load that existed when the walk began and still matched when its page was read. Loads recorded after the first page have higher ids and stay outside the walk; a new walk finds them (on PostgreSQL an id is taken before its row commits, so a load can also commit below the cursor and be found by a later page). With `status=failed`, or a status a load leaves (`processing` to `done`), a load can start or stop matching between two pages: one that starts matching above the cursor needs a new walk. A page after a cursor can be empty when the loads it would have held stopped matching: stop on `null`, not on an empty page.
+- **Refused** with `400 invalid_query`: a `limit` outside 1 to 200 (`field: limit`), a `source` with a control character (`field: source`), another `status` (`field: status`), a malformed `cursor` (`field: cursor`), and values of the wrong type or given twice (`limit=abc`, `limit=1&limit=2`, without `field`). The sentence never repeats what was sent.
+
+**Deleted sources and reused ids.** A load stays in the store when its source is deleted, and `GET /api/loads` keeps listing it under the `source_id` and `source_name` it was recorded with. A source id is the only key the engine has for a source's history, and everything kept under it stays when the source is deleted. A source created later with the same id takes it over:
+
+- its loads: they appear in the new source's list, under `source=`, and in its stats and monitoring figures;
+- its events and failure figures: `/api/events?source=` and `/api/sources/{id}/failures` include the earlier source's;
+- checks still pending for the id: the new source's next scan answers them with its own loads;
+- its pause state, its rules and its open alerts: a silence rule counts from the earlier source's last load and keeps its threshold, so the new source may be reported silent at once, and its `expect_every` does not replace that rule;
+- its read cursors, when the new source reads the same column or resource types: a database or FHIR-server source then continues after the earlier source's cursor rather than from its own start;
+- its unfinished rows: rows still received, and rows put back by a Retry of an earlier load, are handled as the new source handles its own: transformed by its transform and delivered to its destination, or, when it hands over source objects, checked and handed over without a transform; rows already transformed and waiting for delivery keep the resources the earlier transform made, and a new source that delivers by REST or by `$bulk-submit` of transformed NDJSON sends them as they are, while one that hands over source objects hands over the load's file, which fails for a file the engine did not keep; submissions still open on the `$bulk-submit` path are followed only if the new source also delivers that way;
+- its files, for deduplication: a file or object whose content the earlier source took is recorded as a `duplicate` of the earlier load by a source that moves what it reads, skipped without a load by a `read_only` source (which knows a non-empty file it took by its name and size, so a different file with the same name and size is skipped too), and skipped while the earlier object still waits to be fetched on the `$bulk-submit` path; an entry of a new zip whose content was taken before is recorded as a `duplicate` by either kind.
+
+To keep two histories apart, give the new source a new id. `source_name` and `received_at` tell the earlier loads apart when the name changed. `GET /api/sources` says whether a source is registered under an id now, on the instance that answers; it cannot say whether that is the definition that recorded a given load. `DELETE` removes `sources/{id}.yaml` only: a definition kept under another file name in the sources directory starts again with the engine.
 
 ### The destination
 
@@ -115,7 +304,7 @@ What a token may do is decided by its scopes (the `scope`, `scp` or `roles` clai
 
 | Scope | Grants |
 |---|---|
-| `hie/read` | Every `GET` except `/api/secrets`: sources, loads, records, transforms, alerts, rules, monitoring |
+| `hie/read` | Every `GET` except `/api/secrets`: sources, loads, checks, records, transforms, alerts, events, rules, monitoring |
 | `hie/manage` | Changing sources, rules, loads and records (`POST`, `PUT`, `DELETE`, pause, resume, retry, reprocess, try), and reading; and credentials: every method on `/api/secrets`, reads included |
 | `hie/transforms` | `PUT /api/transforms/{name}`: code the engine then runs; and reading |
 | `hie/*` | Everything |

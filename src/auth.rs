@@ -200,6 +200,11 @@ mod tests {
             );
         }
         assert_eq!(required_scope("GET", "/api/secretsx"), SCOPE_READ);
+        assert_eq!(required_scope("GET", "/api/checks/7"), SCOPE_READ);
+        assert_eq!(
+            required_scope("POST", "/api/sources/lab/check-now"),
+            SCOPE_MANAGE
+        );
     }
 
     #[test]
