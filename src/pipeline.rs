@@ -1811,24 +1811,17 @@ enum Decided {
 }
 
 /// A share above `limit`, with one decimal or as many more as it takes to
-/// read above it: 1 in 81 against 1.23% is 1.235, not 1.2.
+/// read above it, and below 100 unless every row failed: 1 in 81 against
+/// 1.23% is 1.235, not 1.2.
 fn above(share: f64, limit: f64) -> String {
     (1..=6)
         .map(|decimals| format!("{share:.decimals$}"))
-        .find(|shown| shown.parse::<f64>().is_ok_and(|v| v > limit))
+        .find(|shown| {
+            shown
+                .parse::<f64>()
+                .is_ok_and(|v| v > limit && (v < 100.0 || share >= 100.0))
+        })
         .unwrap_or_else(|| share.to_string())
-}
-
-#[cfg(test)]
-mod share_tests {
-    use super::above;
-
-    #[test]
-    fn a_share_reads_above_the_limit_it_exceeds() {
-        assert_eq!(above(500.0 / 6.0, 10.0), "83.3");
-        assert_eq!(above(100.0 / 81.0, 1.23), "1.235");
-        assert_eq!(above(100.0, 99.99), "100.0");
-    }
 }
 
 pub fn human(d: Duration) -> String {
@@ -2020,5 +2013,21 @@ mod tests {
         assert_eq!(signed_with(&runner).await, "AKIDSECOND");
         assert!(db.open_alert("s", "credential", None).unwrap().is_none());
         drop(other);
+    }
+}
+
+#[cfg(test)]
+mod share_tests {
+    use super::above;
+
+    #[test]
+    fn a_share_reads_above_the_limit_it_exceeds() {
+        assert_eq!(above(500.0 / 6.0, 10.0), "83.3");
+        assert_eq!(above(100.0 / 81.0, 1.23), "1.235");
+        assert_eq!(above(100.0, 99.99), "100.0");
+        assert_eq!(above(9996.0 / 100.0, 99.95), "99.96");
+        // Closer than six decimals: shown in full, still above.
+        let shown = above(100.0 / 3.0, 33.333_333_3);
+        assert!(shown.parse::<f64>().unwrap() > 33.333_333_3, "{shown}");
     }
 }
