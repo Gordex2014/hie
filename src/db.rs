@@ -185,6 +185,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("files", "archived", "INTEGER NOT NULL DEFAULT 0"),
     ("files", "origin", "TEXT"),
     ("files", "source_name", "TEXT"),
+    // The most failing rows (rejected, not `filtered`) a finish of the file has
+    // seen: a load's alert is raised again only when more rows fail than that.
+    // `rejected_reported` counted filtered rows too; it is kept up to date for
+    // earlier versions sharing the store, and no longer read.
+    ("files", "failing_reported", "INTEGER NOT NULL DEFAULT 0"),
     ("records", "submission", "TEXT"),
     // Bumped when a person puts a record back: an outcome computed for an older
     // revision changes nothing.
@@ -234,6 +239,12 @@ const ADDED_INDEXES: [&str; 2] = [
     "CREATE INDEX IF NOT EXISTS records_submission_id ON records(submission, id)",
     "CREATE INDEX IF NOT EXISTS events_source_kind_at ON events(source_id, kind, at)",
 ];
+
+/// A record that fails: rejected for any reason but `filtered`, which a
+/// transform asks for on purpose by returning no resources. `rejected` counts
+/// both; `failing` only these. The partial indexes below spell it out, so
+/// SQLite matches their predicate to the queries that use this.
+pub const FAILING: &str = "status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'";
 
 /// The indexes the loads list chooses its pages through, each built in a
 /// transaction of its own: a build over a large `records` locks that table
@@ -544,9 +555,14 @@ pub struct FinishedFile {
     pub name: String,
     pub total: i64,
     pub sent: i64,
+    /// Every rejected row, the `filtered` ones included.
     pub rejected: i64,
-    pub newly_rejected: i64,
-    pub first_rejection: Option<(i64, String)>,
+    /// The rejected rows that fail the load: every one but the `filtered`.
+    pub failing: i64,
+    /// Failing rows beyond the most any earlier finish of the file saw.
+    pub newly_failing: i64,
+    /// The failing row with the lowest line, and its error.
+    pub first_failure: Option<(i64, String)>,
 }
 
 /// Who holds a source and until when.
@@ -1703,7 +1719,8 @@ impl Db {
         .map(drop)
     }
 
-    /// Rejected records of a file, grouped by reason, each with a few sample rows.
+    /// Rejected records of a file, grouped by reason, each with a few sample
+    /// rows: the `filtered` ones too, which do not fail the load.
     pub fn failure_groups(&self, file_id: i64) -> Result<Vec<Value>> {
         let groups = self.query_json(
             "SELECT error_kind AS kind, error AS reason, COUNT(*) AS n, MIN(line) AS first_line
@@ -1969,22 +1986,30 @@ impl Db {
     pub fn finish_file(&self, feed: &str, candidate: i64) -> Result<Option<FinishedFile>> {
         self.transaction(|tx| {
                 let lock = format!(
-                    "SELECT name, status, rejected_reported FROM files
+                    "SELECT name, status, failing_reported FROM files
                      WHERE id = $1 AND status IN ('processing', 'unpacked'){}",
                     tx.for_update()
                 );
                 let Some(file) = tx.query_one(&lock, &params![candidate])? else {
                     return Ok(None);
                 };
+                // The marks are raised by the statement that checks no row is in
+                // progress, so they count the rows as they are finished.
                 let moved = tx.query_one(
-                    "UPDATE files SET status = 'done', finished_at = $2,
-                            rejected_reported = CASE
-                              WHEN rejected_reported > (SELECT COUNT(*) FROM records WHERE file_id = $1 AND status = 'rejected')
-                              THEN rejected_reported
-                              ELSE (SELECT COUNT(*) FROM records WHERE file_id = $1 AND status = 'rejected') END
-                     WHERE id = $1 AND status IN ('processing', 'unpacked')
-                       AND NOT EXISTS (SELECT 1 FROM records WHERE file_id = $1 AND status IN ('received', 'pending', 'submitted'))
-                     RETURNING id",
+                    &format!(
+                        "UPDATE files SET status = 'done', finished_at = $2,
+                                rejected_reported = CASE
+                                  WHEN rejected_reported > (SELECT COUNT(*) FROM records WHERE file_id = $1 AND status = 'rejected')
+                                  THEN rejected_reported
+                                  ELSE (SELECT COUNT(*) FROM records WHERE file_id = $1 AND status = 'rejected') END,
+                                failing_reported = CASE
+                                  WHEN failing_reported > (SELECT COUNT(*) FROM records WHERE file_id = $1 AND {FAILING})
+                                  THEN failing_reported
+                                  ELSE (SELECT COUNT(*) FROM records WHERE file_id = $1 AND {FAILING}) END
+                         WHERE id = $1 AND status IN ('processing', 'unpacked')
+                           AND NOT EXISTS (SELECT 1 FROM records WHERE file_id = $1 AND status IN ('received', 'pending', 'submitted'))
+                         RETURNING id"
+                    ),
                     &params![candidate, now_ms()],
                 )?;
                 if moved.is_none() {
@@ -1992,21 +2017,27 @@ impl Db {
                 }
                 let counts = tx
                     .query_one(
-                        "SELECT COUNT(id),
-                                CAST(COALESCE(SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END), 0) AS BIGINT),
-                                CAST(COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT)
-                         FROM records WHERE file_id = $1",
+                        &format!(
+                            "SELECT COUNT(id),
+                                    CAST(COALESCE(SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END), 0) AS BIGINT),
+                                    CAST(COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT),
+                                    CAST(COALESCE(SUM(CASE WHEN {FAILING} THEN 1 ELSE 0 END), 0) AS BIGINT)
+                             FROM records WHERE file_id = $1"
+                        ),
                         &params![candidate],
                     )?
                     .context("no counts")?;
-                let (total, sent, rejected) = (counts.i64(0), counts.i64(1), counts.i64(2));
-                let first_rejection = tx
+                let (total, sent, rejected, failing) =
+                    (counts.i64(0), counts.i64(1), counts.i64(2), counts.i64(3));
+                let first_failure = tx
                     .query_one(
-                        "SELECT line, error FROM records WHERE file_id = $1 AND status = 'rejected' ORDER BY line LIMIT 1",
+                        &format!(
+                            "SELECT line, error FROM records WHERE file_id = $1 AND {FAILING} ORDER BY line LIMIT 1"
+                        ),
                         &params![candidate],
                     )?
                     .map(|r| (r.i64(0), r.string(1)));
-                let mut detail = json!({"records": total, "sent": sent, "rejected": rejected});
+                let mut detail = json!({"records": total, "sent": sent, "rejected": rejected, "failing": failing});
                 if file.string(1) == "unpacked" {
                     detail["container"] = json!(true);
                 }
@@ -2019,8 +2050,9 @@ impl Db {
                     total,
                     sent,
                     rejected,
-                    newly_rejected: rejected - file.i64(2),
-                    first_rejection,
+                    failing,
+                    newly_failing: failing - file.i64(2),
+                    first_failure,
                 }))
             })
     }

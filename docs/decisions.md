@@ -142,7 +142,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 ## 12. Alerts for data events in the engine; routing left to a product
 
 **Chosen:**
-- HIE raises alerts for rejected records, unreadable files, delivery outages and recovery, and **silence**: no data within the feed's `expect_every`. (Recovery now clears the outage alert instead of raising one: decision 43.)
+- HIE raises alerts for rejected records, unreadable files, delivery outages and recovery, and **silence**: no data within the feed's `expect_every`. (Recovery now clears the outage alert instead of raising one: decision 43. Rows a transform filtered out on purpose raise none: decision 47.)
 - Alerts are stored, logged, and posted to a webhook (`text` field, the shape Slack and Teams accept). (Superseded in part by decision 40: the webhook gets a signed, retried and recorded event per change, and keeps `text`.)
 - A repeated condition alerts once. (Superseded in part by decision 22: conditions are rules, and an alert clears itself.)
 
@@ -251,7 +251,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 ## 22. Alert rules are data, and an alert clears itself
 
-**Chosen:** A rule names a source (or all of them), one of four conditions with its threshold — `silence` (duration), `missing_by` (time of day, in the rule's time zone; UTC without one), `rejected_share` (percentage of a load), `unreachable` (failed delivery attempts) — who to notify, and the channels (`app`, `webhook`, `email`). Rules are rows in the engine's database with a CRUD under `/api/alert-rules`. A condition raises **one** alert per rule and source, and the engine closes it when the condition goes away: data arrives, the file arrives, a later load is within the limit, delivery succeeds. The alert keeps its rule, the recipients, the channels, and when and why it cleared. Every source gets a `silence` rule at birth, set to its `expect_every` or two hours (amended by decision 45: only when the source is created, never again on a replace or a restart). Without a `rejected_share` or `unreachable` rule the fixed behaviour of decision 12 stays.
+**Chosen:** A rule names a source (or all of them), one of four conditions with its threshold — `silence` (duration), `missing_by` (time of day, in the rule's time zone; UTC without one), `rejected_share` (percentage of a load; of the rows it kept, amended by decision 47), `unreachable` (failed delivery attempts) — who to notify, and the channels (`app`, `webhook`, `email`). Rules are rows in the engine's database with a CRUD under `/api/alert-rules`. A condition raises **one** alert per rule and source, and the engine closes it when the condition goes away: data arrives, the file arrives, a later load is within the limit, delivery succeeds. The alert keeps its rule, the recipients, the channels, and when and why it cleared. Every source gets a `silence` rule at birth, set to its `expect_every` or two hours (amended by decision 45: only when the source is created, never again on a replace or a restart). Without a `rejected_share` or `unreachable` rule the fixed behaviour of decision 12 stays.
 
 **Why:**
 - The four conditions are the ones the monitoring brief asks the UI to offer, with the thresholds in the units a person would type.
@@ -629,6 +629,26 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - An id of its own for a tagged submission: the span-based id would make the server refuse a tagged re-delivery as a repeat, and the engine would settle it with the earlier, untagged receipts. Without that refusal to fall back on, it relies on a submission taking its records all or none (decision 38), so two runners crossing in a lease handover never submit the same page twice.
 
 **Cost / not yet:** direct `$bulk-submit` is not tagged until the server can do it on ingest. The bound assumes a server does not keep writing a REST request more than four minutes after it was sent, and it covers the current version of each resource, not the server's history. Any failed untagged submission, even one the server refused outright, keeps its source open until the mark is taken again by hand (delete the `stamping_tracked` mark and restart, once the server is known to run nothing of it); one left unpolled by a replaced or deleted source must also be set to `failed` first; the same after a rolling upgrade or a downgrade. With the setting off, each REST batch costs one more store write. Instants are each instance's clock. Turning the setting on makes unchanged resources differ once.
+
+## 47. Load alerts count failing rows, not the rows a transform filtered out
+
+**Chosen (amending decisions 12 and 22):** the alerts a finished load raises follow its failing rows (rejected for any reason but `filtered`, as decision 42 counts them), not every rejected row.
+- Without a `rejected_share` rule, a load raises its `rejected_records` alert when it finishes with more failing rows than any earlier finish of it saw: `files.failing_reported` holds that most, raised in the statement that moves the load to `done`, so it counts the rows as they were finished. The message counts the failing rows, says how many more were filtered out, and quotes the first failing row. A load whose only rejected rows are filtered out raises nothing.
+- A `rejected_share` rule weighs the failing rows among the rows the load kept (every row but the filtered ones, so the sent and the failing). A load that kept none neither fires nor clears it.
+- `load.finished` gains `failing`.
+
+**Why:**
+- Decision 42 settled that a filtered row is a transform's choice, not something a person must fix; a "rows failed" alert for a load with no failing row sends a person to look for nothing, while its loads and its source say nothing failed.
+- A mark of its own: `rejected_reported` counted filtered rows, so read as a count of failing rows it would hide new failures (nine filtered rows and one failing leave a mark of ten; a reprocess that makes two fail would raise nothing). It is kept up to date for earlier versions sharing the store.
+- A filtered row is neither a failure nor a success; out of the load, it is out of the share. Counted among the rows, it would dilute the share: a 10% rule on a source that filters out 95% of its rows could never fire, even with every row it kept failing. A load that kept nothing has nothing to judge, so it cannot clear an alert another load raised; before, an empty load (a zip, whose entries are loads of their own, or a header alone) cleared it.
+
+**Cost / not yet:**
+- A load finished by an earlier version starts with no mark of failing rows: finished again after a Retry or a reprocess, it raises its alert for failing rows an earlier alert may already have reported, once each time its count rises until the mark catches up. The same holds for a load an earlier version finishes again, as it raises only its own mark. A notice is repeated rather than lost, short of the crash that already could lose one: the load is stored as finished before its alert is written.
+- An existing `rejected_share` rule changes meaning: on the same load it now weighs fewer rows as failing, never more, so a rule raised to tolerate filtering may be lowered again.
+- Alerts raised before the upgrade for loads whose rows were all filtered out are left as they are: a `rejected_records` alert has no rule, no load id and nothing that clears it, and its first line cannot tell such a load from a mixed one. It stays open, and may stay its source's `last_alert`, until retention purges it (30 days by default; never while it is the store's newest alert).
+- While an earlier version shares the store, the loads it finishes are judged its way: filtered rows raise its alert and count in its shares, and an empty load clears.
+- An enabled rule's open `rejected_share` alert stays open while every load keeps no row.
+- `GET /api/loads/{id}` still groups every rejected row by reason, filtered ones included as kind `filtered`, so they can be read and retried by reason; `failed` and `failing` say whether the load fails.
 
 ## Not in the prototype
 

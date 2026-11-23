@@ -562,7 +562,7 @@ async fn a_file_that_cannot_be_read_and_a_zip_are_loads_in_the_log() {
     assert_eq!(kinds(&container), ["load.received", "load.finished"]);
     assert_eq!(
         container[1]["detail"],
-        json!({"records": 0, "sent": 0, "rejected": 0, "container": true})
+        json!({"records": 0, "sent": 0, "rejected": 0, "failing": 0, "container": true})
     );
     let entry = by_name("drop.zip!/a.ndjson");
     assert_eq!(
@@ -1496,6 +1496,138 @@ fn a_finish_that_waits_for_a_retry_sees_the_rows_put_back_on_postgres() {
         .unwrap();
     assert_eq!(row[0]["status"], "processing");
     assert_eq!(events(&db).len(), before, "no load.finished");
+}
+
+/// The ids of a load's records, by line.
+fn record_ids(db: &Db, file: i64) -> Vec<i64> {
+    db.query_json(
+        "SELECT id FROM records WHERE file_id = $1 ORDER BY line",
+        hie::db::params![file],
+    )
+    .unwrap()
+    .iter()
+    .map(|r| r["id"].as_i64().unwrap())
+    .collect()
+}
+
+fn reported(db: &Db, file: i64) -> (i64, i64) {
+    let row = &db
+        .query_json(
+            "SELECT rejected_reported, failing_reported FROM files WHERE id = $1",
+            hie::db::params![file],
+        )
+        .unwrap()[0];
+    (
+        row["rejected_reported"].as_i64().unwrap(),
+        row["failing_reported"].as_i64().unwrap(),
+    )
+}
+
+/// A finish reports the rows that fail, not those filtered out, and only
+/// beyond the most failing rows an earlier finish of the load saw.
+#[test]
+fn a_finish_reports_failing_rows_beyond_the_most_seen_before() {
+    let db = Db::in_memory().unwrap();
+    // Two rows that could not be parsed, one filtered out.
+    let file = load(&db, "s", "a", 2, 1);
+    let ids = record_ids(&db, file);
+    db.mark_rejected(ids[2], "filtered", "transform returned no resources", None)
+        .unwrap();
+    let done = db.finish_files("s").unwrap();
+    assert_eq!(
+        (done[0].rejected, done[0].failing, done[0].newly_failing),
+        (3, 2, 2)
+    );
+    assert_eq!(done[0].first_failure.as_ref().unwrap().0, 1);
+    assert_eq!(reported(&db, file), (3, 2));
+
+    // A Retry whose rows come back the same: nothing new fails.
+    assert_eq!(db.reprocess_rejected(file, None).unwrap(), 3);
+    db.mark_rejected(ids[0], "parse", "not JSON", None).unwrap();
+    db.mark_rejected(ids[1], "parse", "not JSON", None).unwrap();
+    db.mark_rejected(ids[2], "filtered", "transform returned no resources", None)
+        .unwrap();
+    let done = db.finish_files("s").unwrap();
+    assert_eq!((done[0].failing, done[0].newly_failing), (2, 0));
+
+    // The filtered row fails once reprocessed: one more than ever seen.
+    assert!(db.reprocess(ids[2], None).unwrap());
+    db.mark_rejected(ids[2], "data", "a bad value", None)
+        .unwrap();
+    let done = db.finish_files("s").unwrap();
+    assert_eq!(
+        (done[0].rejected, done[0].failing, done[0].newly_failing),
+        (3, 3, 1)
+    );
+    assert_eq!(reported(&db, file), (3, 3));
+
+    // Fewer failing rows after a fix leave the mark where it was.
+    assert!(db.reprocess(ids[0], None).unwrap());
+    db.mark_rejected(ids[0], "filtered", "transform returned no resources", None)
+        .unwrap();
+    let done = db.finish_files("s").unwrap();
+    assert_eq!((done[0].failing, done[0].newly_failing), (2, -1));
+    assert_eq!(done[0].first_failure.as_ref().unwrap().0, 2);
+    assert_eq!(reported(&db, file), (3, 3));
+    let last = events(&db)
+        .into_iter()
+        .rfind(|e| e["kind"] == "load.finished")
+        .unwrap();
+    assert_eq!(
+        last["detail"],
+        json!({"records": 3, "sent": 0, "rejected": 3, "failing": 2})
+    );
+}
+
+#[test]
+fn a_finish_that_waits_for_a_change_counts_failing_rows_as_committed_on_postgres() {
+    if test_database_url().is_none() {
+        eprintln!("skipping: HIE_TEST_DATABASE_URL is not set");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open(&dir.path().join("hie.db")).unwrap());
+    // Two rows rejected as unparseable: the load can finish.
+    let file = load(&db, "s", "a", 2, 0);
+    let ids = record_ids(&db, file);
+
+    // Another instance holds the file's row and turns one row into a filtered
+    // one, not committed yet.
+    let mut other = raw_client(&db).unwrap();
+    other.batch_execute("BEGIN").unwrap();
+    other
+        .query("SELECT id FROM files WHERE id = $1 FOR UPDATE", &[&file])
+        .unwrap();
+    other
+        .execute(
+            "UPDATE records SET error_kind = 'filtered' WHERE id = $1",
+            &[&ids[0]],
+        )
+        .unwrap();
+    let finisher = {
+        let db = db.clone();
+        std::thread::spawn(move || db.finish_files("s"))
+    };
+    wait_until_blocked_by(backend_pid(&mut other));
+    assert!(
+        !finisher.is_finished(),
+        "the finish waits for the file's row"
+    );
+    other.batch_execute("COMMIT").unwrap();
+
+    let done = finisher.join().unwrap().unwrap();
+    assert_eq!(
+        (done[0].rejected, done[0].failing, done[0].newly_failing),
+        (2, 1, 1)
+    );
+    assert_eq!(done[0].first_failure.as_ref().unwrap().0, 2);
+    assert_eq!(reported(&db, file), (2, 1));
+    let last = events(&db).pop().unwrap();
+    assert_eq!(last["kind"], "load.finished");
+    assert_eq!(
+        last["detail"],
+        json!({"records": 2, "sent": 0, "rejected": 2, "failing": 1})
+    );
 }
 
 #[test]

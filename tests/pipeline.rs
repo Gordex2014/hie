@@ -464,6 +464,156 @@ async fn a_feed_survives_an_outage_bad_rows_and_resends() {
     assert_eq!(finished, 3);
 }
 
+/// A transform that keeps a row, filters it out (`skip`), or rejects it (`bad`).
+const SIEVE: &str = r#"
+from hie import DataError
+
+
+def transform(record, context):
+    if record["kind"] == "skip":
+        return None
+    if record["kind"] == "bad":
+        raise DataError(f"row {record['n']} is bad")
+    return {"resourceType": "Patient", "id": "p" + record["n"]}
+"#;
+
+/// The `load.finished` events of one load.
+fn finishes(state: &hie::api::AppState, load: &Value) -> Vec<Value> {
+    events(state)
+        .into_iter()
+        .filter(|e| e["kind"] == "load.finished" && e["load_id"] == *load)
+        .collect()
+}
+
+fn load_alerts(state: &hie::api::AppState) -> Vec<String> {
+    state
+        .db
+        .query_json(
+            "SELECT message FROM alerts WHERE kind = 'rejected_records' ORDER BY id",
+            [],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|r| r["message"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Rows a transform filtered out on purpose are not failures: a load with only
+/// those raises no alert, and a mixed load's alert counts the failing rows.
+#[tokio::test]
+async fn rows_filtered_out_raise_no_load_alert() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let (base, _fhir) = fhir_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::write(root.join("transforms/sieve.py"), SIEVE).unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {base}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sources/sieve.yaml"),
+        "id: sieve\nname: Sieve\nsource:\n  type: folder\n  path: inbox\n  pattern: \"*.csv\"\n  min_file_age_ms: 0\n\
+         transform: transforms/sieve.py\n",
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let runner: Arc<FeedRunner> = manager.runner("sieve").unwrap();
+    manager.pause("sieve", None).unwrap(); // the test drives the passes itself
+    let inbox = root.join("inbox");
+
+    // Every row filtered out: the load finishes, and nothing is raised.
+    drop_file(&inbox, "only.csv", "n,kind\n1,skip\n2,skip\n3,skip\n");
+    runner.tick().await.unwrap();
+    let only = file_id(&state, "only.csv");
+    let finished = finishes(&state, &only);
+    assert_eq!(finished.len(), 1, "the load finished in this pass");
+    assert_eq!(
+        finished[0]["detail"],
+        json!({"records": 3, "sent": 0, "rejected": 3, "failing": 0})
+    );
+    assert_eq!(load_alerts(&state), Vec::<String>::new());
+
+    // Filtered and failing rows: one alert, counting the failing ones, its first
+    // line the first failing row (a filtered one comes before it).
+    drop_file(
+        &inbox,
+        "mixed.csv",
+        "n,kind\n1,skip\n2,keep\n3,bad\n4,bad\n5,skip\n",
+    );
+    runner.tick().await.unwrap();
+    let mixed = file_id(&state, "mixed.csv");
+    let finished = finishes(&state, &mixed);
+    assert_eq!(finished.len(), 1);
+    assert_eq!(
+        finished[0]["detail"],
+        json!({"records": 5, "sent": 1, "rejected": 4, "failing": 2})
+    );
+    let alerts = load_alerts(&state);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert!(
+        alerts[0].starts_with(
+            "Sieve: 2 of 5 records failed in mixed.csv. 2 more filtered out by its transform. First: line 4: "
+        ),
+        "{alerts:?}"
+    );
+    assert!(alerts[0].contains("row 3 is bad"), "{alerts:?}");
+
+    // A Retry whose rows come back the same: the load finishes again, with
+    // no more failing rows than before, and no second alert.
+    assert_eq!(
+        state
+            .db
+            .reprocess_rejected(mixed.as_i64().unwrap(), None)
+            .unwrap(),
+        4
+    );
+    runner.tick().await.unwrap();
+    assert_eq!(finishes(&state, &mixed).len(), 2);
+    assert_eq!(load_alerts(&state).len(), 1);
+
+    // A filtered row reprocessed into a failure: as many rejected rows as
+    // before, one more failing, and an alert for it.
+    let skipped = state
+        .db
+        .query_json(
+            "SELECT id, raw FROM records WHERE file_id = $1 AND line = 2",
+            hie::db::params![mixed.as_i64().unwrap()],
+        )
+        .unwrap();
+    let mut raw = skipped[0]["raw"].clone();
+    raw["kind"] = json!("bad");
+    assert!(
+        state
+            .db
+            .reprocess(skipped[0]["id"].as_i64().unwrap(), Some(&raw))
+            .unwrap()
+    );
+    runner.tick().await.unwrap();
+    let finished = finishes(&state, &mixed);
+    assert_eq!(finished.len(), 3);
+    assert_eq!(
+        finished[2]["detail"],
+        json!({"records": 5, "sent": 1, "rejected": 4, "failing": 3})
+    );
+    let alerts = load_alerts(&state);
+    assert_eq!(alerts.len(), 2, "{alerts:?}");
+    assert!(
+        alerts[1].starts_with(
+            "Sieve: 3 of 5 records failed in mixed.csv. 1 more filtered out by its transform. First: line 2: "
+        ),
+        "{alerts:?}"
+    );
+}
+
 // ---- the transform worker's failures, as the pipeline sees them ----------
 
 /// A probe transform: every record it is sent is noted in `seen`, and its

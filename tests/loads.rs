@@ -749,6 +749,39 @@ async fn loads_recorded_before_the_name_was_kept_have_none() {
     assert_eq!(failed["loads"], json!([]));
 }
 
+/// A load finished by an earlier version has no mark of its failing rows:
+/// it starts at none, and its mark of rejected rows is kept.
+#[test]
+fn loads_finished_before_failing_rows_were_marked_start_at_none() {
+    if std::env::var("HIE_TEST_DATABASE_URL").is_ok_and(|v| !v.is_empty()) {
+        return; // The earlier schema is written here for SQLite.
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hie.db");
+    let old = rusqlite::Connection::open(&path).unwrap();
+    old.execute_batch(
+        "CREATE TABLE files (
+           id INTEGER PRIMARY KEY, feed_id TEXT NOT NULL, name TEXT NOT NULL, sha256 TEXT NOT NULL,
+           size INTEGER NOT NULL, status TEXT NOT NULL, duplicate_of INTEGER, received_at INTEGER NOT NULL,
+           finished_at INTEGER, error TEXT, rejected_reported INTEGER NOT NULL DEFAULT 0,
+           source_key TEXT, archived INTEGER NOT NULL DEFAULT 0, origin TEXT, source_name TEXT);
+         INSERT INTO files (feed_id, name, sha256, size, status, received_at, finished_at, rejected_reported)
+         VALUES ('alpha', 'old.csv', 'sha', 1, 'done', 1000, 2000, 10);",
+    )
+    .unwrap();
+    drop(old);
+    for _ in 0..2 {
+        let db = hie::db::Db::open(&path).unwrap();
+        let row = &db
+            .query_json("SELECT rejected_reported, failing_reported FROM files", [])
+            .unwrap()[0];
+        assert_eq!(
+            (&row["rejected_reported"], &row["failing_reported"]),
+            (&json!(10), &json!(0))
+        );
+    }
+}
+
 fn python() -> Option<String> {
     let candidates = match std::env::var("HIE_TEST_PYTHON") {
         Ok(p) => vec![p],

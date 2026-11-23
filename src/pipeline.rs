@@ -1623,13 +1623,23 @@ impl FeedRunner {
             let Some(f) = self.db.finish_file(&self.feed.id, candidate)? else {
                 continue;
             };
-            tracing::info!(feed = %self.feed.id, file = %f.name, total = f.total, sent = f.sent, rejected = f.rejected, "file done");
-            // The rules say whether a few rejected rows are worth an alert; without
-            // one, every rejection is.
+            tracing::info!(feed = %self.feed.id, file = %f.name, total = f.total, sent = f.sent, rejected = f.rejected, failing = f.failing, "file done");
+            // Rows a transform filtered out on purpose are not failures: they
+            // neither raise these alerts nor count in a share.
+            let filtered = f.rejected - f.failing;
+            let filtered_note = |sep: &str| {
+                if filtered > 0 {
+                    format!("{sep}{filtered} more filtered out by its transform")
+                } else {
+                    String::new()
+                }
+            };
+            // The rules say whether a few failing rows are worth an alert; without
+            // one, every failing row is.
             let share_rules = self.rules("rejected_share")?;
-            if f.newly_rejected > 0 && share_rules.is_empty() {
+            if f.newly_failing > 0 && share_rules.is_empty() {
                 let first = f
-                    .first_rejection
+                    .first_failure
                     .as_ref()
                     .map(|(line, err)| {
                         format!(
@@ -1638,22 +1648,30 @@ impl FeedRunner {
                         )
                     })
                     .unwrap_or_default();
+                let note = filtered_note(" ");
+                let note = if note.is_empty() {
+                    note
+                } else {
+                    format!("{note}.")
+                };
                 self.alerts.raise(
                     Some(&self.feed.id),
                     "rejected_records",
                     &format!(
-                        "{}: {} of {} records rejected in {}.{first}",
-                        self.feed.name, f.rejected, f.total, f.name
+                        "{}: {} of {} records failed in {}.{note}{first}",
+                        self.feed.name, f.failing, f.total, f.name
                     ),
                 )?;
             }
-            // "More than N% of the rows in a load fail": fires on this load, clears on
-            // the next load within the limit.
-            let share = if f.total > 0 {
-                f.rejected as f64 * 100.0 / f.total as f64
-            } else {
-                0.0
-            };
+            // "More than N% of the rows a load kept fail": fires on this load,
+            // clears on the next load within the limit. A load that kept no row
+            // (all filtered out, or none at all, as a zip of entries) says nothing
+            // either way.
+            let kept = f.total - filtered;
+            if kept <= 0 {
+                continue;
+            }
+            let share = f.failing as f64 * 100.0 / kept as f64;
             for rule in share_rules {
                 let limit: f64 = rule.threshold.trim_end_matches('%').parse().unwrap_or(1.0);
                 if share > limit {
@@ -1662,8 +1680,12 @@ impl FeedRunner {
                         "rejected_share",
                         &rule,
                         &format!(
-                            "{}: {share:.1}% of the rows in {} failed, more than the {limit}% allowed ({} of {})",
-                            self.feed.name, f.name, f.rejected, f.total
+                            "{}: {share:.1}% of the rows kept from {} failed, more than the {limit}% allowed ({} of {}{})",
+                            self.feed.name,
+                            f.name,
+                            f.failing,
+                            kept,
+                            filtered_note(", ")
                         ),
                     )?;
                 } else {

@@ -1322,6 +1322,108 @@ async fn stats_count_local_days_and_echo_the_zone() {
     }
 }
 
+/// A `rejected_share` rule weighs the failing rows among those a load kept:
+/// rows its transform filtered out on purpose count on neither side, and a
+/// load that kept none neither fires nor clears it.
+#[tokio::test]
+async fn rejected_share_counts_failing_rows_among_those_kept() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let lab = lab(&python).await;
+    let r = lab
+        .post(
+            "/api/alert-rules",
+            json!({"source_id": "lab-results", "condition": "rejected_share", "threshold": "10%"}),
+        )
+        .await;
+    assert_eq!(r.status(), 201);
+    let sieve = "from hie import DataError\n\n\ndef transform(record, context):\n    if record['kind'] == 'skip':\n        return None\n    if record['kind'] == 'bad':\n        raise DataError('a bad row')\n    return {'resourceType': 'Patient', 'id': 'p' + record['n']}\n";
+    let r = lab
+        .http
+        .put(format!("{}/api/transforms/lab_results", lab.api))
+        .json(&json!({ "code": sieve }))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let rows = |kinds: &[&str]| {
+        let mut csv = String::from("n,kind\n");
+        for (n, kind) in kinds.iter().enumerate() {
+            csv.push_str(&format!("{n},{kind}\n"));
+        }
+        csv
+    };
+    let drop = |name: &str, content: String| {
+        std::fs::write(lab.root.join("inbox").join(name), content).unwrap();
+    };
+    let done = |name: &'static str| {
+        move |l: &Value| {
+            l["loads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["name"] == name && f["status"] == "done" && f["in_progress"] == 0)
+        }
+    };
+    let share_alerts = |alerts: &Value| -> Vec<Value> {
+        alerts["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["kind"] == "rejected_share")
+            .cloned()
+            .collect()
+    };
+
+    // Nine rows filtered out and one sent: nothing failed.
+    let mut kept_one = vec!["skip"; 9];
+    kept_one.push("keep");
+    drop("kept.csv", rows(&kept_one));
+    lab.check_now().await;
+    lab.wait_until("/api/sources/lab-results/loads", done("kept.csv"))
+        .await;
+
+    // Nine filtered out and one failing: all of what the load kept failed. Over
+    // every row it would be 10%, within the limit.
+    let mut failed_one = vec!["skip"; 9];
+    failed_one.push("bad");
+    drop("failed.csv", rows(&failed_one));
+    let alerts = lab
+        .wait_for("the rejected_share alert", |a| !share_alerts(a).is_empty())
+        .await;
+    let fired = share_alerts(&alerts);
+    assert_eq!(fired.len(), 1, "kept.csv fired nothing: {alerts}");
+    assert_eq!(
+        fired[0]["message"],
+        "Lab results: 100.0% of the rows kept from failed.csv failed, more than the 10% allowed (1 of 1, 9 more filtered out by its transform)"
+    );
+
+    // A load that kept nothing says nothing either way.
+    drop("none-kept.csv", rows(&["skip", "skip", "skip"]));
+    lab.check_now().await;
+    lab.wait_until("/api/sources/lab-results/loads", done("none-kept.csv"))
+        .await;
+
+    // A load within the limit clears it, named in the reason.
+    drop("clean.csv", rows(&["keep", "keep"]));
+    let alerts = lab
+        .wait_for("the alert to clear", |a| {
+            share_alerts(a)
+                .first()
+                .is_some_and(|x| !x["cleared_at"].is_null())
+        })
+        .await;
+    let cleared = share_alerts(&alerts);
+    assert_eq!(cleared.len(), 1);
+    assert_eq!(
+        cleared[0]["cleared_reason"],
+        "Lab results: clean.csv loaded with 0.0% failed, within the limit",
+        "none-kept.csv did not clear it"
+    );
+}
+
 #[tokio::test]
 async fn rows_filtered_out_are_not_failures() {
     let Some(python) = python() else {
@@ -1362,6 +1464,18 @@ async fn rows_filtered_out_are_not_failures() {
     assert_eq!(status["last_24h"]["rejected"], filtered);
     assert_eq!(status["last_24h"]["failing"], 0);
     assert_eq!(status["needs_you"], json!([]), "{status}");
+    // The load does not fail; its filtered rows are still listed by reason, to
+    // be read and retried.
+    let loads = lab.get("/api/sources/lab-results/loads").await;
+    let load = lab
+        .get(&format!("/api/loads/{}", loads["loads"][0]["id"]))
+        .await;
+    assert_eq!(
+        (&load["failed"], &load["failing"]),
+        (&json!(false), &json!(0))
+    );
+    assert_eq!(load["failures"][0]["kind"], "filtered", "{load}");
+    assert_eq!(load["failures"][0]["count"], filtered, "{load}");
 
     // Rows that fail are a reason to look.
     let code = std::fs::read_to_string(repo().join("transforms/lab_results.py")).unwrap();
@@ -1394,4 +1508,24 @@ async fn rows_filtered_out_are_not_failures() {
     );
     let stats = lab.get("/api/sources/lab-results/stats?days=1").await;
     assert_eq!(stats["today"]["failing"], failing, "{stats}");
+    // Without a `rejected_share` rule a load with failing rows raises an alert;
+    // the earlier load, whose rows were all filtered out, raised none.
+    let alerts = lab
+        .wait_for("the rejected_records alert", |a| {
+            alert(a, "rejected_records").is_some()
+        })
+        .await;
+    let raised: Vec<&Value> = alerts["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["kind"] == "rejected_records")
+        .collect();
+    assert_eq!(raised.len(), 1, "{alerts}");
+    assert!(
+        raised[0]["message"].as_str().unwrap().starts_with(&format!(
+            "Lab results: {failing} of 6 records failed in messy.csv."
+        )),
+        "{alerts}"
+    );
 }
