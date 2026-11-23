@@ -542,12 +542,14 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - No connection, a timeout, a lost connection, or `502`/`503`/`504` is a failure; any other answer means the server answers. `last_error` is one of a few fixed sentences, and a REST delivery that cannot reach the server stores the same sentence as its reason; the detail, with the error chain and without the URL, goes to the log.
 - A request that started before the latest observation does not overwrite it; a probe gives way to a delivery started after it; a probe's answer does not end an outage deliveries see as `502`–`504` until none has for ten minutes.
 - Recovery clears every open `delivery` alert of the source, with a rule or without, and `delivery_recovered` is no longer raised. A rule-less outage alert is raised once per outage, checked in the store. REST recovery needs HFS to decide at least one entry of a batch. At start-up the engine closes, in the store only, the `delivery_recovered` alerts earlier versions left open, and the rule-less outage alerts that a later `delivery_recovered`, or the source's newest record having been delivered after them, shows to be over.
+- On PostgreSQL every index, old or new, is checked or built in a transaction of its own after the tables and their added columns, as the loads indexes already were (decision 42). This replaces the single batch that held the indexes of #28 and #31 (and the schema's own) in one transaction.
 
 **Why:**
 - When the FHIR server is down, every source fails on its own; one shared answer says the destination is the cause, and since when.
 - Deliveries are the best evidence and cost nothing; the probe only fills the silence, so an idle engine does not report a state hours old, and a busy one never probes. `/metadata` is the one read every FHIR server serves, usually without a token.
 - `502`–`504` are what a server or its proxy answers when the service is down; a `500` or a `4xx` is about the request. Counting a payload-specific `500` would make the state flap against the probe. Keeping the token endpoint out keeps the answer about the server.
 - Fixed sentences can be shown to anyone: the failure text a delivery stores names the server's URL and a library's error.
+- `CREATE INDEX IF NOT EXISTS` takes a `SHARE` lock on its table even when the index exists. A start holding that lock on one table while it waits for a running instance's write to another, which that write held while it waited for the first, deadlocked with it; one transaction per index holds one table at a time.
 - The rule-less outage alert stayed open after recovery, beside a `delivery_recovered` alert that never cleared either, so a list of open alerts showed outages that were over. Clearing it is what rule-governed outage alerts already did, and the clear is posted to the webhook like any other.
 
 **Cost / not yet:**
@@ -556,6 +558,7 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - While deliveries see `502`–`504`, `observed_at` advances only with the probe's failures and the retries, which back off up to `max_backoff_ms`; and if the retrying source is paused, the probe takes over only after ten minutes. A source whose `max_backoff_ms` is above ten minutes lets the probe's answer show `true` between its retries, and each retry starts a new outage with a new `since`.
 - `delivery_recovered` disappears: a consumer that counted it (`hie_alerts_total{kind="delivery_recovered"}` stops growing) reads cleared `delivery` alerts instead. An old outage alert with no recovery and no delivery after it stays open until the source's next successful delivery, and until then stands for a new outage of that source too.
 - Alert transitions are not fenced by the source's lease: two instances overlapping in a hand-over can each raise an outage alert, as for every other alert. A store failure at the clear leaves the alert open until the next recovery; on the bulk path that is the next completed submission.
+- An index check per table per start is a short lock per index rather than one long one; a start on a store in use waits for each.
 - Delivery failure reasons that are not about reaching the server (a token endpoint's answer, HFS's own OperationOutcome text) reach records and alerts as before.
 
 ## Not in the prototype

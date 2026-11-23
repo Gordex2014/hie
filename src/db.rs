@@ -192,10 +192,10 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
 ];
 
 /// Indexes made after the added columns, since they may name one.
-const ADDED_INDEXES: &str = "
-CREATE INDEX IF NOT EXISTS records_submission_id ON records(submission, id);
-CREATE INDEX IF NOT EXISTS events_source_kind_at ON events(source_id, kind, at);
-";
+const ADDED_INDEXES: [&str; 2] = [
+    "CREATE INDEX IF NOT EXISTS records_submission_id ON records(submission, id)",
+    "CREATE INDEX IF NOT EXISTS events_source_kind_at ON events(source_id, kind, at)",
+];
 
 /// The indexes the loads list chooses its pages through, each built in a
 /// transaction of its own: a build over a large `records` locks that table
@@ -209,9 +209,32 @@ const LOAD_INDEXES: [&str; 4] = [
 ];
 
 /// On PostgreSQL only: on SQLite `records_file` already orders by id, the rowid.
-const ADDED_INDEXES_POSTGRES: &str = "
-CREATE INDEX IF NOT EXISTS records_file_id ON records(file_id, id);
-";
+const ADDED_INDEXES_POSTGRES: [&str; 1] =
+    ["CREATE INDEX IF NOT EXISTS records_file_id ON records(file_id, id)"];
+
+/// `SCHEMA`'s statements, its tables apart from its indexes.
+fn schema_statements() -> impl Iterator<Item = &'static str> {
+    SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn is_index(statement: &str) -> bool {
+    statement.starts_with("CREATE INDEX")
+}
+
+/// Every index of a PostgreSQL store, in the order they are built: `SCHEMA`'s,
+/// then the ones added since. Each is built in a transaction of its own, after
+/// the tables and their added columns: `CREATE INDEX IF NOT EXISTS` takes a
+/// `SHARE` lock on its table even when the index exists, and a start holding
+/// that lock on one table while it waits for another instance's write to a
+/// second table, which that write holds while it waits for the first, would
+/// deadlock with it.
+fn postgres_indexes() -> Vec<&'static str> {
+    let mut all: Vec<&'static str> = schema_statements().filter(|s| is_index(s)).collect();
+    all.extend(ADDED_INDEXES);
+    all.extend(LOAD_INDEXES);
+    all.extend(ADDED_INDEXES_POSTGRES);
+    all
+}
 
 /// When the event log began on this store: set once, at the first start of a
 /// version that keeps it, and kept.
@@ -1276,8 +1299,8 @@ impl Db {
                 )?;
             }
         }
-        conn.execute_batch(ADDED_INDEXES)?;
-        for index in LOAD_INDEXES {
+        // SCHEMA made its own indexes; SQLite has one writer at a time.
+        for index in ADDED_INDEXES.into_iter().chain(LOAD_INDEXES) {
             conn.execute(index, [])?;
         }
         never_reuse_rule_ids(&conn)?;
@@ -1319,7 +1342,11 @@ impl Db {
             .batch("SELECT pg_advisory_lock(hashtext('hie.schema'), hashtext(current_schema()))")?;
         let built = (|| {
             // A sequence never gives an id twice, as SQLite's AUTOINCREMENT does not.
-            let ddl = SCHEMA
+            // The tables only: the indexes come after, one at a time (`postgres_indexes`).
+            let ddl = schema_statements()
+                .filter(|s| !is_index(s))
+                .collect::<Vec<_>>()
+                .join(";\n")
                 .replace(" AUTOINCREMENT", "")
                 .replace("INTEGER PRIMARY KEY", "BIGSERIAL PRIMARY KEY")
                 .replace("INTEGER", "BIGINT");
@@ -1332,9 +1359,7 @@ impl Db {
                     kind.replace("INTEGER", "BIGINT")
                 ))?;
             }
-            client.batch(ADDED_INDEXES)?;
-            client.batch(ADDED_INDEXES_POSTGRES)?;
-            for index in LOAD_INDEXES {
+            for index in postgres_indexes() {
                 client.batch(index)?;
             }
             client.execute(EVENTS_SINCE, &params![now_ms().to_string()])?;
@@ -4263,5 +4288,78 @@ mod tests {
             redact("postgres://hie:secret@db:5432/hie"),
             "postgres://hie:***@db:5432/hie"
         );
+    }
+
+    // ---- starting on a store in use ------------------------------------------
+
+    /// The tables `postgres_indexes` builds an index on.
+    fn indexed_tables() -> Vec<&'static str> {
+        let mut tables: Vec<&'static str> = postgres_indexes()
+            .into_iter()
+            .filter_map(|i| i.split(" ON ").nth(1)?.split('(').next())
+            .collect();
+        tables.sort_unstable();
+        tables.dedup();
+        tables
+    }
+
+    /// A second instance starts while a write on another holds one table and
+    /// then takes every other one, as a write spanning tables does. The start
+    /// waits for the held table without holding any other, so the write goes
+    /// through and neither is ended as a deadlock. Once for each indexed table.
+    #[test]
+    fn a_start_on_postgres_waits_for_a_write_without_holding_what_it_needs() {
+        let Some(url) = test_database_url() else {
+            return;
+        };
+        let schema = test_schema_name();
+        let _first = Db::open_postgres(&url, Some(schema.clone())).unwrap();
+        let tables = indexed_tables();
+        assert!(tables.len() >= 7, "{tables:?}");
+        let mut watch = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        for held in &tables {
+            let mut write = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            write
+                .batch_execute(&format!("SET search_path TO {schema}"))
+                .unwrap();
+            write.batch_execute("BEGIN").unwrap();
+            write
+                .batch_execute(&format!("LOCK TABLE {held} IN ROW EXCLUSIVE MODE"))
+                .unwrap();
+            let start = {
+                let (url, schema) = (url.clone(), schema.clone());
+                std::thread::spawn(move || Db::open_postgres(&url, Some(schema)).map(drop))
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let waiting = watch
+                    .query(
+                        "SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+                           JOIN pg_namespace n ON n.oid = c.relnamespace
+                         WHERE NOT l.granted AND n.nspname = $1 AND c.relname = $2",
+                        &[&schema, held],
+                    )
+                    .unwrap();
+                if !waiting.is_empty() {
+                    break;
+                }
+                assert!(!start.is_finished(), "the start did not wait for {held}");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the start never reached {held}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            for other in tables.iter().filter(|t| *t != held) {
+                write
+                    .batch_execute(&format!("LOCK TABLE {other} IN ROW EXCLUSIVE MODE"))
+                    .unwrap_or_else(|e| panic!("holding {held}, taking {other}: {e}"));
+            }
+            write.batch_execute("COMMIT").unwrap();
+            start
+                .join()
+                .unwrap()
+                .unwrap_or_else(|e| panic!("starting while {held} was held: {e:#}"));
+        }
     }
 }
