@@ -298,6 +298,25 @@ fn count(db: &Db, sql: &str, p: impl Into<Vec<Param>>) -> anyhow::Result<i64> {
         .unwrap_or(0))
 }
 
+/// Rows rejected since `since`, and how many of them are failing, of one
+/// source or of all: one statement, so failing never exceeds rejected.
+fn rejected_and_failing(db: &Db, feed: Option<&str>, since: i64) -> anyhow::Result<(i64, i64)> {
+    let sql = "SELECT COUNT(*) AS rejected,
+                CAST(COALESCE(SUM(CASE WHEN COALESCE(error_kind, '') <> 'filtered' THEN 1 ELSE 0 END), 0) AS BIGINT) AS failing
+         FROM records WHERE status = 'rejected' AND updated_at >= $1";
+    let rows = match feed {
+        Some(feed) => db.query_json(&format!("{sql} AND feed_id = $2"), params![since, feed])?,
+        None => db.query_json(sql, params![since])?,
+    };
+    let n = |key: &str| {
+        rows.first()
+            .and_then(|r| r.get(key))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    };
+    Ok((n("rejected"), n("failing")))
+}
+
 /// A source's definition and its state, as one object.
 fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
     let db = &*s.db;
@@ -326,11 +345,7 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         params![feed.id],
     )?;
     let since = now_ms() - DAY_MS;
-    let rejected_24h = count(
-        db,
-        "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status = 'rejected' AND updated_at >= $2",
-        params![feed.id, since],
-    )?;
+    let (rejected_24h, failing_24h) = rejected_and_failing(db, Some(&feed.id), since)?;
     Ok(json!({
         "id": feed.id,
         "name": feed.name,
@@ -347,11 +362,7 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         "last_received_at": last.and_then(iso_ms),
         "records": db.feed_counts(&feed.id)?,
         "rejected_last_24h": rejected_24h,
-        "failing_last_24h": count(
-            db,
-            &format!("SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND {FAILING} AND updated_at >= $2"),
-            params![feed.id, since],
-        )?,
+        "failing_last_24h": failing_24h,
         "last_alert": last_alert.into_iter().next(),
         "definition": s.manager.definition(&feed.id)?,
     }))
@@ -797,11 +808,12 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
         sources.push(status);
     }
     let since = now_ms() - DAY_MS;
+    let (rejected, failing) = rejected_and_failing(&s.db, None, since)?;
     let last_24h = json!({
         "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE status <> 'duplicate' AND received_at >= $1", params![since])?,
         "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'sent' AND updated_at >= $1", params![since])?,
-        "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'rejected' AND updated_at >= $1", params![since])?,
-        "failing": count(&s.db, &format!("SELECT COUNT(*) AS n FROM records WHERE {FAILING} AND updated_at >= $1"), params![since])?,
+        "rejected": rejected,
+        "failing": failing,
         "alerts": count(&s.db, "SELECT COUNT(*) AS n FROM alerts WHERE created_at >= $1", params![since])?,
     });
     let destination = s.manager.destination().snapshot();

@@ -238,8 +238,16 @@ impl Alerter {
         // against its own day: a file of today must not hide that yesterday's
         // never came. Once per day: not when an alert of the rule was still open
         // at that deadline or raised since. An alert raised here is left for the
-        // next pass to clear, so that it is never cleared before it is sent.
+        // next pass to clear, so that it is never cleared before it is sent. A
+        // rule made after that deadline does not judge the day before it.
+        let made_after = |deadline: i64| {
+            rule.created_at
+                .as_deref()
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .is_some_and(|t| t.timestamp_millis() > deadline)
+        };
         if let Some((day, from, to)) = check.pushed
+            && !made_after(to)
             && !self.db.received_between(feed, from, to)?
             && !self
                 .db
@@ -1063,6 +1071,43 @@ mod tests {
         lab.receive(&at(-60));
         assert_eq!(lab.check(&at(1)), None);
         assert_eq!(lab.alerts(), 0);
+    }
+
+    #[test]
+    fn a_pushed_deadline_is_judged_by_the_rule_as_it_is_now() {
+        let start = Zone::parse("America/Nuuk")
+            .unwrap()
+            .day_start(date("2026-03-29"));
+        let at =
+            |offset_minutes: i64| (start + chrono::Duration::minutes(offset_minutes)).to_rfc3339();
+        // A rule made after the pushed deadline does not judge the day before.
+        let mut lab = Lab::new("23:30", Some("America/Nuuk"));
+        lab.rule.created_at = Some(at(1));
+        assert_eq!(lab.check(&at(2)), None);
+        assert_eq!(lab.alerts(), 0);
+        // One made at the deadline does.
+        lab.rule.created_at = Some(at(0));
+        assert!(lab.check(&at(3)).is_some());
+
+        // A UTC rule fired for the 28th; changed to Nuuk just after the 29th
+        // began there, its alert ends, and the rule as changed raises its own
+        // for the 28th: the cleared alert watched the rule as it was.
+        let mut lab = Lab::new("23:30", None);
+        assert!(lab.check("2026-03-28T23:30:00Z").is_some());
+        let mut changed = lab.rule.clone();
+        changed.tz = Some("America/Nuuk".into());
+        assert!(lab.alerter.update_rule(lab.rule.id, &changed).unwrap());
+        assert_eq!(lab.alerts(), 1);
+        lab.rule = changed;
+        assert_eq!(
+            lab.check(&at(2)).as_deref(),
+            Some(
+                "Lab: nothing arrived on 2026-03-28 and the file was expected by 23:30 America/Nuuk"
+            )
+        );
+        assert_eq!(lab.alerts(), 2);
+        lab.check(&at(3));
+        assert_eq!(lab.alerts(), 2, "once");
     }
 
     #[test]

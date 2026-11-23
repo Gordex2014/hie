@@ -2408,6 +2408,22 @@ async fn rejected_records_are_counted_in_local_days_of_the_zone_asked_for() {
     let api = serve(hie::api::router(state.clone())).await;
     // Fourteen hours ahead of UTC, so its days are not UTC's.
     let zone = hie::zone::Zone::parse("Pacific/Kiritimati").unwrap();
+    // The test reads the clock apart from the handler: kept clear of a
+    // midnight, in the zone (10:00Z) or in UTC, that could fall between them.
+    // Neither zone changes its offset, so their days are 24 hours.
+    loop {
+        let now = chrono::Utc::now();
+        let near = |start: i64| {
+            let ms = now.timestamp_millis();
+            (start - ms).abs() < 30_000 || (start + 86_400_000 - ms).abs() < 30_000
+        };
+        let (_, from, _) = zone.today_bounds(now);
+        let (_, utc_from, _) = hie::zone::Zone::utc().today_bounds(now);
+        if !near(from) && !near(utc_from) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
     let (today, from, to) = zone.today_bounds(chrono::Utc::now());
     load(&db, "one", "a", 0, 3);
     let [a, b, c] = [1, 2, 3].map(|line| record_id(&db, "one", line));

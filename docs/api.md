@@ -128,9 +128,9 @@ A poller pages with `cursor`: the first request may give `since`, and each next 
 `GET /api/sources/{id}/failures?days=14&tz=Europe/Madrid` counts, from the event log, the distinct records a source rejected in each window: a record rejected more than once in a window counts once.
 
 ```json
-{"source_id": "lab-results", "tz": "UTC", "covered_from": "2026-11-12T09:30:00.000Z",
+{"source_id": "lab-results", "tz": "Europe/Madrid", "covered_from": "2026-11-12T09:30:00.000Z",
  "last_24h": {"from": "...", "to": "...", "records": 3, "filtered": 1, "complete": true},
- "days": [{"day": "2026-11-07", "from": "2026-11-07T00:00:00.000Z", "to": "2026-11-08T00:00:00.000Z",
+ "days": [{"day": "2026-11-07", "from": "2026-11-06T23:00:00.000Z", "to": "2026-11-07T23:00:00.000Z",
            "records": 0, "filtered": 0, "complete": false}, ...]}
 ```
 

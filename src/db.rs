@@ -2907,6 +2907,8 @@ impl Db {
     }
 
     /// Whether an alert of a rule was open at `at` (epoch ms) or raised since.
+    /// One the rule's own change, turning off or deletion cleared does not
+    /// count: it watched the rule as it was.
     pub fn rule_alert_alive_since(
         &self,
         feed: &str,
@@ -2917,8 +2919,18 @@ impl Db {
         Ok(self
             .query_one(
                 "SELECT 1 FROM alerts WHERE feed_id = $1 AND kind = $2 AND rule_id = $3
-                   AND (cleared_at IS NULL OR cleared_at >= $4) LIMIT 1",
-                &params![feed, kind, rule_id, at],
+                   AND (cleared_at IS NULL
+                        OR (cleared_at >= $4 AND COALESCE(cleared_reason, '') NOT IN ($5, $6, $7)))
+                 LIMIT 1",
+                &params![
+                    feed,
+                    kind,
+                    rule_id,
+                    at,
+                    RuleGone::Changed.reason(),
+                    RuleGone::TurnedOff.reason(),
+                    RuleGone::Deleted.reason()
+                ],
             )?
             .is_some())
     }
