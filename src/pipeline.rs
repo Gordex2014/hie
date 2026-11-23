@@ -1627,12 +1627,11 @@ impl FeedRunner {
             // Rows a transform filtered out on purpose are not failures: they
             // neither raise these alerts nor count in a share.
             let filtered = f.rejected - f.failing;
-            let filtered_note = |sep: &str| {
-                if filtered > 0 {
-                    format!("{sep}{filtered} more filtered out by its transform")
-                } else {
-                    String::new()
-                }
+            // The filtered rows, named apart from the failing ones.
+            let others = |before: &str, after: &str| match filtered {
+                0 => String::new(),
+                1 => format!("{before}1 other was filtered out by its transform{after}"),
+                n => format!("{before}{n} others were filtered out by its transform{after}"),
             };
             // The rules say whether a few failing rows are worth an alert; without
             // one, every failing row is.
@@ -1648,12 +1647,7 @@ impl FeedRunner {
                         )
                     })
                     .unwrap_or_default();
-                let note = filtered_note(" ");
-                let note = if note.is_empty() {
-                    note
-                } else {
-                    format!("{note}.")
-                };
+                let note = others(" ", ".");
                 self.alerts.raise(
                     Some(&self.feed.id),
                     "rejected_records",
@@ -1685,7 +1679,7 @@ impl FeedRunner {
                             f.name,
                             f.failing,
                             kept,
-                            filtered_note(", ")
+                            others(", ", "")
                         ),
                     )?;
                 } else {

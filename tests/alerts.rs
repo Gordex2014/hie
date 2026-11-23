@@ -1377,6 +1377,12 @@ async fn rejected_share_counts_failing_rows_among_those_kept() {
             .collect()
     };
 
+    // Every row filtered out: the load kept nothing, so the rule says nothing.
+    drop("all-filtered.csv", rows(&["skip"; 4]));
+    lab.check_now().await;
+    lab.wait_until("/api/sources/lab-results/loads", done("all-filtered.csv"))
+        .await;
+
     // Nine rows filtered out and one sent: nothing failed.
     let mut kept_one = vec!["skip"; 9];
     kept_one.push("keep");
@@ -1394,10 +1400,14 @@ async fn rejected_share_counts_failing_rows_among_those_kept() {
         .wait_for("the rejected_share alert", |a| !share_alerts(a).is_empty())
         .await;
     let fired = share_alerts(&alerts);
-    assert_eq!(fired.len(), 1, "kept.csv fired nothing: {alerts}");
+    assert_eq!(
+        fired.len(),
+        1,
+        "all-filtered.csv and kept.csv fired nothing: {alerts}"
+    );
     assert_eq!(
         fired[0]["message"],
-        "Lab results: 100.0% of the rows kept from failed.csv failed, more than the 10% allowed (1 of 1, 9 more filtered out by its transform)"
+        "Lab results: 100.0% of the rows kept from failed.csv failed, more than the 10% allowed (1 of 1, 9 others were filtered out by its transform)"
     );
 
     // A load that kept nothing says nothing either way.

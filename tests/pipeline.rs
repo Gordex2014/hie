@@ -561,7 +561,7 @@ async fn rows_filtered_out_raise_no_load_alert() {
     assert_eq!(alerts.len(), 1, "{alerts:?}");
     assert!(
         alerts[0].starts_with(
-            "Sieve: 2 of 5 records failed in mixed.csv. 2 more filtered out by its transform. First: line 4: "
+            "Sieve: 2 of 5 records failed in mixed.csv. 2 others were filtered out by its transform. First: line 4: "
         ),
         "{alerts:?}"
     );
@@ -608,7 +608,7 @@ async fn rows_filtered_out_raise_no_load_alert() {
     assert_eq!(alerts.len(), 2, "{alerts:?}");
     assert!(
         alerts[1].starts_with(
-            "Sieve: 3 of 5 records failed in mixed.csv. 1 more filtered out by its transform. First: line 2: "
+            "Sieve: 3 of 5 records failed in mixed.csv. 1 other was filtered out by its transform. First: line 2: "
         ),
         "{alerts:?}"
     );
