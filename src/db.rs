@@ -3964,8 +3964,8 @@ impl Db {
     /// default rule, when this is its first appearance in the store: returns the
     /// rule's id when one was added. An id the store has seen before gets
     /// nothing, whatever its rules are now. An id it has no birth of but holds
-    /// something of (a rule, an alert, a file, a pause, a cursor) is a source
-    /// from before births were recorded: it is marked born and gets nothing.
+    /// something of (a rule, an alert, a file, a pause, a cursor, a check, an
+    /// event, a count of purged alerts) is a source from before births were recorded: it is marked born and gets nothing.
     /// `force` (a create through the API) gives the rule whatever the store
     /// remembers, unless the source already has a rule of that condition. One
     /// transaction, read committed on PostgreSQL: on a failure nothing is
@@ -4009,6 +4009,9 @@ impl Db {
                              UNION ALL SELECT 1 FROM files WHERE feed_id = $1
                              UNION ALL SELECT 1 FROM source_state WHERE feed_id = $1
                              UNION ALL SELECT 1 FROM source_cursors WHERE feed_id = $1
+                             UNION ALL SELECT 1 FROM checks WHERE feed_id = $1
+                             UNION ALL SELECT 1 FROM alert_counts_purged WHERE feed_id = $1
+                             UNION ALL SELECT 1 FROM events WHERE source_id = $1
                              LIMIT 1",
                             &params![feed],
                         )?
@@ -4599,7 +4602,8 @@ mod tests {
         let db = Db::in_memory().unwrap();
         // What an earlier version left: a source whose silence rule was deleted
         // but that has another rule, one with a file, one paused, one with a
-        // cursor, one with an alert.
+        // cursor, one with an alert, one with a check, one with an event, one
+        // whose alerts were all purged.
         let mut other = default_rule("ruled");
         other.condition = "rejected_share".into();
         other.threshold = "10%".into();
@@ -4613,7 +4617,20 @@ mod tests {
             &params!["alerted"],
         )
         .unwrap();
-        for feed in ["ruled", "filed", "paused", "cursored", "alerted"] {
+        db.insert_check("checked").unwrap();
+        db.execute(
+            "INSERT INTO events (at, source_id, kind) VALUES (0, $1, 'load.received')",
+            &params!["evented"],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO alert_counts_purged (feed_id, kind, n) VALUES ($1, 'silence', 1)",
+            &params!["purged"],
+        )
+        .unwrap();
+        for feed in [
+            "ruled", "filed", "paused", "cursored", "alerted", "checked", "evented", "purged",
+        ] {
             assert_eq!(
                 db.give_default_rule(&default_rule(feed), false).unwrap(),
                 None,

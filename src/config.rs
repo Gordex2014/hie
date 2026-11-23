@@ -567,10 +567,19 @@ fn contact_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>
 
 /// Whether a character would break a contact's single line or reorder the text
 /// around it: control characters, the Unicode line and paragraph separators,
-/// and the bidirectional embedding, override and isolate controls.
+/// and the bidirectional marks and embedding, override and isolate controls.
 fn breaks_contact_line(c: char) -> bool {
     c.is_control()
-        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 fn default_spool() -> PathBuf {
@@ -1567,6 +1576,9 @@ mod tests {
             "a\u{2029}b",
             "a\u{202e}b",
             "a\u{2066}b",
+            "a\u{061c}b",
+            "a\u{200e}b",
+            "a\u{200f}b",
         ] {
             let err = format!(
                 "{:#}",
