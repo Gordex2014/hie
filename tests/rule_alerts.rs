@@ -33,7 +33,7 @@ fn repo() -> PathBuf {
 }
 
 struct Engine {
-    _root: tempfile::TempDir,
+    root: Arc<tempfile::TempDir>,
     runner: Arc<FeedRunner>,
     state: hie::api::AppState,
     api: String,
@@ -75,6 +75,11 @@ async fn engine() -> Engine {
          transform: transforms/lab_results.py\n",
     )
     .unwrap();
+    start(Arc::new(root), hooks).await
+}
+
+/// An engine on the files in `root`, as a start of the process.
+async fn start(root: Arc<tempfile::TempDir>, hooks: Hooks) -> Engine {
     let (config, feeds) = hie::config::load(&root.path().join("hie.yaml")).unwrap();
     let (manager, state) =
         hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
@@ -82,7 +87,7 @@ async fn engine() -> Engine {
     manager.pause("lab-results", None).unwrap(); // the test drives the passes
     let api = serve(hie::api::router(state.clone())).await;
     Engine {
-        _root: root,
+        root,
         runner,
         state,
         api,
@@ -93,6 +98,12 @@ async fn engine() -> Engine {
 }
 
 impl Engine {
+    /// Another start on the same files and store, this one still running (on
+    /// PostgreSQL the first handle keeps the test's schema).
+    async fn again(&self) -> Engine {
+        start(self.root.clone(), self.hooks.clone()).await
+    }
+
     /// Makes a rule through the API; returns it as stored.
     async fn rule(&self, body: Value) -> Rule {
         let r = self
@@ -321,10 +332,57 @@ async fn a_changed_rule_that_still_fails_raises_a_new_alert() {
 }
 
 /// A pass that read a rule just before it was turned off, deleted or changed
-/// can raise an alert after the change cleared the open ones: the source's
-/// next pass clears it. Here the store changes behind the API's back.
+/// raises nothing after the change: the alert is written only while the rule
+/// still watches what the pass read. An alert raised under the rule as changed
+/// stays.
 #[tokio::test]
-async fn a_pass_clears_an_alert_its_rule_no_longer_watches() {
+async fn an_alert_from_a_rule_read_before_its_change_is_not_raised() {
+    let e = engine().await;
+    let alerts = &e.state.alerts;
+    let rule = e
+        .rule(json!({"source_id": "lab-results", "condition": "rejected_share", "threshold": "10%", "channels": ["app"]}))
+        .await;
+    let read_before = rule.clone();
+    e.change(&rule, json!({"threshold": "50%"})).await;
+    assert!(
+        !alerts
+            .fire_once("lab-results", "rejected_share", &read_before, "stale")
+            .unwrap()
+    );
+    assert!(e.open_of(&rule).is_empty());
+
+    let changed = e.state.db.rule(rule.id).unwrap().unwrap();
+    assert!(
+        alerts
+            .fire_once("lab-results", "rejected_share", &changed, "current")
+            .unwrap()
+    );
+    assert_eq!(e.open_of(&rule).len(), 1);
+
+    // Turned off, then deleted: nothing more is raised under it.
+    e.change(&changed, json!({"enabled": false})).await;
+    let off = e.state.db.rule(rule.id).unwrap().unwrap();
+    for read in [&changed, &off] {
+        assert!(
+            !alerts
+                .fire_once("lab-results", "rejected_share", read, "stale")
+                .unwrap()
+        );
+    }
+    e.delete(&off).await;
+    assert!(
+        !alerts
+            .fire_once("lab-results", "rejected_share", &off, "stale")
+            .unwrap()
+    );
+    assert!(e.open_of(&rule).is_empty());
+}
+
+/// Alerts of rules an earlier version turned off, deleted or changed, which
+/// it left open, are cleared at the next start. Here the store is changed
+/// directly, as that version did.
+#[tokio::test]
+async fn a_start_clears_the_alerts_their_rules_no_longer_watch() {
     let e = engine().await;
     let db = &e.state.db;
     let silence = |threshold: &str| json!({"source_id": "lab-results", "condition": "silence", "threshold": threshold, "channels": ["app"]});
@@ -334,7 +392,6 @@ async fn a_pass_clears_an_alert_its_rule_no_longer_watches() {
     let source = e
         .rule(json!({"condition": "silence", "threshold": "5h", "channels": ["app"]}))
         .await;
-    // Cleared only by a load within the limit, which no pass here makes.
     let watching = e
         .rule(json!({"source_id": "lab-results", "condition": "rejected_share", "threshold": "10%", "channels": ["app"]}))
         .await;
@@ -343,6 +400,28 @@ async fn a_pass_clears_an_alert_its_rule_no_longer_watches() {
     let a_condition = e.raise("lab-results", "silence", Some(&condition));
     let a_source = e.raise("lab-results", "silence", Some(&source));
     let a_watching = e.raise("lab-results", "rejected_share", Some(&watching));
+    // Every condition's own kind is watched: `unreachable` raises `delivery`
+    // and `missing_by` raises `missing`.
+    let unreachable = e
+        .rule(json!({"source_id": "lab-results", "condition": "unreachable", "threshold": "5", "channels": ["app"]}))
+        .await;
+    let missing_by = e
+        .rule(json!({"source_id": "lab-results", "condition": "missing_by", "threshold": "06:00", "channels": ["app"]}))
+        .await;
+    let all_sources = e
+        .rule(json!({"condition": "silence", "threshold": "7h", "channels": ["app"]}))
+        .await;
+    let a_unreachable = e.raise("lab-results", "delivery", Some(&unreachable));
+    let a_missing = e.raise("lab-results", "missing", Some(&missing_by));
+    let a_all_sources = e.raise("elsewhere", "silence", Some(&all_sources));
+    // Its id given to a rule made after it (as a SQLite store did before ids
+    // came from AUTOINCREMENT): the rule that raised it is gone.
+    let reused = e.raise("lab-results", "rejected_share", Some(&watching));
+    db.query_json(
+        "UPDATE alerts SET created_at = 1 WHERE id = $1 RETURNING id",
+        [hie::db::Param::Int(reused)],
+    )
+    .unwrap();
     let a_ruleless = e.raise("lab-results", "delivery", None);
 
     db.update_rule(
@@ -372,11 +451,15 @@ async fn a_pass_clears_an_alert_its_rule_no_longer_watches() {
     )
     .unwrap();
 
-    e.runner.tick().await.unwrap();
+    let _next = e.again().await;
     assert_eq!(e.state_of(a_off), (true, Some(OFF.into())));
     assert_eq!(e.state_of(a_deleted), (true, Some(DELETED.into())));
     assert_eq!(e.state_of(a_condition), (true, Some(CHANGED.into())));
     assert_eq!(e.state_of(a_source), (true, Some(CHANGED.into())));
     assert_eq!(e.state_of(a_watching), (false, None));
+    assert_eq!(e.state_of(a_unreachable), (false, None));
+    assert_eq!(e.state_of(a_missing), (false, None));
+    assert_eq!(e.state_of(a_all_sources), (false, None));
+    assert_eq!(e.state_of(reused), (true, Some(DELETED.into())));
     assert_eq!(e.state_of(a_ruleless), (false, None));
 }

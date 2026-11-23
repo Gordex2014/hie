@@ -527,10 +527,9 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
         db.insert_alert(Some("old-source"), "delivery", "outage", None)
             .unwrap();
         // An outage alert whose source delivered a record after it, though
-        // no recovery notice was written (the engine restarted in between).
-        db.insert_alert(Some("sent-source"), "delivery", "outage", None)
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(5));
+        // no recovery notice was written (the engine restarted in between):
+        // the record retried and delivered after it is not the newest one,
+        // which was delivered before the outage.
         let file = db
             .insert_file(
                 "sent-source",
@@ -544,12 +543,25 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
                 None,
             )
             .unwrap();
-        db.insert_records(file, "sent-source", &[(1, json!({}), None)])
+        db.insert_records(
+            file,
+            "sent-source",
+            &[(1, json!({}), None), (2, json!({}), None)],
+        )
+        .unwrap();
+        for item in db.received_records("sent-source", 2).unwrap() {
+            db.mark_transformed(&item, &json!([])).unwrap();
+        }
+        let mut due = db.due_records("sent-source", 2).unwrap();
+        let (retried, newest) = (due.remove(0), due.remove(0));
+        assert!(newest.id > retried.id);
+        db.delivered(&[(&newest, hie::db::Delivery::Sent(&json!([])))])
             .unwrap();
-        let item = db.received_records("sent-source", 1).unwrap().remove(0);
-        db.mark_transformed(&item, &json!([])).unwrap();
-        let item = db.due_records("sent-source", 1).unwrap().remove(0);
-        db.delivered(&[(&item, hie::db::Delivery::Sent(&json!([])))])
+        std::thread::sleep(Duration::from_millis(5));
+        db.insert_alert(Some("sent-source"), "delivery", "outage", None)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        db.delivered(&[(&retried, hie::db::Delivery::Sent(&json!([])))])
             .unwrap();
         db
     };
@@ -587,6 +599,26 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
             true,
             Some("delivery to HFS recovered (recorded before recovery cleared this alert)".into())
         )]
+    );
+
+    // Once per store: alerts of that shape written later stay, for recovery
+    // to clear with its event.
+    let db = &e.state.db;
+    let later = db
+        .insert_alert(Some("later-source"), "delivery", "outage", None)
+        .unwrap();
+    db.insert_alert(
+        Some("later-source"),
+        "delivery_recovered",
+        "recovered",
+        None,
+    )
+    .unwrap();
+    assert_eq!(db.close_legacy_recoveries().unwrap(), 0);
+    assert!(
+        e.alerts("later-source").iter().all(|a| !a.2),
+        "{later}: {:?}",
+        e.alerts("later-source")
     );
 
     // A new outage is alerted, though the old one was never followed by a success.
@@ -629,6 +661,39 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
     assert!(!e.alerts("old-source")[0].2, "another source's alert stays");
     drop(e);
     drop(legacy);
+}
+
+/// An open rule-less outage alert is what keeps a second one from being
+/// raised for the same outage: retention keeps it whatever its age.
+#[tokio::test]
+async fn retention_keeps_an_open_outage_alert() {
+    let e = engine("http://127.0.0.1:9/fhir", 0).await;
+    let db = &e.state.db;
+    let outage = db
+        .insert_alert(Some("lab-results"), "delivery", "outage", None)
+        .unwrap();
+    let old = db
+        .insert_alert(Some("lab-results"), "silence", "quiet", None)
+        .unwrap();
+    db.clear_alert(old, "done").unwrap();
+    // Newer than both, so neither is kept as the newest.
+    db.insert_alert(Some("lab-results"), "unreadable_file", "x", None)
+        .unwrap();
+    db.query_json(
+        "UPDATE alerts SET created_at = 1, cleared_at = CASE WHEN cleared_at IS NULL THEN NULL ELSE 1 END
+         WHERE id IN ($1, $2) RETURNING id",
+        [hie::db::Param::Int(outage), hie::db::Param::Int(old)],
+    )
+    .unwrap();
+    assert_eq!(db.purge_alerts(hie::db::now_ms(), 100).unwrap(), 1);
+    let left: Vec<i64> = db
+        .query_json("SELECT id FROM alerts ORDER BY id", [])
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    assert!(left.contains(&outage), "{left:?}");
+    assert!(!left.contains(&old), "{left:?}");
 }
 
 #[test]

@@ -166,12 +166,13 @@ impl Alerter {
 
     /// Raises an alert for a rule unless one is already open for that rule and
     /// source. Returns whether a new alert was raised.
+    /// Nothing is raised when the rule was turned off, deleted or changed in
+    /// what it watches since it was read.
     pub fn fire_once(&self, feed: &str, kind: &str, rule: &Rule, message: &str) -> Result<bool> {
         if self.db.open_alert(feed, kind, Some(rule.id))?.is_some() {
             return Ok(false);
         }
-        self.fire(Some(feed), kind, message, Some(rule))?;
-        Ok(true)
+        Ok(self.fire(Some(feed), kind, message, Some(rule))?.is_some())
     }
 
     /// Clears the open alert of a rule for a source, when there is one. Returns
@@ -194,13 +195,7 @@ impl Alerter {
     pub fn clear(&self, id: i64, feed: &str, kind: &str, reason: &str) -> Result<bool> {
         let cleared = self
             .db
-            .clear_alert_with_webhook(id, reason, now_ms(), |alert| {
-                let wanted = alert
-                    .channels
-                    .as_ref()
-                    .is_none_or(|c| c.iter().any(|c| c == "webhook"));
-                self.event("cleared", alert, wanted)
-            })?;
+            .clear_alert_with_webhook(id, reason, now_ms(), |alert| self.cleared_event(alert))?;
         if cleared.is_none() {
             return Ok(false);
         }
@@ -209,45 +204,62 @@ impl Alerter {
         Ok(true)
     }
 
-    /// Clears every open alert of a rule, for `why`: the rule was deleted,
-    /// turned off, or changed in what it watches. Each clear writes the
-    /// alert's `cleared` event for the channels recorded when it fired. If the
-    /// condition still holds under a rule that is still on, the next
-    /// evaluation raises a new alert, with its own id. Returns how many this
-    /// call cleared.
-    pub fn clear_rule(&self, rule_id: i64, why: RuleGone) -> Result<usize> {
-        let mut cleared = 0;
-        for (id, feed, kind) in self.db.open_alerts_of_rule(rule_id)? {
-            if self.clear(id, feed.as_deref().unwrap_or(""), &kind, why.reason())? {
-                cleared += 1;
-            }
-        }
-        Ok(cleared)
+    /// Replaces a rule through the API. Turned off, or changed in its
+    /// condition, threshold or source, the rule ends its open alerts in the
+    /// same transaction, each with its `cleared` event for the channels
+    /// recorded when it fired; if the changed rule still finds the condition,
+    /// its next evaluation raises a new alert with its own id. A change of
+    /// recipients or channels alone ends nothing. Returns whether the rule exists.
+    pub fn update_rule(&self, id: i64, rule: &Rule) -> Result<bool> {
+        let cleared = self.db.update_rule_ending_alerts(
+            id,
+            rule,
+            now_ms(),
+            |before| rule_update_ends_alerts(before, rule).map(RuleGone::reason),
+            |alert| self.cleared_event(alert),
+        )?;
+        Ok(self.cleared_with_rule(cleared))
     }
 
-    /// When an update of a rule ends its open alerts: turned off, or changed
-    /// in its condition, threshold or source. Recipients and channels are not
-    /// part of what an alert describes.
-    pub fn rule_update_ends_alerts(old: &Rule, new: &Rule) -> Option<RuleGone> {
-        if !new.enabled {
-            Some(RuleGone::TurnedOff)
-        } else if old.condition != new.condition
-            || old.threshold.trim() != new.threshold.trim()
-            || old.source_id != new.source_id
-        {
-            Some(RuleGone::Changed)
-        } else {
-            None
+    /// Deletes a rule through the API, ending its open alerts as `update_rule`
+    /// does. Returns whether the rule existed.
+    pub fn delete_rule(&self, id: i64) -> Result<bool> {
+        let cleared = self.db.delete_rule_ending_alerts(
+            id,
+            RuleGone::Deleted.reason(),
+            now_ms(),
+            |alert| self.cleared_event(alert),
+        )?;
+        Ok(self.cleared_with_rule(cleared))
+    }
+
+    fn cleared_with_rule(&self, cleared: Option<Vec<AlertRow>>) -> bool {
+        let Some(cleared) = cleared else {
+            return false;
+        };
+        for alert in &cleared {
+            tracing::info!(
+                alert = alert.id,
+                feed = alert.feed_id.as_deref().unwrap_or(""),
+                kind = %alert.kind,
+                "cleared: {}",
+                alert.cleared_reason.as_deref().unwrap_or_default()
+            );
         }
+        if !cleared.is_empty() {
+            self.wake.notify_one();
+        }
+        true
     }
 
     /// Clears the open alerts whose rule no longer watches them (deleted,
-    /// turned off, or changed to another condition or source), of one source
-    /// or of all. Each clear writes the alert's `cleared` event for the
-    /// channels recorded when it fired. Returns how many this call cleared.
-    pub fn clear_unwatched(&self, feed: Option<&str>) -> Result<usize> {
+    /// turned off, or changed to another condition or source): left by an
+    /// earlier version, or by a change made in the store rather than through
+    /// the API. Each clear writes the alert's `cleared` event for the channels
+    /// recorded when it fired. Returns how many this call cleared.
+    pub fn clear_unwatched(&self) -> Result<usize> {
         let mut cleared = 0;
-        for alert in self.db.unwatched_alerts(feed)? {
+        for alert in self.db.unwatched_alerts()? {
             if self.clear(
                 alert.id,
                 alert.feed.as_deref().unwrap_or(""),
@@ -260,19 +272,31 @@ impl Alerter {
         Ok(cleared)
     }
 
+    /// The `cleared` event of an alert, for the channels recorded when it fired.
+    fn cleared_event(&self, alert: &AlertRow) -> NewWebhook {
+        let wanted = alert
+            .channels
+            .as_ref()
+            .is_none_or(|c| c.iter().any(|c| c == "webhook"));
+        self.event("cleared", alert, wanted)
+    }
+
     fn fire(
         &self,
         feed: Option<&str>,
         kind: &str,
         message: &str,
         rule: Option<&Rule>,
-    ) -> Result<i64> {
+    ) -> Result<Option<i64>> {
         let wanted = rule.is_none_or(|r| r.channels.iter().any(|c| c == "webhook"));
-        let alert =
+        let Some(alert) =
             self.db
                 .insert_alert_with_webhook(feed, kind, message, rule, now_ms(), |alert| {
                     self.event("fired", alert, wanted)
-                })?;
+                })?
+        else {
+            return Ok(None);
+        };
         tracing::warn!(alert = alert.id, feed, kind, "{message}");
         if rule.is_some_and(|r| r.channels.iter().any(|c| c == "email")) {
             tracing::info!(
@@ -281,7 +305,7 @@ impl Alerter {
             );
         }
         self.wake.notify_one();
-        Ok(alert.id)
+        Ok(Some(alert.id))
     }
 
     /// The webhook event of an alert's change: queued for the configured URL,
@@ -305,6 +329,22 @@ impl Alerter {
             payload,
             state,
         }
+    }
+}
+
+/// Whether replacing rule `before` with `after` ends the alerts it raised:
+/// turned off, or changed in its condition, threshold or source. Recipients and
+/// channels are not part of what an alert describes.
+pub fn rule_update_ends_alerts(before: &Rule, after: &Rule) -> Option<RuleGone> {
+    if !after.enabled {
+        Some(RuleGone::TurnedOff)
+    } else if before.condition != after.condition
+        || before.threshold != after.threshold
+        || before.source_id != after.source_id
+    {
+        Some(RuleGone::Changed)
+    } else {
+        None
     }
 }
 

@@ -140,6 +140,12 @@ pub fn build_with(
     if closed > 0 {
         tracing::info!("closed {closed} delivery alert(s) left open by an earlier version");
     }
+    // Alerts of rules turned off, deleted or changed by an earlier version,
+    // which left them open: cleared, each with its `cleared` event.
+    let unwatched = alerts.clear_unwatched()?;
+    if unwatched > 0 {
+        tracing::info!("cleared {unwatched} alert(s) whose rule no longer watches them");
+    }
     destination::spawn_probe(
         Arc::downgrade(fhir.destination()),
         config.destination.probe_every(),

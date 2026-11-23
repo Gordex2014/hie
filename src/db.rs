@@ -2982,7 +2982,11 @@ impl Db {
     }
 
     /// Records an alert and, in the same transaction, the webhook event `webhook`
-    /// builds from the stored row.
+    /// builds from the stored row. An alert of a rule is recorded only while
+    /// the rule is still on and watches what it did when it was read (its
+    /// condition, threshold and source): `None` when it does not any more. On
+    /// PostgreSQL the rule's row stays locked to the commit, so a change of the
+    /// rule waits for the alert and then clears it.
     pub fn insert_alert_with_webhook(
         &self,
         feed: Option<&str>,
@@ -2991,11 +2995,27 @@ impl Db {
         rule: Option<&Rule>,
         now: i64,
         webhook: impl FnOnce(&AlertRow) -> NewWebhook,
-    ) -> Result<AlertRow> {
+    ) -> Result<Option<AlertRow>> {
         let columns = self.alert_columns();
+        let postgres = self.postgres;
         self.with(|c| {
-            c.batch("BEGIN")?;
+            // Immediate on SQLite: the rule is read under the write lock.
+            c.batch(if postgres { "BEGIN" } else { "BEGIN IMMEDIATE" })?;
             let result = (|| {
+                if let Some(rule) = rule {
+                    let lock = if postgres { " FOR SHARE" } else { "" };
+                    let current = c.query(
+                        &format!(
+                            "SELECT 1 FROM alert_rules
+                             WHERE id = $1 AND enabled = 1 AND condition = $2 AND threshold = $3
+                               AND source_id IS NOT DISTINCT FROM $4{lock}"
+                        ),
+                        &params![rule.id, rule.condition, rule.threshold, rule.source_id],
+                    )?;
+                    if current.is_empty() {
+                        return Ok(None);
+                    }
+                }
                 let row = c
                     .query(
                         &format!(
@@ -3016,7 +3036,7 @@ impl Db {
                     .map(Self::alert_row)
                     .context("INSERT returned no alert")?;
                 Self::insert_webhook(c, row.id, &webhook(&row), now)?;
-                Ok::<_, anyhow::Error>(row)
+                Ok::<_, anyhow::Error>(Some(row))
             })();
             match result {
                 Ok(row) => match c.batch("COMMIT") {
@@ -3111,28 +3131,27 @@ impl Db {
 
     /// The open alerts whose rule no longer watches them, oldest first, each
     /// with why: the rule was deleted, turned off, or changed to another
-    /// condition or to a source that is not the alert's. Of one source, or of
-    /// every source (alerts about no source included).
-    pub fn unwatched_alerts(&self, feed: Option<&str>) -> Result<Vec<UnwatchedAlert>> {
-        let mut sql = String::from(
-            "SELECT a.id, a.feed_id, a.kind,
-                    CASE WHEN r.id IS NULL THEN 'deleted' WHEN r.enabled = 0 THEN 'off' ELSE 'changed' END
+    /// condition or to a source that is not the alert's, alerts about no
+    /// source included. A rule made after the alert is another rule given the
+    /// deleted one's id (a SQLite store before ids came from `AUTOINCREMENT`),
+    /// as retention reads it. A change of threshold alone cannot be told from
+    /// here.
+    pub fn unwatched_alerts(&self) -> Result<Vec<UnwatchedAlert>> {
+        Ok(self
+            .query(
+                "SELECT a.id, a.feed_id, a.kind,
+                    CASE WHEN r.id IS NULL OR r.created_at > a.created_at THEN 'deleted'
+                         WHEN r.enabled = 0 THEN 'off' ELSE 'changed' END
              FROM alerts a LEFT JOIN alert_rules r ON r.id = a.rule_id
              WHERE a.cleared_at IS NULL AND a.rule_id IS NOT NULL
-               AND (r.id IS NULL OR r.enabled = 0
+               AND (r.id IS NULL OR r.created_at > a.created_at OR r.enabled = 0
                     OR (r.source_id IS NOT NULL AND (a.feed_id IS NULL OR r.source_id <> a.feed_id))
                     OR a.kind <> CASE r.condition WHEN 'unreachable' THEN 'delivery'
                                                   WHEN 'missing_by' THEN 'missing'
-                                                  ELSE r.condition END)",
-        );
-        let mut values = Vec::new();
-        if let Some(feed) = feed {
-            values.push(Param::Text(feed.to_string()));
-            sql.push_str(" AND a.feed_id = $1");
-        }
-        sql.push_str(" ORDER BY a.id");
-        Ok(self
-            .query(&sql, &values)?
+                                                  ELSE r.condition END)
+             ORDER BY a.id",
+                &[],
+            )?
             .iter()
             .map(|r| UnwatchedAlert {
                 id: r.i64(0),
@@ -3160,36 +3179,47 @@ impl Db {
     }
 
     /// Closes what versions before recovery cleared the `delivery` alert left
-    /// open: every `delivery_recovered` alert (a notice, never a condition), and
-    /// every rule-less `delivery` alert shown to be over, by a later
-    /// `delivery_recovered` of its source or by the source's newest record
-    /// being delivered after it (the newest by id, which the index finds at
-    /// once, so a start does not read every record). A rule-less `delivery` alert with neither may be an outage
-    /// still going on: it stays, for the next successful delivery to clear.
-    /// Only the store changes. Returns how many alerts were closed.
+    /// open, once per store: every `delivery_recovered` alert (a notice, never
+    /// a condition), and every rule-less `delivery` alert shown to be over, by
+    /// a later `delivery_recovered` of its source or by a record of the source
+    /// delivered after it. A rule-less `delivery` alert with neither may be an
+    /// outage still going on: it stays, for the next successful delivery to
+    /// clear. Later starts change nothing, so an outage alert this version
+    /// raised is cleared only by its recovery. Only the store changes. Returns
+    /// how many alerts were closed.
     pub fn close_legacy_recoveries(&self) -> Result<u64> {
         let now = now_ms();
-        let over = self.execute(
-            "UPDATE alerts SET cleared_at = $1, cleared_reason = $2
-             WHERE kind = 'delivery' AND rule_id IS NULL AND cleared_at IS NULL AND feed_id IS NOT NULL
-               AND (EXISTS (SELECT 1 FROM alerts later WHERE later.feed_id = alerts.feed_id
-                            AND later.kind = 'delivery_recovered' AND later.id > alerts.id)
-                    OR (SELECT r.updated_at FROM records r WHERE r.feed_id = alerts.feed_id
-                        AND r.status = 'sent' ORDER BY r.id DESC LIMIT 1) > alerts.created_at)",
-            &params![
-                now,
-                "delivery to HFS recovered (recorded before recovery cleared this alert)"
-            ],
-        )?;
-        let notices = self.execute(
-            "UPDATE alerts SET cleared_at = $1, cleared_reason = $2
-             WHERE kind = 'delivery_recovered' AND cleared_at IS NULL",
-            &params![
-                now,
-                "a recovery notice; recovery now clears the delivery alert instead"
-            ],
-        )?;
-        Ok(over + notices)
+        self.transaction(|tx| {
+            let first = tx.execute(
+                "INSERT INTO store_meta (key, value) VALUES ('delivery_alerts_reconciled', $1)
+                 ON CONFLICT (key) DO NOTHING",
+                &params![now.to_string()],
+            )?;
+            if first == 0 {
+                return Ok(0);
+            }
+            let over = tx.execute(
+                "UPDATE alerts SET cleared_at = $1, cleared_reason = $2
+                 WHERE kind = 'delivery' AND rule_id IS NULL AND cleared_at IS NULL AND feed_id IS NOT NULL
+                   AND (EXISTS (SELECT 1 FROM alerts later WHERE later.feed_id = alerts.feed_id
+                                AND later.kind = 'delivery_recovered' AND later.id > alerts.id)
+                        OR EXISTS (SELECT 1 FROM records r WHERE r.feed_id = alerts.feed_id
+                                   AND r.status = 'sent' AND r.updated_at > alerts.created_at))",
+                &params![
+                    now,
+                    "delivery to HFS recovered (recorded before recovery cleared this alert)"
+                ],
+            )?;
+            let notices = tx.execute(
+                "UPDATE alerts SET cleared_at = $1, cleared_reason = $2
+                 WHERE kind = 'delivery_recovered' AND cleared_at IS NULL",
+                &params![
+                    now,
+                    "a recovery notice; recovery now clears the delivery alert instead"
+                ],
+            )?;
+            Ok(over + notices)
+        })
     }
 
     // ---- alert webhook deliveries --------------------------------------------
@@ -3491,6 +3521,7 @@ impl Db {
                      AND {a}.id < (SELECT MAX(id) FROM alerts)
                      AND NOT ({a}.cleared_at IS NULL AND (
                            {a}.kind IN ('credential', 'definition')
+                           OR ({a}.kind = 'delivery' AND {a}.rule_id IS NULL)
                            OR EXISTS (SELECT 1 FROM alert_rules r
                                       WHERE r.id = {a}.rule_id AND r.enabled = 1
                                         AND r.created_at <= {a}.created_at)))"
@@ -3694,28 +3725,118 @@ impl Db {
 
     const RULE_SELECT: &'static str = "SELECT id, source_id, condition, threshold, notify, channels, enabled, created_by, created_at FROM alert_rules";
 
+    fn rule_from(r: &Row) -> Rule {
+        Rule {
+            id: r.i64(0),
+            source_id: r.opt_string(1),
+            condition: r.string(2),
+            threshold: r.string(3),
+            notify: r
+                .json(4)
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            channels: r
+                .json(5)
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            enabled: r.i64(6) != 0,
+            created_by: r.opt_string(7),
+            created_at: r.opt_i64(8).and_then(iso_ms),
+        }
+    }
+
     fn rule_rows(&self, sql: &str, p: &[Param]) -> Result<Vec<Rule>> {
-        Ok(self
-            .query(sql, p)?
+        Ok(self.query(sql, p)?.iter().map(Self::rule_from).collect())
+    }
+
+    /// Replaces a rule and, in the same transaction, clears its open alerts
+    /// with the reason `ends` gives from the rule as it was (`None`: they stay),
+    /// each with the webhook event `webhook` builds from the cleared row. `None`
+    /// when there is no such rule. The rule's row is locked first, so an alert
+    /// being raised under it (`insert_alert_with_webhook`) is either committed
+    /// before, and cleared here, or checked against the rule as replaced.
+    pub fn update_rule_ending_alerts(
+        &self,
+        id: i64,
+        rule: &Rule,
+        now: i64,
+        ends: impl FnOnce(&Rule) -> Option<&'static str>,
+        webhook: impl FnMut(&AlertRow) -> NewWebhook,
+    ) -> Result<Option<Vec<AlertRow>>> {
+        let columns = self.alert_columns();
+        self.transaction(|tx| {
+            let lock = tx.for_update();
+            let Some(before) = tx
+                .query_one(
+                    &format!("{} WHERE id = $1{lock}", Self::RULE_SELECT),
+                    &params![id],
+                )?
+                .map(|r| Self::rule_from(&r))
+            else {
+                return Ok(None);
+            };
+            tx.execute(
+                "UPDATE alert_rules SET source_id = $2, condition = $3, threshold = $4, notify = $5, channels = $6, enabled = $7
+                 WHERE id = $1",
+                &params![
+                    id,
+                    rule.source_id,
+                    rule.condition,
+                    rule.threshold,
+                    serde_json::to_string(&rule.notify).unwrap_or_default(),
+                    serde_json::to_string(&rule.channels).unwrap_or_default(),
+                    rule.enabled
+                ],
+            )?;
+            match ends(&before) {
+                Some(reason) => Self::clear_rule_alerts(tx, &columns, id, reason, now, webhook).map(Some),
+                None => Ok(Some(vec![])),
+            }
+        })
+    }
+
+    /// Deletes a rule and, in the same transaction, clears its open alerts
+    /// with `reason`, as `update_rule_ending_alerts` does. `None` when there is
+    /// no such rule.
+    pub fn delete_rule_ending_alerts(
+        &self,
+        id: i64,
+        reason: &str,
+        now: i64,
+        webhook: impl FnMut(&AlertRow) -> NewWebhook,
+    ) -> Result<Option<Vec<AlertRow>>> {
+        let columns = self.alert_columns();
+        self.transaction(|tx| {
+            if tx.execute("DELETE FROM alert_rules WHERE id = $1", &params![id])? == 0 {
+                return Ok(None);
+            }
+            Self::clear_rule_alerts(tx, &columns, id, reason, now, webhook).map(Some)
+        })
+    }
+
+    fn clear_rule_alerts(
+        tx: &mut Tx,
+        columns: &str,
+        rule_id: i64,
+        reason: &str,
+        now: i64,
+        mut webhook: impl FnMut(&AlertRow) -> NewWebhook,
+    ) -> Result<Vec<AlertRow>> {
+        let cleared: Vec<AlertRow> = tx
+            .query(
+                &format!(
+                    "UPDATE alerts SET cleared_at = $2, cleared_reason = $3
+                     WHERE rule_id = $1 AND cleared_at IS NULL RETURNING {columns}"
+                ),
+                &params![rule_id, now, reason],
+            )?
             .iter()
-            .map(|r| Rule {
-                id: r.i64(0),
-                source_id: r.opt_string(1),
-                condition: r.string(2),
-                threshold: r.string(3),
-                notify: r
-                    .json(4)
-                    .and_then(|v| serde_json::from_value(v).ok())
-                    .unwrap_or_default(),
-                channels: r
-                    .json(5)
-                    .and_then(|v| serde_json::from_value(v).ok())
-                    .unwrap_or_default(),
-                enabled: r.i64(6) != 0,
-                created_by: r.opt_string(7),
-                created_at: r.opt_i64(8).and_then(iso_ms),
-            })
-            .collect())
+            .map(Self::alert_row)
+            .collect();
+        for row in &cleared {
+            Self::insert_webhook(tx.conn, row.id, &webhook(row), now)?;
+        }
+        Ok(cleared)
     }
 
     pub fn rules(&self) -> Result<Vec<Rule>> {
@@ -3894,6 +4015,7 @@ mod tests {
         db.insert_alert_with_webhook(Some("src"), "silence", "quiet", None, 1_000, |_| {
             hook(event_id, "fired", destination)
         })
+        .unwrap()
         .unwrap()
         .id
     }
@@ -4386,6 +4508,8 @@ mod tests {
     /// then takes every other one, as a write spanning tables does. The start
     /// waits for the held table without holding any other, so the write goes
     /// through and neither is ended as a deadlock. Once for each indexed table.
+    /// A table with added columns stops the start at its `ALTER TABLE`; the
+    /// others stop it at an index, which the test checks by the lock awaited.
     #[test]
     fn a_start_on_postgres_waits_for_a_write_without_holding_what_it_needs() {
         let Some(url) = test_database_url() else {
@@ -4413,13 +4537,21 @@ mod tests {
             loop {
                 let waiting = watch
                     .query(
-                        "SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+                        "SELECT l.mode FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
                            JOIN pg_namespace n ON n.oid = c.relnamespace
                          WHERE NOT l.granted AND n.nspname = $1 AND c.relname = $2",
                         &[&schema, held],
                     )
                     .unwrap();
-                if !waiting.is_empty() {
+                if let Some(row) = waiting.first() {
+                    let mode: String = row.get(0);
+                    let altered = ADDED_COLUMNS.iter().any(|(table, ..)| table == held);
+                    let expected = if altered {
+                        "AccessExclusiveLock"
+                    } else {
+                        "ShareLock"
+                    };
+                    assert_eq!(mode, expected, "{held}");
                     break;
                 }
                 assert!(!start.is_finished(), "the start did not wait for {held}");
