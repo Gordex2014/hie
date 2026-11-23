@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,6 +35,9 @@ pub struct Config {
     /// How the engine delivers, for every source.
     #[serde(default)]
     pub delivery: EngineDeliveryConfig,
+    /// How the engine watches whether the FHIR server answers.
+    #[serde(default)]
+    pub destination: DestinationConfig,
     /// What each transform's worker process may use and how long it may take.
     #[serde(default)]
     pub worker: WorkerConfig,
@@ -41,6 +45,9 @@ pub struct Config {
     /// not in the environment.
     #[serde(default)]
     pub secrets: SecretsConfig,
+    /// How long the engine keeps its history (events and alerts).
+    #[serde(default)]
+    pub retention: RetentionConfig,
     /// The directory holding `hie.yaml`; relative paths in source files resolve against it.
     #[serde(skip)]
     pub base_dir: PathBuf,
@@ -58,6 +65,8 @@ pub struct Config {
 pub struct SkippedSource {
     pub file: PathBuf,
     pub source_id: String,
+    /// The `name` the file gives the source.
+    pub source_name: String,
     pub reason: String,
 }
 
@@ -99,9 +108,250 @@ pub struct EngineDeliveryConfig {
     pub stamp_source: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+/// The `retention:` block: how long the engine keeps its history.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetentionConfig {
+    /// Events and stored alerts, from `1d` to `3650d`. Records, loads and
+    /// submissions are not purged.
+    pub history: String,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            history: "30d".into(),
+        }
+    }
+}
+
+impl RetentionConfig {
+    const MIN: Duration = Duration::from_secs(86_400);
+    const MAX: Duration = Duration::from_secs(3650 * 86_400);
+
+    pub fn check(&self) -> Result<()> {
+        let history = parse_duration(&self.history).context("retention.history")?;
+        if !(Self::MIN..=Self::MAX).contains(&history) {
+            bail!(
+                "retention.history must be from 1d to 3650d, not {:?}",
+                self.history
+            );
+        }
+        Ok(())
+    }
+
+    /// The history setting as a duration; the default when it does not parse,
+    /// which `check` refuses at load.
+    pub fn history(&self) -> Duration {
+        parse_duration(&self.history)
+            .ok()
+            .filter(|d| (Self::MIN..=Self::MAX).contains(d))
+            .unwrap_or(Duration::from_secs(30 * 86_400))
+    }
+}
+
+/// The `alerts:` block: where the alert webhook posts, the secret it signs
+/// with, and how long it waits before retrying. `Debug` and every error leave
+/// the URL and the secret out: a chat webhook's URL is itself a credential.
+#[derive(Clone, Default)]
 pub struct AlertConfig {
+    /// Trimmed; `None` when unset or blank.
     pub webhook_url: Option<String>,
+    pub webhook_secret: Option<secrecy::SecretString>,
+    /// The wait before the first retry, doubling for each one after it.
+    /// `None` means `AlertConfig::DEFAULT_BACKOFF_MS`.
+    pub webhook_backoff_ms: Option<u64>,
+}
+
+impl std::fmt::Debug for AlertConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlertConfig")
+            .field(
+                "webhook_url",
+                &self.webhook_url.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "webhook_secret",
+                &self.webhook_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field("webhook_backoff_ms", &self.webhook_backoff_ms)
+            .finish()
+    }
+}
+
+fn is_http_url(text: &str) -> bool {
+    url::Url::parse(text)
+        .ok()
+        .is_some_and(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some())
+}
+
+/// What a malformed `alerts:` block is refused with: the keys it may have and
+/// nothing of the values it has.
+const ALERTS_SHAPE: &str = "alerts: expected a mapping with webhook_url (an http or https URL), webhook_secret (text) and webhook_backoff_ms (milliseconds)";
+
+impl<'de> Deserialize<'de> for AlertConfig {
+    /// Every error here is a fixed sentence: the YAML parser's own messages
+    /// quote the offending value, which may be the URL or the secret.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value =
+            serde_yaml::Value::deserialize(d).map_err(|_| D::Error::custom(ALERTS_SHAPE))?;
+        let mut config = AlertConfig::default();
+        let map = match value {
+            serde_yaml::Value::Null => return Ok(config),
+            serde_yaml::Value::Mapping(map) => map,
+            _ => return Err(D::Error::custom(ALERTS_SHAPE)),
+        };
+        for (key, value) in map {
+            let text = |what: &str| match &value {
+                serde_yaml::Value::Null => Ok(None),
+                serde_yaml::Value::String(s) => Ok(Some(s.clone())),
+                _ => Err(D::Error::custom(format!("alerts.{what} must be text"))),
+            };
+            match key.as_str() {
+                Some("webhook_url") => {
+                    config.webhook_url = text("webhook_url")?
+                        .map(|u| u.trim().to_string())
+                        .filter(|u| !u.is_empty());
+                }
+                Some("webhook_secret") => {
+                    config.webhook_secret = match text("webhook_secret")? {
+                        Some(s) if s.trim().is_empty() => {
+                            return Err(D::Error::custom("alerts.webhook_secret is blank"));
+                        }
+                        other => other.map(secrecy::SecretString::from),
+                    };
+                }
+                Some("webhook_backoff_ms") => {
+                    config.webhook_backoff_ms = match &value {
+                        serde_yaml::Value::Null => None,
+                        serde_yaml::Value::Number(n) => Some(n.as_u64().ok_or_else(|| {
+                            D::Error::custom(
+                                "alerts.webhook_backoff_ms must be a whole number of milliseconds",
+                            )
+                        })?),
+                        _ => {
+                            return Err(D::Error::custom(
+                                "alerts.webhook_backoff_ms must be a whole number of milliseconds",
+                            ));
+                        }
+                    };
+                }
+                Some(other) => {
+                    // A key that looks like a key is named; anything else
+                    // (a pasted URL, say) is not.
+                    let named = other.len() <= 64
+                        && other.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    let which = if named {
+                        format!(" {other:?}")
+                    } else {
+                        String::new()
+                    };
+                    return Err(D::Error::custom(format!(
+                        "alerts: unknown key{which} (use webhook_url, webhook_secret or webhook_backoff_ms)"
+                    )));
+                }
+                None => return Err(D::Error::custom(ALERTS_SHAPE)),
+            }
+        }
+        Ok(config)
+    }
+}
+
+impl AlertConfig {
+    /// Ten seconds: retries after 10, 20, 40, 80 and 160 seconds.
+    pub const DEFAULT_BACKOFF_MS: u64 = 10_000;
+    /// An hour.
+    pub const MAX_BACKOFF_MS: u64 = 3_600_000;
+
+    pub fn backoff_ms(&self) -> u64 {
+        self.webhook_backoff_ms.unwrap_or(Self::DEFAULT_BACKOFF_MS)
+    }
+
+    /// `HIE_ALERT_WEBHOOK_URL` and `HIE_ALERT_WEBHOOK_SECRET` from `lookup`
+    /// (the process environment in `hie`): an unset or blank variable leaves
+    /// the file's value; one that is not UTF-8 is refused.
+    pub fn apply_env(&mut self, lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<()> {
+        let read = |name: &str| -> Result<Option<String>> {
+            match lookup(name) {
+                None => Ok(None),
+                Some(v) => {
+                    let v = v
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("{name} is not valid UTF-8"))?;
+                    Ok((!v.trim().is_empty()).then_some(v))
+                }
+            }
+        };
+        if let Some(url) = read("HIE_ALERT_WEBHOOK_URL")? {
+            let url = url.trim().to_string();
+            if !is_http_url(&url) {
+                bail!(
+                    "HIE_ALERT_WEBHOOK_URL (overriding alerts.webhook_url) is not an http or https URL"
+                );
+            }
+            self.webhook_url = Some(url);
+        }
+        if let Some(secret) = read("HIE_ALERT_WEBHOOK_SECRET")? {
+            self.webhook_secret = Some(secrecy::SecretString::from(secret));
+        }
+        Ok(())
+    }
+
+    /// Refuses a blank secret, a URL that is not http or https, and a backoff
+    /// out of range.
+    /// The messages never quote the URL.
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .webhook_secret
+            .as_ref()
+            .is_some_and(|s| s.expose_secret().trim().is_empty())
+        {
+            bail!("alerts.webhook_secret is blank");
+        }
+        if self.webhook_url.as_deref().is_some_and(|u| !is_http_url(u)) {
+            bail!("alerts.webhook_url is not an http or https URL");
+        }
+        if !(1..=Self::MAX_BACKOFF_MS).contains(&self.backoff_ms()) {
+            bail!(
+                "alerts.webhook_backoff_ms must be from 1 to {}",
+                Self::MAX_BACKOFF_MS
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The `destination:` block.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DestinationConfig {
+    /// Seconds without any request to the FHIR server after which the engine
+    /// probes its `/metadata`; `0` turns the probe off.
+    pub probe_seconds: u64,
+}
+
+impl Default for DestinationConfig {
+    fn default() -> Self {
+        Self { probe_seconds: 60 }
+    }
+}
+
+impl DestinationConfig {
+    pub fn check(&self) -> Result<()> {
+        if self.probe_seconds > crate::destination::MAX_PROBE_SECONDS {
+            bail!(
+                "destination.probe_seconds must be at most {} (0 turns the probe off)",
+                crate::destination::MAX_PROBE_SECONDS
+            );
+        }
+        Ok(())
+    }
+
+    /// How long the destination stays idle before a probe; zero when off.
+    pub fn probe_every(&self) -> Duration {
+        Duration::from_secs(self.probe_seconds)
+    }
 }
 
 /// The `worker:` block: the limits every transform worker process runs under.
@@ -166,6 +416,14 @@ impl WorkerConfig {
 pub struct FeedConfig {
     pub id: String,
     pub name: String,
+    /// Who to call about this source: one line of display text, never
+    /// interpreted. Blank means none.
+    #[serde(
+        default,
+        deserialize_with = "contact_text",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub contact: Option<String>,
     pub source: SourceConfig,
     #[serde(default)]
     pub format: Format,
@@ -288,6 +546,53 @@ pub enum SourceConfig {
         #[serde(default = "default_mllp_poll_seconds")]
         poll_seconds: u64,
     },
+}
+
+/// The longest contact a source may have, in characters.
+pub const CONTACT_MAX_CHARS: usize = 500;
+
+/// A contact as text, or none: a string, or null. A blank one (empty or only
+/// whitespace) is none, so it is never written. Anything else is refused,
+/// whatever the format: a bare `5550100` in YAML is a number, not text, and
+/// would come back as a number in `definition`.
+fn contact_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    struct Text;
+    impl<'de> serde::de::Visitor<'de> for Text {
+        type Value = Option<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a contact as text, or null (in a YAML file, quote one that reads as a number or true/false)")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok((!v.trim().is_empty()).then(|| v.to_string()))
+        }
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok((!v.trim().is_empty()).then_some(v))
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+    d.deserialize_any(Text)
+}
+
+/// Whether a character would break a contact's single line or reorder the text
+/// around it: control characters, the Unicode line and paragraph separators,
+/// and the bidirectional marks and embedding, override and isolate controls.
+fn breaks_contact_line(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 fn default_spool() -> PathBuf {
@@ -656,6 +961,22 @@ impl FeedConfig {
                 self.id
             );
         }
+        // Before anything that can skip the file, so an invalid contact is
+        // refused in every build.
+        if let Some(contact) = &self.contact {
+            if contact.chars().count() > CONTACT_MAX_CHARS {
+                bail!(
+                    "source {}: contact must be at most {CONTACT_MAX_CHARS} characters",
+                    self.id
+                );
+            }
+            if contact.chars().any(breaks_contact_line) {
+                bail!(
+                    "source {}: contact must be one line of plain text, without control, line separator or text direction characters",
+                    self.id
+                );
+            }
+        }
         self.source.resolve(base);
         self.source
             .check()
@@ -758,8 +1079,9 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     // and its transforms run in the local worker instead: refuse to start, whatever
     // its value (`runtime: null` and a bare `runtime:` included) and however the
     // key is tagged (`as_str` sees through YAML tags).
+    // Its errors may quote anything in the file, a webhook secret included.
     let raw: serde_yaml::Value =
-        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        serde_yaml::from_str(&text).map_err(|e| parse_error(path, true, e))?;
     if raw
         .as_mapping()
         .is_some_and(|m| m.keys().any(|k| k.as_str() == Some("runtime")))
@@ -769,10 +1091,18 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
             path.display()
         );
     }
-    let mut config: Config =
-        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let mut config: Config = serde_yaml::from_str(&text)
+        .map_err(|e| parse_error(path, holds_alert_settings(&raw), e))?;
     config
         .worker
+        .check()
+        .with_context(|| format!("checking {}", path.display()))?;
+    config
+        .retention
+        .check()
+        .with_context(|| format!("checking {}", path.display()))?;
+    config
+        .destination
         .check()
         .with_context(|| format!("checking {}", path.display()))?;
     let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -807,6 +1137,7 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
                 config.skipped.push(SkippedSource {
                     file: feed_path.clone(),
                     source_id: needs.source.clone(),
+                    source_name: feed.name.clone(),
                     reason: needs.to_string(),
                 });
                 continue;
@@ -819,6 +1150,69 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
         feeds.push(feed);
     }
     Ok((config, feeds))
+}
+
+/// A YAML error in `hie.yaml`; with `hide`, without whatever the parser quotes.
+/// YAML lets a value reach an error from anywhere in the file (an alias of the
+/// secret used in another field, a repeated key), so no line is safe to quote
+/// while the file may hold the webhook's URL or secret.
+fn parse_error(path: &Path, hide: bool, e: serde_yaml::Error) -> anyhow::Error {
+    if !hide {
+        return anyhow::Error::new(e).context(format!("parsing {}", path.display()));
+    }
+    anyhow::anyhow!(
+        "parsing {}: {} (quoted values are not shown: the file may hold the alert webhook's URL or secret)",
+        path.display(),
+        unquoted(&e.to_string())
+    )
+}
+
+/// Whether the parsed file gives `alerts:` anything but blank values, keys
+/// taken as YAML decodes them.
+fn holds_alert_settings(raw: &serde_yaml::Value) -> bool {
+    use serde_yaml::Value;
+    let blank = |v: &Value| match v {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        _ => false,
+    };
+    let Some(top) = raw.as_mapping() else {
+        return false;
+    };
+    top.iter()
+        .filter(|(k, _)| k.as_str() == Some("alerts"))
+        .any(|(_, alerts)| match alerts {
+            Value::Null => false,
+            Value::Mapping(m) => m.values().any(|v| !blank(v)),
+            _ => true,
+        })
+}
+
+/// `text` with whatever stands between double quotes or backticks replaced by `…`.
+fn unquoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        let close = match c {
+            '"' => '"',
+            '`' => '`',
+            _ => continue,
+        };
+        out.push('…');
+        let mut escaped = false;
+        for d in chars.by_ref() {
+            if escaped {
+                escaped = false;
+            } else if d == '\\' && close == '"' {
+                escaped = true;
+            } else if d == close {
+                out.push(d);
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// The source files in `dir`, in the order `load` reads them: every `*.yaml`
@@ -866,13 +1260,16 @@ pub fn parse_duration(text: &str) -> Result<Duration> {
     let n: u64 = number
         .parse()
         .with_context(|| format!("invalid duration {text:?}"))?;
-    let secs = match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86_400,
+    let unit = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
         _ => bail!("invalid duration unit in {text:?} (use s, m, h or d)"),
     };
+    let secs = n
+        .checked_mul(unit)
+        .with_context(|| format!("duration {text:?} is too long"))?;
     Ok(Duration::from_secs(secs))
 }
 
@@ -894,6 +1291,155 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+
+    fn alerts_from(yaml: &str) -> Result<AlertConfig, String> {
+        serde_yaml::from_str::<Config>(&format!("fhir_base_url: http://hfs\n{yaml}"))
+            .map(|c| c.alerts)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn alert_settings_default_without_a_block() {
+        let alerts = alerts_from("").unwrap();
+        assert!(alerts.webhook_url.is_none() && alerts.webhook_secret.is_none());
+        assert_eq!(alerts.backoff_ms(), 10_000);
+        assert!(alerts.validate().is_ok());
+        let alerts = alerts_from("alerts:\n  webhook_url: '  '\n").unwrap();
+        assert!(alerts.webhook_url.is_none(), "a blank URL is no URL");
+    }
+
+    #[test]
+    fn alert_settings_are_read_and_checked() {
+        let alerts = alerts_from(
+            "alerts:\n  webhook_url: ' https://hooks.example.org/x '\n  webhook_secret: s3cr3t\n  webhook_backoff_ms: 50\n",
+        )
+        .unwrap();
+        assert_eq!(
+            alerts.webhook_url.as_deref(),
+            Some("https://hooks.example.org/x")
+        );
+        assert_eq!(
+            alerts.webhook_secret.as_ref().unwrap().expose_secret(),
+            "s3cr3t"
+        );
+        assert_eq!(alerts.backoff_ms(), 50);
+        assert!(alerts.validate().is_ok());
+        let debug = format!("{alerts:?}");
+        assert!(
+            !debug.contains("hooks.example.org") && !debug.contains("s3cr3t"),
+            "{debug}"
+        );
+
+        for (yaml, canary) in [
+            (
+                "alerts:\n  webhook_url: ftp://canary.example.org/x\n",
+                "canary",
+            ),
+            ("alerts:\n  webhook_url: not a url canary\n", "canary"),
+            ("alerts:\n  webhook_backoff_ms: 0\n", "webhook_backoff_ms"),
+        ] {
+            let e = alerts_from(yaml)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            if canary == "canary" {
+                assert!(!e.contains(canary), "{e}");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_alert_settings_never_echo_their_values() {
+        for yaml in [
+            "alerts: https://canary.example.org/hook\n",
+            "alerts:\n  webhook_url: [https://canary.example.org/hook]\n",
+            "alerts:\n  webhook_secret: {canary: 1}\n",
+            "alerts:\n  webhook_secret: 123456789\n",
+            "alerts:\n  webhook_backoff_ms: canary\n",
+            "alerts:\n  webhook_backoff_ms: -5\n",
+        ] {
+            let e = alerts_from(yaml).unwrap_err();
+            assert!(!e.contains("canary") && !e.contains("123456789"), "{e}");
+        }
+        assert!(
+            alerts_from("alerts:\n  webhook_secret: '  '\n")
+                .unwrap_err()
+                .contains("blank")
+        );
+        let typo = alerts_from("alerts:\n  webhook_secrt: x\n").unwrap_err();
+        assert!(typo.contains("webhook_secrt"), "{typo}");
+    }
+
+    #[test]
+    fn quoted_values_can_be_left_out_of_errors() {
+        assert_eq!(
+            unquoted(r#"invalid type: string "s3c\"ret", expected `u64` at line 3"#),
+            "invalid type: string \"…\", expected `…` at line 3"
+        );
+    }
+
+    #[test]
+    fn a_blank_secret_is_refused_on_every_path() {
+        let alerts = AlertConfig {
+            webhook_url: Some("https://hooks.example.org/x".into()),
+            webhook_secret: Some(secrecy::SecretString::from(" ".to_string())),
+            webhook_backoff_ms: None,
+        };
+        assert!(alerts.validate().unwrap_err().to_string().contains("blank"));
+    }
+
+    #[test]
+    fn alert_settings_from_the_environment() {
+        use std::ffi::OsString;
+        let mut alerts =
+            alerts_from("alerts:\n  webhook_url: https://file.example.org/x\n").unwrap();
+        let env = |pairs: Vec<(&'static str, OsString)>| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.clone())
+            }
+        };
+        alerts
+            .apply_env(env(vec![("HIE_ALERT_WEBHOOK_URL", " ".into())]))
+            .unwrap();
+        assert_eq!(
+            alerts.webhook_url.as_deref(),
+            Some("https://file.example.org/x"),
+            "blank is ignored"
+        );
+        alerts
+            .apply_env(env(vec![
+                (
+                    "HIE_ALERT_WEBHOOK_URL",
+                    " https://env.example.org/y ".into(),
+                ),
+                ("HIE_ALERT_WEBHOOK_SECRET", "from-env".into()),
+            ]))
+            .unwrap();
+        assert_eq!(
+            alerts.webhook_url.as_deref(),
+            Some("https://env.example.org/y")
+        );
+        assert_eq!(
+            alerts.webhook_secret.as_ref().unwrap().expose_secret(),
+            "from-env"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let e = alerts
+                .apply_env(env(vec![(
+                    "HIE_ALERT_WEBHOOK_SECRET",
+                    OsString::from_vec(vec![0xff, 0xfe]),
+                )]))
+                .unwrap_err();
+            assert!(e.to_string().contains("not valid UTF-8"));
+        }
+    }
 
     #[test]
     fn durations_parse_with_units() {
@@ -953,6 +1499,136 @@ mod tests {
         feed.id = "good-id".into();
         feed.resolve(dir.path()).unwrap();
         assert!(feed.transform.is_absolute());
+    }
+
+    const CONTACT_BASE: &str =
+        "id: lab\nname: Lab\nsource:\n  type: folder\n  path: inbox\ntransform: t.py\n";
+
+    fn contact_yaml(line: &str) -> Result<FeedConfig, serde_yaml::Error> {
+        serde_yaml::from_str(&format!("{CONTACT_BASE}{line}"))
+    }
+
+    fn contact_json(contact: Value) -> Result<FeedConfig, serde_json::Error> {
+        serde_json::from_value(json!({
+            "id": "lab", "name": "Lab",
+            "source": {"type": "folder", "path": "inbox"},
+            "transform": "t.py", "contact": contact,
+        }))
+    }
+
+    fn resolved(mut feed: FeedConfig) -> Result<FeedConfig> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.py"), "def transform(r, c): return r\n").unwrap();
+        feed.resolve(dir.path()).map(|()| feed)
+    }
+
+    #[test]
+    fn a_contact_is_read_kept_as_given_and_written_only_when_there_is_one() {
+        let feed = contact_yaml("contact: \" Lab IT on-call, +1 555 0100 \"\n").unwrap();
+        assert_eq!(
+            feed.contact.as_deref(),
+            Some(" Lab IT on-call, +1 555 0100 ")
+        );
+        let yaml = feed.to_yaml().unwrap();
+        let again: FeedConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(again.contact, feed.contact);
+        // A quoted number is text, and stays text through YAML and JSON.
+        let feed = contact_yaml("contact: \"5550100\"\n").unwrap();
+        assert_eq!(feed.contact.as_deref(), Some("5550100"));
+        let again: FeedConfig = serde_yaml::from_str(&feed.to_yaml().unwrap()).unwrap();
+        assert_eq!(again.contact.as_deref(), Some("5550100"));
+        let as_json = serde_json::to_value(
+            serde_yaml::from_str::<serde_yaml::Value>(&feed.to_yaml().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(as_json["contact"], "5550100");
+        // None, null and blank are all no contact, and no key is written.
+        for line in [
+            "",
+            "contact: null\n",
+            "contact: ~\n",
+            "contact: \"\"\n",
+            "contact: \"   \"\n",
+            "contact: \"\\n\\t\"\n",
+        ] {
+            let feed = contact_yaml(line).unwrap();
+            assert_eq!(feed.contact, None, "{line:?}");
+            assert!(!feed.to_yaml().unwrap().contains("contact"), "{line:?}");
+        }
+        for blank in [Value::Null, json!(""), json!("  "), json!("\n")] {
+            assert_eq!(
+                contact_json(blank.clone()).unwrap().contact,
+                None,
+                "{blank}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_contact_that_is_not_text_is_refused() {
+        for line in [
+            "contact: 5550100\n",
+            "contact: true\n",
+            "contact: [a]\n",
+            "contact:\n  name: x\n",
+        ] {
+            let err = contact_yaml(line).unwrap_err().to_string();
+            assert!(err.starts_with("contact: invalid type"), "{line:?}: {err}");
+        }
+        for value in [
+            json!(5550100),
+            json!(true),
+            json!(["a"]),
+            json!({"name": "x"}),
+        ] {
+            let err = contact_json(value.clone()).unwrap_err().to_string();
+            assert!(
+                err.starts_with("invalid type") && err.contains("a contact as text, or null"),
+                "{value}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_contact_is_bounded_and_one_line_of_plain_text() {
+        let longest = "é".repeat(CONTACT_MAX_CHARS);
+        assert!(resolved(contact_json(json!(longest)).unwrap()).is_ok());
+        let err = format!(
+            "{:#}",
+            resolved(contact_json(json!(format!("{longest}x"))).unwrap()).unwrap_err()
+        );
+        assert!(
+            err.contains("source lab: contact must be at most 500 characters"),
+            "{err}"
+        );
+        for bad in [
+            "a\nb",
+            "a\rb",
+            "a\tb",
+            "a\u{1b}[31mb",
+            "a\u{85}b",
+            "a\u{7f}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{202e}b",
+            "a\u{2066}b",
+            "a\u{061c}b",
+            "a\u{200e}b",
+            "a\u{200f}b",
+        ] {
+            let err = format!(
+                "{:#}",
+                resolved(contact_json(json!(bad)).unwrap()).unwrap_err()
+            );
+            assert!(
+                err.contains("contact must be one line of plain text"),
+                "{bad:?}: {err}"
+            );
+        }
+        // A block scalar keeps its line breaks; a plain one folded over lines is one line.
+        assert!(resolved(contact_yaml("contact: |\n  Lab IT\n  +1 555 0100\n").unwrap()).is_err());
+        let folded = resolved(contact_yaml("contact: Lab IT\n  +1 555 0100\n").unwrap()).unwrap();
+        assert_eq!(folded.contact.as_deref(), Some("Lab IT +1 555 0100"));
     }
 
     fn load_engine_yaml(yaml: &str) -> Result<(Config, Vec<FeedConfig>)> {
@@ -1035,6 +1711,32 @@ mod tests {
                 .unwrap()
                 .contains("stamp_source")
         );
+    }
+
+    #[test]
+    fn the_retention_block_has_a_default_and_is_checked() {
+        let (config, _) = load_engine_yaml("fhir_base_url: http://hfs\n").unwrap();
+        assert_eq!(config.retention.history(), Duration::from_secs(30 * 86_400));
+        let (config, _) =
+            load_engine_yaml("fhir_base_url: http://hfs\nretention:\n  history: 7d\n").unwrap();
+        assert_eq!(config.retention.history(), Duration::from_secs(7 * 86_400));
+        for (history, says) in [
+            ("12h", "from 1d to 3650d"),
+            ("0d", "from 1d to 3650d"),
+            ("3651d", "from 1d to 3650d"),
+            ("soon", "invalid duration"),
+            ("99999999999999999999d", "invalid duration"),
+            ("9999999999999999d", "too long"),
+        ] {
+            let err = load_engine_yaml(&format!(
+                "fhir_base_url: http://hfs\nretention:\n  history: {history}\n"
+            ))
+            .unwrap_err();
+            assert!(format!("{err:#}").contains(says), "{history}: {err:#}");
+        }
+        let err =
+            load_engine_yaml("fhir_base_url: http://hfs\nretention:\n  records: 7d\n").unwrap_err();
+        assert!(format!("{err:#}").contains("records"), "{err:#}");
     }
 
     #[test]

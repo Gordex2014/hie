@@ -67,8 +67,9 @@ fn repo() -> PathBuf {
 }
 
 /// A FHIR server's status endpoints: `poll` in progress, `done` with receipts
-/// that cannot be fetched, `refused` with a diagnostic naming a signed URL, and
-/// anything else failing.
+/// that cannot be fetched, `refused` with a diagnostic naming signed URLs (one on
+/// a bracketed IPv6 host, one with parentheses in its path) and echoing the
+/// engine's own path with the submission's token, and anything else failing.
 async fn status(State(base): State<String>, Path(which): Path<String>) -> Response {
     match which.as_str() {
         "poll" => StatusCode::ACCEPTED.into_response(),
@@ -76,10 +77,18 @@ async fn status(State(base): State<String>, Path(which): Path<String>) -> Respon
             "url": format!("{base}/receipts/1?X-Amz-Signature=CANARY-RECEIPT-SIGNATURE&X-Amz-Security-Token=CANARY-RECEIPT-TOKEN"),
             "count": 1}], "outcome": []}))
         .into_response(),
+        "settled" => Json(json!({"output": [{"type": "Patient",
+            "url": format!("{base}/receipts-ok/cleanup"), "count": 1}], "outcome": []}))
+        .into_response(),
         "refused" => (
             StatusCode::BAD_REQUEST,
             Json(json!({"resourceType": "OperationOutcome", "issue": [{"severity": "error", "code": "processing",
-                "diagnostics": "could not fetch https://b.s3.amazonaws.com/a.ndjson?X-Amz-Signature=CANARY-REFUSED-SIGNATURE&X-Amz-Security-Token=CANARY-REFUSED-TOKEN"}]})),
+                "diagnostics": "could not fetch https://b.s3.amazonaws.com/a.ndjson?X-Amz-Signature=CANARY-REFUSED-SIGNATURE&X-Amz-Security-Token=CANARY-REFUSED-TOKEN \
+                    nor https://[2001:db8::1]:9000/b/a.ndjson?X-Amz-Signature=CANARY-REFUSED-V6 \
+                    nor https://b.test/a(CANARY-REFUSED-PAREN)/b?sig=CANARY-REFUSED-SIG; \
+                    manifest /bulk/hie-canary-refused/manifest.json; \
+                    receipts /receipts/1?X-Amz-Signature=CANARY-REFUSED-RELATIVE, \
+                    receipts?X-Amz-Signature=CANARY-REFUSED-QUERY and ?sig=CANARY-REFUSED-BARE"}]})),
         )
             .into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -101,18 +110,25 @@ async fn status_kickoff(State(base): State<String>) -> Response {
 /// The stand-in FHIR server, at the returned URL.
 async fn fhir_server() -> String {
     let (listener, base) = bind().await;
-    let app = Router::new()
-        .route(
-            "/$bulk-submit",
-            post(|| async { Json(json!({"resourceType": "OperationOutcome", "issue": []})) }),
-        )
-        .route("/$bulk-submit-status", post(status_kickoff))
-        .route("/status/{which}", get(status))
-        .route(
-            "/receipts/{n}",
-            get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
-        )
-        .with_state(base.clone());
+    let app =
+        Router::new()
+            .route(
+                "/$bulk-submit",
+                post(|| async { Json(json!({"resourceType": "OperationOutcome", "issue": []})) }),
+            )
+            .route("/$bulk-submit-status", post(status_kickoff))
+            .route("/status/{which}", get(status))
+            .route(
+                "/receipts/{n}",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route(
+                "/receipts-ok/{id}",
+                get(|Path(id): Path<String>| async move {
+                    format!("{{\"reference\":\"Patient/{id}\"}}\n")
+                }),
+            )
+            .with_state(base.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     base
 }
@@ -154,6 +170,7 @@ fn submission(db: &hie::db::Db, which: &str, status: Option<&str>) {
     let file = db
         .insert_file(
             "drops",
+            "drops",
             &format!("{which}.ndjson"),
             which,
             1,
@@ -177,10 +194,16 @@ fn submission(db: &hie::db::Db, which: &str, status: Option<&str>) {
         .unwrap()[0]["id"]
         .as_i64()
         .unwrap();
-    db.mark_passthrough(&[record]).unwrap();
+    db.mark_passthrough(&[(record, 0)]).unwrap();
     let token = format!("hie-canary-{which}");
-    db.create_submission_for_files(&token, "drops", &token, &json!({"output": []}), &[file])
-        .unwrap();
+    db.create_submission_for_files(
+        &token,
+        "drops",
+        &format!("sub-{which}"),
+        &json!({"output": []}),
+        &[(file, 1)],
+    )
+    .unwrap();
     if let Some(status) = status {
         db.update_submission(&token, "running", Some(status), 0, 0, None)
             .unwrap();
@@ -202,6 +225,18 @@ fn stored(db: &hie::db::Db) -> (String, String, String) {
         column("SELECT error FROM records", "error"),
         column("SELECT message FROM alerts", "message"),
     )
+}
+
+/// The event log as text, and its kinds.
+fn logged_events(db: &hie::db::Db) -> (String, Vec<String>) {
+    let rows = db
+        .query_json("SELECT kind, reason, detail FROM events ORDER BY id", [])
+        .unwrap();
+    let kinds = rows
+        .iter()
+        .map(|r| r["kind"].as_str().unwrap().to_string())
+        .collect();
+    (serde_json::to_string(&rows).unwrap(), kinds)
 }
 
 /// A failing status poll, and receipts that cannot be fetched.
@@ -229,7 +264,17 @@ async fn a_failing_poll_never_puts_credentials_in_logs_or_alerts() {
             && submissions.contains("fetching"),
         "{submissions}\n{alerts}"
     );
-    for text in [&logs, &submissions, &alerts] {
+    // Both failed attempts are in the event log, without their URLs' secrets.
+    let (events, kinds) = logged_events(&db);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| *k == "submission.attempt_failed")
+            .count(),
+        2,
+        "{kinds:?}"
+    );
+    for text in [&logs, &submissions, &alerts, &events] {
         assert!(!text.contains("CANARY-STATUS"), "{text}");
         assert!(!text.contains("CANARY-RECEIPT"), "{text}");
     }
@@ -249,12 +294,31 @@ async fn a_refusal_that_echoes_a_signed_url_keeps_it_out_of_logs_and_records() {
     let (submissions, records, alerts) = stored(&db);
     assert!(logs.contains("refused: HTTP 400"), "{logs}");
     assert!(
-        submissions.contains("HTTP 400") && submissions.contains("https://b.s3.amazonaws.com/…"),
+        submissions.contains("HTTP 400")
+            && submissions.contains("https://b.s3.amazonaws.com/…")
+            && submissions.contains("https://[2001:db8::1]:9000/…")
+            && submissions.contains("/bulk/<token>/manifest.json"),
         "{submissions}"
     );
     assert!(records.contains("HTTP 400"), "{records}");
-    for text in [&logs, &submissions, &records, &alerts] {
+    // The server's answer kept on the record, scrubbed the same way.
+    let responses = db
+        .query_json("SELECT response FROM records", [])
+        .unwrap()
+        .iter()
+        .map(|r| r["response"].to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(responses.contains("OperationOutcome"), "{responses}");
+    let (events, kinds) = logged_events(&db);
+    assert!(
+        kinds.contains(&"submission.refused".to_string())
+            && kinds.contains(&"record.rejected".to_string()),
+        "{kinds:?}"
+    );
+    for text in [&logs, &submissions, &records, &alerts, &responses, &events] {
         assert!(!text.contains("CANARY-REFUSED"), "{text}");
+        assert!(!text.contains("bulk/hie-canary-refused"), "{text}");
     }
 }
 
@@ -323,4 +387,106 @@ async fn a_status_url_stored_during_delivery_is_never_logged() {
     let logs = logged();
     assert!(logs.contains(" TRACE "), "the filter lets TRACE through");
     assert!(!logs.contains("CANARY-RUNTIME"), "{logs}");
+}
+
+/// A FHIR server whose status kick-off names a relative target that carries a
+/// signature: it cannot be polled, and its text is never shown.
+async fn relative_server() -> String {
+    let (listener, base) = bind().await;
+    let app = Router::new()
+        .route(
+            "/$bulk-submit",
+            post(|| async { Json(json!({"resourceType": "OperationOutcome", "issue": []})) }),
+        )
+        .route(
+            "/$bulk-submit-status",
+            post(|| async {
+                (
+                    StatusCode::ACCEPTED,
+                    [(
+                        "content-location",
+                        "/status/poll?X-Amz-Signature=CANARY-RELATIVE-SIGNATURE",
+                    )],
+                )
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    base
+}
+
+/// The event log, the records' errors and answers, the submissions' errors and
+/// the alerts, as one text.
+fn everything_stored(db: &hie::db::Db) -> String {
+    let (submissions, records, alerts) = stored(db);
+    let (events, _) = logged_events(db);
+    let responses = db
+        .query_json("SELECT response FROM records", [])
+        .unwrap()
+        .iter()
+        .map(|r| r["response"].to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    [submissions, records, alerts, events, responses].join("\n")
+}
+
+#[tokio::test]
+async fn a_relative_status_target_is_never_shown() {
+    logs();
+    let base = relative_server().await;
+    let db = Arc::new(hie::db::Db::in_memory().unwrap());
+    let runner = runner(&db, hie::fhir::FhirClient::new(&base), &base);
+    submission(&db, "relative", None);
+    // Kicked off; then the poll of a target that cannot be reached.
+    runner.tick().await.unwrap();
+    runner.tick().await.unwrap();
+
+    let (_, kinds) = logged_events(&db);
+    assert!(
+        kinds.contains(&"submission.attempt_failed".to_string()),
+        "{kinds:?}"
+    );
+    let stored = everything_stored(&db);
+    assert!(stored.contains("fetching <URL>"), "{stored}");
+    for text in [&logged(), &stored] {
+        assert!(!text.contains("CANARY-RELATIVE"), "{text}");
+    }
+}
+
+/// A settled submission whose files cannot be removed: the reason is logged,
+/// without the token that names the directory.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_cleanup_that_fails_never_logs_the_token() {
+    use std::os::unix::fs::PermissionsExt;
+    logs();
+    let base = fhir_server().await;
+    let db = Arc::new(hie::db::Db::in_memory().unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let bulk_dir = dir.path().join("bulk");
+    let token = "hie-canary-cleanup";
+    std::fs::create_dir_all(bulk_dir.join(token)).unwrap();
+    std::fs::write(bulk_dir.join(token).join("1.ndjson"), "{}\n").unwrap();
+    let runner = runner(&db, hie::fhir::FhirClient::new(&base), &base).with_bulk_dir(&bulk_dir);
+    submission(&db, "cleanup", Some(&format!("{base}/status/settled")));
+    // The bulk directory cannot be written: its submission directory stays.
+    std::fs::set_permissions(&bulk_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    runner.tick().await.unwrap();
+    let kept = bulk_dir.join(token).exists();
+    std::fs::set_permissions(&bulk_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(db.feed_counts("drops").unwrap()["sent"], 1);
+    // Only root could remove it anyway.
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(kept, "the cleanup was expected to fail");
+    }
+    let logs = logged();
+    if kept {
+        assert!(
+            logs.contains("cannot remove") && logs.contains("<token>"),
+            "{logs}"
+        );
+    }
+    for text in [&logs, &everything_stored(&db)] {
+        assert!(!text.contains(token), "{text}");
+    }
 }

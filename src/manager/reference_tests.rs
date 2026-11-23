@@ -569,6 +569,44 @@ async fn a_transform_save_after_a_failed_start_runs_the_saved_definition() {
     a.delete_secret(&x).await.unwrap();
 }
 
+/// After a start that failed, the running source keeps its contact and the
+/// saved definition has the new one, until the saved definition starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_failed_start_the_running_and_saved_contacts_differ() {
+    let dir = tempfile::tempdir().unwrap();
+    let (database, _keeper) = store(dir.path());
+    let bucket = refusing_bucket().await;
+    let a = Instance::start(&dir.path().join("a"), &database, &key());
+    a.secret("x").await;
+    let with_contact = |contact: &str| {
+        let mut definition = a.definition("s", "x", &bucket);
+        definition["contact"] = json!(contact);
+        definition
+    };
+    a.manager.create(&with_contact("Ann"), None).await.unwrap();
+    a.settled("s").await;
+    a.manager.fail_next_start.store(true, Ordering::SeqCst);
+    let err = a
+        .manager
+        .replace("s", &with_contact("Bea"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ManagerError::NotStarted(_)), "{err:?}");
+    let running = |a: &Instance| a.manager.source("s").unwrap().contact;
+    assert_eq!(running(&a).as_deref(), Some("Ann"));
+    assert_eq!(
+        a.manager.definition("s").unwrap().unwrap()["contact"],
+        "Bea"
+    );
+
+    a.manager
+        .save_transform("t", "def transform(r, c):\n    return []\n")
+        .await
+        .unwrap();
+    a.settled("s").await;
+    assert_eq!(running(&a).as_deref(), Some("Bea"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nothing_is_released_while_the_saved_and_running_definitions_differ() {
     let dir = tempfile::tempdir().unwrap();
@@ -626,4 +664,150 @@ async fn sources_loaded_from_any_yaml_name_are_restarted_and_cleaned() {
         a.delete_secret(&x).await.unwrap();
         assert_eq!(in_use(a.delete_secret(&y).await), ["s"], "{file}");
     }
+}
+
+impl Instance {
+    /// The ids of the source's `silence` rules.
+    fn silence_rules(&self, source: &str) -> Vec<i64> {
+        self.db
+            .rules()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.source_id.as_deref() == Some(source) && r.condition == "silence")
+            .map(|r| r.id)
+            .collect()
+    }
+
+    fn delete_rules(&self, source: &str) {
+        for id in self.silence_rules(source) {
+            self.db.delete_rule(id).unwrap();
+        }
+    }
+
+    async fn delete_source(&self, source: &str) {
+        self.manager.delete(source).await.unwrap();
+        self.settled(source).await;
+    }
+}
+
+/// A source gets its default rule when it is created, and a replace, a
+/// restart or a failed start never brings back one that was deleted. A source
+/// deleted and created again through the API is created: it gets one, never a
+/// second; put back as a file, it is the source the store knew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_rule_comes_with_a_creation_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (database, _keeper) = store(dir.path());
+    let bucket = refusing_bucket().await;
+    let k = key();
+    let a = Instance::start(&dir.path().join("a"), &database, &k);
+    a.secret("x").await;
+    let definition = a.definition("s", "x", &bucket);
+    a.manager.create(&definition, Some("ann")).await.unwrap();
+    a.settled("s").await;
+    let rules = a.silence_rules("s");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(
+        a.db.rule(rules[0]).unwrap().unwrap().created_by.as_deref(),
+        Some("ann")
+    );
+
+    a.delete_rules("s");
+    let mut renamed = a.manager.definition("s").unwrap().unwrap();
+    renamed["contact"] = json!("Lab IT");
+    a.manager.replace("s", &renamed).await.unwrap();
+    a.settled("s").await;
+    assert!(a.silence_rules("s").is_empty(), "a replace adds none");
+    a.manager.fail_next_start.store(true, Ordering::SeqCst);
+    let err = a.manager.replace("s", &renamed).await.unwrap_err();
+    assert!(matches!(err, ManagerError::NotStarted(_)), "{err:?}");
+    assert!(a.silence_rules("s").is_empty(), "a failed start adds none");
+    let root = a.stop();
+    let a = Instance::start(&root, &database, &k);
+    assert!(a.silence_rules("s").is_empty(), "a restart adds none");
+
+    // Deleted and created again: one rule, and still one when the old one stayed.
+    let saved = a.file_text("s");
+    a.delete_source("s").await;
+    a.manager.create(&definition, None).await.unwrap();
+    a.settled("s").await;
+    assert_eq!(a.silence_rules("s").len(), 1);
+    a.delete_source("s").await;
+    a.manager.create(&definition, None).await.unwrap();
+    a.settled("s").await;
+    assert_eq!(a.silence_rules("s").len(), 1, "never a second one");
+
+    // Deleted, its rule too, then its file put back: the store knew it.
+    a.delete_rules("s");
+    a.delete_source("s").await;
+    std::fs::write(root.join("sources/s.yaml"), saved).unwrap();
+    let root = a.stop();
+    let a = Instance::start(&root, &database, &k);
+    assert!(a.manager.source("s").is_some());
+    assert!(a.silence_rules("s").is_empty());
+}
+
+/// A source that first appears as a file at a start gets its rule there, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_source_first_seen_in_a_file_gets_its_rule_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (database, _keeper) = store(dir.path());
+    let bucket = refusing_bucket().await;
+    let k = key();
+    let a = Instance::start(&dir.path().join("a"), &database, &k);
+    a.secret("x").await;
+    let mut definition = a.definition("f", "x", &bucket);
+    definition["expect_every"] = json!("24h");
+    let feed: crate::config::FeedConfig = serde_json::from_value(definition).unwrap();
+    let root = a.stop();
+    std::fs::write(root.join("sources/f.yaml"), feed.to_yaml().unwrap()).unwrap();
+
+    let a = Instance::start(&root, &database, &k);
+    let rules = a.silence_rules("f");
+    assert_eq!(rules.len(), 1);
+    let rule = a.db.rule(rules[0]).unwrap().unwrap();
+    assert_eq!((rule.threshold.as_str(), rule.created_by), ("24h", None));
+    a.delete_rules("f");
+    let root = a.stop();
+    let a = Instance::start(&root, &database, &k);
+    assert!(a.silence_rules("f").is_empty());
+}
+
+/// A create whose birth cannot be recorded publishes nothing and keeps no
+/// registration. One whose write fails keeps the rule it was born with, and a
+/// create sent again uses it; one whose start fails keeps it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_keeps_its_rule_through_a_failed_write_or_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let (database, _keeper) = store(dir.path());
+    let bucket = refusing_bucket().await;
+    let k = key();
+    let a = Instance::start(&dir.path().join("a"), &database, &k);
+    let x = a.secret("x").await;
+    let definition = a.definition("s", "x", &bucket);
+    a.manager.fail_next_birth.store(true, Ordering::SeqCst);
+    let err = a.manager.create(&definition, None).await.unwrap_err();
+    assert!(matches!(err, ManagerError::Internal(_)), "{err:?}");
+    assert!(a.manager.definition("s").unwrap().is_none());
+    assert!(a.refs("s").is_empty());
+    assert!(a.silence_rules("s").is_empty());
+    a.delete_secret(&x).await.unwrap();
+    let x = a.secret("x").await;
+
+    a.manager.fail_next_write.store(true, Ordering::SeqCst);
+    let err = a.manager.create(&definition, None).await.unwrap_err();
+    assert!(matches!(err, ManagerError::Internal(_)), "{err:?}");
+    assert!(a.manager.definition("s").unwrap().is_none());
+    assert!(a.refs("s").is_empty());
+    assert_eq!(a.silence_rules("s").len(), 1);
+
+    a.manager.fail_next_start.store(true, Ordering::SeqCst);
+    let err = a.manager.create(&definition, None).await.unwrap_err();
+    assert!(matches!(err, ManagerError::NotStarted(_)), "{err:?}");
+    assert_eq!(a.refs("s"), set(&[&x]));
+    assert_eq!(a.silence_rules("s").len(), 1);
+    let root = a.stop();
+    let a = Instance::start(&root, &database, &k);
+    assert!(a.manager.source("s").is_some());
+    assert_eq!(a.silence_rules("s").len(), 1);
 }

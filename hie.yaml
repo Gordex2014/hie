@@ -3,4 +3,8 @@ database: data/hie.db
 listen: 127.0.0.1:8090
 sources_dir: sources
 alerts:
+  # Where alert events are posted (docs/sources.md, "The alert webhook").
+  # HIE_ALERT_WEBHOOK_URL overrides it, and HIE_ALERT_WEBHOOK_SECRET sets the
+  # secret that signs them (webhook_secret here; not blank). Retries wait
+  # webhook_backoff_ms (1 to 3600000; 10000 by default), doubling each time.
   webhook_url:

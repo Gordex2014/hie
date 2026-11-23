@@ -1,8 +1,10 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use crate::credentials::Credentials;
+use crate::destination::Destination;
 
 /// Why a Bundle could not be delivered as a whole.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +27,7 @@ pub struct FhirClient {
     base: String,
     http: reqwest::Client,
     credentials: Credentials,
+    destination: Arc<Destination>,
 }
 
 /// How long one HTTP call to FHIR may take, `$bulk-submit` calls included.
@@ -45,6 +48,7 @@ impl FhirClient {
             base: base.trim_end_matches('/').to_string(),
             http,
             credentials,
+            destination: Arc::new(Destination::new(base)),
         }
     }
 
@@ -52,23 +56,30 @@ impl FhirClient {
         &self.credentials
     }
 
+    /// Whether the server answers, as this client and the probe saw it.
+    pub fn destination(&self) -> &Arc<Destination> {
+        &self.destination
+    }
+
+    /// Posts a batch Bundle. A failure to reach the server is told with the
+    /// destination's fixed sentence, never the URL or a library's error text:
+    /// it reaches the record's error and the delivery alert. The log has the
+    /// detail.
     pub async fn post_bundle(&self, bundle: &Value) -> Result<Value, SendError> {
-        let request = self.bundle_request(bundle);
-        let request = authorize(request, &self.credentials).await?;
+        let request = self.bundle_request(bundle).await?;
         self.send_bundle(request).await
     }
 
     /// Posts a Bundle, running `before_send` once the request is authorized and
-    /// just before it leaves. When `before_send` fails nothing is sent, and its
-    /// error comes back as the outer one: not a `SendError`, since HFS was not
-    /// asked anything.
+    /// built, just before it leaves. When `before_send` fails nothing is sent,
+    /// and its error comes back as the outer one: not a `SendError`, since HFS
+    /// was not asked anything.
     pub async fn post_bundle_with(
         &self,
         bundle: &Value,
         before_send: impl FnOnce() -> anyhow::Result<()>,
     ) -> anyhow::Result<Result<Value, SendError>> {
-        let request = self.bundle_request(bundle);
-        let request = match authorize(request, &self.credentials).await {
+        let request = match self.bundle_request(bundle).await {
             Ok(request) => request,
             Err(e) => return Ok(Err(e)),
         };
@@ -76,26 +87,47 @@ impl FhirClient {
         Ok(self.send_bundle(request).await)
     }
 
-    fn bundle_request(&self, bundle: &Value) -> reqwest::RequestBuilder {
-        self.http
+    /// The Bundle's request, authorized and built. Built before it counts as a
+    /// request to the server: one that cannot be built never leaves the engine.
+    async fn bundle_request(&self, bundle: &Value) -> Result<reqwest::Request, SendError> {
+        let request = self
+            .http
             .post(&self.base)
             .header("Content-Type", "application/fhir+json")
             .header("Accept", "application/fhir+json")
-            .json(bundle)
+            .json(bundle);
+        authorize(request, &self.credentials)
+            .await?
+            .build()
+            .map_err(|e| {
+                tracing::warn!(
+                    "a request to the FHIR server could not be built: {}",
+                    crate::destination::send_detail(&e)
+                );
+                SendError::Transient("the request to the FHIR server could not be built".into())
+            })
     }
 
-    async fn send_bundle(&self, request: reqwest::RequestBuilder) -> Result<Value, SendError> {
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| SendError::Transient(format!("cannot reach {}: {e}", self.base)))?;
+    async fn send_bundle(&self, request: reqwest::Request) -> Result<Value, SendError> {
+        // Held until the answer has been read: the destination is not idle
+        // while it downloads.
+        let exchange = self.destination.start();
+        let sent = self.http.execute(request).await;
+        exchange.observe_send(&sent);
+        let resp = sent.map_err(|e| {
+            SendError::Transient(
+                crate::destination::send_failure(&e)
+                    .map_or("the request to the FHIR server failed", |f| f.sentence())
+                    .into(),
+            )
+        })?;
         let status = resp.status().as_u16();
         let body: Value = resp.json().await.unwrap_or(Value::Null);
+        drop(exchange);
         match status {
             200..=299 => Ok(body),
             429 | 500..=599 => Err(SendError::Transient(format!(
-                "HTTP {status} from {}",
-                self.base
+                "HTTP {status} from the FHIR server"
             ))),
             401 | 403 if self.credentials.is_some() => {
                 Err(refused_token(status, &self.credentials).await)

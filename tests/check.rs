@@ -30,6 +30,143 @@ fn check_config(yaml: &str, runtime_url: Option<&std::ffi::OsStr>) -> Output {
     command.output().unwrap()
 }
 
+/// `hie check` on `yaml` with the alert webhook variables set as given.
+fn check_alerts(yaml: &str, env: &[(&str, &std::ffi::OsStr)]) -> Output {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("hie.yaml");
+    std::fs::write(&config, yaml).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hie"));
+    command
+        .arg("--config")
+        .arg(&config)
+        .arg("check")
+        .env_remove("HIE_CONFIG")
+        .env_remove("HIE_RUNTIME_URL")
+        .env_remove("HIE_ALERT_WEBHOOK_URL")
+        .env_remove("HIE_ALERT_WEBHOOK_SECRET");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.output().unwrap()
+}
+
+#[test]
+fn check_refuses_bad_alert_settings_without_printing_them() {
+    let base = "fhir_base_url: http://127.0.0.1:1/fhir\n";
+    let os = std::ffi::OsStr::new;
+    for (yaml, env) in [
+        (
+            format!("{base}alerts: https://urlcanary.example.org/hook\n"),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  webhook_url: ftp://urlcanary.example.org/hook\n"),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  webhook_secret: [secretcanary]\n"),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  webhook_secret: 987654321\n"),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  webhook_secret:\n    secretcanary: 1\n    secretcanary: 2\n"),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  https://urlcanary.example.org/hook: 1\n"),
+            vec![],
+        ),
+        (
+            format!("{base}\"alerts\":\n  webhook_secret: !!int secretcanary\n"),
+            vec![],
+        ),
+        (
+            format!("{base}\"alerts\":\n  webhook_secret:\n    secretcanary: 1\n    secretcanary: 2\n"),
+            vec![],
+        ),
+        (
+            format!("{base}? alerts\n: webhook_secret: !!int secretcanary\n"),
+            vec![],
+        ),
+        (
+            "{fhir_base_url: http://127.0.0.1:1/fhir, alerts: {webhook_secret: !!int secretcanary}}\n".to_string(),
+            vec![],
+        ),
+        (
+            format!("{base}alerts:\n  webhook_secret: &s secretcanary\nworker:\n  memory_mib: *s\n"),
+            vec![],
+        ),
+        (
+            base.to_string(),
+            vec![(
+                "HIE_ALERT_WEBHOOK_URL",
+                os("gopher://urlcanary.example.org/hook"),
+            )],
+        ),
+    ] {
+        let out = check_alerts(&yaml, &env);
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.status.success(), "{yaml}: {printed}");
+        assert!(printed.contains("alert"), "{printed}");
+        for canary in ["urlcanary", "secretcanary", "987654321"] {
+            assert!(!printed.contains(canary), "{canary} printed: {printed}");
+        }
+    }
+    // A malformed leftover `runtime:` is still refused.
+    let out = check_alerts(&format!("{base}runtime: a\nruntime: b\n"), &[]);
+    assert!(
+        !out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // Without webhook settings in the file, errors keep their names: the
+    // template's blank `webhook_url:` and a misspelt worker key.
+    let out = check_alerts(
+        &format!("{base}alerts:\n  webhook_url:\nworker:\n  memroy_mib: 5\n"),
+        &[],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("memroy_mib"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // An escaped key is the same key.
+    let out = check_alerts(
+        &format!(
+            "{base}alerts:\n  \"webhook_\\x73ecret\": &s secretcanary\nworker:\n  memory_mib: *s\n"
+        ),
+        &[],
+    );
+    let printed = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && !printed.contains("secretcanary"),
+        "{printed}"
+    );
+    // Good settings, from the file and from the environment, are not printed either.
+    let out = check_alerts(
+        &format!("{base}alerts:\n  webhook_url: https://urlcanary.example.org/hook\n"),
+        &[("HIE_ALERT_WEBHOOK_SECRET", os("secretcanary"))],
+    );
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{printed}");
+    assert!(
+        !printed.contains("urlcanary") && !printed.contains("secretcanary"),
+        "{printed}"
+    );
+}
+
 #[test]
 fn check_fails_while_hie_runtime_url_is_set() {
     let out = check(Some("http://127.0.0.1:8790"));
@@ -232,4 +369,75 @@ fn a_start_with_the_wrong_key_or_an_ambiguous_one_is_refused_before_serving() {
     assert!(stderr.contains("more than one place"), "{stderr}");
     assert_eq!(refusal_markers(&stderr), (store_key, "ambiguous".into()));
     drop(db);
+}
+
+/// A source file with this tail in a configuration of its own.
+fn check_source(source: &str) -> Output {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("t.py"), "def transform(r, c): return r\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("sources")).unwrap();
+    std::fs::write(dir.path().join("sources").join("lab.yaml"), source).unwrap();
+    let config = dir.path().join("hie.yaml");
+    std::fs::write(&config, "fhir_base_url: http://127.0.0.1:1/fhir\n").unwrap();
+    Command::new(env!("CARGO_BIN_EXE_hie"))
+        .arg("--config")
+        .arg(&config)
+        .arg("check")
+        .env_remove("HIE_CONFIG")
+        .env_remove("HIE_RUNTIME_URL")
+        .output()
+        .unwrap()
+}
+
+const CONTACT_FOLDER: &str =
+    "id: lab\nname: Lab\nsource:\n  type: folder\n  path: inbox\ntransform: t.py\n";
+
+#[test]
+fn check_prints_a_source_contact() {
+    let out = check_source(&format!(
+        "{CONTACT_FOLDER}contact: \"Lab IT on-call, +1 555 0100\"\n"
+    ));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("    contact: Lab IT on-call, +1 555 0100"),
+        "{stdout}"
+    );
+    let out = check_source(CONTACT_FOLDER);
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("    contact: "));
+}
+
+#[test]
+fn check_refuses_an_invalid_contact_naming_the_file() {
+    let long = "x".repeat(501);
+    // An S3 source naming a credential too: a build without a secret store
+    // would skip that file, but not one whose contact is invalid.
+    let s3 = "id: lab\nname: Lab\nsource:\n  type: s3\n  bucket: b\n  credential: lab\nformat: ndjson\ntransform: t.py\n";
+    for (source, reason) in [
+        (
+            format!("{CONTACT_FOLDER}contact: {long}\n"),
+            "at most 500 characters",
+        ),
+        (
+            format!("{CONTACT_FOLDER}contact: 5550100\n"),
+            "contact: invalid type: integer",
+        ),
+        (
+            format!("{s3}contact: \"a\\u202Eb\"\n"),
+            "one line of plain text",
+        ),
+    ] {
+        let out = check_source(&source);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{source}");
+        assert!(
+            stderr.contains("lab.yaml") && stderr.contains(reason),
+            "{source}: {stderr}"
+        );
+    }
 }

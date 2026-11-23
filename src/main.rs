@@ -62,6 +62,8 @@ async fn main() -> Result<()> {
     {
         config.terminology_url = Some(url);
     }
+    config.alerts.apply_env(|name| std::env::var_os(name))?;
+    config.alerts.validate()?;
     let runtime_dir = std::env::var_os("HIE_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -85,6 +87,9 @@ async fn main() -> Result<()> {
                 f.source.describe(),
                 f.transform.display()
             );
+            if let Some(contact) = &f.contact {
+                println!("    contact: {contact}");
+            }
         }
         for skipped in &config.skipped {
             println!("skipped {}: {}", skipped.file.display(), skipped.reason);
