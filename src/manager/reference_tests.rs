@@ -773,26 +773,38 @@ async fn a_source_first_seen_in_a_file_gets_its_rule_once() {
     assert!(a.silence_rules("f").is_empty());
 }
 
-/// A create that fails before its definition is published leaves no rule; one
-/// whose start fails keeps the rule it was born with.
+/// A create whose birth cannot be recorded publishes nothing and keeps no
+/// registration. One whose write fails keeps the rule it was born with, and a
+/// create sent again uses it; one whose start fails keeps it too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_failed_create_leaves_no_rule_and_a_failed_start_keeps_it() {
+async fn a_create_keeps_its_rule_through_a_failed_write_or_start() {
     let dir = tempfile::tempdir().unwrap();
     let (database, _keeper) = store(dir.path());
     let bucket = refusing_bucket().await;
     let k = key();
     let a = Instance::start(&dir.path().join("a"), &database, &k);
-    a.secret("x").await;
+    let x = a.secret("x").await;
     let definition = a.definition("s", "x", &bucket);
+    a.manager.fail_next_birth.store(true, Ordering::SeqCst);
+    let err = a.manager.create(&definition, None).await.unwrap_err();
+    assert!(matches!(err, ManagerError::Internal(_)), "{err:?}");
+    assert!(a.manager.definition("s").unwrap().is_none());
+    assert!(a.refs("s").is_empty());
+    assert!(a.silence_rules("s").is_empty());
+    a.delete_secret(&x).await.unwrap();
+    let x = a.secret("x").await;
+
     a.manager.fail_next_write.store(true, Ordering::SeqCst);
     let err = a.manager.create(&definition, None).await.unwrap_err();
     assert!(matches!(err, ManagerError::Internal(_)), "{err:?}");
     assert!(a.manager.definition("s").unwrap().is_none());
-    assert!(a.silence_rules("s").is_empty());
+    assert!(a.refs("s").is_empty());
+    assert_eq!(a.silence_rules("s").len(), 1);
 
     a.manager.fail_next_start.store(true, Ordering::SeqCst);
     let err = a.manager.create(&definition, None).await.unwrap_err();
     assert!(matches!(err, ManagerError::NotStarted(_)), "{err:?}");
+    assert_eq!(a.refs("s"), set(&[&x]));
     assert_eq!(a.silence_rules("s").len(), 1);
     let root = a.stop();
     let a = Instance::start(&root, &database, &k);

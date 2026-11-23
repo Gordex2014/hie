@@ -1724,19 +1724,14 @@ impl Db {
         )
     }
 
-    pub fn has_rule(&self, feed: &str, condition: &str) -> Result<bool> {
-        Ok(self
-            .query_one(
-                "SELECT 1 FROM alert_rules WHERE source_id = $1 AND condition = $2 LIMIT 1",
-                &params![feed, condition],
-            )?
-            .is_some())
+    pub fn insert_rule(&self, rule: &Rule) -> Result<i64> {
+        self.with(|c| Self::insert_rule_in(c, rule))
     }
 
-    pub fn insert_rule(&self, rule: &Rule) -> Result<i64> {
-        self.insert_returning_id(
+    fn insert_rule_in(c: &mut Conn, rule: &Rule) -> Result<i64> {
+        c.query(
             "INSERT INTO alert_rules (source_id, condition, threshold, notify, channels, enabled, created_by, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
             &params![
                 rule.source_id,
                 rule.condition,
@@ -1747,7 +1742,10 @@ impl Db {
                 rule.created_by,
                 now_ms()
             ],
-        )
+        )?
+        .first()
+        .map(|r| r.i64(0))
+        .context("INSERT returned no id")
     }
 
     pub fn update_rule(&self, id: i64, rule: &Rule) -> Result<bool> {
@@ -1778,16 +1776,20 @@ impl Db {
     /// something of (a rule, an alert, a file, a pause, a cursor) is a source
     /// from before births were recorded: it is marked born and gets nothing.
     /// `force` (a create through the API) gives the rule whatever the store
-    /// remembers, unless the source has a `silence` rule. One transaction: on a
-    /// failure nothing is recorded. Two instances giving the same source at once
-    /// add one rule: the second waits on the first's birth row.
+    /// remembers, unless the source already has a rule of that condition. One
+    /// transaction, read committed on PostgreSQL: on a failure nothing is
+    /// recorded. Two instances giving the same source at once add one rule: the
+    /// second waits on the first's birth row, then sees what it committed.
     pub fn give_default_rule(&self, rule: &Rule, force: bool) -> Result<Option<i64>> {
         let feed = rule
             .source_id
             .as_deref()
             .context("a default rule names its source")?;
         self.with(|c| {
-            c.batch("BEGIN")?;
+            c.batch(match c {
+                Conn::Postgres(_) => "BEGIN ISOLATION LEVEL READ COMMITTED",
+                Conn::Sqlite(_) => "BEGIN",
+            })?;
             let result = (|| {
                 let conflict = if force {
                     "DO UPDATE SET born_at = excluded.born_at"
@@ -1801,10 +1803,11 @@ impl Db {
                     ),
                     &params![feed, now_ms()],
                 )? == 1;
+                pause_point!(self, "birth:after-insert");
                 let new = if force {
                     c.query(
-                        "SELECT 1 FROM alert_rules WHERE source_id = $1 AND condition = 'silence' LIMIT 1",
-                        &params![feed],
+                        "SELECT 1 FROM alert_rules WHERE source_id = $1 AND condition = $2 LIMIT 1",
+                        &params![feed, rule.condition],
                     )?
                     .is_empty()
                 } else {
@@ -1823,25 +1826,7 @@ impl Db {
                 if !new {
                     return Ok(None);
                 }
-                let id = c
-                    .query(
-                        "INSERT INTO alert_rules (source_id, condition, threshold, notify, channels, enabled, created_by, created_at)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
-                        &params![
-                            feed,
-                            rule.condition,
-                            rule.threshold,
-                            serde_json::to_string(&rule.notify).unwrap_or_default(),
-                            serde_json::to_string(&rule.channels).unwrap_or_default(),
-                            rule.enabled,
-                            rule.created_by,
-                            now_ms()
-                        ],
-                    )?
-                    .first()
-                    .map(|r| r.i64(0))
-                    .context("INSERT returned no id")?;
-                Ok::<_, anyhow::Error>(Some(id))
+                Ok::<_, anyhow::Error>(Some(Self::insert_rule_in(c, rule)?))
             })();
             match result {
                 Ok(v) => match c.batch("COMMIT") {
@@ -1937,8 +1922,6 @@ fn redact(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
 
     #[test]
@@ -2092,40 +2075,62 @@ mod tests {
         }
     }
 
+    /// Two handles on one store, each with its own connection, one source
+    /// given its default rule by both at once in every order that matters: the
+    /// first holds its transaction open after writing the birth, the second
+    /// waits on it, then adds nothing.
+    #[cfg(feature = "secrets-native")]
     #[test]
     fn two_handles_on_one_store_give_one_default_rule() {
+        use std::sync::{Arc, Barrier};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hie.db");
-        let keeper = Arc::new(Db::open(&path).unwrap());
-        let other = Arc::new(Db::open(&path).unwrap());
-        for (round, force) in [(0, false), (1, true), (2, true)] {
+        let a = Arc::new(Db::open(&path).unwrap());
+        let b = Arc::new(Db::open(&path).unwrap());
+        // (first, second, the source already born with its rule deleted)
+        for (round, (first, second, known)) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let feed = format!("s{round}");
-            if round == 2 {
-                // Known already, its rule gone: two creates at once add one.
-                keeper
-                    .give_default_rule(&default_rule(&feed), false)
-                    .unwrap();
-                for id in silence_rules(&keeper, &feed) {
-                    keeper.delete_rule(id).unwrap();
+            if known {
+                a.give_default_rule(&default_rule(&feed), false).unwrap();
+                for id in silence_rules(&a, &feed) {
+                    a.delete_rule(id).unwrap();
                 }
             }
-            let threads: Vec<_> = (0..8)
-                .map(|i| {
-                    let db = if i % 2 == 0 {
-                        keeper.clone()
-                    } else {
-                        other.clone()
-                    };
-                    let rule = default_rule(&feed);
-                    std::thread::spawn(move || db.give_default_rule(&rule, force).unwrap())
-                })
-                .collect();
-            let added = threads
-                .into_iter()
-                .filter_map(|t| t.join().unwrap())
-                .count();
-            assert_eq!(added, 1, "round {round}");
-            assert_eq!(silence_rules(&keeper, &feed).len(), 1, "round {round}");
+            let reached = Arc::new(Barrier::new(2));
+            let release = Arc::new(Barrier::new(2));
+            let (r, l) = (reached.clone(), release.clone());
+            let once = std::sync::atomic::AtomicBool::new(false);
+            a.on_pause(Arc::new(move |at| {
+                if at == "birth:after-insert"
+                    && !once.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    r.wait();
+                    l.wait();
+                }
+            }));
+            let holder = {
+                let (a, rule) = (a.clone(), default_rule(&feed));
+                std::thread::spawn(move || a.give_default_rule(&rule, first))
+            };
+            reached.wait();
+            let waiter = {
+                let (b, rule) = (b.clone(), default_rule(&feed));
+                std::thread::spawn(move || b.give_default_rule(&rule, second))
+            };
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(!waiter.is_finished(), "round {round}: the second waits");
+            release.wait();
+            assert!(holder.join().unwrap().unwrap().is_some(), "round {round}");
+            assert_eq!(waiter.join().unwrap().unwrap(), None, "round {round}");
+            assert_eq!(silence_rules(&a, &feed).len(), 1, "round {round}");
         }
     }
 

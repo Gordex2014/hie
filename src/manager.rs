@@ -155,6 +155,9 @@ pub struct SourceManager {
     /// Makes the next definition write fail, for tests.
     #[cfg(all(test, feature = "secrets-native"))]
     fail_next_write: std::sync::atomic::AtomicBool,
+    /// Makes the next record of a source's birth fail, for tests.
+    #[cfg(all(test, feature = "secrets-native"))]
+    fail_next_birth: std::sync::atomic::AtomicBool,
 }
 
 impl SourceManager {
@@ -191,6 +194,8 @@ impl SourceManager {
             fail_next_start: std::sync::atomic::AtomicBool::new(false),
             #[cfg(all(test, feature = "secrets-native"))]
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(test, feature = "secrets-native"))]
+            fail_next_birth: std::sync::atomic::AtomicBool::new(false),
             handover_grace_ms: AtomicU64::new(
                 (config
                     .worker
@@ -483,11 +488,11 @@ impl SourceManager {
             ));
         }
         self.start(feed.clone()).map_err(|e| {
-                tracing::error!(feed = %feed.id, "the definition was saved, but the source did not start: {e:#}");
-                ManagerError::NotStarted(format!(
-                    "the definition was saved, but the source could not be started: {e:#}; it starts with this definition at the next start of the engine"
-                ))
-            })
+            tracing::error!(feed = %feed.id, "the definition was saved, but the source did not start: {e:#}");
+            ManagerError::NotStarted(format!(
+                "the definition was saved, but the source could not be started: {e:#}; it starts with this definition at the next start of the engine"
+            ))
+        })
     }
 
     /// Publishes the definition all at once: written to a temporary file of its
@@ -545,21 +550,19 @@ impl SourceManager {
         };
         pause_point!(await self, "manager:after-hold");
         // A create is always a creation: the default rule comes before the
-        // definition is published, so a start that fails cannot lose it.
-        let rule = match self.give_default_rule(&resolved, by, true) {
-            Ok(rule) => rule,
-            Err(e) => {
-                self.take_back(&submitted.id, secret.as_deref(), made);
-                return Err(e.into());
-            }
-        };
+        // definition is published, so a start that fails cannot lose it. A write
+        // that fails keeps it: another create, here or on another instance, may
+        // already count on it, and a create sent again uses it.
+        if let Err(e) = self.give_default_rule(&resolved, by, true) {
+            self.take_back(&submitted.id, secret.as_deref(), made);
+            return Err(if crate::db::is_busy(&e) {
+                ManagerError::StoreBusy
+            } else {
+                e.into()
+            });
+        }
         if let Err(e) = self.write(&submitted) {
             self.take_back(&submitted.id, secret.as_deref(), made);
-            if let Some(rule) = rule
-                && let Err(e) = self.db.delete_rule(rule)
-            {
-                tracing::warn!(feed = %submitted.id, "the default rule of a source that was not created stays: {e:#}");
-            }
             return Err(e.into());
         }
         pause_point!(await self, "manager:after-publish");
@@ -577,6 +580,13 @@ impl SourceManager {
         by: Option<&str>,
         force: bool,
     ) -> Result<Option<i64>> {
+        #[cfg(all(test, feature = "secrets-native"))]
+        if self
+            .fail_next_birth
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("recording the birth of {}: a test made it fail", feed.id);
+        }
         let rule = Rule {
             id: 0,
             source_id: Some(feed.id.clone()),
