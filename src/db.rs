@@ -200,11 +200,6 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("alerts", "channels", "TEXT"),
     ("alert_rules", "tz", "TEXT"),
     ("submissions", "stamped", "INTEGER NOT NULL DEFAULT 0"),
-    (
-        "submissions",
-        "kickoff_refused",
-        "INTEGER NOT NULL DEFAULT 0",
-    ),
 ];
 
 /// How long the store write before an untagged REST request may take: a
@@ -2589,11 +2584,14 @@ impl Db {
 
     /// What the store knows about `feed`'s deliveries without the tag, read in
     /// one statement. Untagged submissions count whatever the source's path
-    /// is now: one nobody polls any more stays open. A failed one is a bound
-    /// only when HFS refused its first kick-off; any other failure may have
-    /// left HFS importing, and stays open. Submissions last touched before the
-    /// store began recording (`stamping_tracked`) are inside that mark's
-    /// bound: taking the mark assumes the server runs nothing they started.
+    /// is now: one nobody polls any more stays open. One that is done is a
+    /// bound at its last update; one still to send or running is open, from
+    /// whichever version wrote it. A failed one may have left HFS importing (a
+    /// refusal can answer a repeat of a kick-off HFS took, or cross another
+    /// runner's), so it is open, unless it was last touched before the store
+    /// began recording (`stamping_tracked`): taking that mark assumes the
+    /// server runs nothing that ended before it. Without the mark (deleted,
+    /// until the next start takes it again) every failure counts.
     pub fn stamping(&self, feed: &str, now: i64) -> Result<Stamping> {
         let row = self
             .query_one(
@@ -2601,11 +2599,12 @@ impl Db {
                    (SELECT untagged_until FROM source_stamping WHERE feed_id = $1) AS rest,
                    (SELECT MAX(updated_at) FROM submissions
                      WHERE feed_id = $1 AND stamped = 0
-                       AND (status = 'done' OR (status = 'failed' AND kickoff_refused = 1))) AS bulk,
+                       AND status = 'done') AS bulk,
                    (SELECT COUNT(*) FROM submissions
                      WHERE feed_id = $1 AND stamped = 0
-                       AND (status IN ('kickoff', 'running') OR (status = 'failed' AND kickoff_refused = 0))
-                       AND updated_at >= (SELECT CAST(value AS BIGINT) FROM store_meta WHERE key = $2)) AS open",
+                       AND (status IN ('kickoff', 'running')
+                            OR (status = 'failed'
+                                AND updated_at >= COALESCE((SELECT CAST(value AS BIGINT) FROM store_meta WHERE key = $2), 0)))) AS open",
                 &params![feed, STAMPING_TRACKED],
             )?
             .context("the stamping read returned no row")?;
@@ -2854,9 +2853,7 @@ impl Db {
     /// `reason` and `response` are already scrubbed; the events never carry the
     /// response. Nothing happens unless the submission is open at the attempt
     /// count `captured` read before the request (an older request's answer
-    /// changes nothing). `kickoff_refused` when the refusal answered the
-    /// submission's first kick-off: the one failure that proves the server never
-    /// took it. Returns how many records were rejected, or `None`.
+    /// changes nothing). Returns how many records were rejected, or `None`.
     pub fn reject_submission(
         &self,
         token: &str,
@@ -2864,16 +2861,14 @@ impl Db {
         kind: &str,
         reason: &str,
         response: &Value,
-        kickoff_refused: bool,
     ) -> Result<Option<usize>> {
         self.transaction(|tx| {
             let now = now_ms();
             let Some(sub) = tx.query_one(
-                "UPDATE submissions SET status = 'failed', next_attempt_at = 0, error = $2, updated_at = $3,
-                        kickoff_refused = $5
+                "UPDATE submissions SET status = 'failed', next_attempt_at = 0, error = $2, updated_at = $3
                  WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $4
                  RETURNING feed_id, submission_id",
-                &params![token, reason, now, captured, kickoff_refused],
+                &params![token, reason, now, captured],
             )?
             else {
                 return Ok(None);
@@ -4704,18 +4699,11 @@ mod tests {
     }
 
     /// A submission row as a pass would have left it.
-    fn submission_row(
-        db: &Db,
-        token: &str,
-        status: &str,
-        stamped: bool,
-        kickoff_refused: bool,
-        at: i64,
-    ) {
+    fn submission_row(db: &Db, token: &str, status: &str, stamped: bool, at: i64) {
         db.execute(
-            "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, created_at, updated_at, stamped, kickoff_refused)
-             VALUES ($1, 'lab', $1, $2, '{}', $3, $3, $4, $5)",
-            &params![token, status, at, stamped, kickoff_refused],
+            "INSERT INTO submissions (token, feed_id, submission_id, status, manifest, created_at, updated_at, stamped)
+             VALUES ($1, 'lab', $1, $2, '{}', $3, $3, $4)",
+            &params![token, status, at, stamped],
         )
         .unwrap();
     }
@@ -4755,21 +4743,21 @@ mod tests {
         let db = Db::in_memory().unwrap();
         let now = now_ms();
         let read = |db: &Db| db.stamping("lab", now + 1_000).unwrap();
-        submission_row(&db, "tagged", "running", true, false, now);
-        submission_row(&db, "tagged-failed", "failed", true, false, now);
+        submission_row(&db, "tagged", "running", true, now);
+        submission_row(&db, "tagged-failed", "failed", true, now);
         assert_eq!(read(&db).untagged_until, None);
         assert!(!read(&db).open);
 
-        // Running, or failed in any way but a refused first kick-off: HFS may
-        // be importing, so there is no date.
+        // To send, running, or failed (a refusal may answer a repeat of a
+        // kick-off HFS took): HFS may be importing, so there is no date.
         for status in ["kickoff", "running", "failed"] {
-            submission_row(&db, status, status, false, false, now);
+            submission_row(&db, status, status, false, now);
             assert!(read(&db).open, "{status}");
             db.execute("DELETE FROM submissions WHERE token = $1", &params![status])
                 .unwrap();
         }
         // Done: HFS said so, so its writes ended before the engine recorded it.
-        submission_row(&db, "done", "done", false, false, now + 5);
+        submission_row(&db, "done", "done", false, now + 5);
         assert_eq!(
             read(&db),
             Stamping {
@@ -4777,13 +4765,13 @@ mod tests {
                 untagged_until: Some(now + 5)
             }
         );
-        // Refused at its first kick-off: HFS never took it.
-        submission_row(&db, "refused", "failed", false, true, now + 7);
+        // A later failure keeps the date known so far, and no more.
+        submission_row(&db, "refused", "failed", false, now + 7);
         assert_eq!(
             read(&db),
             Stamping {
-                open: false,
-                untagged_until: Some(now + 7)
+                open: true,
+                untagged_until: Some(now + 5)
             }
         );
     }
@@ -4809,7 +4797,6 @@ mod tests {
             "DROP TABLE source_stamping",
             "DELETE FROM store_meta WHERE key = 'stamping_tracked'",
             "ALTER TABLE submissions DROP COLUMN stamped",
-            "ALTER TABLE submissions DROP COLUMN kickoff_refused",
         ] {
             db.execute(statement, &[]).unwrap();
         }
@@ -4835,6 +4822,14 @@ mod tests {
         // The old failure is inside the upgrade's bound: taking the mark
         // assumes the server runs nothing the older version started.
         assert!(!db.stamping("lab", until + 1).unwrap().open);
+        // One the older version left to send or running is not: this version
+        // may still send it, so it stays open until it ends.
+        for status in ["kickoff", "running"] {
+            submission_row(&db, "unsent", status, false, now - 86_400_000);
+            assert!(db.stamping("lab", until + 1).unwrap().open, "{status}");
+            db.execute("DELETE FROM submissions WHERE token = 'unsent'", &[])
+                .unwrap();
+        }
         drop(opened);
         // Opening again changes nothing.
         let again = Db::open(&path).unwrap();
@@ -4851,10 +4846,16 @@ mod tests {
         );
         // A failure after the mark keeps its source open, until the mark is
         // taken again once the server is known to run nothing of it.
-        submission_row(&again, "later", "failed", false, false, now_ms());
+        submission_row(&again, "later", "failed", false, now_ms());
         assert!(again.stamping("lab", until + 1).unwrap().open);
         again
             .execute("DELETE FROM store_meta WHERE key = 'stamping_tracked'", &[])
+            .unwrap();
+        // Until the next start takes it again, every failure counts.
+        submission_row(&again, "legacy", "failed", false, now - 86_400_000);
+        assert!(again.stamping("lab", until + 1).unwrap().open);
+        again
+            .execute("DELETE FROM submissions WHERE token = 'legacy'", &[])
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
         let reset = Db::open(&path).unwrap();

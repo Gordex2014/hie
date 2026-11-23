@@ -1063,8 +1063,6 @@ impl FeedRunner {
             return Ok(());
         };
         for sub in self.db.submissions_due(&self.feed.id)? {
-            // HFS refused this submission's very first kick-off: it never took it.
-            let mut refused_at_first_kickoff = false;
             let step = match sub.status.as_str() {
                 "kickoff" => {
                     match bulk
@@ -1086,11 +1084,7 @@ impl FeedRunner {
                                 Err(e) => Err(e),
                             }
                         }
-                        Err(e) => {
-                            refused_at_first_kickoff =
-                                sub.attempts == 0 && matches!(e, SendError::Refused(..));
-                            Err(e)
-                        }
+                        Err(e) => Err(e),
                     }
                 }
                 _ => match sub.status_url.as_deref() {
@@ -1160,7 +1154,6 @@ impl FeedRunner {
                             "server",
                             &reason,
                             &bulk::scrub_value(&body, &sub.token),
-                            refused_at_first_kickoff,
                         )?
                         .is_some()
                     {

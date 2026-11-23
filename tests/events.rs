@@ -1635,7 +1635,7 @@ fn set_writes_over_more_than_one_chunk_change_and_log_every_row_once() {
     );
     let before = events(&db).len();
     assert_eq!(
-        db.reject_submission("t", 0, "server", "HTTP 400", &json!({}), false)
+        db.reject_submission("t", 0, "server", "HTTP 400", &json!({}))
             .unwrap(),
         Some(450)
     );
@@ -2197,7 +2197,7 @@ fn an_older_answer_cannot_settle_or_refuse_a_submission() {
     assert!(db.submission_attempt_failed("t", 0, 0, "HTTP 503").unwrap());
     // Answers to the poll made at attempt 0.
     assert_eq!(
-        db.reject_submission("t", 0, "server", "HTTP 400", &json!({}), false)
+        db.reject_submission("t", 0, "server", "HTTP 400", &json!({}))
             .unwrap(),
         None
     );
