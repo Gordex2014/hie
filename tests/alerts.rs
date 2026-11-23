@@ -6,6 +6,11 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use std::sync::{Arc, Mutex};
+
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
@@ -54,11 +59,17 @@ struct Lab {
     root: PathBuf,
     api: String,
     http: reqwest::Client,
+    db: std::sync::Arc<hie::db::Db>,
 }
 
 /// An engine with one folder source, `lab-results`, polling every minute so only
 /// `check-now` moves it.
 async fn lab(python: &str) -> Lab {
+    lab_with(python, "").await
+}
+
+/// `lab`, with more lines for `hie.yaml` (an `alerts:` block).
+async fn lab_with(python: &str, more_config: &str) -> Lab {
     let fhir = serve(Router::new().route("/", post(batch))).await;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -71,12 +82,13 @@ async fn lab(python: &str) -> Lab {
     .unwrap();
     std::fs::write(
         root.join("hie.yaml"),
-        format!("fhir_base_url: {fhir}\ndatabase: data/hie.db\npython: {python}\n"),
+        format!("fhir_base_url: {fhir}\ndatabase: data/hie.db\npython: {python}\n{more_config}"),
     )
     .unwrap();
     let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
     let (_manager, state) =
         hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let db = state.db.clone();
     let api = serve(hie::api::router(state)).await;
     let http = reqwest::Client::new();
     let created = http
@@ -96,6 +108,7 @@ async fn lab(python: &str) -> Lab {
         root,
         api,
         http,
+        db,
     }
 }
 
@@ -379,6 +392,706 @@ async fn silence_fires_once_and_clears_when_data_arrives() {
         alert(&alerts, "silence").unwrap()["cleared_reason"],
         "Lab results: data arrived"
     );
+}
+
+// ---- rule ids and when rules were made -------------------------------------
+
+fn new_rule(db: &hie::db::Db) -> i64 {
+    let rule: hie::db::Rule = serde_json::from_value(
+        json!({"source_id": "s", "condition": "silence", "threshold": "1h"}),
+    )
+    .unwrap();
+    db.insert_rule(&rule).unwrap()
+}
+
+#[test]
+fn a_rule_id_is_never_given_again_even_after_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hie.db");
+    let db = hie::db::Db::open(&path).unwrap();
+    let ids: Vec<i64> = (0..3).map(|_| new_rule(&db)).collect();
+    assert!(db.delete_rule(ids[2]).unwrap());
+    let next = new_rule(&db);
+    assert!(next > ids[2], "{next} after {ids:?}");
+    assert!(db.delete_rule(next).unwrap());
+    // Opened again: still past every id used. On PostgreSQL the first handle
+    // owns the test schema, so it stays open.
+    let keep = std::env::var("HIE_TEST_DATABASE_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .map(|_| db);
+    let again = hie::db::Db::open(&path).unwrap();
+    assert!(new_rule(&again) > next);
+    drop(keep);
+}
+
+#[test]
+fn a_store_whose_rules_table_was_made_the_old_way_stops_reusing_ids() {
+    if std::env::var("HIE_TEST_DATABASE_URL").is_ok_and(|u| !u.trim().is_empty()) {
+        eprintln!("skipping: the old table is SQLite's");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hie.db");
+    {
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE alert_rules (
+               id INTEGER PRIMARY KEY, source_id TEXT, condition TEXT NOT NULL, threshold TEXT NOT NULL,
+               notify TEXT NOT NULL DEFAULT '[]', channels TEXT NOT NULL DEFAULT '[\"app\"]',
+               enabled INTEGER NOT NULL DEFAULT 1, created_by TEXT, created_at INTEGER NOT NULL);
+             INSERT INTO alert_rules (id, condition, threshold, created_at) VALUES
+               (1, 'silence', '1h', 1000), (2, 'silence', '2h', 2000), (3, 'silence', '3h', 3000);",
+        )
+        .unwrap();
+    }
+    let db = hie::db::Db::open(&path).unwrap();
+    // The rows and ids are kept.
+    let rules = db.rules().unwrap();
+    assert_eq!(
+        rules
+            .iter()
+            .map(|r| (r.id, r.threshold.as_str()))
+            .collect::<Vec<_>>(),
+        [(1, "1h"), (2, "2h"), (3, "3h")]
+    );
+    assert_eq!(
+        rules[0].created_at.as_deref(),
+        Some("1970-01-01T00:00:01.000Z")
+    );
+    assert!(db.delete_rule(3).unwrap());
+    assert!(new_rule(&db) > 3);
+    drop(db);
+    let sql: String = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'alert_rules'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(sql.contains("AUTOINCREMENT"), "{sql}");
+}
+
+#[tokio::test]
+async fn a_rule_answer_says_when_it_was_made_and_a_body_cannot() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("hie.yaml"),
+        "fhir_base_url: http://127.0.0.1:9\ndatabase: data/hie.db\n",
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&dir.path().join("hie.yaml")).unwrap();
+    let (_manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let api = serve(hie::api::router(state)).await;
+    let http = reqwest::Client::new();
+    let body =
+        json!({"condition": "silence", "threshold": "1h", "created_at": "2001-01-01T00:00:00Z"});
+    let created: Value = http
+        .post(format!("{api}/api/alert-rules"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let made = created["created_at"].as_str().unwrap().to_string();
+    assert!(
+        made.ends_with('Z') && !made.starts_with("2001"),
+        "{created}"
+    );
+    let id = created["id"].as_i64().unwrap();
+    let replaced: Value = http
+        .put(format!("{api}/api/alert-rules/{id}"))
+        .json(&json!({"condition": "silence", "threshold": "2h", "created_at": "2001-01-01T00:00:00Z"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(replaced["created_at"], made.as_str());
+    assert_eq!(replaced["threshold"], "2h");
+    let one: Value = reqwest::get(format!("{api}/api/alert-rules/{id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["created_at"], made.as_str());
+    let all: Value = reqwest::get(format!("{api}/api/alert-rules"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        all["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["created_at"].is_string())
+    );
+}
+
+// ---- Reading alerts by period and in pages ------------------------------------
+
+/// An engine with no source and no Python, whose alerts a test writes itself.
+struct Store {
+    _dir: tempfile::TempDir,
+    _manager: std::sync::Arc<hie::manager::SourceManager>,
+    db: std::sync::Arc<hie::db::Db>,
+    api: String,
+    http: reqwest::Client,
+}
+
+async fn store() -> Store {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("hie.yaml"),
+        "fhir_base_url: http://127.0.0.1:9/fhir\ndatabase: data/hie.db\n",
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&dir.path().join("hie.yaml")).unwrap();
+    let (manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let db = state.db.clone();
+    let api = serve(hie::api::router(state)).await;
+    Store {
+        _dir: dir,
+        _manager: manager,
+        db,
+        api,
+        http: reqwest::Client::new(),
+    }
+}
+
+/// A whole second an hour ago: recent enough for any retention, and exact.
+fn base_ms() -> i64 {
+    (chrono::Utc::now().timestamp() - 3600) * 1000
+}
+
+fn iso(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+#[derive(Clone, Copy)]
+struct Seeded {
+    id: i64,
+    source: &'static str,
+    at: i64,
+    open: bool,
+}
+
+impl Store {
+    /// An alert created at exactly `at`. The store's write helpers are private,
+    /// so the time is set through `query_json`, which runs any statement.
+    fn seed(&self, source: &'static str, at: i64, open: bool) -> Seeded {
+        let id = self
+            .db
+            .insert_alert(Some(source), "test", "a test alert", None)
+            .unwrap();
+        let updated = self
+            .db
+            .query_json(
+                "UPDATE alerts SET created_at = $1 WHERE id = $2 RETURNING id",
+                hie::db::params![at, id],
+            )
+            .unwrap();
+        assert_eq!(updated, vec![json!({"id": id})]);
+        if !open {
+            self.db.clear_alert(id, "cleared by the test").unwrap();
+        }
+        Seeded {
+            id,
+            source,
+            at,
+            open,
+        }
+    }
+
+    async fn list(&self, query: &[(&str, &str)]) -> (u16, Value) {
+        let r = self
+            .http
+            .get(format!("{}/api/alerts", self.api))
+            .query(query)
+            .send()
+            .await
+            .unwrap();
+        (r.status().as_u16(), r.json().await.unwrap())
+    }
+
+    /// Every page of a query, following `next_cursor` to its end: the ids in
+    /// order. Each page has at most `limit` alerts, carries `next_cursor`, and
+    /// only the first may be empty.
+    async fn walk(&self, query: &[(&str, &str)], limit: usize) -> Vec<i64> {
+        self.walk_from(query, limit, None).await
+    }
+
+    /// `walk`, starting after a cursor already in hand.
+    async fn walk_from(
+        &self,
+        query: &[(&str, &str)],
+        limit: usize,
+        mut cursor: Option<String>,
+    ) -> Vec<i64> {
+        let limit_text = limit.to_string();
+        let mut ids = Vec::new();
+        for page in 0.. {
+            assert!(page < 1000, "the walk does not end");
+            let mut q = query.to_vec();
+            q.push(("limit", &limit_text));
+            if let Some(c) = &cursor {
+                q.push(("cursor", c));
+            }
+            let (status, body) = self.list(&q).await;
+            assert_eq!(status, 200, "{body}");
+            let alerts = body["alerts"].as_array().unwrap();
+            assert!(alerts.len() <= limit, "{body}");
+            assert!(page == 0 || !alerts.is_empty(), "an empty page: {body}");
+            ids.extend(alerts.iter().map(|a| a["id"].as_i64().unwrap()));
+            match body.get("next_cursor") {
+                Some(Value::String(c)) => cursor = Some(c.clone()),
+                Some(Value::Null) => return ids,
+                _ => panic!("no next_cursor: {body}"),
+            }
+        }
+        unreachable!()
+    }
+}
+
+fn newest_first(seeded: &[Seeded], keep: impl Fn(&Seeded) -> bool) -> Vec<i64> {
+    let mut ids: Vec<i64> = seeded.iter().filter(|a| keep(a)).map(|a| a.id).collect();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids
+}
+
+#[tokio::test]
+async fn alerts_are_read_by_period_and_in_pages() {
+    let store = store().await;
+    let b = base_ms();
+    // Ids follow this order; times do not always: a later id may be older, and
+    // some share a millisecond. Two sources, open and cleared, on both sides
+    // of each `since` below.
+    let seeded: Vec<Seeded> = [
+        ("lab", 0, true),
+        ("imaging", 100, false),
+        ("lab", 123, false),
+        ("lab", 123, true),
+        ("imaging", 200, true),
+        ("lab", 50, true),
+        ("lab", 300, true),
+        ("lab", 300, false),
+        ("imaging", 122, true),
+        ("lab", 124, true),
+        ("lab", 10, false),
+    ]
+    .into_iter()
+    .map(|(source, offset, open)| store.seed(source, b + offset, open))
+    .collect();
+
+    // The boundary as a consumer has it: the `created_at` the list returned.
+    let (_, all) = store.list(&[]).await;
+    let third = seeded[2];
+    let returned = all["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == third.id)
+        .unwrap()["created_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(returned, iso(b + 123));
+
+    // Each `since` and the first stored millisecond it keeps.
+    let at_123 = iso(b + 123);
+    let a_bit_after_123 = iso(b + 123).replace("Z", "1Z");
+    let offset_form = chrono::DateTime::from_timestamp_millis(b + 123)
+        .unwrap()
+        .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+        .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+        .to_string();
+    let after_all = iso(b + 301);
+    let sinces: [(Option<&str>, i64); 6] = [
+        (None, i64::MIN),
+        (Some(&returned), b + 123),
+        (Some(&at_123), b + 123),
+        (Some(&a_bit_after_123), b + 124),
+        (Some(&offset_form), b + 123),
+        (Some(&after_all), b + 301),
+    ];
+    assert!(offset_form.contains('+'), "{offset_form}");
+
+    for (since, from) in sinces {
+        for source in [None, Some("lab"), Some("imaging")] {
+            for open in [false, true] {
+                let mut query = Vec::new();
+                if let Some(s) = source {
+                    query.push(("source", s));
+                }
+                if open {
+                    query.push(("open", "true"));
+                }
+                if let Some(s) = since {
+                    query.push(("since", s));
+                }
+                let expected = newest_first(&seeded, |a| {
+                    a.at >= from && source.is_none_or(|s| a.source == s) && (!open || a.open)
+                });
+                for limit in [1, 2, 3, 100] {
+                    assert_eq!(
+                        store.walk(&query, limit).await,
+                        expected,
+                        "{query:?} limit {limit}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_walk_keeps_its_place_while_alerts_change() {
+    let store = store().await;
+    let b = base_ms();
+    let s: Vec<Seeded> = (0..6)
+        .map(|i| store.seed("lab", b + i * 10, true))
+        .collect();
+    let open = [("open", "true"), ("limit", "2")];
+
+    let (_, first) = store.list(&open).await;
+    let page: Vec<i64> = first["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(page, vec![s[5].id, s[4].id]);
+    let cursor = first["next_cursor"].as_str().unwrap().to_string();
+
+    // Between pages: a new alert, one further down cleared, and the cursor's
+    // own alert removed, as a purge would.
+    let new = store.seed("lab", b + 1000, true);
+    store
+        .db
+        .clear_alert(s[2].id, "cleared by the test")
+        .unwrap();
+    let deleted = store
+        .db
+        .query_json(
+            "DELETE FROM alerts WHERE id = $1 RETURNING id",
+            hie::db::params![s[4].id],
+        )
+        .unwrap();
+    assert_eq!(deleted, vec![json!({"id": s[4].id})]);
+
+    let rest = store
+        .walk_from(&[("open", "true")], 2, Some(cursor.clone()))
+        .await;
+    assert_eq!(rest, vec![s[3].id, s[1].id, s[0].id]);
+    // Without `open`, the cleared alert stays where it was.
+    let rest = store.walk_from(&[], 2, Some(cursor)).await;
+    assert_eq!(rest, vec![s[3].id, s[2].id, s[1].id, s[0].id]);
+
+    // The new alert is on a fresh first page.
+    let (_, fresh) = store.list(&open).await;
+    assert_eq!(fresh["alerts"][0]["id"], new.id);
+
+    // A cursor whose remaining alerts all left leads to an empty last page.
+    let (_, four) = store.list(&[("open", "true"), ("limit", "4")]).await;
+    assert_eq!(four["alerts"][3]["id"], s[1].id);
+    let cursor = four["next_cursor"].as_str().unwrap().to_string();
+    store
+        .db
+        .clear_alert(s[0].id, "cleared by the test")
+        .unwrap();
+    let (status, empty) = store
+        .list(&[("open", "true"), ("limit", "4"), ("cursor", &cursor)])
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        empty,
+        json!({"alerts": [], "next_cursor": null, "webhook": {"configured": false, "signed": false}})
+    );
+}
+
+#[tokio::test]
+async fn the_default_page_holds_a_hundred_alerts() {
+    let store = store().await;
+    let b = base_ms();
+    let s: Vec<Seeded> = (0..101).map(|i| store.seed("lab", b + i, true)).collect();
+
+    let (status, first) = store.list(&[]).await;
+    assert_eq!(status, 200);
+    let alerts = first["alerts"].as_array().unwrap();
+    assert_eq!(alerts.len(), 100);
+    assert_eq!(alerts[0]["id"], s[100].id);
+    assert_eq!(alerts[99]["id"], s[1].id);
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let (_, last) = store.list(&[("cursor", cursor)]).await;
+    assert_eq!(last["alerts"].as_array().unwrap().len(), 1);
+    assert_eq!(last["alerts"][0]["id"], s[0].id);
+    assert_eq!(last.get("next_cursor"), Some(&Value::Null));
+
+    let (_, none) = store.list(&[("limit", "0")]).await;
+    assert_eq!(
+        none,
+        json!({"alerts": [], "next_cursor": null, "webhook": {"configured": false, "signed": false}})
+    );
+    // A negative limit has always meant every alert.
+    let (_, every) = store.list(&[("limit", "-1")]).await;
+    assert_eq!(every["alerts"].as_array().unwrap().len(), 101);
+    assert_eq!(every.get("next_cursor"), Some(&Value::Null));
+    // Empty values are absent ones.
+    let (status, empty) = store.list(&[("since", ""), ("cursor", "")]).await;
+    assert_eq!(status, 200);
+    assert_eq!(empty["alerts"].as_array().unwrap().len(), 100);
+}
+
+#[tokio::test]
+async fn a_malformed_query_is_refused_without_echoing_it() {
+    let store = store().await;
+    store.seed("lab", base_ms(), true);
+    type Case<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>);
+    let cases: [Case; 14] = [
+        (&[("since", "yesterday")], Some("since")),
+        (&[("since", "2025-01-02")], Some("since")),
+        (&[("since", "2016-12-31T23:59:60Z")], Some("since")),
+        (
+            &[("since", "2025-01-02T00:00:00.1230000001Z")],
+            Some("since"),
+        ),
+        (&[("cursor", "abc")], Some("cursor")),
+        (&[("cursor", "17")], Some("cursor")),
+        (&[("cursor", "a1.-1")], Some("cursor")),
+        (&[("cursor", "a1.0")], Some("cursor")),
+        (&[("cursor", "a1.+5")], Some("cursor")),
+        (&[("cursor", "a1.99999999999999999999")], Some("cursor")),
+        (&[("limit", "0"), ("since", "garbage")], Some("since")),
+        (&[("limit", "abc")], None),
+        (&[("open", "yes")], None),
+        (&[("limit", "1"), ("limit", "2")], None),
+    ];
+    for (query, field) in cases {
+        let (status, body) = store.list(query).await;
+        assert_eq!(status, 400, "{query:?}: {body}");
+        assert_eq!(body["code"], "invalid_query", "{query:?}: {body}");
+        assert_eq!(body["field"].as_str(), field, "{query:?}: {body}");
+        assert!(body["error"].is_string(), "{body}");
+        for (_, value) in query {
+            if value.len() > 2 {
+                assert!(!body.to_string().contains(value), "echoed: {body}");
+            }
+        }
+    }
+    // The rules list still checks the types of what it ignores.
+    for query in ["limit=abc", "open=yes"] {
+        let r = store
+            .http
+            .get(format!("{}/api/alert-rules?{query}", store.api))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{query}");
+    }
+}
+
+/// What a webhook receiver got: headers and raw body of each request.
+type Received = Arc<Mutex<Vec<(HeaderMap, Bytes)>>>;
+
+async fn receive(State(got): State<Received>, headers: HeaderMap, body: Bytes) {
+    got.lock().unwrap().push((headers, body));
+}
+
+fn webhook_of<'a>(alerts: &'a Value, id: &Value) -> &'a Value {
+    &alerts["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == *id)
+        .unwrap()["webhook"]
+}
+
+#[tokio::test]
+async fn the_webhook_gets_each_alert_change_and_the_api_shows_its_delivery() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let got = Received::default();
+    let receiver = serve(
+        Router::new()
+            .route("/hook/urlcanary", post(receive))
+            .with_state(got.clone()),
+    )
+    .await;
+    let url = format!("{receiver}/hook/urlcanary");
+    let lab = lab_with(
+        &python,
+        &format!(
+            "alerts:\n  webhook_url: {url}\n  webhook_secret: secretcanary\n  webhook_backoff_ms: 50\n"
+        ),
+    )
+    .await;
+    let rule = |threshold: &str, channels: Value| json!({"source_id": "lab-results", "condition": "rejected_share", "threshold": threshold, "channels": channels});
+    let posted = lab
+        .post("/api/alert-rules", rule("10%", json!(["app", "webhook"])))
+        .await;
+    let webhook_rule = posted.json::<Value>().await.unwrap()["id"].clone();
+    let posted = lab
+        .post("/api/alert-rules", rule("20%", json!(["app"])))
+        .await;
+    let app_rule = posted.json::<Value>().await.unwrap()["id"].clone();
+
+    // An alert left open by an earlier version: no webhook event recorded.
+    let earlier = lab.db.query_json(
+        "INSERT INTO alerts (feed_id, kind, message, created_at, rule_id, notify, channels)
+         VALUES ('lab-results', 'rejected_share', 'from before', 1700000000123, $1, '[]', '[\"app\",\"webhook\"]')
+         RETURNING id",
+        vec![hie::db::Param::Int(webhook_rule.as_i64().unwrap())],
+    ).unwrap()[0]["id"].clone();
+    // Two events that are not due: one for this URL, one for another.
+    use sha2::Digest;
+    let ours = hex::encode(&sha2::Sha256::digest(url.as_bytes())[..8]);
+    let mut waiting = vec![];
+    for (event_id, destination) in [
+        ("waits-here", ours.as_str()),
+        ("waits-elsewhere", "0123456789abcdef"),
+    ] {
+        let id = lab.db.query_json(
+            "INSERT INTO alerts (feed_id, kind, message, created_at) VALUES ('other', 'unreadable_file', 'x', 1) RETURNING id",
+            vec![],
+        ).unwrap()[0]["id"].clone();
+        lab.db.query_json(
+            "INSERT INTO alert_webhooks (event_id, alert_id, event, destination, payload, state, attempts, next_attempt_at, created_at)
+             VALUES ($1, $2, 'fired', $3, '{}', 'pending', 0, 9000000000000000, 1) RETURNING id",
+            vec![
+                hie::db::Param::Text(event_id.into()),
+                hie::db::Param::Int(id.as_i64().unwrap()),
+                hie::db::Param::Text(destination.into()),
+            ],
+        ).unwrap();
+        waiting.push(id);
+    }
+    let all = lab.get("/api/alerts").await;
+    assert_eq!(webhook_of(&all, &waiting[0])["state"], "pending");
+    assert_eq!(webhook_of(&all, &waiting[1])["state"], "parked");
+    let alerts = lab.get("/api/alerts?source=lab-results").await;
+    assert_eq!(
+        alerts["webhook"],
+        json!({"configured": true, "signed": true})
+    );
+    assert_eq!(*webhook_of(&alerts, &earlier), Value::Null);
+
+    // messy.csv: the webhook rule's alert is still open, so only the app-only rule fires.
+    lab.drop_file("messy.csv").await;
+    let alerts = lab
+        .wait_for("the app-only alert", |a| {
+            a["alerts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["rule_id"] == app_rule)
+        })
+        .await;
+    let app_alert = alerts["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["rule_id"] == app_rule)
+        .unwrap()
+        .clone();
+    let hook = webhook_of(&alerts, &app_alert["id"]);
+    assert_eq!(
+        (hook["event"].as_str(), hook["state"].as_str()),
+        (Some("fired"), Some("not_requested"))
+    );
+    assert_eq!(hook["attempts"], 0);
+
+    // labs.csv clears both; the earlier alert's clear goes out, the app-only one's does not.
+    lab.drop_file("labs.csv").await;
+    let alerts = lab
+        .wait_for("the clear to be delivered", |a| {
+            webhook_of(a, &earlier)["state"] == "delivered"
+                && !webhook_of(a, &app_alert["id"]).is_null()
+                && webhook_of(a, &app_alert["id"])["event"] == "cleared"
+        })
+        .await;
+    let hook = webhook_of(&alerts, &earlier);
+    assert_eq!(hook["event"], "cleared");
+    assert_eq!(hook["attempts"], 1);
+    assert_eq!(hook["last_status"], 200);
+    assert_eq!(hook["last_error"], Value::Null);
+    assert!(hook["delivered_at"].is_string());
+    assert_eq!(
+        webhook_of(&alerts, &app_alert["id"])["state"],
+        "not_requested"
+    );
+
+    let got = got.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "only the webhook rule's clear is posted");
+    let (headers, body) = &got[0];
+    assert_eq!(
+        headers["x-hie-signature"].to_str().unwrap(),
+        hie::alerts::signature(b"secretcanary", body)
+    );
+    let payload: Value = serde_json::from_slice(body).unwrap();
+    assert_eq!(payload["event_id"], hook["event_id"]);
+    assert_eq!(
+        payload["source"],
+        json!({"id": "lab-results", "name": "Lab results"})
+    );
+    let listed = alerts["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == earlier)
+        .unwrap();
+    // The times are the strings the API shows.
+    assert_eq!(payload["alert"]["created_at"], listed["created_at"]);
+    assert_eq!(payload["alert"]["created_at"], "2023-11-14T22:13:20.123Z");
+    assert_eq!(payload["alert"]["cleared_at"], listed["cleared_at"]);
+    assert_eq!(payload["alert"]["message"], "from before");
+    // Neither the URL nor the secret is in any answer, nor is the stored fingerprint.
+    let answer = lab.get("/api/alerts").await.to_string();
+    for canary in ["urlcanary", "secretcanary", ours.as_str()] {
+        assert!(!answer.contains(canary), "{canary} in {answer}");
+    }
+}
+
+#[tokio::test]
+async fn without_a_webhook_the_api_says_so() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let lab = lab(&python).await;
+    lab.post(
+        "/api/alert-rules",
+        json!({"source_id": "lab-results", "condition": "rejected_share", "threshold": "10%"}),
+    )
+    .await;
+    lab.drop_file("messy.csv").await;
+    let alerts = lab
+        .wait_for("the alert", |a| alert(a, "rejected_share").is_some())
+        .await;
+    assert_eq!(
+        alerts["webhook"],
+        json!({"configured": false, "signed": false})
+    );
+    let hook = &alert(&alerts, "rejected_share").unwrap()["webhook"];
+    assert_eq!(
+        (hook["event"].as_str(), hook["state"].as_str()),
+        (Some("fired"), Some("not_configured"))
+    );
+    assert_eq!(hook["attempts"], 0);
+    assert_eq!(hook["last_status"], Value::Null);
 }
 
 /// The alert a rule raised, by rule id.

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::alerts::Alerter;
 use crate::bulk::{self, BulkSubmitter, Poll};
 use crate::config::{DeliveryMethod, FeedConfig, Format, parse_duration};
-use crate::db::{Db, Rule, WorkItem, now_ms};
+use crate::db::{Admission, CheckFailure, Db, Delivery, NewFile, Rule, WorkItem, now_ms};
 use crate::fhir::{self, DeliveryKey, EntryResult, FhirClient, SendError};
 use crate::reader;
 use crate::secrets::Secrets;
@@ -21,6 +21,9 @@ use tokio::sync::Notify;
 const TRANSFORM_CHUNK: usize = 200;
 /// Records settled per page when a submission's receipts come back.
 const SETTLE_PAGE: usize = 5_000;
+
+/// A scan that failed: at which step, for the check it answers, and why, for the log.
+struct ScanError(CheckFailure, anyhow::Error);
 
 /// How the manager drives a running feed: `poke` makes it pass now, `stopped` ends it.
 #[derive(Default)]
@@ -53,7 +56,6 @@ pub struct FeedRunner {
     transformer: Transformer,
     alerts: Arc<Alerter>,
     started_at: i64,
-    outage_alerted: AtomicBool,
     /// Which engine instance this runner acts as, for the source's lease.
     instance: String,
     /// Where transformed submissions are written when the engine serves them.
@@ -62,6 +64,9 @@ pub struct FeedRunner {
     bulk_transformed: bool,
     /// How the manager drives this runner, once it runs: a halt is seen between records.
     control: std::sync::OnceLock<Arc<RunnerControl>>,
+    /// The last record the transform could not finish now, as (id, revision,
+    /// reason): its `record.attempt_failed` is written once, not on every pass.
+    last_transient: std::sync::Mutex<Option<(i64, i64, String)>>,
 }
 
 /// This process's name among the instances sharing a store: `HIE_INSTANCE_ID`,
@@ -127,10 +132,12 @@ impl FeedRunner {
         public_url: &str,
     ) -> Self {
         let transformer = Transformer::new(python, runtime_dir, &feed.transform);
+        alerts.know_source(&feed.id, &feed.name);
         let feed_bulk_transformed = feed.bulk_transformed();
         let bulk = (feed.delivery.method == DeliveryMethod::BulkSubmit).then(|| {
             BulkSubmitter::new(fhir_base_url, public_url)
                 .with_credentials(fhir.credentials().clone())
+                .with_destination(fhir.destination().clone())
         });
         Self {
             feed,
@@ -149,8 +156,8 @@ impl FeedRunner {
             instance: instance_id().to_string(),
             bulk_dir: std::env::temp_dir().join("hie-bulk"),
             bulk_transformed: feed_bulk_transformed,
-            outage_alerted: AtomicBool::new(false),
             control: std::sync::OnceLock::new(),
+            last_transient: std::sync::Mutex::new(None),
         }
     }
 
@@ -245,11 +252,57 @@ impl FeedRunner {
                 &format!("{}: {e:#}", self.feed.name),
             )?;
         }
-        if !self.db.is_paused(&self.feed.id)? {
+        if self.db.is_paused(&self.feed.id)? {
+            // A pause still in place once the waiting checks are read fails
+            // them. Resumed meanwhile, they are left to the pass the resume
+            // starts, which scans.
+            let snapshot = self.pending_checks();
+            if !snapshot.is_empty() && self.db.is_paused(&self.feed.id)? {
+                self.answer_checks(&snapshot, Some(CheckFailure::Paused));
+            }
+        } else {
             self.ensure_credential().await;
-            self.tick().await?;
+            // Read here, after the credential, so the snapshot is taken just
+            // before the scan; `tick_with` directly keeps this future shallow.
+            let snapshot = self.pending_checks();
+            // Paused while the credential was loaded: the checks read after
+            // the pause fail, and the pass stops here.
+            if !snapshot.is_empty() && self.db.is_paused(&self.feed.id)? {
+                self.answer_checks(&snapshot, Some(CheckFailure::Paused));
+                return Ok(true);
+            }
+            self.tick_with(&snapshot).await?;
         }
         Ok(true)
+    }
+
+    /// The source's checks waiting now, which the scan about to start answers;
+    /// none for a runner that is being replaced or stopped, so its successor
+    /// answers them. A store error is logged: the scan runs anyway. Public for
+    /// tests that drive a scan by hand.
+    pub fn pending_checks(&self) -> Vec<i64> {
+        if self.halted() {
+            return Vec::new();
+        }
+        let snapshot = self.db.pending_checks(&self.feed.id).unwrap_or_else(|e| {
+            tracing::error!(feed = %self.feed.id, "reading the pending checks: {e:#}");
+            Vec::new()
+        });
+        // Stopped while they were read: a check asked for after the replace
+        // may be among them, and is the successor's to answer.
+        if self.halted() {
+            return Vec::new();
+        }
+        snapshot
+    }
+
+    /// Answers the checks of `snapshot`. A store error is logged: they stay
+    /// pending, and the next scan answers them with every load since each was
+    /// asked for, so nothing taken meanwhile is left out.
+    fn answer_checks(&self, snapshot: &[i64], failure: Option<CheckFailure>) {
+        if let Err(e) = self.db.answer_checks(&self.feed.id, snapshot, failure) {
+            tracing::error!(feed = %self.feed.id, "answering checks {snapshot:?}: {e:#}");
+        }
     }
 
     /// Whether the source can read its store: it names no credential, or it is
@@ -407,14 +460,30 @@ impl FeedRunner {
     /// One pass of the whole pipeline. Each step picks up whatever the previous
     /// passes left, so a step that fails is simply retried on the next pass.
     pub async fn tick(&self) -> Result<()> {
+        let snapshot = self.pending_checks();
+        self.tick_with(&snapshot).await
+    }
+
+    /// A pass that answers the checks of `snapshot`, taken before it started.
+    /// Public for tests that drive a scan by hand.
+    pub async fn tick_with(&self, snapshot: &[i64]) -> Result<()> {
         // Without its credential loaded, a source cannot read its store: nothing
         // is listed and nothing is handed over this pass, but what is open is
         // still polled and settled.
         let ready = self.credential_ready();
         // A source that cannot be read this pass must not hold back what is
         // already in the store: the rest of the pass runs, the scan is retried next.
-        if ready && let Err(e) = self.scan().await {
-            tracing::error!(feed = %self.feed.id, "scan failed, will retry next pass: {e:#}");
+        // The checks are answered by the scan, before anything is delivered.
+        if ready {
+            match self.scan().await {
+                Ok(()) => self.answer_checks(snapshot, None),
+                Err(ScanError(failure, e)) => {
+                    tracing::error!(feed = %self.feed.id, "scan failed, will retry next pass: {e:#}");
+                    self.answer_checks(snapshot, Some(failure));
+                }
+            }
+        } else {
+            self.answer_checks(snapshot, Some(CheckFailure::CredentialNotLoaded));
         }
         if self.bulk.is_some() {
             if self.bulk_transformed {
@@ -437,13 +506,24 @@ impl FeedRunner {
         Ok(())
     }
 
-    async fn scan(&self) -> Result<()> {
+    async fn scan(&self) -> Result<(), ScanError> {
+        use CheckFailure::*;
         let source = self.source();
         let read_only = source.is_read_only();
-        for (key, name, size) in source.list_meta().await? {
+        let listed = source
+            .list_meta()
+            .await
+            .map_err(|e| ScanError(Listing, e))?;
+        for (key, name, size) in listed {
             // Someone else's bucket keeps what we took: known by name and size,
             // it is not downloaded again just to recognise its hash.
-            if read_only && size > 0 && self.db.has_file(&self.feed.id, &name, size)? {
+            if read_only
+                && size > 0
+                && self
+                    .db
+                    .has_file(&self.feed.id, &name, size)
+                    .map_err(|e| ScanError(Taking, e))?
+            {
                 continue;
             }
             let incoming = match source.fetch(&key).await {
@@ -453,13 +533,18 @@ impl FeedRunner {
                     tracing::warn!(feed = %self.feed.id, key, "object no longer there, skipped");
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(ScanError(Fetching, e)),
             };
-            self.ingest(incoming).await?;
+            self.ingest(incoming)
+                .await
+                .map_err(|e| ScanError(Taking, e))?;
         }
         // Notifications are acknowledged only once what they announced is in the
         // store: a pass that failed before this leaves them to be delivered again.
-        source.settle_notifications().await?;
+        source
+            .settle_notifications()
+            .await
+            .map_err(|e| ScanError(Notifications, e))?;
         Ok(())
     }
 
@@ -494,30 +579,9 @@ impl FeedRunner {
         let sha = reader::sha256_hex(&bytes);
 
         if let Some(original) = self.db.find_file_by_hash(feed, &sha)? {
-            if self.source().is_read_only() {
-                // Someone else's bucket: the object stays, and was already taken.
-                return Ok(());
-            }
-            if self.bulk.is_some() && self.db.file_source(original)?.is_some() {
-                // The same object, still waiting for HFS to fetch it: leave it alone.
-                return Ok(());
-            }
-            let id = self.db.insert_file(
-                feed,
-                &name,
-                &sha,
-                bytes.len() as u64,
-                "duplicate",
-                Some(original),
-                None,
-                None,
-            )?;
-            tracing::info!(feed, file = %name, duplicate_of = original, "same content already received; not reprocessed");
-            let archived = self
-                .source()
-                .acknowledge(&key, &format!("{id}-{name}"))
-                .await?;
-            return self.db.mark_file_archived(id, &archived);
+            return self
+                .duplicate(&key, &name, &sha, bytes.len() as u64, original)
+                .await;
         }
 
         if name.to_ascii_lowercase().ends_with(".zip") {
@@ -531,17 +595,27 @@ impl FeedRunner {
         } else {
             "local"
         };
-        let file_id = self.db.insert_file(
-            feed,
-            &name,
-            &sha,
-            bytes.len() as u64,
-            "processing",
-            None,
-            keep.then_some(key.as_str()),
-            keep.then_some(origin),
+        let (admission, readable) = self.admit(
+            &NewFile {
+                feed,
+                source_name: &self.feed.name,
+                name: &name,
+                sha: &sha,
+                size: bytes.len() as u64,
+                source_key: keep.then_some(key.as_str()),
+                origin: keep.then_some(origin),
+            },
+            &bytes,
         )?;
-        let readable = self.admit(file_id, &name, &bytes)?;
+        let file_id = match admission {
+            Admission::Admitted(id) => id,
+            // Taken meanwhile, by an instance that held the source before.
+            Admission::AlreadyTaken(original) => {
+                return self
+                    .duplicate(&key, &name, &sha, bytes.len() as u64, original)
+                    .await;
+            }
+        };
         if keep && readable {
             return Ok(());
         }
@@ -552,27 +626,63 @@ impl FeedRunner {
         self.db.mark_file_archived(file_id, &archived)
     }
 
-    /// Reads a file's records into the store; `false` when the file could not be read.
-    fn admit(&self, file_id: i64, name: &str, bytes: &[u8]) -> Result<bool> {
+    /// A file whose content was already taken, as `original`.
+    async fn duplicate(
+        &self,
+        key: &str,
+        name: &str,
+        sha: &str,
+        size: u64,
+        original: i64,
+    ) -> Result<()> {
         let feed = &self.feed.id;
+        if self.source().is_read_only() {
+            // Someone else's bucket: the object stays, and was already taken.
+            return Ok(());
+        }
+        if self.bulk.is_some() && self.db.file_source(original)?.is_some() {
+            // The same object, still waiting for HFS to fetch it: leave it alone.
+            return Ok(());
+        }
+        let id = self
+            .db
+            .insert_duplicate(feed, &self.feed.name, name, sha, size, original)?;
+        tracing::info!(feed, file = %name, duplicate_of = original, "same content already received; not reprocessed");
+        let archived = self
+            .source()
+            .acknowledge(key, &format!("{id}-{name}"))
+            .await?;
+        self.db.mark_file_archived(id, &archived)
+    }
+
+    /// Records a file and reads its records into the store, in one transaction
+    /// (`Db::admit_file`). Returns what was done with it, and `false` when it
+    /// could not be read.
+    fn admit(&self, file: &NewFile, bytes: &[u8]) -> Result<(Admission, bool)> {
+        let feed = &self.feed.id;
+        let name = file.name;
         match reader::read(self.feed.format, bytes) {
             Ok(records) => {
                 let rows: Vec<_> = records
                     .into_iter()
                     .map(|r| (r.line, r.raw, r.parse_error))
                     .collect();
-                self.db.insert_records(file_id, feed, &rows)?;
-                tracing::info!(feed, file = %name, records = rows.len(), "received");
-                Ok(true)
+                let admission = self.db.admit_file(file, Ok(&rows))?;
+                if let Admission::Admitted(_) = admission {
+                    tracing::info!(feed, file = %name, records = rows.len(), "received");
+                }
+                Ok((admission, true))
             }
             Err(e) => {
-                self.db.fail_file(file_id, &format!("{e:#}"))?;
-                self.alerts.raise(
-                    Some(feed),
-                    "unreadable_file",
-                    &format!("{}: cannot read {name}: {e:#}", self.feed.name),
-                )?;
-                Ok(false)
+                let admission = self.db.admit_file(file, Err(&format!("{e:#}")))?;
+                if let Admission::Admitted(_) = admission {
+                    self.alerts.raise(
+                        Some(feed),
+                        "unreadable_file",
+                        &format!("{}: cannot read {name}: {e:#}", self.feed.name),
+                    )?;
+                }
+                Ok((admission, false))
             }
         }
     }
@@ -582,16 +692,9 @@ impl FeedRunner {
     /// zip is recorded as `unpacked` (so it is not read twice) and archived.
     async fn unpack(&self, key: &str, name: &str, sha: &str, bytes: Vec<u8>) -> Result<()> {
         let feed = &self.feed.id;
-        let container = self.db.insert_file(
-            feed,
-            name,
-            sha,
-            bytes.len() as u64,
-            "unpacked",
-            None,
-            None,
-            None,
-        )?;
+        let container =
+            self.db
+                .insert_container(feed, &self.feed.name, name, sha, bytes.len() as u64)?;
         let wanted = match self.feed.format {
             Format::Csv => &["csv"][..],
             Format::Ndjson => &["ndjson", "jsonl"][..],
@@ -636,6 +739,7 @@ impl FeedRunner {
                 }
             };
         let mut taken = 0;
+        let mut stage_count = 0usize;
         for (path, data) in entries {
             let extension = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
             if !wanted.contains(&extension.as_str()) {
@@ -645,22 +749,23 @@ impl FeedRunner {
             let entry_name = format!("{name}!/{path}");
             let entry_sha = reader::sha256_hex(&data);
             if let Some(original) = self.db.find_file_by_hash(feed, &entry_sha)? {
-                self.db.insert_file(
+                self.db.insert_duplicate(
                     feed,
+                    &self.feed.name,
                     &entry_name,
                     &entry_sha,
                     data.len() as u64,
-                    "duplicate",
-                    Some(original),
-                    None,
-                    None,
+                    original,
                 )?;
                 continue;
             }
             // On the source_objects bulk path HFS reads the entry, not the zip: the
             // entry is staged where HFS can fetch it and kept until the receipts.
             let staged = if self.bulk.is_some() && !self.bulk_transformed {
-                let base = format!("{}.ndjson", taken + 1);
+                // Each entry staged gets a name of its own, also after one that
+                // turned out to be taken already.
+                stage_count += 1;
+                let base = format!("{stage_count}.ndjson");
                 match self.source().put_unpacked(container, &base, &data).await? {
                     Some(key) => Some((key, "store")),
                     None => {
@@ -676,17 +781,37 @@ impl FeedRunner {
             } else {
                 None
             };
-            let file_id = self.db.insert_file(
-                feed,
-                &entry_name,
-                &entry_sha,
-                data.len() as u64,
-                "processing",
-                None,
-                staged.as_ref().map(|(key, _)| key.as_str()),
-                staged.as_ref().map(|(_, origin)| *origin),
+            // Each entry is admitted in a transaction of its own; one that fails
+            // part way leaves the container recognised by its hash next time.
+            let (admission, _) = self.admit(
+                &NewFile {
+                    feed,
+                    source_name: &self.feed.name,
+                    name: &entry_name,
+                    sha: &entry_sha,
+                    size: data.len() as u64,
+                    source_key: staged.as_ref().map(|(key, _)| key.as_str()),
+                    origin: staged.as_ref().map(|(_, origin)| *origin),
+                },
+                &data,
             )?;
-            self.admit(file_id, &entry_name, &data)?;
+            if let Admission::AlreadyTaken(original) = admission {
+                // Taken meanwhile: a duplicate. A copy staged on disk goes; one
+                // staged in the store stays where it was written (the source has
+                // no way to remove a single object), under a name not used again.
+                if let Some((path, "staged")) = &staged {
+                    let _ = std::fs::remove_file(path);
+                }
+                self.db.insert_duplicate(
+                    feed,
+                    &self.feed.name,
+                    &entry_name,
+                    &entry_sha,
+                    data.len() as u64,
+                    original,
+                )?;
+                continue;
+            }
             taken += 1;
         }
         tracing::info!(feed, file = %name, entries = taken, "unpacked");
@@ -720,22 +845,33 @@ impl FeedRunner {
                         return Ok(());
                     }
                 };
+                // Each outcome changes the record only while it is still at the
+                // revision it was selected at; a person may have put it back since.
                 match outcome {
                     Outcome::Transient(message) => {
                         // Not the row's fault: leave it and the rest for the next pass.
                         tracing::warn!(feed = %self.feed.id, line = item.line, "transform cannot finish now, will retry: {message}");
+                        // Logged once for the record and reason while this runner
+                        // runs; again when the reason changes. Remembered only once
+                        // stored, so an event that could not be is tried again.
+                        let seen = (item.id, item.revision, message);
+                        let repeat = self.last_transient.lock().expect("transient lock").as_ref()
+                            == Some(&seen);
+                        if !repeat && self.db.transform_deferred(item, &seen.2)? {
+                            *self.last_transient.lock().expect("transient lock") = Some(seen);
+                        }
                         return Ok(());
                     }
                     Outcome::Rejected { kind, message } => {
-                        self.db.mark_rejected(item.id, &kind, &message, None)?
+                        self.db.reject_item(item, "received", &kind, &message)?;
                     }
                     Outcome::Resources(resources) if resources.is_empty() => {
-                        self.db.mark_rejected(
-                            item.id,
+                        self.db.reject_item(
+                            item,
+                            "received",
                             "filtered",
                             "transform returned no resources",
-                            None,
-                        )?
+                        )?;
                     }
                     Outcome::Resources(mut resources) => {
                         // On the transformed bulk path a resource must carry an id:
@@ -752,10 +888,12 @@ impl FeedRunner {
                                 .collect::<Result<Vec<_>, _>>()
                         };
                         match checked {
-                            Ok(_) => self
-                                .db
-                                .mark_transformed(item.id, &Value::Array(resources))?,
-                            Err(msg) => self.db.mark_rejected(item.id, "validation", &msg, None)?,
+                            Ok(_) => {
+                                self.db.mark_transformed(item, &Value::Array(resources))?;
+                            }
+                            Err(msg) => {
+                                self.db.reject_item(item, "received", "validation", &msg)?;
+                            }
                         }
                     }
                 }
@@ -778,14 +916,20 @@ impl FeedRunner {
             let mut good = Vec::with_capacity(items.len());
             for item in &items {
                 match transform::check_resource(&item.raw) {
-                    Ok(DeliveryKey::Id { .. }) => good.push(item.id),
-                    Ok(DeliveryKey::Identifier { resource_type, .. }) => self.db.mark_rejected(
-                        item.id,
-                        "validation",
-                        &format!("{resource_type} has no id; $bulk-submit stores resources by id"),
-                        None,
-                    )?,
-                    Err(msg) => self.db.mark_rejected(item.id, "validation", &msg, None)?,
+                    Ok(DeliveryKey::Id { .. }) => good.push((item.id, item.revision)),
+                    Ok(DeliveryKey::Identifier { resource_type, .. }) => {
+                        self.db.reject_item(
+                            item,
+                            "received",
+                            "validation",
+                            &format!(
+                                "{resource_type} has no id; $bulk-submit stores resources by id"
+                            ),
+                        )?;
+                    }
+                    Err(msg) => {
+                        self.db.reject_item(item, "received", "validation", &msg)?;
+                    }
                 }
             }
             self.db.mark_passthrough(&good)?;
@@ -815,7 +959,7 @@ impl FeedRunner {
             let token = bulk::token();
             let ttl = Duration::from_secs(self.feed.delivery.url_ttl_seconds);
             let mut entries = Vec::new();
-            let mut file_ids = Vec::new();
+            let mut claims = Vec::new();
             let mut records = 0usize;
             let mut hashes = Vec::new();
             for file in &files {
@@ -855,7 +999,7 @@ impl FeedRunner {
                     },
                 };
                 entries.push((file.resource_type.clone(), url, file.count));
-                file_ids.push(file.file_id);
+                claims.push((file.file_id, file.count));
                 records += file.count;
                 hashes.push(file.name.clone());
             }
@@ -865,13 +1009,18 @@ impl FeedRunner {
             let hash_refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
             let submission_id = bulk::submission_id(&self.feed.id, &hash_refs);
             let manifest = bulk.manifest(&entries);
-            self.db.create_submission_for_files(
+            if !self.db.create_submission_for_files(
                 &token,
                 &self.feed.id,
                 &submission_id,
                 &manifest,
-                &file_ids,
-            )?;
+                &claims,
+            )? {
+                // A record changed after the manifest was built for it: nothing
+                // was opened, and it is built again from what is pending now.
+                tracing::info!(feed = %self.feed.id, "a record changed while its submission was built; building it again");
+                continue;
+            }
             tracing::info!(feed = %self.feed.id, submission = %submission_id, files = files.len(), records, "submission opened");
         }
     }
@@ -912,17 +1061,29 @@ impl FeedRunner {
                     Some(url) => match bulk.poll(url).await {
                         Ok(Poll::InProgress) => Ok(None),
                         Ok(Poll::Done { references, errors }) => {
-                            self.settle(&sub.token, &references, &errors).await?;
-                            Ok(Some(("done", None)))
+                            if self
+                                .settle(&sub.token, sub.attempts, &references, &errors)
+                                .await?
+                            {
+                                Ok(Some(("done", None)))
+                            } else {
+                                Ok(Some(("stale", None)))
+                            }
                         }
                         Err(e) => Err(e),
                     },
                 },
             };
+            // Each write below holds only while the submission still has the
+            // attempt count read before the request: an older runner's answer
+            // (a progress, a failure, a refusal or the receipts) changes nothing.
             match step {
+                // Answered for an older attempt: the current runner decides.
+                Ok(Some(("stale", _))) => {}
                 Ok(None) => {
-                    self.db.update_submission(
+                    self.db.progress_submission(
                         &sub.token,
+                        Some(sub.attempts),
                         &sub.status,
                         None,
                         sub.attempts,
@@ -930,48 +1091,60 @@ impl FeedRunner {
                         None,
                     )?;
                 }
-                Ok(Some((status, url))) => {
-                    self.db
-                        .update_submission(&sub.token, status, url.as_deref(), 0, 0, None)?;
-                    if status == "done" {
+                Ok(Some(("done", _))) => {
+                    if self.db.settle_submission(&sub.token, sub.attempts)? {
                         self.recovered()?;
                     }
                 }
-                Err(SendError::Refused(status, body)) => {
-                    let reason =
-                        bulk::safe_reason(&format!("HTTP {status}: {}", fhir::outcome_text(&body)));
-                    tracing::warn!(feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
-                    for (record_id, _, _) in self.db.submitted_records(&sub.token)? {
-                        self.db
-                            .mark_rejected(record_id, "server", &reason, Some(&body))?;
-                    }
-                    self.db.update_submission(
+                Ok(Some((status, url))) => {
+                    self.db.progress_submission(
                         &sub.token,
-                        "failed",
-                        None,
-                        sub.attempts,
+                        Some(sub.attempts),
+                        status,
+                        url.as_deref(),
                         0,
-                        Some(&reason),
+                        0,
+                        None,
                     )?;
-                    self.archive_submission(&sub.token).await?;
+                }
+                Err(SendError::Refused(status, body)) => {
+                    // What the server said may echo signed URLs or the engine's
+                    // own paths: scrubbed before it is logged or stored.
+                    let reason = bulk::scrub(
+                        &format!("HTTP {status}: {}", fhir::outcome_text(&body)),
+                        &sub.token,
+                    );
+                    tracing::warn!(feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
+                    if self
+                        .db
+                        .reject_submission(
+                            &sub.token,
+                            sub.attempts,
+                            "server",
+                            &reason,
+                            &bulk::scrub_value(&body, &sub.token),
+                        )?
+                        .is_some()
+                    {
+                        self.archive_submission(&sub.token).await?;
+                    }
                 }
                 Err(SendError::Transient(reason)) => {
-                    let reason = bulk::safe_reason(&reason);
+                    let reason = bulk::scrub(&reason, &sub.token);
                     let attempts = sub.attempts + 1;
                     let d = &self.feed.delivery;
                     let backoff = d
                         .initial_backoff_ms
                         .saturating_mul(1u64 << (attempts - 1).min(20))
                         .min(d.max_backoff_ms);
-                    self.db.update_submission(
+                    if self.db.submission_attempt_failed(
                         &sub.token,
-                        &sub.status,
-                        None,
-                        attempts,
+                        sub.attempts,
                         now_ms() + backoff as i64,
-                        Some(&reason),
-                    )?;
-                    self.outage(attempts, &reason)?;
+                        &reason,
+                    )? {
+                        self.outage(attempts, &reason)?;
+                    }
                 }
             }
         }
@@ -979,17 +1152,25 @@ impl FeedRunner {
     }
 
     /// Gives every submitted record its disposition from the receipts, then archives
-    /// the objects HFS has read.
+    /// the objects HFS has read. Only while the submission is still at the
+    /// attempt count `captured` read before the poll: `false` when it moved, with
+    /// the pages already applied kept and the rest, and the archive, left to the
+    /// runner that moved it.
     async fn settle(
         &self,
         token: &str,
+        captured: u32,
         references: &std::collections::HashSet<String>,
         errors: &[String],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let hint = match errors.len() {
             0 => String::new(),
             n => format!(" HFS reported {n} error(s); the first: {}", errors[0]),
         };
+        let missing_reason = bulk::scrub(
+            &format!("no receipt from HFS for this resource.{hint}"),
+            token,
+        );
         // Page through the submission: a large one holds a million records, and
         // each page's receipts are applied in sets.
         let mut after_id = 0;
@@ -1001,6 +1182,7 @@ impl FeedRunner {
                 break;
             }
             let mut sent = Vec::with_capacity(page.len());
+            let mut missing = Vec::new();
             for (record_id, _, resources) in &page {
                 let reference = resources
                     .get(0)
@@ -1010,33 +1192,44 @@ impl FeedRunner {
                     Some(r) if references.contains(&r) => {
                         sent.push((*record_id, json!([{"reference": r, "via": "$bulk-submit"}])))
                     }
-                    _ => self.db.mark_rejected(
-                        *record_id,
-                        "server",
-                        &format!("no receipt from HFS for this resource.{hint}"),
-                        None,
-                    )?,
+                    _ => missing.push(*record_id),
                 }
                 after_id = *record_id;
             }
-            self.db.mark_sent_many(&sent)?;
+            // The page's outcomes, its tallies and its events in one transaction.
+            if !self
+                .db
+                .settle_page(token, captured, &sent, &missing, &missing_reason)?
+            {
+                return Ok(false);
+            }
+        }
+        // Nothing is archived for an answer to an older poll.
+        if !self.db.submission_open_at(token, captured)? {
+            return Ok(false);
         }
         self.archive_submission(token).await?;
         self.remove_submission_files(token).await;
-        Ok(())
+        Ok(true)
     }
 
     /// Drops what the engine wrote for a transformed submission, now that HFS has
     /// read it and answered.
     async fn remove_submission_files(&self, token: &str) {
+        // The token names the directory and the objects: never logged.
         let dir = self.bulk_dir.join(token);
         if dir.is_dir()
             && let Err(e) = std::fs::remove_dir_all(&dir)
         {
-            tracing::warn!(feed = %self.feed.id, "cannot remove {}: {e}", dir.display());
+            let reason = bulk::scrub(&format!("cannot remove {}: {e}", dir.display()), token);
+            tracing::warn!(feed = %self.feed.id, "{reason}");
         }
         if let Err(e) = self.source().remove_submission_files(token).await {
-            tracing::warn!(feed = %self.feed.id, "cannot remove submission files at the source: {e:#}");
+            let reason = bulk::scrub(
+                &format!("cannot remove submission files at the source: {e:#}"),
+                token,
+            );
+            tracing::warn!(feed = %self.feed.id, "{reason}");
         }
     }
 
@@ -1058,7 +1251,7 @@ impl FeedRunner {
             let ttl = Duration::from_secs(self.feed.delivery.url_ttl_seconds);
             let mut by_type: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
             let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-            for (_, resources) in &records {
+            for (_, _, resources) in &records {
                 for resource in resources.as_array().into_iter().flatten() {
                     let kind = resource["resourceType"]
                         .as_str()
@@ -1070,47 +1263,59 @@ impl FeedRunner {
                     *counts.entry(kind).or_default() += 1;
                 }
             }
-            let mut entries = Vec::new();
-            for (n, (kind, bytes)) in by_type.into_iter().enumerate() {
-                let n = n as i64 + 1;
-                let name = format!("{n}.ndjson");
-                let shared = match self
-                    .source()
-                    .put_submission_file(&token, &name, bytes.clone())
-                    .await?
-                {
-                    Some(key) => self.source().share(&key, ttl).await?,
-                    None => None,
-                };
-                let url = match shared {
-                    Some(url) => url,
-                    None => {
-                        let dir = self.bulk_dir.join(&token);
-                        std::fs::create_dir_all(&dir)
-                            .with_context(|| format!("creating {}", dir.display()))?;
-                        std::fs::write(dir.join(&name), &bytes)
-                            .with_context(|| format!("writing {}", dir.join(&name).display()))?;
-                        bulk.file_url(&token, n)
-                    }
-                };
-                entries.push((kind.clone(), url, counts[&kind]));
+            let written = async {
+                let mut entries = Vec::new();
+                for (n, (kind, bytes)) in by_type.into_iter().enumerate() {
+                    let n = n as i64 + 1;
+                    let name = format!("{n}.ndjson");
+                    let shared = match self
+                        .source()
+                        .put_submission_file(&token, &name, bytes.clone())
+                        .await?
+                    {
+                        Some(key) => self.source().share(&key, ttl).await?,
+                        None => None,
+                    };
+                    let url = match shared {
+                        Some(url) => url,
+                        None => {
+                            let dir = self.bulk_dir.join(&token);
+                            std::fs::create_dir_all(&dir)
+                                .with_context(|| format!("creating {}", dir.display()))?;
+                            std::fs::write(dir.join(&name), &bytes).with_context(|| {
+                                format!("writing {}", dir.join(&name).display())
+                            })?;
+                            bulk.file_url(&token, n)
+                        }
+                    };
+                    entries.push((kind.clone(), url, counts[&kind]));
+                }
+                Ok::<_, anyhow::Error>(entries)
             }
-            let record_ids: Vec<i64> = records.iter().map(|(id, _)| *id).collect();
-            let span = format!(
-                "records {}-{}",
-                record_ids[0],
-                record_ids[record_ids.len() - 1]
-            );
+            .await;
+            // The paths and keys written are named after the token: an error
+            // about them never carries it.
+            let entries =
+                written.map_err(|e| anyhow::anyhow!(bulk::scrub(&format!("{e:#}"), &token)))?;
+            let claims: Vec<(i64, i64)> = records.iter().map(|(id, rev, _)| (*id, *rev)).collect();
+            let span = format!("records {}-{}", claims[0].0, claims[claims.len() - 1].0);
             let submission_id = bulk::submission_id(&self.feed.id, &[span.as_str()]);
             let manifest = bulk.manifest(&entries);
-            self.db.create_submission(
+            if !self.db.create_submission(
                 &token,
                 &self.feed.id,
                 &submission_id,
                 &manifest,
-                &record_ids,
-            )?;
-            tracing::info!(feed = %self.feed.id, submission = %submission_id, files = entries.len(), records = record_ids.len(), "submission opened (transformed)");
+                &claims,
+            )? {
+                // A record changed while its file was written (a person put it
+                // back): nothing was opened; the files go, and the submission is
+                // built again from what is pending now.
+                tracing::info!(feed = %self.feed.id, "a record changed while its submission was written; building it again");
+                self.remove_submission_files(&token).await;
+                continue;
+            }
+            tracing::info!(feed = %self.feed.id, submission = %submission_id, files = entries.len(), records = claims.len(), "submission opened (transformed)");
         }
     }
 
@@ -1186,9 +1391,11 @@ impl FeedRunner {
         }
         match self.fhir.post_bundle(&fhir::batch_bundle(&entries)).await {
             Err(SendError::Transient(reason)) => {
-                for item in items {
-                    self.defer(item, &reason)?;
-                }
+                let deferred: Vec<_> = items
+                    .iter()
+                    .map(|item| (item, self.defer(item, &reason)))
+                    .collect();
+                self.db.delivered(&deferred)?;
                 let worst = items.iter().map(|i| i.attempts + 1).max().unwrap_or(0);
                 self.outage(worst, &reason)?;
                 Ok(false)
@@ -1208,13 +1415,30 @@ impl FeedRunner {
             }
             Err(SendError::Refused(status, body)) => {
                 let reason = format!("HTTP {status}: {}", fhir::outcome_text(&body));
-                self.db
-                    .mark_rejected(items[0].id, "server", &reason, Some(&body))?;
+                self.db.delivered(&[(
+                    &items[0],
+                    Delivery::Rejected {
+                        kind: "server",
+                        error: &reason,
+                        response: Some(&body),
+                    },
+                )])?;
                 Ok(true)
             }
             Ok(response) => {
-                self.recovered()?;
                 let results = fhir::entry_results(&response, entries.len());
+                // HFS answered, but delivery recovered only if it decided at
+                // least one entry: a batch whose every entry is to be retried
+                // is still an outage for this source.
+                if results
+                    .iter()
+                    .any(|r| matches!(r, EntryResult::Ok(_) | EntryResult::Rejected(..)))
+                {
+                    self.recovered()?;
+                }
+                // Each record's outcome, worked out first, then stored together
+                // with their events before the next batch is sent.
+                let mut decided: Vec<(&WorkItem, Decided)> = Vec::with_capacity(items.len());
                 for (i, item) in items.iter().enumerate() {
                     let mine: Vec<&EntryResult> = results
                         .iter()
@@ -1230,43 +1454,68 @@ impl FeedRunner {
                             | EntryResult::Transient(_, v) => v.clone(),
                         })
                         .collect();
+                    let responses = Value::Array(responses);
                     if let Some(EntryResult::Rejected(status, v)) =
                         mine.iter().find(|r| matches!(r, EntryResult::Rejected(..)))
                     {
                         let reason = format!("HTTP {status}: {}", fhir::outcome_text(v));
-                        self.db.mark_rejected(
-                            item.id,
-                            "server",
-                            &reason,
-                            Some(&Value::Array(responses)),
-                        )?;
+                        decided.push((item, Decided::Rejected(reason, responses)));
                     } else if let Some(EntryResult::Transient(status, _)) = mine
                         .iter()
                         .find(|r| matches!(r, EntryResult::Transient(..)))
                     {
-                        self.defer(item, &format!("HTTP {status} for this entry"))?;
+                        decided.push((
+                            item,
+                            Decided::Deferred(format!("HTTP {status} for this entry")),
+                        ));
                     } else {
-                        self.db.mark_sent(item.id, &Value::Array(responses))?;
+                        decided.push((item, Decided::Sent(responses)));
                     }
                 }
+                let outcomes: Vec<(&WorkItem, Delivery)> = decided
+                    .iter()
+                    .map(|(item, d)| {
+                        let outcome = match d {
+                            Decided::Sent(responses) => Delivery::Sent(responses),
+                            Decided::Rejected(reason, responses) => Delivery::Rejected {
+                                kind: "server",
+                                error: reason,
+                                response: Some(responses),
+                            },
+                            Decided::Deferred(reason) => self.defer(item, reason),
+                        };
+                        (*item, outcome)
+                    })
+                    .collect();
+                self.db.delivered(&outcomes)?;
                 Ok(true)
             }
         }
     }
 
-    fn defer(&self, item: &WorkItem, reason: &str) -> Result<()> {
+    /// The next attempt of a record whose delivery failed for a reason that may pass.
+    fn defer<'a>(&self, item: &WorkItem, reason: &'a str) -> Delivery<'a> {
         let attempts = item.attempts + 1;
         let d = &self.feed.delivery;
         let backoff = d
             .initial_backoff_ms
             .saturating_mul(1u64 << (attempts - 1).min(20))
             .min(d.max_backoff_ms);
-        self.db
-            .defer(item.id, attempts, now_ms() + backoff as i64, reason)
+        Delivery::Deferred {
+            attempts,
+            next_attempt_at: now_ms() + backoff as i64,
+            error: reason,
+        }
     }
 
+    /// Finishes each file that looks finished, one at a time, and weighs its
+    /// alerts right after it is stored: a later file that fails to finish never
+    /// leaves an earlier one without them.
     fn finish(&self) -> Result<()> {
-        for f in self.db.finish_files(&self.feed.id)? {
+        for candidate in self.db.finish_candidates(&self.feed.id)? {
+            let Some(f) = self.db.finish_file(&self.feed.id, candidate)? else {
+                continue;
+            };
             tracing::info!(feed = %self.feed.id, file = %f.name, total = f.total, sent = f.sent, rejected = f.rejected, "file done");
             // The rules say whether a few rejected rows are worth an alert; without
             // one, every rejection is.
@@ -1336,7 +1585,8 @@ impl FeedRunner {
     }
 
     /// Delivery failed `attempts` times in a row. The unreachable rules say when to
-    /// tell someone; without one, the source's `alert_after_attempts` does.
+    /// tell someone; without one, the source's `alert_after_attempts` does, once
+    /// per outage: no second alert while one is open, whichever process raised it.
     fn outage(&self, attempts: u32, reason: &str) -> Result<()> {
         let message = format!(
             "{}: cannot deliver to HFS after {attempts} attempts ({reason}); data is kept and retried",
@@ -1345,7 +1595,10 @@ impl FeedRunner {
         let rules = self.rules("unreachable")?;
         if rules.is_empty() {
             if attempts >= self.feed.delivery.alert_after_attempts
-                && !self.outage_alerted.swap(true, Ordering::SeqCst)
+                && self
+                    .db
+                    .open_alert(&self.feed.id, "delivery", None)?
+                    .is_none()
             {
                 self.alerts
                     .raise(Some(&self.feed.id), "delivery", &message)?;
@@ -1361,15 +1614,17 @@ impl FeedRunner {
         Ok(())
     }
 
+    /// Delivery works again: every open `delivery` alert of the source is
+    /// cleared, with a rule or without, and whether or not its rule still
+    /// exists. The cleared alert is the recovery notice.
     fn recovered(&self) -> Result<()> {
-        let message = format!("{}: delivery to HFS recovered", self.feed.name);
-        if self.outage_alerted.swap(false, Ordering::SeqCst) {
-            self.alerts
-                .raise(Some(&self.feed.id), "delivery_recovered", &message)?;
+        let open = self.db.open_alert_ids(&self.feed.id, "delivery")?;
+        if open.is_empty() {
+            return Ok(());
         }
-        for rule in self.rules("unreachable")? {
-            self.alerts
-                .clear_open(&self.feed.id, "delivery", Some(rule.id), &message)?;
+        let message = format!("{}: delivery to HFS recovered", self.feed.name);
+        for id in open {
+            self.alerts.clear(id, &self.feed.id, "delivery", &message)?;
         }
         Ok(())
     }
@@ -1422,6 +1677,13 @@ impl FeedRunner {
         }
         Ok(())
     }
+}
+
+/// A record's outcome from a batch answer, before it is stored.
+enum Decided {
+    Sent(Value),
+    Rejected(String, Value),
+    Deferred(String),
 }
 
 pub fn human(d: Duration) -> String {
