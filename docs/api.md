@@ -28,7 +28,7 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /api/records?source=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
 | `GET /api/records/{id}` | One record: file, line, original and corrected row, resources sent, HFS response |
 | `POST /api/records/{id}/reprocess` | Runs a record again; body `{"raw": {...}}` replaces the row and keeps the original |
-| `GET /api/alerts?source=&open=true` | Alerts, newest first, each with its rule, recipients, channels, and when and why it cleared; `open=true` lists only those not cleared. Kept for `retention.history` (see [Alerts and retention](#alerts-and-retention)) |
+| `GET /api/alerts?source=&open=true&since=&limit=100&cursor=` | Alerts, newest first, each with its rule, recipients, channels, and when and why it cleared; `open=true` lists only those not cleared. `since` and `cursor` read a period page by page (see [Reading alerts by period](#reading-alerts-by-period)). Kept for `retention.history` (see [Alerts and retention](#alerts-and-retention)) |
 | `GET /api/events?source=&kind=&since=&cursor=&limit=` | The event log, oldest first: each record's attempts and outcomes, each load's steps, each submission's steps (see [Events](#events)) |
 | `GET /api/alert-rules?source=` | Every rule, each with its `created_at`; `POST` creates one (`400` names what is wrong with it). `created_at` is set by the engine, never by the body. A rule id is never given again, like alert and event ids |
 | `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove |
@@ -40,7 +40,7 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind (`hie_alerts_total`, which counts purged alerts too and never goes down) |
 | `GET /health` | `{"status": "ok", "service": "hie", "version", "uptime_seconds", "started_at", "timestamp", "secrets"}`; `secrets` is `{"backend": "native"\|"none", "available", "key_id"}`, the key id being a one-way 16-hex fingerprint of the key in use, or `null` |
 
-Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), `invalid_query` (`400` with `field`: a query parameter of `/api/events` that cannot be read), and the codes of the credential routes below.
+Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), `invalid_query` (`400`: a query parameter of `/api/events` or `/api/alerts` that cannot be read, with `field` as their sections say), and the codes of the credential routes below.
 
 ### Events
 
@@ -137,6 +137,23 @@ Stored alerts follow `retention.history` too. An alert is purged that long after
 - the alert with the highest id.
 
 Open alerts of a deleted or disabled rule, and other open alerts without a rule, are purged by age. An alert id is never given again after a purge: the newest alert is always kept, so a SQLite store never reuses one, and PostgreSQL ids come from a sequence. Rule ids are never given again either: SQLite rules take their ids from `AUTOINCREMENT` (a store made before is rebuilt to it once, at its first start with this version), PostgreSQL's from a sequence. `hie_alerts_total` in `/metrics` adds the purged alerts to the stored ones, so it never goes down.
+
+### Reading alerts by period
+
+`GET /api/alerts` reads every alert of a period by following a cursor:
+
+```
+GET /api/alerts?since=2026-11-13T00:00:00Z&limit=100
+→ {"alerts": [...], "next_cursor": "a1.8421"}
+GET /api/alerts?since=2026-11-13T00:00:00Z&limit=100&cursor=a1.8421
+→ {"alerts": [...], "next_cursor": null}
+```
+
+- **`since`** keeps the alerts created at or after an RFC 3339 instant (`Z` or an offset, with `+` sent as `%2B`). Alerts are stored to the millisecond, so a finer instant counts from the next millisecond; more than nine fraction digits and leap seconds (`:60`) are refused. Alerts purged by `retention.history` are no longer listed.
+- **`next_cursor`** is set when more alerts match, and `null` on the last page, so a reader stops there without asking again. It is opaque: pass it back as `cursor` with the same `source`, `open`, `since` and `limit`; it does not carry them. Empty `since=` and `cursor=` are the same as leaving them out.
+- **`limit`** is 100 by default. `0` answers an empty page with `next_cursor: null`, whatever matches, and a negative value every matching alert (as SQLite always did; PostgreSQL used to answer `500`).
+- **While a reader pages**, the order holds: a walk returns, once each and newest first, every alert that existed when it began and still matches when its page is read. An alert created meanwhile may or may not appear; a new walk finds it. An alert that clears, or is removed, between two pages leaves the others where they were: with `open=true` it simply no longer appears, and the alert a cursor points after need not exist any more. So a page after a cursor can be empty, when the alerts it would have held left in the meantime: stop on `null`, not on an empty page.
+- **Refused** with `400 invalid_query`: a `since` that is not such an instant (`field: since`), a malformed `cursor` (`field: cursor`), and values of the wrong type or given twice (`limit=abc`, `open=yes`, `limit=1&limit=2`, without `field`). The sentence never repeats what was sent.
 
 ### Secrets
 

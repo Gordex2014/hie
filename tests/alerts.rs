@@ -504,3 +504,363 @@ async fn a_rule_answer_says_when_it_was_made_and_a_body_cannot() {
             .all(|r| r["created_at"].is_string())
     );
 }
+
+// ---- Reading alerts by period and in pages ------------------------------------
+
+/// An engine with no source and no Python, whose alerts a test writes itself.
+struct Store {
+    _dir: tempfile::TempDir,
+    _manager: std::sync::Arc<hie::manager::SourceManager>,
+    db: std::sync::Arc<hie::db::Db>,
+    api: String,
+    http: reqwest::Client,
+}
+
+async fn store() -> Store {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("hie.yaml"),
+        "fhir_base_url: http://127.0.0.1:9/fhir\ndatabase: data/hie.db\n",
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&dir.path().join("hie.yaml")).unwrap();
+    let (manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let db = state.db.clone();
+    let api = serve(hie::api::router(state)).await;
+    Store {
+        _dir: dir,
+        _manager: manager,
+        db,
+        api,
+        http: reqwest::Client::new(),
+    }
+}
+
+/// A whole second an hour ago: recent enough for any retention, and exact.
+fn base_ms() -> i64 {
+    (chrono::Utc::now().timestamp() - 3600) * 1000
+}
+
+fn iso(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+#[derive(Clone, Copy)]
+struct Seeded {
+    id: i64,
+    source: &'static str,
+    at: i64,
+    open: bool,
+}
+
+impl Store {
+    /// An alert created at exactly `at`. The store's write helpers are private,
+    /// so the time is set through `query_json`, which runs any statement.
+    fn seed(&self, source: &'static str, at: i64, open: bool) -> Seeded {
+        let id = self
+            .db
+            .insert_alert(Some(source), "test", "a test alert", None)
+            .unwrap();
+        let updated = self
+            .db
+            .query_json(
+                "UPDATE alerts SET created_at = $1 WHERE id = $2 RETURNING id",
+                hie::db::params![at, id],
+            )
+            .unwrap();
+        assert_eq!(updated, vec![json!({"id": id})]);
+        if !open {
+            self.db.clear_alert(id, "cleared by the test").unwrap();
+        }
+        Seeded {
+            id,
+            source,
+            at,
+            open,
+        }
+    }
+
+    async fn list(&self, query: &[(&str, &str)]) -> (u16, Value) {
+        let r = self
+            .http
+            .get(format!("{}/api/alerts", self.api))
+            .query(query)
+            .send()
+            .await
+            .unwrap();
+        (r.status().as_u16(), r.json().await.unwrap())
+    }
+
+    /// Every page of a query, following `next_cursor` to its end: the ids in
+    /// order. Each page has at most `limit` alerts, carries `next_cursor`, and
+    /// only the first may be empty.
+    async fn walk(&self, query: &[(&str, &str)], limit: usize) -> Vec<i64> {
+        self.walk_from(query, limit, None).await
+    }
+
+    /// `walk`, starting after a cursor already in hand.
+    async fn walk_from(
+        &self,
+        query: &[(&str, &str)],
+        limit: usize,
+        mut cursor: Option<String>,
+    ) -> Vec<i64> {
+        let limit_text = limit.to_string();
+        let mut ids = Vec::new();
+        for page in 0.. {
+            assert!(page < 1000, "the walk does not end");
+            let mut q = query.to_vec();
+            q.push(("limit", &limit_text));
+            if let Some(c) = &cursor {
+                q.push(("cursor", c));
+            }
+            let (status, body) = self.list(&q).await;
+            assert_eq!(status, 200, "{body}");
+            let alerts = body["alerts"].as_array().unwrap();
+            assert!(alerts.len() <= limit, "{body}");
+            assert!(page == 0 || !alerts.is_empty(), "an empty page: {body}");
+            ids.extend(alerts.iter().map(|a| a["id"].as_i64().unwrap()));
+            match body.get("next_cursor") {
+                Some(Value::String(c)) => cursor = Some(c.clone()),
+                Some(Value::Null) => return ids,
+                _ => panic!("no next_cursor: {body}"),
+            }
+        }
+        unreachable!()
+    }
+}
+
+fn newest_first(seeded: &[Seeded], keep: impl Fn(&Seeded) -> bool) -> Vec<i64> {
+    let mut ids: Vec<i64> = seeded.iter().filter(|a| keep(a)).map(|a| a.id).collect();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids
+}
+
+#[tokio::test]
+async fn alerts_are_read_by_period_and_in_pages() {
+    let store = store().await;
+    let b = base_ms();
+    // Ids follow this order; times do not always: a later id may be older, and
+    // some share a millisecond. Two sources, open and cleared, on both sides
+    // of each `since` below.
+    let seeded: Vec<Seeded> = [
+        ("lab", 0, true),
+        ("imaging", 100, false),
+        ("lab", 123, false),
+        ("lab", 123, true),
+        ("imaging", 200, true),
+        ("lab", 50, true),
+        ("lab", 300, true),
+        ("lab", 300, false),
+        ("imaging", 122, true),
+        ("lab", 124, true),
+        ("lab", 10, false),
+    ]
+    .into_iter()
+    .map(|(source, offset, open)| store.seed(source, b + offset, open))
+    .collect();
+
+    // The boundary as a consumer has it: the `created_at` the list returned.
+    let (_, all) = store.list(&[]).await;
+    let third = seeded[2];
+    let returned = all["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == third.id)
+        .unwrap()["created_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(returned, iso(b + 123));
+
+    // Each `since` and the first stored millisecond it keeps.
+    let at_123 = iso(b + 123);
+    let a_bit_after_123 = iso(b + 123).replace("Z", "1Z");
+    let offset_form = chrono::DateTime::from_timestamp_millis(b + 123)
+        .unwrap()
+        .with_timezone(&chrono::FixedOffset::east_opt(2 * 3600).unwrap())
+        .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+        .to_string();
+    let after_all = iso(b + 301);
+    let sinces: [(Option<&str>, i64); 6] = [
+        (None, i64::MIN),
+        (Some(&returned), b + 123),
+        (Some(&at_123), b + 123),
+        (Some(&a_bit_after_123), b + 124),
+        (Some(&offset_form), b + 123),
+        (Some(&after_all), b + 301),
+    ];
+    assert!(offset_form.contains('+'), "{offset_form}");
+
+    for (since, from) in sinces {
+        for source in [None, Some("lab"), Some("imaging")] {
+            for open in [false, true] {
+                let mut query = Vec::new();
+                if let Some(s) = source {
+                    query.push(("source", s));
+                }
+                if open {
+                    query.push(("open", "true"));
+                }
+                if let Some(s) = since {
+                    query.push(("since", s));
+                }
+                let expected = newest_first(&seeded, |a| {
+                    a.at >= from && source.is_none_or(|s| a.source == s) && (!open || a.open)
+                });
+                for limit in [1, 2, 3, 100] {
+                    assert_eq!(
+                        store.walk(&query, limit).await,
+                        expected,
+                        "{query:?} limit {limit}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_walk_keeps_its_place_while_alerts_change() {
+    let store = store().await;
+    let b = base_ms();
+    let s: Vec<Seeded> = (0..6)
+        .map(|i| store.seed("lab", b + i * 10, true))
+        .collect();
+    let open = [("open", "true"), ("limit", "2")];
+
+    let (_, first) = store.list(&open).await;
+    let page: Vec<i64> = first["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(page, vec![s[5].id, s[4].id]);
+    let cursor = first["next_cursor"].as_str().unwrap().to_string();
+
+    // Between pages: a new alert, one further down cleared, and the cursor's
+    // own alert removed, as a purge would.
+    let new = store.seed("lab", b + 1000, true);
+    store
+        .db
+        .clear_alert(s[2].id, "cleared by the test")
+        .unwrap();
+    let deleted = store
+        .db
+        .query_json(
+            "DELETE FROM alerts WHERE id = $1 RETURNING id",
+            hie::db::params![s[4].id],
+        )
+        .unwrap();
+    assert_eq!(deleted, vec![json!({"id": s[4].id})]);
+
+    let rest = store
+        .walk_from(&[("open", "true")], 2, Some(cursor.clone()))
+        .await;
+    assert_eq!(rest, vec![s[3].id, s[1].id, s[0].id]);
+    // Without `open`, the cleared alert stays where it was.
+    let rest = store.walk_from(&[], 2, Some(cursor)).await;
+    assert_eq!(rest, vec![s[3].id, s[2].id, s[1].id, s[0].id]);
+
+    // The new alert is on a fresh first page.
+    let (_, fresh) = store.list(&open).await;
+    assert_eq!(fresh["alerts"][0]["id"], new.id);
+
+    // A cursor whose remaining alerts all left leads to an empty last page.
+    let (_, four) = store.list(&[("open", "true"), ("limit", "4")]).await;
+    assert_eq!(four["alerts"][3]["id"], s[1].id);
+    let cursor = four["next_cursor"].as_str().unwrap().to_string();
+    store
+        .db
+        .clear_alert(s[0].id, "cleared by the test")
+        .unwrap();
+    let (status, empty) = store
+        .list(&[("open", "true"), ("limit", "4"), ("cursor", &cursor)])
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(empty, json!({"alerts": [], "next_cursor": null}));
+}
+
+#[tokio::test]
+async fn the_default_page_holds_a_hundred_alerts() {
+    let store = store().await;
+    let b = base_ms();
+    let s: Vec<Seeded> = (0..101).map(|i| store.seed("lab", b + i, true)).collect();
+
+    let (status, first) = store.list(&[]).await;
+    assert_eq!(status, 200);
+    let alerts = first["alerts"].as_array().unwrap();
+    assert_eq!(alerts.len(), 100);
+    assert_eq!(alerts[0]["id"], s[100].id);
+    assert_eq!(alerts[99]["id"], s[1].id);
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let (_, last) = store.list(&[("cursor", cursor)]).await;
+    assert_eq!(last["alerts"].as_array().unwrap().len(), 1);
+    assert_eq!(last["alerts"][0]["id"], s[0].id);
+    assert_eq!(last.get("next_cursor"), Some(&Value::Null));
+
+    let (_, none) = store.list(&[("limit", "0")]).await;
+    assert_eq!(none, json!({"alerts": [], "next_cursor": null}));
+    // A negative limit has always meant every alert.
+    let (_, every) = store.list(&[("limit", "-1")]).await;
+    assert_eq!(every["alerts"].as_array().unwrap().len(), 101);
+    assert_eq!(every.get("next_cursor"), Some(&Value::Null));
+    // Empty values are absent ones.
+    let (status, empty) = store.list(&[("since", ""), ("cursor", "")]).await;
+    assert_eq!(status, 200);
+    assert_eq!(empty["alerts"].as_array().unwrap().len(), 100);
+}
+
+#[tokio::test]
+async fn a_malformed_query_is_refused_without_echoing_it() {
+    let store = store().await;
+    store.seed("lab", base_ms(), true);
+    type Case<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>);
+    let cases: [Case; 14] = [
+        (&[("since", "yesterday")], Some("since")),
+        (&[("since", "2025-01-02")], Some("since")),
+        (&[("since", "2016-12-31T23:59:60Z")], Some("since")),
+        (
+            &[("since", "2025-01-02T00:00:00.1230000001Z")],
+            Some("since"),
+        ),
+        (&[("cursor", "abc")], Some("cursor")),
+        (&[("cursor", "17")], Some("cursor")),
+        (&[("cursor", "a1.-1")], Some("cursor")),
+        (&[("cursor", "a1.0")], Some("cursor")),
+        (&[("cursor", "a1.+5")], Some("cursor")),
+        (&[("cursor", "a1.99999999999999999999")], Some("cursor")),
+        (&[("limit", "0"), ("since", "garbage")], Some("since")),
+        (&[("limit", "abc")], None),
+        (&[("open", "yes")], None),
+        (&[("limit", "1"), ("limit", "2")], None),
+    ];
+    for (query, field) in cases {
+        let (status, body) = store.list(query).await;
+        assert_eq!(status, 400, "{query:?}: {body}");
+        assert_eq!(body["code"], "invalid_query", "{query:?}: {body}");
+        assert_eq!(body["field"].as_str(), field, "{query:?}: {body}");
+        assert!(body["error"].is_string(), "{body}");
+        for (_, value) in query {
+            if value.len() > 2 {
+                assert!(!body.to_string().contains(value), "echoed: {body}");
+            }
+        }
+    }
+    // The rules list still checks the types of what it ignores.
+    for query in ["limit=abc", "open=yes"] {
+        let r = store
+            .http
+            .get(format!("{}/api/alert-rules?{query}", store.api))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{query}");
+    }
+}
