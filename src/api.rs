@@ -63,6 +63,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sources/{id}/pause", post(pause_source))
         .route("/api/sources/{id}/resume", post(resume_source))
         .route("/api/sources/{id}/check-now", post(check_now))
+        .route("/api/checks/{id}", get(get_check))
         .route("/api/sources/{id}/files", get(list_files))
         .route("/api/sources/{id}/loads", get(list_files))
         .route("/api/loads/{file_id}", get(get_load))
@@ -412,15 +413,89 @@ async fn resume_source(State(s): State<AppState>, Path(id): Path<String>) -> Api
     get_source(State(s), Path(id)).await
 }
 
+/// Records a check of the source and makes it pass now; `GET /api/checks/{id}`
+/// answers what the check found.
 async fn check_now(
     State(s): State<AppState>,
     Path(id): Path<String>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    s.manager.check_now(&id)?;
+) -> Result<Response, ApiError> {
+    let check = s.manager.request_check(&id).await?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(json!({"id": id, "checking": true})),
-    ))
+        [(header::LOCATION, format!("/api/checks/{check}"))],
+        Json(json!({"id": id, "checking": true, "check_id": check})),
+    )
+        .into_response())
+}
+
+/// Loads listed per answer of `GET /api/checks/{id}` unless `limit` asks for fewer.
+const CHECK_FILES: i64 = 1000;
+
+/// The text of a check's cursor: opaque to clients, the position after a load's id.
+const CHECK_CURSOR_PREFIX: &str = "l1.";
+
+/// Reads `GET /api/checks/{id}` parameters as `GET /api/events` does: every
+/// refusal is a `400 invalid_query` naming the parameter. The load to list
+/// after, and how many.
+fn check_query(raw: Option<&str>) -> Result<(i64, i64), ApiError> {
+    let (mut after, mut limit) = (None, None);
+    for (key, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        let slot = match key.as_ref() {
+            "cursor" => &mut after,
+            "limit" => &mut limit,
+            other => {
+                let shown: String = other.chars().take(64).collect();
+                return Err(invalid_query(
+                    &shown,
+                    format!("unknown parameter {shown:?} (use cursor or limit)"),
+                ));
+            }
+        };
+        if slot.replace(value.into_owned()).is_some() {
+            return Err(invalid_query(
+                &key,
+                format!("{key} is given more than once"),
+            ));
+        }
+    }
+    let after = match after {
+        None => 0,
+        Some(cursor) => cursor
+            .strip_prefix(CHECK_CURSOR_PREFIX)
+            .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|id| id.parse::<i64>().ok())
+            .ok_or_else(|| {
+                invalid_query("cursor", "cursor is not one this API gave as next_cursor")
+            })?,
+    };
+    let limit = match limit {
+        None => CHECK_FILES,
+        // Digits only: `parse` would take a sign.
+        Some(l) => Some(l.as_str())
+            .filter(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|l| l.parse::<i64>().ok())
+            .filter(|n| (1..=CHECK_FILES).contains(n))
+            .ok_or_else(|| invalid_query("limit", "limit must be a whole number from 1 to 1000"))?,
+    };
+    Ok((after, limit))
+}
+
+async fn get_check(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, ApiError> {
+    let (after, limit) = check_query(raw.as_deref())?;
+    let mut check =
+        s.db.check(id, after, limit)?
+            .ok_or_else(|| not_found(&format!("check {id}")))?;
+    let next = check
+        .as_object_mut()
+        .and_then(|c| c.remove("next_after"))
+        .and_then(|n| n.as_i64());
+    check["next_cursor"] = json!(next.map(|id| format!("{CHECK_CURSOR_PREFIX}{id}")));
+    check["has_more"] = json!(next.is_some());
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(check)).into_response())
 }
 
 async fn test_source(State(s): State<AppState>, Json(body): Json<Value>) -> ApiResult {

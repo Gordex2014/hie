@@ -11,10 +11,11 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `POST /api/sources/test` | Tests a connection: `{"source": {...}}` or a full definition. Answers `reachable`, `elapsed_ms`, `objects`, `newest`, `newest_at`. An S3 source with a `credential` is tested with the credential's current revision; with no secret store, whether the key is missing or unusable or the build has no secret backend, it answers `503 secrets_unavailable` |
 | `GET /api/sources/{id}` | One source, as above |
 | `PUT /api/sources/{id}` | Replaces the definition and restarts the source. A definition is refused as `POST` refuses it: `400 invalid_definition` (in a build without a secret backend too, when it names a credential), or `503 secrets_unavailable` when it names a credential and the store has no usable key |
-| `DELETE /api/sources/{id}` | Stops the source and removes its file; its records and alerts stay |
+| `DELETE /api/sources/{id}` | Stops the source and removes its file; its records and alerts stay. Its checks still pending fail (unless another instance holds the source); `503 store_busy` when the store's lock was not free, and the source is left as it was |
 | `POST /api/sources/{id}/pause` | Stops polling and delivery until resumed; body `{"by": "..."}` is kept with the time |
 | `POST /api/sources/{id}/resume` | Resumes and passes at once |
-| `POST /api/sources/{id}/check-now` | Passes now instead of at the next poll |
+| `POST /api/sources/{id}/check-now` | Passes now instead of at the next poll, and records a check of the source: `202 {"id", "checking": true, "check_id"}` with `Location: /api/checks/{check_id}`. `503 store_busy` when the store's lock was not free. See [checks](#checks) |
+| `GET /api/checks/{id}?cursor=&limit=` | What a check found: `pending`, `found` (with the loads), `nothing_new` or `failed` (with the reason), and when it was asked for and answered. `404` for an unknown or purged check; an id that is not an integer answers `400`, a parameter that cannot be read `400 invalid_query` |
 | `GET /api/sources/{id}/loads` (also `/files`) | Every load: the file, its method, records read, sent, rejected, in progress, how long it took, where it is archived |
 | `GET /api/loads/{id}` | One load with its **failures grouped by reason**: kind, reason, count, first line, and up to three sample rows each |
 | `POST /api/loads/{id}/retry` | Puts the load's rejected rows back at the start, all of them or those with one reason (`{"reason": "..."}`); the source passes at once |
@@ -40,7 +41,7 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind (`hie_alerts_total`, which counts purged alerts too and never goes down) |
 | `GET /health` | `{"status": "ok", "service": "hie", "version", "uptime_seconds", "started_at", "timestamp", "secrets"}`; `secrets` is `{"backend": "native"\|"none", "available", "key_id"}`, the key id being a one-way 16-hex fingerprint of the key in use, or `null` |
 
-Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), `invalid_query` (`400`: a query parameter of `/api/events` or `/api/alerts` that cannot be read, with `field` as their sections say), and the codes of the credential routes below.
+Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), `invalid_query` (`400`: a query parameter of `/api/events`, `/api/alerts` or `/api/checks/{id}` that cannot be read, with `field` as their sections say), and the codes of the credential routes below.
 
 ### Events
 
@@ -156,6 +157,26 @@ GET /api/alerts?since=2026-11-13T00:00:00Z&limit=100&cursor=a1.8421
 - **While a reader pages**, the order holds: a walk returns, once each and newest first, every alert that existed when it began and still matches when its page is read. An alert created meanwhile may or may not appear; a new walk finds it. An alert that clears, or is removed, between two pages leaves the others where they were: with `open=true` it simply no longer appears, and the alert a cursor points after need not exist any more. So a page after a cursor can be empty, when the alerts it would have held left in the meantime: stop on `null`, not on an empty page.
 - **Refused** with `400 invalid_query`: a `since` that is not such an instant (`field: since`), a malformed `cursor` (`field: cursor`), and values of the wrong type or given twice (`limit=abc`, `open=yes`, `limit=1&limit=2`, without `field`). The sentence never repeats what was sent.
 
+### Checks
+
+`POST /api/sources/{id}/check-now` records a check and answers its `check_id`; `GET /api/checks/{id}` says what it found (sent with `Cache-Control: no-store`):
+
+```json
+{"check_id": 7, "source": "lab-results", "status": "found",
+ "requested_at": "2026-11-20T10:00:00.000Z", "finished_at": "2026-11-20T10:00:00.412Z",
+ "file_count": 1, "files": [{"id": 31, "name": "labs.csv", "status": "processing", "duplicate_of": null}],
+ "next_cursor": null, "has_more": false, "reason": null}
+```
+
+- **Who answers it.** The first scan of the source that starts after the check was recorded, on whichever instance holds the source. A pass reads the waiting checks just before its scan; a check asked for after that is answered by the next pass, which the request starts at once on that instance once the current pass, delivery included, has finished. Sent to an instance that stands by, the check waits for the holder's next poll.
+- **`found`** lists the loads the source recorded from the moment the check was asked for until the end of the scan that answered it: duplicates (with `duplicate_of`), a zip and its entries, and files that could not be read are loads too. Each comes with its current `status`; `GET /api/loads/{id}` has the rest. A check covers taking files in, not delivering them: delivery is on the loads.
+- **`nothing_new`**: the source recorded no load from the moment the check was asked for until the end of the scan that answered it. Files younger than the source's `min_file_age_ms` are not new, nor are objects a read-only source took before, copies of content a read-only source already took, or a copy whose original still waits for the FHIR server on the bulk path.
+- **`failed`**, with a fixed `reason`: the source is paused; its credential is not loaded; listing it, reading an object, taking one in or acknowledging its notifications failed; or it was deleted. The reason never carries the error itself (it can hold a URL, a query or a server's answer); the engine log does. Loads taken before the failure are still listed.
+- **`pending`**: not answered yet; `finished_at` is `null` and `files` empty. A check whose source was removed from disk while the engine was down, or sent to an instance whose holder never scans it, stays pending until the retention purge.
+- **More than 1000 loads**: `files` holds the first `limit` (1 to 1000, by default 1000), `has_more` says whether there are more, and `?cursor=<next_cursor>` lists the following ones; the cursor is opaque. `file_count` counts them all. An unknown parameter, one given twice, or a value that cannot be read answers `400 invalid_query` with `field`.
+- **Timestamps**: `requested_at` is taken by the instance that recorded the check, `finished_at` by the one that answered it (never before `requested_at`); with several instances their clocks may differ.
+- **Retention**: checks are kept for `retention.history` (see [Retention](running.md#retention)), purged with events and alerts, from when they were asked for, answered or not, then purged; a purged check answers `404`, and its id is never given to another check. Only loads still stored are listed.
+
 ### Secrets
 
 Connector credentials, which S3 sources name with `credential:` (see [sources](sources.md)). A credential has an id (`sec_` and 16 hex characters), a name, a kind and a current revision. Only `aws` exists: an access key id and a secret access key, held together in each revision, with no session token.
@@ -199,7 +220,7 @@ What a token may do is decided by its scopes (the `scope`, `scp` or `roles` clai
 
 | Scope | Grants |
 |---|---|
-| `hie/read` | Every `GET` except `/api/secrets`: sources, loads, records, transforms, alerts, events, rules, monitoring |
+| `hie/read` | Every `GET` except `/api/secrets`: sources, loads, checks, records, transforms, alerts, events, rules, monitoring |
 | `hie/manage` | Changing sources, rules, loads and records (`POST`, `PUT`, `DELETE`, pause, resume, retry, reprocess, try), and reading; and credentials: every method on `/api/secrets`, reads included |
 | `hie/transforms` | `PUT /api/transforms/{name}`: code the engine then runs; and reading |
 | `hie/*` | Everything |

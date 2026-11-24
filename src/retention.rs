@@ -3,8 +3,8 @@
 //! history and are never purged here.
 //!
 //! Each kind of history has its own `Db::purge_*` and its own field in
-//! `Purged`. Check records will add `purge_checks` and a field; alert delivery
-//! state will go with its alerts, in `purge_alerts`.
+//! `Purged`: events, alerts (their delivery state goes with them), and the
+//! checks `check-now` records.
 
 use std::sync::Weak;
 use std::time::Duration;
@@ -33,7 +33,7 @@ impl Retention {
         }
     }
 
-    /// How long events and alerts are kept.
+    /// How long events, alerts and checks are kept.
     pub fn history(&self) -> Duration {
         self.history
     }
@@ -49,6 +49,7 @@ impl Retention {
 pub struct Purged {
     pub events: usize,
     pub alerts: usize,
+    pub checks: usize,
 }
 
 /// Removes the history older than `cutoff_ms`, in chunks of `CHUNK` rows, one
@@ -58,6 +59,7 @@ pub fn purge(db: &Db, cutoff_ms: i64) -> Result<Purged> {
     Ok(Purged {
         events: in_chunks(|| db.purge_events(cutoff_ms, CHUNK))?,
         alerts: in_chunks(|| db.purge_alerts(cutoff_ms, CHUNK))?,
+        checks: in_chunks(|| db.purge_checks(cutoff_ms, CHUNK))?,
     })
 }
 
@@ -86,6 +88,7 @@ pub fn spawn(db: Weak<Db>, retention: Retention) {
                     tracing::info!(
                         events = purged.events,
                         alerts = purged.alerts,
+                        checks = purged.checks,
                         "history older than the retention purged"
                     );
                 }
