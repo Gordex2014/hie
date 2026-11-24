@@ -453,6 +453,11 @@ impl FeedRunner {
     fn credential_problem(&self, reference: &str, message: &str) {
         let message = format!("{}: credential {reference}: {message}", self.feed.name);
         tracing::error!(feed = %self.feed.id, "{message}");
+        // A runner stopped (its source deleted or replaced) raises nothing
+        // more: its successor, if any, finds the same problem.
+        if self.halted() {
+            return;
+        }
         let open = match self.db.open_alert(&self.feed.id, "credential", None) {
             Ok(open) => open.is_some(),
             Err(e) => {
@@ -1068,6 +1073,17 @@ impl FeedRunner {
         let Some(bulk) = &self.bulk else {
             return Ok(());
         };
+        // Under the lease, it is renewed first: a pass that ran past it (a
+        // large file transformed) would otherwise claim nothing; one another
+        // instance took meanwhile stops here.
+        if self.leased.load(std::sync::atomic::Ordering::Acquire)
+            && !self
+                .db
+                .acquire_lease(&self.feed.id, &self.instance, self.lease_ttl_ms())?
+        {
+            tracing::info!(feed = %self.feed.id, "another instance took the source during the pass; its submissions are left to it");
+            return Ok(());
+        }
         for sub in self.db.submissions_due(&self.feed.id)? {
             // Claimed before its request: only while it is still as read here,
             // so a request is never built from a row another runner has moved
@@ -1076,7 +1092,6 @@ impl FeedRunner {
                 &sub,
                 &self.instance,
                 self.leased.load(std::sync::atomic::Ordering::Acquire),
-                now_ms(),
             )?
             else {
                 continue;
@@ -1735,6 +1750,12 @@ impl FeedRunner {
     /// tell someone; without one, the source's `alert_after_attempts` does, once
     /// per outage: no second alert while one is open, whichever process raised it.
     fn outage(&self, attempts: u32, reason: &str) -> Result<()> {
+        // A runner stopped while its request was in flight (its source
+        // deleted or replaced) raises nothing: a deleted source's alert would
+        // outlive it, and a successor sees the same outage at its next attempt.
+        if self.halted() {
+            return Ok(());
+        }
         let message = format!(
             "{}: cannot deliver to HFS after {attempts} attempts ({reason}); data is kept and retried",
             self.feed.name

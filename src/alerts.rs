@@ -311,14 +311,15 @@ impl Alerter {
 
     /// After a delete, once this instance's runner of `feed` has ended: ends
     /// the open alerts only that runner would clear (`Db::orphan_alerts`:
-    /// `delivery` and `credential`, raised at or before `deleted_at`, none
-    /// while another instance holds the source), each with its `cleared`
-    /// event. Left open, a deleted source's outage alert stayed open for good.
-    /// An alert raised after the delete, by a definition created again, is not
-    /// touched. Best effort: a failure is logged.
-    pub fn end_orphans(&self, feed: &str, deleted_at: i64, owner: &str) {
+    /// `delivery` and `credential`, raised at or before `ended_at`, the
+    /// instant the runner was known to have ended; none while another
+    /// instance holds the source), each with its `cleared` event. Left open, a
+    /// deleted source's outage alert stayed open for good. An alert raised
+    /// later, by a definition created again (whose runner starts only once the
+    /// deleted one has ended), is not touched. Best effort: a failure is logged.
+    pub fn end_orphans(&self, feed: &str, ended_at: i64, owner: &str) {
         let reason = format!("{feed}: the source was deleted");
-        let open = match self.db.orphan_alerts(feed, deleted_at, owner) {
+        let open = match self.db.orphan_alerts(feed, ended_at, owner) {
             Ok(open) => open,
             Err(e) => {
                 tracing::warn!(feed, "alerts left open: {e:#}");
@@ -326,8 +327,19 @@ impl Alerter {
             }
         };
         for (alert, kind) in open {
-            if let Err(e) = self.clear(alert, feed, &kind, &reason) {
-                tracing::warn!(feed, alert, "alert left open: {e:#}");
+            // The lease is asked again as each one clears: another instance
+            // that took the source meanwhile keeps it.
+            match self
+                .db
+                .clear_orphan_with_webhook(alert, owner, &reason, now_ms(), |row| {
+                    self.cleared_event(row)
+                }) {
+                Ok(Some(_)) => {
+                    tracing::info!(alert, feed, kind, "cleared: {reason}");
+                    self.wake.notify_one();
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(feed, alert, "alert left open: {e:#}"),
             }
         }
     }

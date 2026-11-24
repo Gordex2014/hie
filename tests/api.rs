@@ -1158,3 +1158,136 @@ async fn a_deleted_sources_outage_ends_with_it() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(cleared(peer), None, "the peer's outage stays");
 }
+
+/// A delivery still in flight when its source is deleted, which fails once
+/// the source was created again: the stopped runner raises no outage alert (it
+/// would outlive its source, and stand for the new one's outage). The new
+/// source delivers, and no outage alert was ever raised.
+#[tokio::test]
+async fn a_stopped_runner_raises_no_outage_for_its_deleted_source() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    #[derive(Clone, Default)]
+    struct Gate {
+        arrived: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        held: Arc<std::sync::atomic::AtomicBool>,
+    }
+    async fn held_batch(
+        State(g): State<Gate>,
+        Json(bundle): Json<Value>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        if g.held.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            g.arrived.notify_one();
+            g.release.notified().await;
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        batch(State(Urls::default()), Json(bundle))
+            .await
+            .into_response()
+    }
+    let gate = Gate::default();
+    gate.held.store(true, std::sync::atomic::Ordering::SeqCst);
+    let fhir = serve(
+        Router::new()
+            .route("/", post(held_batch))
+            .with_state(gate.clone()),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::create_dir_all(root.join("inbox")).unwrap();
+    std::fs::copy(
+        repo().join("transforms/lab_results.py"),
+        root.join("transforms/lab_results.py"),
+    )
+    .unwrap();
+    std::fs::copy(
+        repo().join("examples/data/labs.csv"),
+        root.join("inbox/labs.csv"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {fhir}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    manager.set_handover_grace(Duration::from_secs(30));
+    let db = state.db.clone();
+    let api = serve(hie::api::router(state)).await;
+    let http = reqwest::Client::new();
+    let definition = json!({
+        "id": "lab", "name": "Lab",
+        "source": {"type": "folder", "path": "inbox", "pattern": "*.csv", "poll_seconds": 3600, "min_file_age_ms": 0},
+        "transform": "transforms/lab_results.py",
+        "delivery": {"alert_after_attempts": 1}
+    });
+    let post_source = || async {
+        let r = http
+            .post(format!("{api}/api/sources"))
+            .json(&definition)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 201);
+    };
+    let outages = || -> Vec<(i64, Option<String>)> {
+        db.query_json(
+            "SELECT id, cleared_reason FROM alerts WHERE feed_id = 'lab' AND kind = 'delivery' ORDER BY id",
+            vec![],
+        )
+        .unwrap()
+        .iter()
+        .map(|a| (a["id"].as_i64().unwrap(), a["cleared_reason"].as_str().map(str::to_string)))
+        .collect()
+    };
+
+    post_source().await;
+    // The first runner's batch is held at the server.
+    tokio::time::timeout(Duration::from_secs(30), gate.arrived.notified())
+        .await
+        .expect("the first batch reaches the server");
+    let r = http
+        .delete(format!("{api}/api/sources/lab"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    post_source().await;
+    // Now the deleted runner's batch fails, after the delete and after the new
+    // source's birth; the new source's own batch goes through.
+    gate.release.notify_one();
+    let started = Instant::now();
+    loop {
+        let sent = db
+            .query_json(
+                "SELECT COUNT(*) AS n FROM records WHERE feed_id = 'lab' AND status = 'sent'",
+                vec![],
+            )
+            .unwrap()[0]["n"]
+            .as_i64()
+            .unwrap();
+        if sent > 0 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the new source never delivered"
+        );
+        let _ = http
+            .post(format!("{api}/api/sources/lab/check-now"))
+            .send()
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(outages(), [], "the stopped runner raised an outage alert");
+}

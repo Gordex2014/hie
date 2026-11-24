@@ -722,19 +722,20 @@ impl SourceManager {
         if path.exists() {
             std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         }
-        let deleted_at = crate::db::now_ms();
         let manager = Arc::downgrade(self);
         let grace = Duration::from_millis(self.handover_grace_ms.load(Ordering::Relaxed));
         let id = id.to_string();
         tokio::spawn(async move {
             hand_over(&id, halted, grace).await;
+            // The runner has ended, alerts it raised while it drained
+            // included; a runner of a source created again starts only now.
+            let ended_at = crate::db::now_ms();
             if let Some(manager) = manager.upgrade() {
                 manager.cleanup_refs(&id).await;
-                // The runner has ended: what only it would clear, from before
-                // the delete, is no one's any more.
+                // What only the ended runner would clear is no one's any more.
                 manager
                     .alerts
-                    .end_orphans(&id, deleted_at, crate::pipeline::instance_id());
+                    .end_orphans(&id, ended_at, crate::pipeline::instance_id());
             }
         });
         Ok(())

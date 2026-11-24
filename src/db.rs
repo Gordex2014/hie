@@ -2765,7 +2765,6 @@ impl Db {
         read: &Submission,
         owner: &str,
         leased: bool,
-        now: i64,
     ) -> Result<Option<Claim>> {
         let lease = if leased {
             "EXISTS (SELECT 1 FROM source_leases l
@@ -2774,25 +2773,34 @@ impl Db {
             "NOT EXISTS (SELECT 1 FROM source_leases l
                          WHERE l.feed_id = submissions.feed_id AND l.owner <> $6 AND l.until >= $4)"
         };
+        let sql = format!(
+            "UPDATE submissions SET epoch = epoch + 1
+             WHERE token = $1 AND status IN ('kickoff', 'running') AND status = $5
+               AND epoch = $2 AND attempts = $3 AND next_attempt_at <= $4
+               AND {lease}
+             RETURNING epoch, attempts"
+        );
+        // The instant is taken once the store's connection is held: a claim
+        // that waited for it is judged against the lease, and the due time,
+        // as they are when it runs.
         Ok(self
-            .query_one(
-                &format!(
-                    "UPDATE submissions SET epoch = epoch + 1
-                     WHERE token = $1 AND status IN ('kickoff', 'running') AND status = $5
-                       AND epoch = $2 AND attempts = $3 AND next_attempt_at <= $4
-                       AND {lease}
-                     RETURNING epoch, attempts"
-                ),
-                &params![
-                    read.token,
-                    read.epoch,
-                    read.attempts,
-                    now,
-                    read.status,
-                    owner
-                ],
-            )?
-            .map(|r| Claim {
+            .with(|c| {
+                let now = now_ms();
+                Ok(c.query(
+                    &sql,
+                    &params![
+                        read.token,
+                        read.epoch,
+                        read.attempts,
+                        now,
+                        read.status,
+                        owner
+                    ],
+                )?
+                .into_iter()
+                .next())
+            })?
+            .map(|r: Row| Claim {
                 epoch: r.i64(0),
                 attempts: r.i64(1) as u32,
             }))
@@ -3403,7 +3411,6 @@ impl Db {
         })
     }
 
-    /// The open alert (not cleared) of this kind for a source and rule, if any.
     /// Whether source `feed` has an open outage alert without a rule raised
     /// since its current definition was born (a create through the API sets
     /// the birth again): one an earlier definition of its id left open does
@@ -3445,6 +3452,7 @@ impl Db {
             .collect())
     }
 
+    /// The open alert (not cleared) of this kind for a source and rule, if any.
     pub fn open_alert(
         &self,
         feed: &str,
@@ -3471,6 +3479,31 @@ impl Db {
         now: i64,
         webhook: impl FnOnce(&AlertRow) -> NewWebhook,
     ) -> Result<Option<AlertRow>> {
+        self.clear_alert_guarded(id, reason, now, None, webhook)
+    }
+
+    /// `clear_alert_with_webhook`, only while no instance but `owner` holds
+    /// the lease of the alert's source, checked in the clearing statement: a
+    /// deleted source's alert is not cleared once another instance runs it.
+    pub fn clear_orphan_with_webhook(
+        &self,
+        id: i64,
+        owner: &str,
+        reason: &str,
+        now: i64,
+        webhook: impl FnOnce(&AlertRow) -> NewWebhook,
+    ) -> Result<Option<AlertRow>> {
+        self.clear_alert_guarded(id, reason, now, Some(owner), webhook)
+    }
+
+    fn clear_alert_guarded(
+        &self,
+        id: i64,
+        reason: &str,
+        now: i64,
+        owner: Option<&str>,
+        webhook: impl FnOnce(&AlertRow) -> NewWebhook,
+    ) -> Result<Option<AlertRow>> {
         let columns = self.alert_columns();
         self.with(|c| {
             c.batch("BEGIN")?;
@@ -3479,9 +3512,14 @@ impl Db {
                     .query(
                         &format!(
                             "UPDATE alerts SET cleared_at = $2, cleared_reason = $3
-                             WHERE id = $1 AND cleared_at IS NULL RETURNING {columns}"
+                             WHERE id = $1 AND cleared_at IS NULL
+                               AND (CAST($4 AS TEXT) IS NULL OR NOT EXISTS (
+                                     SELECT 1 FROM source_leases l
+                                     WHERE l.feed_id = alerts.feed_id AND l.owner <> CAST($4 AS TEXT)
+                                       AND l.until >= $2))
+                             RETURNING {columns}"
                         ),
-                        &params![id, now, reason],
+                        &params![id, now, reason, owner],
                     )?
                     .first()
                     .map(Self::alert_row)
