@@ -4181,6 +4181,20 @@ impl Db {
             .source_id
             .as_deref()
             .context("a default rule names its source")?;
+        // A start of a source the store has seen is the common case: answered
+        // by a read, with no write transaction, so a start does not wait for
+        // the write lock of a SQLite file another instance holds. Births are
+        // never removed, so a row read here stays.
+        if !force
+            && self
+                .query_one(
+                    "SELECT 1 FROM source_births WHERE feed_id = $1",
+                    &params![feed],
+                )?
+                .is_some()
+        {
+            return Ok(None);
+        }
         self.with(|c| {
             c.batch(match c {
                 Conn::Postgres(_) => "BEGIN ISOLATION LEVEL READ COMMITTED",
@@ -4967,6 +4981,36 @@ mod tests {
         assert_eq!(
             db.give_default_rule(&default_rule("new"), false).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn a_start_of_a_born_source_takes_no_write_lock() {
+        let (_dir, a, b) = two_handles();
+        if a.is_postgres() {
+            return;
+        }
+        assert!(
+            a.give_default_rule(&default_rule("lab"), false)
+                .unwrap()
+                .is_some()
+        );
+        // Another instance holds SQLite's write lock; this one waits for it at
+        // most briefly.
+        a.set_busy_timeout(std::time::Duration::from_millis(50));
+        b.with(|c| c.batch("BEGIN IMMEDIATE")).unwrap();
+        assert_eq!(
+            a.give_default_rule(&default_rule("lab"), false).unwrap(),
+            None,
+            "a born source is answered without the write lock"
+        );
+        // A source never seen still needs it, and waits.
+        assert!(a.give_default_rule(&default_rule("new"), false).is_err());
+        b.with(|c| c.batch("ROLLBACK")).unwrap();
+        assert!(
+            a.give_default_rule(&default_rule("new"), false)
+                .unwrap()
+                .is_some()
         );
     }
 
