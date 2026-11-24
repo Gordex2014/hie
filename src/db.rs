@@ -573,10 +573,10 @@ pub struct EventQuery {
 /// than walking the whole log under the store's only connection.
 pub const EVENT_SCAN_SPAN: usize = 50_000;
 
-/// How far an event's `at` may be behind that of one stored before it (the
-/// clocks of the instances sharing a store, and the time between taking `at`
-/// and committing). `since` without a cursor starts at the lowest id among
-/// the events from `since` to the first of them plus this margin.
+/// How far an event's `at` may be behind that of one stored before it: the
+/// clocks of the instances sharing a store (`at` is taken under the write
+/// lock). A read with `since` starts at the lowest id among the events from
+/// `since` to the first of them plus this margin.
 pub const EVENT_CLOCK_MARGIN_MS: i64 = 5 * 60_000;
 
 /// The exact kinds a filter asks for, each once: a family is its exact kinds,
@@ -3873,22 +3873,22 @@ impl Db {
             });
         };
         let forward = |next: i64| Some(q.cursor.map_or(next, |c| c.max(next)));
-        // From the cursor; without one, from where `since` starts, or from
-        // the start of the log.
-        let start = match (q.cursor, q.since) {
-            (Some(cursor), _) => cursor,
-            (None, Some(since)) => match self.since_start(since)? {
-                Some(start) => start,
+        // From the cursor, or from where `since` starts when that is later
+        // (no event at or after `since` has a lower id), or from the start of
+        // the log.
+        let start = match q.since {
+            Some(since) => match self.since_start(since)? {
+                Some(start) => q.cursor.map_or(start, |c| c.max(start)),
                 // Nothing stored at or after `since`.
                 None => {
                     return Ok(EventPage {
                         events: vec![],
-                        next: Some(mark),
+                        next: forward(mark),
                         has_more: false,
                     });
                 }
             },
-            (None, None) => 0,
+            None => q.cursor.unwrap_or(0),
         };
         // Filters that no index serves in id order (`since`, a source and a
         // kind together, or several kinds) read at most `span` events past
@@ -5296,6 +5296,12 @@ mod tests {
         let first = page(&db, &[], Some(1_000_000), None, 100);
         assert_eq!(listed(&first), [ids[25]]);
         assert_eq!((first.next, first.has_more), (Some(ids[25]), false));
+        // An old cursor with it starts where `since` does, not at the cursor.
+        let resumed = page(&db, &[], Some(1_000_000), Some(ids[0]), 100);
+        assert_eq!(listed(&resumed), [ids[25]]);
+        // A cursor past where `since` starts is kept.
+        let later = page(&db, &[], Some(1), Some(ids[20]), 100);
+        assert_eq!(listed(&later), ids[21..=25]);
         // Nothing at or after it: an empty page at the newest id.
         let none = page(&db, &[], Some(2_000_000), None, 100);
         assert!(none.events.is_empty() && !none.has_more);
@@ -5392,10 +5398,20 @@ mod tests {
             &[],
         )
         .unwrap();
-        db.execute_for_test("ANALYZE", &[]).unwrap();
+        // As the engine leaves the store (it never analyzes it), then with
+        // statistics.
+        for analyzed in [false, true] {
+            if analyzed {
+                db.execute_for_test("ANALYZE", &[]).unwrap();
+            }
+            plans_use_an_index(&db);
+        }
+    }
+
+    fn plans_use_an_index(db: &Db) {
         let page_plan = |q: EventQuery| {
             let (sql, p) = db.event_page_sql(&EventQuery { limit: 100, ..q }, 0, i64::MAX);
-            plan(&db, &sql, p)
+            plan(db, &sql, p)
         };
         let kind = page_plan(EventQuery {
             kinds: vec!["submission.opened".into()],
@@ -5413,7 +5429,7 @@ mod tests {
         // Where `since` starts: its window is read through `events_at`, never
         // by walking the primary key from the start of the log.
         let start = plan(
-            &db,
+            db,
             &db.since_start_sql(),
             params![2990, EVENT_CLOCK_MARGIN_MS].to_vec(),
         );
