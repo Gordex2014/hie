@@ -187,7 +187,8 @@ fn is_http_url(text: &str) -> bool {
 }
 
 /// `text` without the whitespace around it, in a string of its own exact
-/// size; `text` is wiped, so no untrimmed copy of the secret is left behind.
+/// size; the buffer `text` held is wiped. (The parsed YAML that `text` was
+/// copied from is not this function's to wipe.)
 fn trimmed(mut text: String) -> String {
     use zeroize::Zeroize;
     let out = text.trim().to_owned();
