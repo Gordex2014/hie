@@ -1124,6 +1124,12 @@ impl FeedRunner {
                 }
                 continue;
             };
+            // Stopped while it was claimed: nothing is sent. The claim only
+            // moved the epoch; the successor claims it again.
+            if self.halted() {
+                tracing::info!(feed = %self.feed.id, "stopped during the pass; its submissions are left to its successor");
+                return Ok(());
+            }
             let step = match sub.status.as_str() {
                 "kickoff" => {
                     match bulk
