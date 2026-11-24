@@ -1017,3 +1017,141 @@ async fn a_source_contact_is_read_kept_and_cleared() {
         assert!(!file().contains("contact"), "{cleared:?}: {}", file());
     }
 }
+
+/// The alerts only a source's runner clears (its outage, its credential) end
+/// with the source: once its runner has ended after a delete, or before the
+/// runner of a source created again with its id starts. Another kind stays,
+/// an alert raised after the create stays, and nothing ends while another
+/// instance holds the source.
+#[tokio::test]
+async fn a_deleted_sources_outage_ends_with_it_and_does_not_block_its_successor() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let urls: Urls = Arc::default();
+    let fhir = serve(Router::new().route("/", post(batch)).with_state(urls)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::create_dir_all(root.join("inbox")).unwrap();
+    std::fs::copy(
+        repo().join("transforms/lab_results.py"),
+        root.join("transforms/lab_results.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {fhir}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (_manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let db = state.db.clone();
+    let api = serve(hie::api::router(state)).await;
+    let http = reqwest::Client::new();
+    let definition = json!({
+        "id": "lab", "name": "Lab",
+        "source": {"type": "folder", "path": "inbox", "pattern": "*.csv", "poll_seconds": 3600},
+        "transform": "transforms/lab_results.py"
+    });
+    let create = || async {
+        let r = http
+            .post(format!("{api}/api/sources"))
+            .json(&definition)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 201);
+    };
+    let delete = || async {
+        let r = http
+            .delete(format!("{api}/api/sources/lab"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+    };
+    let raise = |kind: &str| -> i64 {
+        db.query_json(
+            "INSERT INTO alerts (feed_id, kind, message, created_at) VALUES ('lab', $1, 'open', 1700000000000) RETURNING id",
+            vec![hie::db::Param::Text(kind.into())],
+        )
+        .unwrap()[0]["id"]
+            .as_i64()
+            .unwrap()
+    };
+    let cleared = |id: i64| -> Option<String> {
+        db.query_json(
+            "SELECT cleared_reason FROM alerts WHERE id = $1",
+            vec![hie::db::Param::Int(id)],
+        )
+        .unwrap()[0]["cleared_reason"]
+            .as_str()
+            .map(str::to_string)
+    };
+    let wait_cleared = |id: i64, what: &'static str| {
+        let cleared = &cleared;
+        async move {
+            let started = Instant::now();
+            loop {
+                if let Some(reason) = cleared(id) {
+                    return reason;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "timed out waiting for {what}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+
+    create().await;
+    let outage = raise("delivery");
+    let credential = raise("credential");
+    let other = raise("unreadable_file");
+    delete().await;
+    assert_eq!(
+        wait_cleared(outage, "the outage to end").await,
+        "lab: the source was deleted"
+    );
+    assert_eq!(
+        wait_cleared(credential, "the credential alert to end").await,
+        "lab: the source was deleted"
+    );
+    assert_eq!(
+        cleared(other),
+        None,
+        "another kind is left to its own clearing"
+    );
+
+    // Left by an earlier definition after the delete (another instance's
+    // runner, a stale one): ended before the new runner runs.
+    let left = raise("delivery");
+    create().await;
+    assert_eq!(
+        wait_cleared(left, "the left alert to end").await,
+        "lab: the source was created again; this alert was left by its earlier definition"
+    );
+    // The new definition's own outage stays open: neither sweep reaches it.
+    let current = raise("delivery");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(cleared(current), None);
+
+    // While another instance holds the source, its alerts are its own.
+    db.query_json(
+        "UPDATE source_leases SET owner = 'peer', until = 9000000000000000 WHERE feed_id = 'lab' RETURNING feed_id",
+        vec![],
+    )
+    .unwrap();
+    db.query_json(
+        "INSERT INTO source_leases (feed_id, owner, until) VALUES ('lab', 'peer', 9000000000000000) ON CONFLICT (feed_id) DO NOTHING RETURNING feed_id",
+        vec![],
+    )
+    .unwrap();
+    delete().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(cleared(current), None, "the peer's outage stays");
+}

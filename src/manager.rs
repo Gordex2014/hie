@@ -289,6 +289,13 @@ impl SourceManager {
 
     /// Builds and spawns the runner for a resolved definition, replacing a running one.
     pub fn start(self: &Arc<Self>, feed: FeedConfig) -> Result<()> {
+        self.start_as(feed, false)
+    }
+
+    /// `start`; for a source `created` through the API, the alerts an earlier
+    /// definition of its id left open are ended once every earlier runner has
+    /// ended and before the new one runs (`end_orphan_alerts`).
+    fn start_as(self: &Arc<Self>, feed: FeedConfig, created: bool) -> Result<()> {
         // Files recorded before origins were: decided once, here, before
         // the runner can hand any of them over. A stored origin never follows
         // later edits of the definition.
@@ -355,6 +362,12 @@ impl SourceManager {
             // definition does not need can go.
             if let Some(manager) = manager.upgrade() {
                 manager.cleanup_refs(&id).await;
+                if created {
+                    manager.end_orphan_alerts(
+                        &id,
+                        &format!("{id}: the source was created again; this alert was left by its earlier definition"),
+                    );
+                }
             }
             runner.run(control).await;
         });
@@ -506,6 +519,14 @@ impl SourceManager {
     /// The runner of a definition that was just published: a failure here
     /// leaves the definition saved and the registrations kept.
     fn start_published(self: &Arc<Self>, feed: &FeedConfig) -> Result<(), ManagerError> {
+        self.start_published_as(feed, false)
+    }
+
+    fn start_published_as(
+        self: &Arc<Self>,
+        feed: &FeedConfig,
+        created: bool,
+    ) -> Result<(), ManagerError> {
         #[cfg(all(test, feature = "secrets-native"))]
         if self
             .fail_next_start
@@ -515,7 +536,7 @@ impl SourceManager {
                 "the definition was saved, but the source could not be started: a test made the start fail; it starts with this definition at the next start of the engine".into(),
             ));
         }
-        self.start(feed.clone()).map_err(|e| {
+        self.start_as(feed.clone(), created).map_err(|e| {
             tracing::error!(feed = %feed.id, "the definition was saved, but the source did not start: {e:#}");
             ManagerError::NotStarted(format!(
                 "the definition was saved, but the source could not be started: {e:#}; it starts with this definition at the next start of the engine"
@@ -594,7 +615,7 @@ impl SourceManager {
             return Err(e.into());
         }
         pause_point!(await self, "manager:after-publish");
-        self.start_published(&resolved)?;
+        self.start_published_as(&resolved, true)?;
         Ok(resolved)
     }
 
@@ -650,6 +671,11 @@ impl SourceManager {
         }
         let lock = self.source_lock(id);
         let _changing = lock.lock().await;
+        // Deleted while this waited for the lock: a replace would publish it
+        // again without its birth.
+        if self.source(id).is_none() {
+            return Err(ManagerError::NotFound(format!("source {id} not found")));
+        }
         let secret = self.credential_of(&resolved).await?;
         pause_point!(await self, "manager:after-find");
         // The old registrations and definition stay untouched when this fails.
@@ -724,9 +750,52 @@ impl SourceManager {
             hand_over(&id, halted, grace).await;
             if let Some(manager) = manager.upgrade() {
                 manager.cleanup_refs(&id).await;
+                // The runner has ended. Under the source's lock, so a create
+                // either comes after (and its runner starts after this) or
+                // came before, and its own start ends these alerts instead.
+                let lock = manager.source_lock(&id);
+                let _changing = lock.lock().await;
+                if manager.source(&id).is_none() {
+                    manager.end_orphan_alerts(&id, &format!("{id}: the source was deleted"));
+                }
             }
         });
         Ok(())
+    }
+
+    /// Ends the open alerts of source `id` that only its runner would clear,
+    /// once no runner of this instance runs it: `delivery` (with a rule or
+    /// without) and `credential`. Left open, a deleted source's outage alert
+    /// stayed open for good and kept a source created again with that id from
+    /// raising its own. Each gets its `cleared` event. Nothing is ended while
+    /// another instance holds the source: it still runs its own definition, and
+    /// raises and clears its own alerts. Best effort: a failure is logged.
+    fn end_orphan_alerts(&self, id: &str, reason: &str) {
+        match self.db.lease(id) {
+            Ok(Some(lease)) if lease.owner != crate::pipeline::instance_id() => {
+                tracing::info!(feed = %id, "alerts left open: another instance holds the source");
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(feed = %id, "alerts left open: reading the source's lease: {e:#}");
+                return;
+            }
+        }
+        for kind in ["delivery", "credential"] {
+            let open = match self.db.open_alert_ids(id, kind) {
+                Ok(open) => open,
+                Err(e) => {
+                    tracing::warn!(feed = %id, kind, "alerts left open: {e:#}");
+                    continue;
+                }
+            };
+            for alert in open {
+                if let Err(e) = self.alerts.clear(alert, id, kind, reason) {
+                    tracing::warn!(feed = %id, alert, "alert left open: {e:#}");
+                }
+            }
+        }
     }
 
     /// Removes this instance's registrations of source `id` that its current
