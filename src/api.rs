@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::config::FeedConfig;
-use crate::db::{Db, Rule, now_ms};
+use crate::db::{Db, FAILING, Rule, now_ms};
 use crate::manager::{ManagerError, SourceManager};
 use crate::pipeline::human;
 use crate::zone::{Days, Zone};
@@ -181,11 +181,6 @@ async fn bulk_file(
 }
 
 const DAY_MS: i64 = 86_400_000;
-
-/// A record that fails: rejected for any reason but `filtered`, which a
-/// transform asks for on purpose by returning no resources. `rejected` counts
-/// both; `failing` only these.
-const FAILING: &str = "status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'";
 
 /// An error answer: `{"error": <sentence>}`, plus a stable `code` and other
 /// members when set, and any headers it needs.
@@ -941,7 +936,8 @@ async fn list_files(
     Ok(Json(json!({"files": rows, "loads": rows})))
 }
 
-/// One load with its failures grouped by reason, each with sample rows, so a
+/// One load with its rejected rows grouped by reason (those filtered out on
+/// purpose included, as kind `filtered`), each with sample rows, so a
 /// person can see what went wrong and retry the rows after a fix.
 async fn get_load(State(s): State<AppState>, Path(file_id): Path<i64>) -> ApiResult {
     let mut load = load_rows(&s, "", "", "f.id = $1", "", params![file_id].into())?
