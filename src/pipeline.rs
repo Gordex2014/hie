@@ -1689,8 +1689,10 @@ impl FeedRunner {
                         "rejected_share",
                         Some(rule.id),
                         &format!(
-                            "{}: {} loaded with {share:.1}% failed, within the limit",
-                            self.feed.name, f.name
+                            "{}: {} loaded with {}% failed, within the limit",
+                            self.feed.name,
+                            f.name,
+                            within(share, limit)
                         ),
                     )?;
                 }
@@ -1808,6 +1810,20 @@ enum Decided {
     Sent(Value),
     Rejected(String, Value),
     Deferred(String),
+}
+
+/// A share at or below `limit`, with one decimal or as many more as it takes to
+/// read within it: below the limit unless it is the limit, and above 0 unless
+/// nothing failed. 9.96% against 10% is 9.96, not 10.0.
+fn within(share: f64, limit: f64) -> String {
+    (1..=6)
+        .map(|decimals| format!("{share:.decimals$}"))
+        .find(|shown| {
+            shown.parse::<f64>().is_ok_and(|v| {
+                (v < limit || (v == limit && share == limit)) && (v > 0.0 || share == 0.0)
+            })
+        })
+        .unwrap_or_else(|| share.to_string())
 }
 
 /// A share above `limit`, with one decimal or as many more as it takes to
@@ -2018,7 +2034,19 @@ mod tests {
 
 #[cfg(test)]
 mod share_tests {
-    use super::above;
+    use super::{above, within};
+
+    #[test]
+    fn a_share_reads_within_the_limit_it_keeps() {
+        assert_eq!(within(9.96, 10.0), "9.96");
+        assert_eq!(within(10.0, 10.0), "10.0");
+        assert_eq!(within(0.0, 10.0), "0.0");
+        assert_eq!(within(0.04, 10.0), "0.04");
+        assert_eq!(within(500.0 / 6.0, 90.0), "83.3");
+        // Closer than six decimals: shown in full, still not above.
+        let shown = within(9.999_999_9, 10.0);
+        assert!(shown.parse::<f64>().unwrap() < 10.0, "{shown}");
+    }
 
     #[test]
     fn a_share_reads_above_the_limit_it_exceeds() {

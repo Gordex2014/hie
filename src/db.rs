@@ -559,7 +559,7 @@ pub struct FinishedFile {
     pub rejected: i64,
     /// The rejected rows that fail the load: every one but the `filtered`.
     pub failing: i64,
-    /// Failing rows beyond the most any earlier finish of the file saw.
+    /// Failing rows beyond those the previous finish of the file left.
     pub newly_failing: i64,
     /// The failing row with the lowest line, and its error.
     pub first_failure: Option<(i64, String)>,
@@ -1993,8 +1993,12 @@ impl Db {
                 let Some(file) = tx.query_one(&lock, &params![candidate])? else {
                     return Ok(None);
                 };
-                // The marks are raised by the statement that checks no row is in
-                // progress, so they count the rows as they are finished.
+                // The marks are set by the statement that checks no row is in
+                // progress, so they count the rows as they are finished. The
+                // failing mark is this finish's count, lower too: once a Retry
+                // fixed rows, a later finish with more failing than this one
+                // alerts again. The rejected mark, kept for earlier versions,
+                // only goes up.
                 let moved = tx.query_one(
                     &format!(
                         "UPDATE files SET status = 'done', finished_at = $2,
@@ -2002,10 +2006,7 @@ impl Db {
                                   WHEN rejected_reported > (SELECT COUNT(*) FROM records WHERE file_id = $1 AND status = 'rejected')
                                   THEN rejected_reported
                                   ELSE (SELECT COUNT(*) FROM records WHERE file_id = $1 AND status = 'rejected') END,
-                                failing_reported = CASE
-                                  WHEN failing_reported > (SELECT COUNT(*) FROM records WHERE file_id = $1 AND {FAILING})
-                                  THEN failing_reported
-                                  ELSE (SELECT COUNT(*) FROM records WHERE file_id = $1 AND {FAILING}) END
+                                failing_reported = (SELECT COUNT(*) FROM records WHERE file_id = $1 AND {FAILING})
                          WHERE id = $1 AND status IN ('processing', 'unpacked')
                            AND NOT EXISTS (SELECT 1 FROM records WHERE file_id = $1 AND status IN ('received', 'pending', 'submitted'))
                          RETURNING id"

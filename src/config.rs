@@ -591,20 +591,27 @@ fn contact_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>
     d.deserialize_any(Text)
 }
 
-/// Whether a character would break a contact's single line or reorder the text
-/// around it: control characters, the Unicode line and paragraph separators,
-/// and the bidirectional marks and embedding, override and isolate controls.
+/// Whether a character would break a contact's single line, reorder the text
+/// around it or hide in it: control characters, the Unicode line and paragraph
+/// separators, the bidirectional marks and embedding, override and isolate
+/// controls, and the invisible format characters (zero width space, word
+/// joiner and invisible operators, the deprecated shaping controls, the byte
+/// order mark). The zero width joiner and non-joiner stay: scripts and emoji
+/// need them.
 fn breaks_contact_line(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
             '\u{061C}'
+                | '\u{200B}'
                 | '\u{200E}'
                 | '\u{200F}'
                 | '\u{2028}'
                 | '\u{2029}'
                 | '\u{202A}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
         )
 }
 
@@ -1644,6 +1651,12 @@ mod tests {
             "a\u{061c}b",
             "a\u{200e}b",
             "a\u{200f}b",
+            "a\u{200b}b",
+            "a\u{2060}b",
+            "a\u{2064}b",
+            "a\u{206a}b",
+            "a\u{206f}b",
+            "a\u{feff}b",
         ] {
             let err = format!(
                 "{:#}",
@@ -1652,6 +1665,16 @@ mod tests {
             assert!(
                 err.contains("contact must be one line of plain text"),
                 "{bad:?}: {err}"
+            );
+        }
+        // The joiners scripts and emoji need are text.
+        for good in [
+            "\u{0645}\u{200c}\u{06cc}",
+            "\u{1f468}\u{200d}\u{1f4bb} on call",
+        ] {
+            assert!(
+                resolved(contact_json(json!(good)).unwrap()).is_ok(),
+                "{good:?}"
             );
         }
         // A block scalar keeps its line breaks; a plain one folded over lines is one line.
