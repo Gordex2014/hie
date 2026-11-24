@@ -3437,18 +3437,18 @@ impl Db {
         })
     }
 
-    /// Whether source `feed` has an open outage alert without a rule raised
-    /// since its current definition was born (a create through the API sets
-    /// the birth again): one an earlier definition of its id left open does
-    /// not stand for this one's outage.
-    pub fn open_outage_since_birth(&self, feed: &str) -> Result<bool> {
+    /// Whether source `feed` has an open alert of `kind` without a rule
+    /// (its outage, its credential) raised since its current definition was
+    /// born (a create through the API sets the birth again): one an earlier
+    /// definition of its id left open does not stand for this one's.
+    pub fn open_alert_since_birth(&self, feed: &str, kind: &str) -> Result<bool> {
         Ok(self
             .query_one(
                 "SELECT 1 FROM alerts
-                 WHERE feed_id = $1 AND kind = 'delivery' AND rule_id IS NULL AND cleared_at IS NULL
+                 WHERE feed_id = $1 AND kind = $2 AND rule_id IS NULL AND cleared_at IS NULL
                    AND created_at >= COALESCE((SELECT born_at FROM source_births WHERE feed_id = $1), 0)
                  LIMIT 1",
-                &params![feed],
+                &params![feed, kind],
             )?
             .is_some())
     }

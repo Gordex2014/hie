@@ -397,12 +397,8 @@ impl FeedRunner {
         };
         let current = (meta.id.clone(), meta.revision);
         if self.loaded.lock().expect("loaded lock").as_ref() == Some(&current) {
-            if self.credential_alert.swap(false, Ordering::AcqRel)
-                && let Err(e) =
-                    self.alerts
-                        .clear_open(&self.feed.id, "credential", None, "credential loaded")
-            {
-                tracing::error!(feed = %self.feed.id, "{e:#}");
+            if self.credential_alert.swap(false, Ordering::AcqRel) {
+                self.credential_loaded();
             }
             return;
         }
@@ -440,10 +436,23 @@ impl FeedRunner {
             "using the credential's current revision"
         );
         self.credential_alert.store(false, Ordering::Release);
-        if let Err(e) =
-            self.alerts
-                .clear_open(&self.feed.id, "credential", None, "credential loaded")
-        {
+        self.credential_loaded();
+    }
+
+    /// Clears every open `credential` alert of the source, an earlier
+    /// definition's included: the credential works.
+    fn credential_loaded(&self) {
+        let cleared = self
+            .db
+            .open_alert_ids(&self.feed.id, "credential")
+            .and_then(|open| {
+                open.into_iter().try_for_each(|id| {
+                    self.alerts
+                        .clear(id, &self.feed.id, "credential", "credential loaded")
+                        .map(drop)
+                })
+            });
+        if let Err(e) = cleared {
             tracing::error!(feed = %self.feed.id, "{e:#}");
         }
     }
@@ -458,8 +467,10 @@ impl FeedRunner {
         if self.halted() {
             return;
         }
-        let open = match self.db.open_alert(&self.feed.id, "credential", None) {
-            Ok(open) => open.is_some(),
+        // One an earlier definition of the id left open does not stand for
+        // this one's: the delete that ended it clears it.
+        let open = match self.db.open_alert_since_birth(&self.feed.id, "credential") {
+            Ok(open) => open,
             Err(e) => {
                 tracing::error!(feed = %self.feed.id, "{e:#}");
                 return;
@@ -1774,7 +1785,7 @@ impl FeedRunner {
             // and created again) does not stand for this outage; this
             // definition's next recovery clears both.
             if attempts >= self.feed.delivery.alert_after_attempts
-                && !self.db.open_outage_since_birth(&self.feed.id)?
+                && !self.db.open_alert_since_birth(&self.feed.id, "delivery")?
             {
                 self.alerts
                     .raise(Some(&self.feed.id), "delivery", &message)?;
@@ -1960,6 +1971,78 @@ mod tests {
             .unwrap();
         let at = url.find("X-Amz-Credential=").unwrap() + "X-Amz-Credential=".len();
         url[at..].split("%2F").next().unwrap().to_string()
+    }
+
+    /// A source created again whose credential is missing raises its own
+    /// `credential` alert, though one an earlier definition of its id left is
+    /// still open; once the credential loads, both are cleared.
+    #[tokio::test]
+    async fn a_source_created_again_raises_its_own_credential_alert() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("hie.yaml"),
+            "fhir_base_url: http://127.0.0.1:9\ndatabase: data/hie.db\n",
+        )
+        .unwrap();
+        let (config, _) = crate::config::load(&dir.path().join("hie.yaml")).unwrap();
+        let db = Arc::new(Db::open(&config.database).unwrap());
+        let key = {
+            let k = crate::crypto::MasterKey::generate().unwrap();
+            String::from_utf8(k.to_line()[..44].to_vec()).unwrap()
+        };
+        let secrets = secrets::open(&config, &db, KeySettings::inline(&key)).unwrap();
+        let feed: FeedConfig = serde_yaml::from_str(
+            "id: s\nname: S\nsource:\n  type: s3\n  bucket: b\n  region: us-east-1\n  endpoint: http://127.0.0.1:9\n  credential: lab\nformat: ndjson\ntransform: t.py\n",
+        )
+        .unwrap();
+        // The earlier definition's alert, open; then the id is born again.
+        let born = now_ms();
+        let earlier = db
+            .query_json(
+                "INSERT INTO alerts (feed_id, kind, message, created_at) VALUES ('s', 'credential', 'old', $1) RETURNING id",
+                vec![crate::db::Param::Int(born - 1000)],
+            )
+            .unwrap()[0]["id"]
+            .as_i64()
+            .unwrap();
+        db.query_json(
+            "INSERT INTO source_births (feed_id, born_at) VALUES ('s', $1) RETURNING feed_id",
+            vec![crate::db::Param::Int(born)],
+        )
+        .unwrap();
+        let runner = FeedRunner::new(
+            feed,
+            db.clone(),
+            Arc::new(FhirClient::with_credentials("http://127.0.0.1:9", None)),
+            Arc::new(Alerter::new(db.clone(), None)),
+            "python3",
+            dir.path(),
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+        )
+        .unwrap()
+        .with_secrets(secrets.clone());
+
+        runner.ensure_credential().await;
+        let open = db.open_alert_ids("s", "credential").unwrap();
+        assert_eq!(open.len(), 2, "its own beside the earlier one: {open:?}");
+        assert_eq!(open[0], earlier);
+        // A second pass raises no more.
+        runner.ensure_credential().await;
+        assert_eq!(db.open_alert_ids("s", "credential").unwrap().len(), 2);
+
+        secrets
+            .store()
+            .unwrap()
+            .create(NewSecret {
+                name: "lab".into(),
+                kind: SecretKind::Aws,
+                value: value("AKIDFIRST"),
+            })
+            .await
+            .unwrap();
+        runner.ensure_credential().await;
+        assert!(db.open_alert_ids("s", "credential").unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

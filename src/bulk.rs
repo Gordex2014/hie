@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::credentials::Credentials;
-use crate::destination::{Destination, InFlight};
+use crate::destination::Destination;
 use crate::fhir::{self, SendError};
 
 /// Whether `path` lies inside `dir`, as the filesystem resolves both (symbolic
