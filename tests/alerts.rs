@@ -866,10 +866,11 @@ async fn the_default_page_holds_a_hundred_alerts() {
         none,
         json!({"alerts": [], "next_cursor": null, "webhook": {"configured": false, "signed": false}})
     );
-    // A negative limit has always meant every alert.
-    let (_, every) = store.list(&[("limit", "-1")]).await;
-    assert_eq!(every["alerts"].as_array().unwrap().len(), 101);
-    assert_eq!(every.get("next_cursor"), Some(&Value::Null));
+    // At most 1000 a page: every alert is read by following the cursor.
+    let (status, most) = store.list(&[("limit", "1000")]).await;
+    assert_eq!(status, 200);
+    assert_eq!(most["alerts"].as_array().unwrap().len(), 101);
+    assert_eq!(most.get("next_cursor"), Some(&Value::Null));
     // Empty values are absent ones.
     let (status, empty) = store.list(&[("since", ""), ("cursor", "")]).await;
     assert_eq!(status, 200);
@@ -881,7 +882,7 @@ async fn a_malformed_query_is_refused_without_echoing_it() {
     let store = store().await;
     store.seed("lab", base_ms(), true);
     type Case<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>);
-    let cases: [Case; 14] = [
+    let cases: [Case; 17] = [
         (&[("since", "yesterday")], Some("since")),
         (&[("since", "2025-01-02")], Some("since")),
         (&[("since", "2016-12-31T23:59:60Z")], Some("since")),
@@ -897,6 +898,10 @@ async fn a_malformed_query_is_refused_without_echoing_it() {
         (&[("cursor", "a1.99999999999999999999")], Some("cursor")),
         (&[("limit", "0"), ("since", "garbage")], Some("since")),
         (&[("limit", "abc")], None),
+        // A negative limit once meant every alert; a page is now bounded.
+        (&[("limit", "-1")], Some("limit")),
+        (&[("limit", "1001")], Some("limit")),
+        (&[("limit", "-12345")], Some("limit")),
         (&[("open", "yes")], None),
         (&[("limit", "1"), ("limit", "2")], None),
     ];

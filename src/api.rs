@@ -1051,6 +1051,9 @@ struct RuleQuery {
     _open: Option<bool>,
 }
 
+/// The most alerts a page of `GET /api/alerts` holds.
+const MAX_ALERTS_PAGE: i64 = 1000;
+
 /// What `GET /api/alerts` takes: today's filters, a period and a page.
 #[derive(Deserialize)]
 struct AlertListQuery {
@@ -1078,12 +1081,15 @@ async fn list_alerts(
     let after = paging::cursor_id(q.cursor.as_deref())?;
     let (configured, signed) = s.alerts.webhook_status();
     let webhook = json!({"configured": configured, "signed": signed});
-    // A negative limit has always meant every alert on SQLite; so it does on both stores.
-    let limit = match q.limit {
-        Some(n) if n < 0 => i64::MAX,
-        Some(n) => n,
-        None => 100,
-    };
+    // A page is bounded: every alert is read by following `next_cursor`. A
+    // negative limit, which once meant every alert, is refused.
+    let limit = q.limit.unwrap_or(100);
+    if !(0..=MAX_ALERTS_PAGE).contains(&limit) {
+        return Err(
+            paging::invalid_query("limit must be a whole number from 0 to 1000")
+                .with("field", "limit"),
+        );
+    }
     if limit == 0 {
         return Ok(Json(
             json!({"alerts": [], "next_cursor": null, "webhook": webhook}),
@@ -1144,7 +1150,7 @@ async fn list_alerts(
             }
         }
     }
-    let page = usize::try_from(limit).unwrap_or(usize::MAX);
+    let page = usize::try_from(limit).unwrap_or(0);
     let next_cursor = if rows.len() > page {
         rows.truncate(page);
         let last = rows.last().and_then(|row| row["id"].as_i64());
