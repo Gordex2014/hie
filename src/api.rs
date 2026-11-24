@@ -1066,8 +1066,9 @@ struct AlertListQuery {
 
 /// Newest first, a page at a time: `next_cursor` is set only when more alerts
 /// match, and the next page holds those older (by id) than the last one here.
-/// Each alert comes with its latest webhook event, read in the same statement;
-/// a pending event written for another URL than this instance's is `parked`.
+/// Each alert comes with its webhook events, read in the same statement: the
+/// latest one's delivery, and every one in `events`; a pending event written
+/// for another URL than this instance's is `parked`.
 async fn list_alerts(
     State(s): State<AppState>,
     q: Result<Query<AlertListQuery>, QueryRejection>,
@@ -1088,25 +1089,28 @@ async fn list_alerts(
             json!({"alerts": [], "next_cursor": null, "webhook": webhook}),
         ));
     }
-    let mut rows = s.db.query_json(
+    // The page of alerts, then every webhook event of each, in one statement:
+    // the latest event and the history agree, and a page holds `limit` alerts
+    // whatever their events.
+    let joined = s.db.query_json(
         &format!(
-            "SELECT alerts.id, alerts.feed_id AS source_id, alerts.kind, alerts.message, alerts.rule_id,
-                    alerts.notify, alerts.channels,
-                    {} AS created_at, {} AS cleared_at, alerts.cleared_reason,
+            "SELECT a.id, a.feed_id AS source_id, a.kind, a.message, a.rule_id,
+                    a.notify, a.channels,
+                    {} AS created_at, {} AS cleared_at, a.cleared_reason,
                     w.event AS webhook_event, w.event_id AS webhook_event_id,
                     CASE WHEN w.state = 'pending' AND w.destination <> CAST($6 AS TEXT) THEN 'parked' ELSE w.state END AS webhook_state,
                     w.attempts AS webhook_attempts, w.last_error AS webhook_last_error,
                     w.last_status AS webhook_last_status,
                     {} AS webhook_delivered_at
-             FROM alerts
-             LEFT JOIN alert_webhooks w
-               ON w.id = (SELECT MAX(x.id) FROM alert_webhooks x WHERE x.alert_id = alerts.id)
-             WHERE (CAST($1 AS TEXT) IS NULL OR alerts.feed_id = CAST($1 AS TEXT))
-               AND (CAST($3 AS BIGINT) = 0 OR alerts.cleared_at IS NULL)
-               AND (CAST($4 AS BIGINT) IS NULL OR alerts.created_at >= CAST($4 AS BIGINT)) AND alerts.id <= $5
-             ORDER BY alerts.id DESC LIMIT $2",
-            s.db.iso("alerts.created_at"),
-            s.db.iso("alerts.cleared_at"),
+             FROM (SELECT * FROM alerts
+                   WHERE (CAST($1 AS TEXT) IS NULL OR alerts.feed_id = CAST($1 AS TEXT))
+                     AND (CAST($3 AS BIGINT) = 0 OR alerts.cleared_at IS NULL)
+                     AND (CAST($4 AS BIGINT) IS NULL OR alerts.created_at >= CAST($4 AS BIGINT)) AND alerts.id <= $5
+                   ORDER BY alerts.id DESC LIMIT $2) a
+             LEFT JOIN alert_webhooks w ON w.alert_id = a.id
+             ORDER BY a.id DESC, w.id",
+            s.db.iso("a.created_at"),
+            s.db.iso("a.cleared_at"),
             s.db.iso("w.delivered_at")
         ),
         params![
@@ -1119,6 +1123,27 @@ async fn list_alerts(
             s.alerts.destination()
         ],
     )?;
+    let mut rows: Vec<Value> = Vec::new();
+    for row in joined {
+        let row = alert_json(row);
+        match rows.last_mut() {
+            Some(last) if last["id"] == row["id"] => {
+                if let (Some(Value::Array(events)), Value::Object(event)) =
+                    (last["webhook"].get_mut("events"), &row["webhook"])
+                {
+                    events.push(Value::Object(event.clone()));
+                }
+                last["webhook"] = latest_with_history(&last["webhook"]);
+            }
+            _ => {
+                let mut row = row;
+                if row["webhook"].is_object() {
+                    row["webhook"]["events"] = json!([row["webhook"].clone()]);
+                }
+                rows.push(row);
+            }
+        }
+    }
     let page = usize::try_from(limit).unwrap_or(usize::MAX);
     let next_cursor = if rows.len() > page {
         rows.truncate(page);
@@ -1129,7 +1154,6 @@ async fn list_alerts(
     } else {
         None
     };
-    let rows: Vec<Value> = rows.into_iter().map(alert_json).collect();
     Ok(Json(json!({
         "alerts": rows,
         "next_cursor": next_cursor,
@@ -1137,9 +1161,22 @@ async fn list_alerts(
     })))
 }
 
+/// The `webhook` of an alert whose `events` just grew: its own fields are the
+/// newest event's, and `events` stays every event, oldest first.
+fn latest_with_history(webhook: &Value) -> Value {
+    let events = webhook["events"].clone();
+    let mut latest = events
+        .as_array()
+        .and_then(|e| e.last())
+        .cloned()
+        .unwrap_or(Value::Null);
+    latest["events"] = events;
+    latest
+}
+
 /// An alert row as the API answers it: the stored lists parsed, and the
 /// `webhook_*` columns folded into `webhook` (`null` for an alert recorded
-/// before events were).
+/// before events were; that row's event alone, before its history is added).
 fn alert_json(mut row: Value) -> Value {
     for key in ["notify", "channels"] {
         if let Some(Value::String(text)) = row.get(key) {

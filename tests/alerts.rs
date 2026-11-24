@@ -1004,6 +1004,52 @@ async fn the_webhook_gets_each_alert_change_and_the_api_shows_its_delivery() {
     let all = lab.get("/api/alerts").await;
     assert_eq!(webhook_of(&all, &waiting[0])["state"], "pending");
     assert_eq!(webhook_of(&all, &waiting[1])["state"], "parked");
+    assert_eq!(
+        webhook_of(&all, &waiting[1])["events"],
+        json!([{"event": "fired", "event_id": "waits-elsewhere", "state": "parked", "attempts": 0,
+                "last_error": null, "last_status": null, "delivered_at": null}])
+    );
+    // A later `cleared` delivered to this URL does not hide the `fired` still
+    // parked for the other one: the latest event is the clear, and `events`
+    // lists both, oldest first.
+    lab.db
+        .query_json(
+            "INSERT INTO alert_webhooks (event_id, alert_id, event, destination, payload, state, attempts, last_status, delivered_at, next_attempt_at, created_at)
+             VALUES ('cleared-here', $1, 'cleared', $2, '{}', 'delivered', 1, 200, 1700000000456, 0, 2) RETURNING id",
+            vec![
+                hie::db::Param::Int(waiting[1].as_i64().unwrap()),
+                hie::db::Param::Text(ours.clone()),
+            ],
+        )
+        .unwrap();
+    let all = lab.get("/api/alerts").await;
+    let hook = webhook_of(&all, &waiting[1]);
+    assert_eq!(
+        (hook["event"].as_str(), hook["state"].as_str()),
+        (Some("cleared"), Some("delivered"))
+    );
+    assert_eq!(hook["delivered_at"], "2023-11-14T22:13:20.456Z");
+    let states: Vec<_> = hook["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["event_id"].as_str().unwrap(),
+                e["state"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [("waits-elsewhere", "parked"), ("cleared-here", "delivered")]
+    );
+    assert_eq!(hook["events"][1]["delivered_at"], hook["delivered_at"]);
+    // Two events of one alert still make one alert of the page.
+    let paged = lab.get("/api/alerts?source=other&limit=1").await;
+    assert_eq!(paged["alerts"].as_array().unwrap().len(), 1);
+    assert_eq!(paged["alerts"][0]["id"], waiting[1]);
+    assert!(paged["next_cursor"].is_string());
     let alerts = lab.get("/api/alerts?source=lab-results").await;
     assert_eq!(
         alerts["webhook"],
