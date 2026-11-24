@@ -720,34 +720,50 @@ async fn source_failures(
         .source(&id)
         .ok_or_else(|| not_found(&format!("source {id}")))?;
     let now = now_ms();
-    // The log covers what it has recorded since it began here, within the
-    // retention.
-    let since = s.db.events_since()?.unwrap_or(now);
-    let covered_from = since.max(s.retention.cutoff(now));
-    let window = |from: i64, to: i64| -> anyhow::Result<Value> {
+    // The counts first: what they read was in the log when they ran.
+    let windows: Vec<(Option<String>, i64, i64)> = day_windows(&zone, now, days)
+        .into_iter()
+        .map(|(day, from, to)| (Some(day.to_string()), from, to))
+        .chain([(None, now - DAY_MS, now)])
+        .collect();
+    let mut counted = Vec::with_capacity(windows.len());
+    for (day, from, to) in windows {
         let (records, filtered) = s.db.rejected_records(&id, from, to)?;
-        Ok(json!({
-            "from": instant(from),
-            "to": instant(to),
-            "records": records,
-            "filtered": filtered,
-            "complete": covered_from <= from,
-        }))
-    };
+        counted.push((day, from, to, records, filtered));
+    }
+    // Then what the log covers, read after them: since it began, within this
+    // instance's retention and after anything any instance on the store has
+    // purged (one with a shorter retention may share it). A purge between the
+    // counts and this read only makes the coverage later, never wrongly
+    // complete.
+    let since = s.db.events_since()?.unwrap_or(now);
+    let purged = s.db.events_purged_before()?.unwrap_or(i64::MIN);
+    let covered_from = since.max(s.retention.cutoff(now)).max(purged);
+    let mut last_24h = Value::Null;
     let mut by_day = Vec::with_capacity(days);
-    for (day, from, to) in day_windows(&zone, now, days) {
+    for (day, from, to, records, filtered) in counted {
         let mut entry = Map::new();
-        entry.insert("day".into(), json!(day));
-        if let Value::Object(w) = window(from, to)? {
-            entry.extend(w);
+        if let Some(day) = &day {
+            entry.insert("day".into(), json!(day));
         }
-        by_day.push(Value::Object(entry));
+        entry.extend([
+            ("from".to_string(), json!(instant(from))),
+            ("to".to_string(), json!(instant(to))),
+            ("records".to_string(), json!(records)),
+            ("filtered".to_string(), json!(filtered)),
+            ("complete".to_string(), json!(covered_from <= from)),
+        ]);
+        if day.is_some() {
+            by_day.push(Value::Object(entry));
+        } else {
+            last_24h = Value::Object(entry);
+        }
     }
     Ok(Json(json!({
         "source_id": id,
         "tz": zone.name(),
         "covered_from": instant(covered_from),
-        "last_24h": window(now - DAY_MS, now)?,
+        "last_24h": last_24h,
         "days": by_day,
     })))
 }

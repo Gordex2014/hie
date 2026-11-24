@@ -3833,16 +3833,41 @@ impl Db {
 
     /// Removes up to `limit` events older than `cutoff_ms` in one transaction.
     /// Returns how many went.
+    /// Whatever the instance's retention, the store records the latest cutoff
+    /// any purge removed events under (`events_purged_before`), so a reader on
+    /// a store shared with an instance of shorter retention knows the log no
+    /// longer covers what came before it.
     pub fn purge_events(&self, cutoff_ms: i64, limit: usize) -> Result<usize> {
         self.transaction(|tx| {
-            Ok(tx
+            let gone = tx
                 .query(
                     "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE at < $1 ORDER BY id LIMIT $2)
                      RETURNING id",
                     &params![cutoff_ms, limit],
                 )?
-                .len())
+                .len();
+            if gone > 0 {
+                tx.execute(
+                    "INSERT INTO store_meta (key, value) VALUES ('events_purged_before', $1)
+                     ON CONFLICT (key) DO UPDATE SET value = CASE
+                       WHEN CAST(excluded.value AS BIGINT) > CAST(store_meta.value AS BIGINT)
+                       THEN excluded.value ELSE store_meta.value END",
+                    &params![cutoff_ms.to_string()],
+                )?;
+            }
+            Ok(gone)
         })
+    }
+
+    /// The latest cutoff a purge removed events under, by any instance of this
+    /// version on the store: the log holds nothing stored before it.
+    pub fn events_purged_before(&self) -> Result<Option<i64>> {
+        Ok(self
+            .query_one(
+                "SELECT value FROM store_meta WHERE key = 'events_purged_before'",
+                &[],
+            )?
+            .and_then(|r| r.string(0).parse().ok()))
     }
 
     /// Removes up to `limit` alerts older than `cutoff_ms` (since they cleared, or

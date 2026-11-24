@@ -2697,6 +2697,38 @@ async fn rejected_records_are_counted_once_per_day_with_their_coverage() {
     let (_, answer) = get_json(&format!("{url}?days=90")).await;
     assert_eq!(answer["days"].as_array().unwrap().len(), 90);
 
+    // Another instance on the store keeps five days: its purge removes a
+    // rejection of ten days ago, and the days before its cutoff are no longer
+    // complete here, whatever this instance's own retention.
+    db.query_json(
+        "INSERT INTO events (at, source_id, kind, record_id, error_kind) VALUES ($1, 'one', 'record.rejected', 999999, 'data') RETURNING id",
+        hie::db::params![today - 10 * day],
+    )
+    .unwrap();
+    let (_, before) = get_json(&format!("{url}?days=14")).await;
+    assert_eq!(day_of(&before, today - 10 * day)["records"], 1);
+    assert_eq!(day_of(&before, today - 10 * day)["complete"], true);
+    assert!(db.purge_events(today - 5 * day, 1000).unwrap() >= 1);
+    let (_, answer) = get_json(&format!("{url}?days=14")).await;
+    assert_eq!(day_of(&answer, today - 10 * day)["records"], 0);
+    assert_eq!(day_of(&answer, today - 10 * day)["complete"], false);
+    assert_eq!(day_of(&answer, today - 4 * day)["complete"], true);
+    assert_eq!(
+        answer["covered_from"],
+        chrono::DateTime::from_timestamp_millis(today - 5 * day)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    );
+    // A purge with a longer retention after it moves nothing back.
+    db.query_json(
+        "INSERT INTO events (at, source_id, kind) VALUES ($1, 'one', 'load.received') RETURNING id",
+        hie::db::params![today - 25 * day],
+    )
+    .unwrap();
+    assert_eq!(db.purge_events(today - 20 * day, 1000).unwrap(), 1);
+    let (_, again) = get_json(&format!("{url}?days=14")).await;
+    assert_eq!(again["covered_from"], answer["covered_from"]);
+
     for (query, field) in [
         ("days=0", "days"),
         ("days=91", "days"),
