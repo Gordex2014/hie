@@ -805,3 +805,74 @@ async fn the_webhook_hears_one_clear_per_recovered_outage_and_nothing_at_start()
     drop(e);
     drop(legacy);
 }
+
+/// A server that answers every request with `head` and `body` as raw bytes,
+/// then closes the connection: a body shorter than its `Content-Length` is a
+/// connection lost while the answer was read.
+async fn raw_server(answer: &'static str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                // The request's head and its body, as far as it says.
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let _ = socket.write_all(answer.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn a_connection_lost_while_the_answer_is_read_is_not_an_answer() {
+    let base = raw_server(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/fhir+json\r\nContent-Length: 5000\r\n\r\n{\"resourceType\": \"Bundle\", \"entry\": [",
+    )
+    .await;
+    let e = engine(&base, 0).await;
+    e.seed();
+    e.runner.tick().await.unwrap();
+    let d = e.destination().await;
+    assert_eq!(d["reachable"], false, "{d}");
+    assert_eq!(
+        d["last_error"],
+        "the connection to the FHIR server was lost"
+    );
+    assert_eq!(e.pending(), 1, "the record waits for its next attempt");
+
+    // An answer read whole that is not JSON is still an answer.
+    let base = raw_server(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\n<html></html>",
+    )
+    .await;
+    let e = engine(&base, 0).await;
+    e.seed();
+    e.runner.tick().await.unwrap();
+    let d = e.destination().await;
+    assert_eq!(d["reachable"], true, "{d}");
+}

@@ -11,8 +11,8 @@ use crate::db::now_ms;
 pub const MAX_PROBE_SECONDS: u64 = 86_400;
 /// How long one probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a 502, 503 or 504 answered to a delivery outweighs a probe that
-/// gets an answer: longer than the default longest delivery backoff (5 min),
+/// How long a 502, 503 or 504 answered to a delivery, or a delivery that timed
+/// out or lost its connection, outweighs a probe that gets an answer: longer than the default longest delivery backoff (5 min),
 /// so a source that keeps retrying is heard before the probe takes over.
 const DELIVERY_AUTHORITY: Duration = Duration::from_secs(600);
 
@@ -270,8 +270,9 @@ impl Destination {
     /// Records an outcome. Late news does not count: a request that started
     /// before the latest one recorded, or a probe that a delivery started
     /// after. Neither does a probe's answer while deliveries see the server
-    /// answer 502 to 504, which `/metadata` may not show; once no delivery has
-    /// had one for `authority`, the probe's answer counts again.
+    /// answer 502 to 504, time out or lose their connection, which `/metadata`
+    /// may not show; once no delivery has for `authority`, the probe's answer
+    /// counts again.
     fn record(
         &self,
         started: Instant,
@@ -296,10 +297,13 @@ impl Destination {
             }
         }
         if via == Via::Delivery {
+            // A 502 to 504, a timeout or a lost connection: `/metadata` may
+            // answer while deliveries do not get through. A connection that
+            // cannot be made, the probe sees too.
             s.delivery_outage = match outcome {
-                Err(Failure::Status(_)) => Some(now),
+                Err(Failure::Status(_) | Failure::Timeout | Failure::Lost) => Some(now),
                 Ok(()) => None,
-                Err(_) => s.delivery_outage,
+                Err(Failure::Connect) => s.delivery_outage,
             };
         }
         let at = now_ms();
@@ -576,6 +580,32 @@ mod tests {
         assert_eq!(s.consecutive_failures, 2);
         // No delivery for longer than the window: the probe's answer counts.
         d.record(t0 + ms(150), Via::Probe, Ok(()), "test", t0 + ms(150));
+        assert_eq!(d.snapshot().reachable, Some(true));
+    }
+
+    #[test]
+    fn a_delivery_that_times_out_or_loses_its_connection_outweighs_the_probe() {
+        for failure in [Failure::Timeout, Failure::Lost] {
+            let d = destination();
+            d.lock().authority = ms(100);
+            let t0 = Instant::now();
+            d.record(t0, Via::Delivery, Err(failure), "test", t0);
+            let since = d.snapshot().since_ms;
+            // HFS answers `/metadata` but not the deliveries: still down, the
+            // outage keeps its start.
+            d.record(t0 + ms(10), Via::Probe, Ok(()), "test", t0 + ms(10));
+            let s = d.snapshot();
+            assert_eq!(s.reachable, Some(false), "{failure:?}");
+            assert_eq!(s.since_ms, since, "{failure:?}");
+            // A delivery that gets an answer ends it at once.
+            d.record(t0 + ms(20), Via::Delivery, Ok(()), "test", t0 + ms(20));
+            assert_eq!(d.snapshot().reachable, Some(true), "{failure:?}");
+        }
+        // A connection that cannot be made gives the probe no such weight.
+        let d = destination();
+        let t0 = Instant::now();
+        d.record(t0, Via::Delivery, Err(Failure::Connect), "test", t0);
+        d.record(t0 + ms(10), Via::Probe, Ok(()), "test", t0 + ms(10));
         assert_eq!(d.snapshot().reachable, Some(true));
     }
 
