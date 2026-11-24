@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,6 +59,8 @@ pub struct Config {
 pub struct SkippedSource {
     pub file: PathBuf,
     pub source_id: String,
+    /// The `name` the file gives the source.
+    pub source_name: String,
     pub reason: String,
 }
 
@@ -131,9 +134,176 @@ impl RetentionConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+/// The `alerts:` block: where the alert webhook posts, the secret it signs
+/// with, and how long it waits before retrying. `Debug` and every error leave
+/// the URL and the secret out: a chat webhook's URL is itself a credential.
+#[derive(Clone, Default)]
 pub struct AlertConfig {
+    /// Trimmed; `None` when unset or blank.
     pub webhook_url: Option<String>,
+    pub webhook_secret: Option<secrecy::SecretString>,
+    /// The wait before the first retry, doubling for each one after it.
+    /// `None` means `AlertConfig::DEFAULT_BACKOFF_MS`.
+    pub webhook_backoff_ms: Option<u64>,
+}
+
+impl std::fmt::Debug for AlertConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlertConfig")
+            .field(
+                "webhook_url",
+                &self.webhook_url.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "webhook_secret",
+                &self.webhook_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field("webhook_backoff_ms", &self.webhook_backoff_ms)
+            .finish()
+    }
+}
+
+fn is_http_url(text: &str) -> bool {
+    url::Url::parse(text)
+        .ok()
+        .is_some_and(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some())
+}
+
+/// What a malformed `alerts:` block is refused with: the keys it may have and
+/// nothing of the values it has.
+const ALERTS_SHAPE: &str = "alerts: expected a mapping with webhook_url (an http or https URL), webhook_secret (text) and webhook_backoff_ms (milliseconds)";
+
+impl<'de> Deserialize<'de> for AlertConfig {
+    /// Every error here is a fixed sentence: the YAML parser's own messages
+    /// quote the offending value, which may be the URL or the secret.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value =
+            serde_yaml::Value::deserialize(d).map_err(|_| D::Error::custom(ALERTS_SHAPE))?;
+        let mut config = AlertConfig::default();
+        let map = match value {
+            serde_yaml::Value::Null => return Ok(config),
+            serde_yaml::Value::Mapping(map) => map,
+            _ => return Err(D::Error::custom(ALERTS_SHAPE)),
+        };
+        for (key, value) in map {
+            let text = |what: &str| match &value {
+                serde_yaml::Value::Null => Ok(None),
+                serde_yaml::Value::String(s) => Ok(Some(s.clone())),
+                _ => Err(D::Error::custom(format!("alerts.{what} must be text"))),
+            };
+            match key.as_str() {
+                Some("webhook_url") => {
+                    config.webhook_url = text("webhook_url")?
+                        .map(|u| u.trim().to_string())
+                        .filter(|u| !u.is_empty());
+                }
+                Some("webhook_secret") => {
+                    config.webhook_secret = match text("webhook_secret")? {
+                        Some(s) if s.trim().is_empty() => {
+                            return Err(D::Error::custom("alerts.webhook_secret is blank"));
+                        }
+                        other => other.map(secrecy::SecretString::from),
+                    };
+                }
+                Some("webhook_backoff_ms") => {
+                    config.webhook_backoff_ms = match &value {
+                        serde_yaml::Value::Null => None,
+                        serde_yaml::Value::Number(n) => Some(n.as_u64().ok_or_else(|| {
+                            D::Error::custom(
+                                "alerts.webhook_backoff_ms must be a whole number of milliseconds",
+                            )
+                        })?),
+                        _ => {
+                            return Err(D::Error::custom(
+                                "alerts.webhook_backoff_ms must be a whole number of milliseconds",
+                            ));
+                        }
+                    };
+                }
+                Some(other) => {
+                    // A key that looks like a key is named; anything else
+                    // (a pasted URL, say) is not.
+                    let named = other.len() <= 64
+                        && other.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    let which = if named {
+                        format!(" {other:?}")
+                    } else {
+                        String::new()
+                    };
+                    return Err(D::Error::custom(format!(
+                        "alerts: unknown key{which} (use webhook_url, webhook_secret or webhook_backoff_ms)"
+                    )));
+                }
+                None => return Err(D::Error::custom(ALERTS_SHAPE)),
+            }
+        }
+        Ok(config)
+    }
+}
+
+impl AlertConfig {
+    /// Ten seconds: retries after 10, 20, 40, 80 and 160 seconds.
+    pub const DEFAULT_BACKOFF_MS: u64 = 10_000;
+    /// An hour.
+    pub const MAX_BACKOFF_MS: u64 = 3_600_000;
+
+    pub fn backoff_ms(&self) -> u64 {
+        self.webhook_backoff_ms.unwrap_or(Self::DEFAULT_BACKOFF_MS)
+    }
+
+    /// `HIE_ALERT_WEBHOOK_URL` and `HIE_ALERT_WEBHOOK_SECRET` from `lookup`
+    /// (the process environment in `hie`): an unset or blank variable leaves
+    /// the file's value; one that is not UTF-8 is refused.
+    pub fn apply_env(&mut self, lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<()> {
+        let read = |name: &str| -> Result<Option<String>> {
+            match lookup(name) {
+                None => Ok(None),
+                Some(v) => {
+                    let v = v
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("{name} is not valid UTF-8"))?;
+                    Ok((!v.trim().is_empty()).then_some(v))
+                }
+            }
+        };
+        if let Some(url) = read("HIE_ALERT_WEBHOOK_URL")? {
+            let url = url.trim().to_string();
+            if !is_http_url(&url) {
+                bail!(
+                    "HIE_ALERT_WEBHOOK_URL (overriding alerts.webhook_url) is not an http or https URL"
+                );
+            }
+            self.webhook_url = Some(url);
+        }
+        if let Some(secret) = read("HIE_ALERT_WEBHOOK_SECRET")? {
+            self.webhook_secret = Some(secrecy::SecretString::from(secret));
+        }
+        Ok(())
+    }
+
+    /// Refuses a blank secret, a URL that is not http or https, and a backoff
+    /// out of range.
+    /// The messages never quote the URL.
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .webhook_secret
+            .as_ref()
+            .is_some_and(|s| s.expose_secret().trim().is_empty())
+        {
+            bail!("alerts.webhook_secret is blank");
+        }
+        if self.webhook_url.as_deref().is_some_and(|u| !is_http_url(u)) {
+            bail!("alerts.webhook_url is not an http or https URL");
+        }
+        if !(1..=Self::MAX_BACKOFF_MS).contains(&self.backoff_ms()) {
+            bail!(
+                "alerts.webhook_backoff_ms must be from 1 to {}",
+                Self::MAX_BACKOFF_MS
+            );
+        }
+        Ok(())
+    }
 }
 
 /// The `worker:` block: the limits every transform worker process runs under.
@@ -767,8 +937,9 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     // and its transforms run in the local worker instead: refuse to start, whatever
     // its value (`runtime: null` and a bare `runtime:` included) and however the
     // key is tagged (`as_str` sees through YAML tags).
+    // Its errors may quote anything in the file, a webhook secret included.
     let raw: serde_yaml::Value =
-        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        serde_yaml::from_str(&text).map_err(|e| parse_error(path, true, e))?;
     if raw
         .as_mapping()
         .is_some_and(|m| m.keys().any(|k| k.as_str() == Some("runtime")))
@@ -778,8 +949,8 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
             path.display()
         );
     }
-    let mut config: Config =
-        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let mut config: Config = serde_yaml::from_str(&text)
+        .map_err(|e| parse_error(path, holds_alert_settings(&raw), e))?;
     config
         .worker
         .check()
@@ -820,6 +991,7 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
                 config.skipped.push(SkippedSource {
                     file: feed_path.clone(),
                     source_id: needs.source.clone(),
+                    source_name: feed.name.clone(),
                     reason: needs.to_string(),
                 });
                 continue;
@@ -832,6 +1004,69 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
         feeds.push(feed);
     }
     Ok((config, feeds))
+}
+
+/// A YAML error in `hie.yaml`; with `hide`, without whatever the parser quotes.
+/// YAML lets a value reach an error from anywhere in the file (an alias of the
+/// secret used in another field, a repeated key), so no line is safe to quote
+/// while the file may hold the webhook's URL or secret.
+fn parse_error(path: &Path, hide: bool, e: serde_yaml::Error) -> anyhow::Error {
+    if !hide {
+        return anyhow::Error::new(e).context(format!("parsing {}", path.display()));
+    }
+    anyhow::anyhow!(
+        "parsing {}: {} (quoted values are not shown: the file may hold the alert webhook's URL or secret)",
+        path.display(),
+        unquoted(&e.to_string())
+    )
+}
+
+/// Whether the parsed file gives `alerts:` anything but blank values, keys
+/// taken as YAML decodes them.
+fn holds_alert_settings(raw: &serde_yaml::Value) -> bool {
+    use serde_yaml::Value;
+    let blank = |v: &Value| match v {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        _ => false,
+    };
+    let Some(top) = raw.as_mapping() else {
+        return false;
+    };
+    top.iter()
+        .filter(|(k, _)| k.as_str() == Some("alerts"))
+        .any(|(_, alerts)| match alerts {
+            Value::Null => false,
+            Value::Mapping(m) => m.values().any(|v| !blank(v)),
+            _ => true,
+        })
+}
+
+/// `text` with whatever stands between double quotes or backticks replaced by `…`.
+fn unquoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        let close = match c {
+            '"' => '"',
+            '`' => '`',
+            _ => continue,
+        };
+        out.push('…');
+        let mut escaped = false;
+        for d in chars.by_ref() {
+            if escaped {
+                escaped = false;
+            } else if d == '\\' && close == '"' {
+                escaped = true;
+            } else if d == close {
+                out.push(d);
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// The source files in `dir`, in the order `load` reads them: every `*.yaml`
@@ -910,6 +1145,154 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn alerts_from(yaml: &str) -> Result<AlertConfig, String> {
+        serde_yaml::from_str::<Config>(&format!("fhir_base_url: http://hfs\n{yaml}"))
+            .map(|c| c.alerts)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn alert_settings_default_without_a_block() {
+        let alerts = alerts_from("").unwrap();
+        assert!(alerts.webhook_url.is_none() && alerts.webhook_secret.is_none());
+        assert_eq!(alerts.backoff_ms(), 10_000);
+        assert!(alerts.validate().is_ok());
+        let alerts = alerts_from("alerts:\n  webhook_url: '  '\n").unwrap();
+        assert!(alerts.webhook_url.is_none(), "a blank URL is no URL");
+    }
+
+    #[test]
+    fn alert_settings_are_read_and_checked() {
+        let alerts = alerts_from(
+            "alerts:\n  webhook_url: ' https://hooks.example.org/x '\n  webhook_secret: s3cr3t\n  webhook_backoff_ms: 50\n",
+        )
+        .unwrap();
+        assert_eq!(
+            alerts.webhook_url.as_deref(),
+            Some("https://hooks.example.org/x")
+        );
+        assert_eq!(
+            alerts.webhook_secret.as_ref().unwrap().expose_secret(),
+            "s3cr3t"
+        );
+        assert_eq!(alerts.backoff_ms(), 50);
+        assert!(alerts.validate().is_ok());
+        let debug = format!("{alerts:?}");
+        assert!(
+            !debug.contains("hooks.example.org") && !debug.contains("s3cr3t"),
+            "{debug}"
+        );
+
+        for (yaml, canary) in [
+            (
+                "alerts:\n  webhook_url: ftp://canary.example.org/x\n",
+                "canary",
+            ),
+            ("alerts:\n  webhook_url: not a url canary\n", "canary"),
+            ("alerts:\n  webhook_backoff_ms: 0\n", "webhook_backoff_ms"),
+        ] {
+            let e = alerts_from(yaml)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            if canary == "canary" {
+                assert!(!e.contains(canary), "{e}");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_alert_settings_never_echo_their_values() {
+        for yaml in [
+            "alerts: https://canary.example.org/hook\n",
+            "alerts:\n  webhook_url: [https://canary.example.org/hook]\n",
+            "alerts:\n  webhook_secret: {canary: 1}\n",
+            "alerts:\n  webhook_secret: 123456789\n",
+            "alerts:\n  webhook_backoff_ms: canary\n",
+            "alerts:\n  webhook_backoff_ms: -5\n",
+        ] {
+            let e = alerts_from(yaml).unwrap_err();
+            assert!(!e.contains("canary") && !e.contains("123456789"), "{e}");
+        }
+        assert!(
+            alerts_from("alerts:\n  webhook_secret: '  '\n")
+                .unwrap_err()
+                .contains("blank")
+        );
+        let typo = alerts_from("alerts:\n  webhook_secrt: x\n").unwrap_err();
+        assert!(typo.contains("webhook_secrt"), "{typo}");
+    }
+
+    #[test]
+    fn quoted_values_can_be_left_out_of_errors() {
+        assert_eq!(
+            unquoted(r#"invalid type: string "s3c\"ret", expected `u64` at line 3"#),
+            "invalid type: string \"…\", expected `…` at line 3"
+        );
+    }
+
+    #[test]
+    fn a_blank_secret_is_refused_on_every_path() {
+        let alerts = AlertConfig {
+            webhook_url: Some("https://hooks.example.org/x".into()),
+            webhook_secret: Some(secrecy::SecretString::from(" ".to_string())),
+            webhook_backoff_ms: None,
+        };
+        assert!(alerts.validate().unwrap_err().to_string().contains("blank"));
+    }
+
+    #[test]
+    fn alert_settings_from_the_environment() {
+        use std::ffi::OsString;
+        let mut alerts =
+            alerts_from("alerts:\n  webhook_url: https://file.example.org/x\n").unwrap();
+        let env = |pairs: Vec<(&'static str, OsString)>| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.clone())
+            }
+        };
+        alerts
+            .apply_env(env(vec![("HIE_ALERT_WEBHOOK_URL", " ".into())]))
+            .unwrap();
+        assert_eq!(
+            alerts.webhook_url.as_deref(),
+            Some("https://file.example.org/x"),
+            "blank is ignored"
+        );
+        alerts
+            .apply_env(env(vec![
+                (
+                    "HIE_ALERT_WEBHOOK_URL",
+                    " https://env.example.org/y ".into(),
+                ),
+                ("HIE_ALERT_WEBHOOK_SECRET", "from-env".into()),
+            ]))
+            .unwrap();
+        assert_eq!(
+            alerts.webhook_url.as_deref(),
+            Some("https://env.example.org/y")
+        );
+        assert_eq!(
+            alerts.webhook_secret.as_ref().unwrap().expose_secret(),
+            "from-env"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let e = alerts
+                .apply_env(env(vec![(
+                    "HIE_ALERT_WEBHOOK_SECRET",
+                    OsString::from_vec(vec![0xff, 0xfe]),
+                )]))
+                .unwrap_err();
+            assert!(e.to_string().contains("not valid UTF-8"));
+        }
+    }
 
     #[test]
     fn durations_parse_with_units() {

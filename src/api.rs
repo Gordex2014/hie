@@ -28,6 +28,8 @@ pub struct AppState {
     pub bulk_dir: std::path::PathBuf,
     /// Connector credentials, or why there are none.
     pub secrets: crate::secrets::Secrets,
+    /// Alerts and their webhook: whether one is configured, and for which URL.
+    pub alerts: Arc<crate::alerts::Alerter>,
     /// How long history is kept: what a report over a period can cover.
     pub retention: crate::retention::Retention,
 }
@@ -872,6 +874,8 @@ struct AlertListQuery {
 
 /// Newest first, a page at a time: `next_cursor` is set only when more alerts
 /// match, and the next page holds those older (by id) than the last one here.
+/// Each alert comes with its latest webhook event, read in the same statement;
+/// a pending event written for another URL than this instance's is `parked`.
 async fn list_alerts(
     State(s): State<AppState>,
     q: Result<Query<AlertListQuery>, QueryRejection>,
@@ -879,6 +883,8 @@ async fn list_alerts(
     let Query(q) = q.map_err(paging::rejected)?;
     let since = paging::since_ms(q.since.as_deref())?;
     let after = paging::cursor_id(q.cursor.as_deref())?;
+    let (configured, signed) = s.alerts.webhook_status();
+    let webhook = json!({"configured": configured, "signed": signed});
     // A negative limit has always meant every alert on SQLite; so it does on both stores.
     let limit = match q.limit {
         Some(n) if n < 0 => i64::MAX,
@@ -886,18 +892,30 @@ async fn list_alerts(
         None => 100,
     };
     if limit == 0 {
-        return Ok(Json(json!({"alerts": [], "next_cursor": null})));
+        return Ok(Json(
+            json!({"alerts": [], "next_cursor": null, "webhook": webhook}),
+        ));
     }
     let mut rows = s.db.query_json(
         &format!(
-            "SELECT id, feed_id AS source_id, kind, message, rule_id, notify, channels,
-                    {} AS created_at, {} AS cleared_at, cleared_reason
+            "SELECT alerts.id, alerts.feed_id AS source_id, alerts.kind, alerts.message, alerts.rule_id,
+                    alerts.notify, alerts.channels,
+                    {} AS created_at, {} AS cleared_at, alerts.cleared_reason,
+                    w.event AS webhook_event, w.event_id AS webhook_event_id,
+                    CASE WHEN w.state = 'pending' AND w.destination <> CAST($6 AS TEXT) THEN 'parked' ELSE w.state END AS webhook_state,
+                    w.attempts AS webhook_attempts, w.last_error AS webhook_last_error,
+                    w.last_status AS webhook_last_status,
+                    {} AS webhook_delivered_at
              FROM alerts
-             WHERE (CAST($1 AS TEXT) IS NULL OR feed_id = CAST($1 AS TEXT)) AND (CAST($3 AS BIGINT) = 0 OR cleared_at IS NULL)
-               AND (CAST($4 AS BIGINT) IS NULL OR created_at >= CAST($4 AS BIGINT)) AND id <= $5
-             ORDER BY id DESC LIMIT $2",
-            s.db.iso("created_at"),
-            s.db.iso("cleared_at")
+             LEFT JOIN alert_webhooks w
+               ON w.id = (SELECT MAX(x.id) FROM alert_webhooks x WHERE x.alert_id = alerts.id)
+             WHERE (CAST($1 AS TEXT) IS NULL OR alerts.feed_id = CAST($1 AS TEXT))
+               AND (CAST($3 AS BIGINT) = 0 OR alerts.cleared_at IS NULL)
+               AND (CAST($4 AS BIGINT) IS NULL OR alerts.created_at >= CAST($4 AS BIGINT)) AND alerts.id <= $5
+             ORDER BY alerts.id DESC LIMIT $2",
+            s.db.iso("alerts.created_at"),
+            s.db.iso("alerts.cleared_at"),
+            s.db.iso("w.delivered_at")
         ),
         params![
             q.source,
@@ -905,7 +923,8 @@ async fn list_alerts(
             q.open.unwrap_or(false),
             since,
             // A bound SQLite seeks on, where `IS NULL OR` would scan.
-            after.map_or(i64::MAX, |id| id - 1)
+            after.map_or(i64::MAX, |id| id - 1),
+            s.alerts.destination()
         ],
     )?;
     let page = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -918,20 +937,50 @@ async fn list_alerts(
     } else {
         None
     };
-    let rows: Vec<Value> = rows
-        .into_iter()
-        .map(|mut row| {
-            for key in ["notify", "channels"] {
-                if let Some(Value::String(text)) = row.get(key) {
-                    let parsed =
-                        serde_json::from_str::<Value>(text).unwrap_or(Value::Array(vec![]));
-                    row[key] = parsed;
-                }
-            }
-            row
-        })
-        .collect();
-    Ok(Json(json!({"alerts": rows, "next_cursor": next_cursor})))
+    let rows: Vec<Value> = rows.into_iter().map(alert_json).collect();
+    Ok(Json(json!({
+        "alerts": rows,
+        "next_cursor": next_cursor,
+        "webhook": webhook,
+    })))
+}
+
+/// An alert row as the API answers it: the stored lists parsed, and the
+/// `webhook_*` columns folded into `webhook` (`null` for an alert recorded
+/// before events were).
+fn alert_json(mut row: Value) -> Value {
+    for key in ["notify", "channels"] {
+        if let Some(Value::String(text)) = row.get(key) {
+            let parsed = serde_json::from_str::<Value>(text).unwrap_or(Value::Array(vec![]));
+            row[key] = parsed;
+        }
+    }
+    let Some(obj) = row.as_object_mut() else {
+        return row;
+    };
+    let mut webhook = serde_json::Map::new();
+    for key in [
+        "event",
+        "event_id",
+        "state",
+        "attempts",
+        "last_error",
+        "last_status",
+        "delivered_at",
+    ] {
+        let value = obj.remove(&format!("webhook_{key}")).unwrap_or(Value::Null);
+        webhook.insert(key.to_string(), value);
+    }
+    let recorded = !webhook["event_id"].is_null();
+    obj.insert(
+        "webhook".into(),
+        if recorded {
+            Value::Object(webhook)
+        } else {
+            Value::Null
+        },
+    );
+    row
 }
 
 // ---- Events -----------------------------------------------------------------

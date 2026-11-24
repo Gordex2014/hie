@@ -132,6 +132,7 @@ impl FeedRunner {
         public_url: &str,
     ) -> Self {
         let transformer = Transformer::new(python, runtime_dir, &feed.transform);
+        alerts.know_source(&feed.id, &feed.name);
         let feed_bulk_transformed = feed.bulk_transformed();
         let bulk = (feed.delivery.method == DeliveryMethod::BulkSubmit).then(|| {
             BulkSubmitter::new(fhir_base_url, public_url)

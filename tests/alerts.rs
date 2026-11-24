@@ -5,6 +5,11 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use std::sync::{Arc, Mutex};
+
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
@@ -53,11 +58,17 @@ struct Lab {
     root: PathBuf,
     api: String,
     http: reqwest::Client,
+    db: std::sync::Arc<hie::db::Db>,
 }
 
 /// An engine with one folder source, `lab-results`, polling every minute so only
 /// `check-now` moves it.
 async fn lab(python: &str) -> Lab {
+    lab_with(python, "").await
+}
+
+/// `lab`, with more lines for `hie.yaml` (an `alerts:` block).
+async fn lab_with(python: &str, more_config: &str) -> Lab {
     let fhir = serve(Router::new().route("/", post(batch))).await;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -70,12 +81,13 @@ async fn lab(python: &str) -> Lab {
     .unwrap();
     std::fs::write(
         root.join("hie.yaml"),
-        format!("fhir_base_url: {fhir}\ndatabase: data/hie.db\npython: {python}\n"),
+        format!("fhir_base_url: {fhir}\ndatabase: data/hie.db\npython: {python}\n{more_config}"),
     )
     .unwrap();
     let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
     let (_manager, state) =
         hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let db = state.db.clone();
     let api = serve(hie::api::router(state)).await;
     let http = reqwest::Client::new();
     let created = http
@@ -95,6 +107,7 @@ async fn lab(python: &str) -> Lab {
         root,
         api,
         http,
+        db,
     }
 }
 
@@ -784,7 +797,10 @@ async fn a_walk_keeps_its_place_while_alerts_change() {
         .list(&[("open", "true"), ("limit", "4"), ("cursor", &cursor)])
         .await;
     assert_eq!(status, 200);
-    assert_eq!(empty, json!({"alerts": [], "next_cursor": null}));
+    assert_eq!(
+        empty,
+        json!({"alerts": [], "next_cursor": null, "webhook": {"configured": false, "signed": false}})
+    );
 }
 
 #[tokio::test]
@@ -806,7 +822,10 @@ async fn the_default_page_holds_a_hundred_alerts() {
     assert_eq!(last.get("next_cursor"), Some(&Value::Null));
 
     let (_, none) = store.list(&[("limit", "0")]).await;
-    assert_eq!(none, json!({"alerts": [], "next_cursor": null}));
+    assert_eq!(
+        none,
+        json!({"alerts": [], "next_cursor": null, "webhook": {"configured": false, "signed": false}})
+    );
     // A negative limit has always meant every alert.
     let (_, every) = store.list(&[("limit", "-1")]).await;
     assert_eq!(every["alerts"].as_array().unwrap().len(), 101);
@@ -863,4 +882,196 @@ async fn a_malformed_query_is_refused_without_echoing_it() {
             .unwrap();
         assert_eq!(r.status(), 400, "{query}");
     }
+}
+
+/// What a webhook receiver got: headers and raw body of each request.
+type Received = Arc<Mutex<Vec<(HeaderMap, Bytes)>>>;
+
+async fn receive(State(got): State<Received>, headers: HeaderMap, body: Bytes) {
+    got.lock().unwrap().push((headers, body));
+}
+
+fn webhook_of<'a>(alerts: &'a Value, id: &Value) -> &'a Value {
+    &alerts["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == *id)
+        .unwrap()["webhook"]
+}
+
+#[tokio::test]
+async fn the_webhook_gets_each_alert_change_and_the_api_shows_its_delivery() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let got = Received::default();
+    let receiver = serve(
+        Router::new()
+            .route("/hook/urlcanary", post(receive))
+            .with_state(got.clone()),
+    )
+    .await;
+    let url = format!("{receiver}/hook/urlcanary");
+    let lab = lab_with(
+        &python,
+        &format!(
+            "alerts:\n  webhook_url: {url}\n  webhook_secret: secretcanary\n  webhook_backoff_ms: 50\n"
+        ),
+    )
+    .await;
+    let rule = |threshold: &str, channels: Value| json!({"source_id": "lab-results", "condition": "rejected_share", "threshold": threshold, "channels": channels});
+    let posted = lab
+        .post("/api/alert-rules", rule("10%", json!(["app", "webhook"])))
+        .await;
+    let webhook_rule = posted.json::<Value>().await.unwrap()["id"].clone();
+    let posted = lab
+        .post("/api/alert-rules", rule("20%", json!(["app"])))
+        .await;
+    let app_rule = posted.json::<Value>().await.unwrap()["id"].clone();
+
+    // An alert left open by an earlier version: no webhook event recorded.
+    let earlier = lab.db.query_json(
+        "INSERT INTO alerts (feed_id, kind, message, created_at, rule_id, notify, channels)
+         VALUES ('lab-results', 'rejected_share', 'from before', 1700000000123, $1, '[]', '[\"app\",\"webhook\"]')
+         RETURNING id",
+        vec![hie::db::Param::Int(webhook_rule.as_i64().unwrap())],
+    ).unwrap()[0]["id"].clone();
+    // Two events that are not due: one for this URL, one for another.
+    use sha2::Digest;
+    let ours = hex::encode(&sha2::Sha256::digest(url.as_bytes())[..8]);
+    let mut waiting = vec![];
+    for (event_id, destination) in [
+        ("waits-here", ours.as_str()),
+        ("waits-elsewhere", "0123456789abcdef"),
+    ] {
+        let id = lab.db.query_json(
+            "INSERT INTO alerts (feed_id, kind, message, created_at) VALUES ('other', 'unreadable_file', 'x', 1) RETURNING id",
+            vec![],
+        ).unwrap()[0]["id"].clone();
+        lab.db.query_json(
+            "INSERT INTO alert_webhooks (event_id, alert_id, event, destination, payload, state, attempts, next_attempt_at, created_at)
+             VALUES ($1, $2, 'fired', $3, '{}', 'pending', 0, 9000000000000000, 1) RETURNING id",
+            vec![
+                hie::db::Param::Text(event_id.into()),
+                hie::db::Param::Int(id.as_i64().unwrap()),
+                hie::db::Param::Text(destination.into()),
+            ],
+        ).unwrap();
+        waiting.push(id);
+    }
+    let all = lab.get("/api/alerts").await;
+    assert_eq!(webhook_of(&all, &waiting[0])["state"], "pending");
+    assert_eq!(webhook_of(&all, &waiting[1])["state"], "parked");
+    let alerts = lab.get("/api/alerts?source=lab-results").await;
+    assert_eq!(
+        alerts["webhook"],
+        json!({"configured": true, "signed": true})
+    );
+    assert_eq!(*webhook_of(&alerts, &earlier), Value::Null);
+
+    // messy.csv: the webhook rule's alert is still open, so only the app-only rule fires.
+    lab.drop_file("messy.csv").await;
+    let alerts = lab
+        .wait_for("the app-only alert", |a| {
+            a["alerts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["rule_id"] == app_rule)
+        })
+        .await;
+    let app_alert = alerts["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["rule_id"] == app_rule)
+        .unwrap()
+        .clone();
+    let hook = webhook_of(&alerts, &app_alert["id"]);
+    assert_eq!(
+        (hook["event"].as_str(), hook["state"].as_str()),
+        (Some("fired"), Some("not_requested"))
+    );
+    assert_eq!(hook["attempts"], 0);
+
+    // labs.csv clears both; the earlier alert's clear goes out, the app-only one's does not.
+    lab.drop_file("labs.csv").await;
+    let alerts = lab
+        .wait_for("the clear to be delivered", |a| {
+            webhook_of(a, &earlier)["state"] == "delivered"
+                && !webhook_of(a, &app_alert["id"]).is_null()
+                && webhook_of(a, &app_alert["id"])["event"] == "cleared"
+        })
+        .await;
+    let hook = webhook_of(&alerts, &earlier);
+    assert_eq!(hook["event"], "cleared");
+    assert_eq!(hook["attempts"], 1);
+    assert_eq!(hook["last_status"], 200);
+    assert_eq!(hook["last_error"], Value::Null);
+    assert!(hook["delivered_at"].is_string());
+    assert_eq!(
+        webhook_of(&alerts, &app_alert["id"])["state"],
+        "not_requested"
+    );
+
+    let got = got.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "only the webhook rule's clear is posted");
+    let (headers, body) = &got[0];
+    assert_eq!(
+        headers["x-hie-signature"].to_str().unwrap(),
+        hie::alerts::signature(b"secretcanary", body)
+    );
+    let payload: Value = serde_json::from_slice(body).unwrap();
+    assert_eq!(payload["event_id"], hook["event_id"]);
+    assert_eq!(
+        payload["source"],
+        json!({"id": "lab-results", "name": "Lab results"})
+    );
+    let listed = alerts["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == earlier)
+        .unwrap();
+    // The times are the strings the API shows.
+    assert_eq!(payload["alert"]["created_at"], listed["created_at"]);
+    assert_eq!(payload["alert"]["created_at"], "2023-11-14T22:13:20.123Z");
+    assert_eq!(payload["alert"]["cleared_at"], listed["cleared_at"]);
+    assert_eq!(payload["alert"]["message"], "from before");
+    // Neither the URL nor the secret is in any answer, nor is the stored fingerprint.
+    let answer = lab.get("/api/alerts").await.to_string();
+    for canary in ["urlcanary", "secretcanary", ours.as_str()] {
+        assert!(!answer.contains(canary), "{canary} in {answer}");
+    }
+}
+
+#[tokio::test]
+async fn without_a_webhook_the_api_says_so() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let lab = lab(&python).await;
+    lab.post(
+        "/api/alert-rules",
+        json!({"source_id": "lab-results", "condition": "rejected_share", "threshold": "10%"}),
+    )
+    .await;
+    lab.drop_file("messy.csv").await;
+    let alerts = lab
+        .wait_for("the alert", |a| alert(a, "rejected_share").is_some())
+        .await;
+    assert_eq!(
+        alerts["webhook"],
+        json!({"configured": false, "signed": false})
+    );
+    let hook = &alert(&alerts, "rejected_share").unwrap()["webhook"];
+    assert_eq!(
+        (hook["event"].as_str(), hook["state"].as_str()),
+        (Some("fired"), Some("not_configured"))
+    );
+    assert_eq!(hook["attempts"], 0);
+    assert_eq!(hook["last_status"], Value::Null);
 }

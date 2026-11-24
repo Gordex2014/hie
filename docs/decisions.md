@@ -143,7 +143,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 **Chosen:**
 - HIE raises alerts for rejected records, unreadable files, delivery outages and recovery, and **silence**: no data within the feed's `expect_every`.
-- Alerts are stored, logged, and posted to a webhook (`text` field, the shape Slack and Teams accept).
+- Alerts are stored, logged, and posted to a webhook (`text` field, the shape Slack and Teams accept). (Superseded in part by decision 40: the webhook gets a signed, retried and recorded event per change, and keeps `text`.)
 - A repeated condition alerts once. (Superseded in part by decision 22: conditions are rules, and an alert clears itself.)
 
 **Why:**
@@ -476,6 +476,25 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - The rule is per page, not a snapshot: a walk returns every alert that existed when it began and still matches, once each; an alert created meanwhile may or may not appear. On PostgreSQL an id is taken before its row commits, so an alert can commit behind a page already read; a new walk finds it. A page after a cursor can be empty when the alerts it would have held left in the meantime.
 - There is no index on the creation time: `since` stops nothing early, and a period far in the past reads back through newer alerts. Alerts are few, and retention (38) bounds them.
 - `/api/alerts` keeps its typed parameters, so a value of the wrong type or given twice is refused without `field`, and an unknown parameter is ignored, unlike `/api/events`, which names the field of every refusal. `/api/records` and the loads lists keep the extractor's plain-text `400`.
+## 40. The alert webhook is a signed, retried and recorded contract
+
+**Chosen:** Every change of an alert, `fired` and `cleared`, is an event with a random `event_id`, written with its exact body in the same transaction as the alert, in the store's `alert_webhooks`. The body is `{event_id, event, alert: {id, rule_id, kind, message, notify, created_at, cleared_at, cleared_reason}, source: {id, name}, text}`. With `alerts.webhook_secret` (or `HIE_ALERT_WEBHOOK_SECRET`) set, `X-HIE-Signature: sha256=<hex>` carries the HMAC-SHA256 of the raw body. A sender task per instance posts waiting events oldest first: a 2xx delivers; anything else, a 3xx included (redirects are not followed), is retried up to five times after `alerts.webhook_backoff_ms` (10 s), doubling, then the event is `failed`. Each attempt is claimed with one conditional update, for a lease of 60 s, and its outcome is stored only while the claim is still that attempt's; a last attempt whose outcome was never stored ends `failed`. A `cleared` event waits for its `fired` event for the same URL to be delivered or given up on. Each event belongs to the URL configured when it was written and waits for that URL. `GET /api/alerts` shows, per alert, the delivery of its latest event (`event`, `state`, `attempts`, `last_error`, `last_status`, `delivered_at`), and `webhook: {configured, signed}` for the instance. Events not requested by the rule's channels, or written with no URL configured, are recorded as `not_requested` and `not_configured` and never sent.
+
+**Why:**
+- External monitoring and paging tools are meant to receive the engine's alerts through its webhook, so it needs a stable shape, a way to prove the sender, and delivery that survives a receiver's outage and the engine's restarts. A host application shows whether an alert reached them, and needs to tell "no webhook configured" from "not delivered yet".
+- Writing the event with the alert, in one transaction, means no alert change is lost between the two; storing the exact body means every retry is the same bytes, so a receiver de-duplicates by `event_id` and a signature never depends on when it was computed.
+- A body-only HMAC (the shape GitHub's webhooks use) is the simplest scheme receivers verify. A replayed request carries an `event_id` the receiver has seen; an old event names an old alert.
+- Claiming by `event_id` with a conditional update, and fencing the outcome by the attempt number, lets several instances on one store send without sending one attempt twice, on SQLite and PostgreSQL alike, and keeps a stalled instance from overwriting a newer outcome.
+- Binding an event to its URL keeps alert text and recipients from going to a receiver configured later for something else; waiting for that URL keeps a brief misconfiguration from losing them.
+- Redirects are refused because a redirected POST becomes a GET without the body, and would carry the signature to another host.
+
+**Cost / not yet:**
+- The body changed: the old `feed`, `kind`, `alert_id`, `notify` and `cleared` keys are gone (`text` stays), and a clear is now posted only when the channels recorded on the alert when it fired include the webhook (a later edit of the rule does not change that; a rule turned off or deleted leaves its open alert open, with no clear). `alerts:` refuses unknown keys, so a misspelt `webhook_secret` cannot send unsigned; a file with stray keys there no longer starts. While instances of an earlier version share the store, those still post the old body, unsigned. In the library, an `Alerter` now only records events: they are sent by the task `Alerter::start` returns, which `build` keeps with the source manager.
+- A receiver can still get an event twice, and a late `fired` after its `cleared`; it must de-duplicate. `event_id` covers retries of one event, not a second alert raised for one condition. Receivers match the two events of an alert by its `id`, which is never given again (decision 38).
+- No timestamp is signed: a receiver that forgets the `event_id`s it has seen accepts a replay of an old event. Use HTTPS.
+- Sends are sequential, one per instance at a time: with a receiver that times out, waiting events queue behind each other. Claims and due times use each instance's clock, as source leases do: instances on one store need synchronised clocks. All instances on a store need the same `alerts:` settings.
+- The API shows the latest event only: a `fired` that failed is shown until its `cleared` is written. A monitor tracking delivery re-reads the alerts it still follows; delivery changes do not move a cursor. Events are kept with their alert and removed with it when `retention.history` purges it (decision 38), waiting ones included: by then only an event parked for an earlier URL, or never sent, can still be waiting.
+- No mail sink, per-rule URLs, redelivery endpoint or delivery metrics.
 
 ## Not in the prototype
 
