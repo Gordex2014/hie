@@ -157,6 +157,7 @@ impl RetentionConfig {
 pub struct AlertConfig {
     /// Trimmed; `None` when unset or blank.
     pub webhook_url: Option<String>,
+    /// Trimmed of leading and trailing whitespace when read.
     pub webhook_secret: Option<secrecy::SecretString>,
     /// The wait before the first retry, doubling for each one after it.
     /// `None` means `AlertConfig::DEFAULT_BACKOFF_MS`.
@@ -183,6 +184,16 @@ fn is_http_url(text: &str) -> bool {
     url::Url::parse(text)
         .ok()
         .is_some_and(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some())
+}
+
+/// `text` without the whitespace around it, in a string of its own exact
+/// size; the buffer `text` held is wiped. (The parsed YAML that `text` was
+/// copied from is not this function's to wipe.)
+fn trimmed(mut text: String) -> String {
+    use zeroize::Zeroize;
+    let out = text.trim().to_owned();
+    text.zeroize();
+    out
 }
 
 /// What a malformed `alerts:` block is refused with: the keys it may have and
@@ -219,7 +230,9 @@ impl<'de> Deserialize<'de> for AlertConfig {
                         Some(s) if s.trim().is_empty() => {
                             return Err(D::Error::custom("alerts.webhook_secret is blank"));
                         }
-                        other => other.map(secrecy::SecretString::from),
+                        // A secret file with a trailing newline signs with
+                        // the secret it holds, not with the newline too.
+                        other => other.map(|s| secrecy::SecretString::from(trimmed(s))),
                     };
                 }
                 Some("webhook_backoff_ms") => {
@@ -293,7 +306,7 @@ impl AlertConfig {
             self.webhook_url = Some(url);
         }
         if let Some(secret) = read("HIE_ALERT_WEBHOOK_SECRET")? {
-            self.webhook_secret = Some(secrecy::SecretString::from(secret));
+            self.webhook_secret = Some(secrecy::SecretString::from(trimmed(secret)));
         }
         Ok(())
     }
@@ -1427,6 +1440,22 @@ mod tests {
         assert_eq!(
             alerts.webhook_secret.as_ref().unwrap().expose_secret(),
             "from-env"
+        );
+        // A secret read from a file keeps no trailing newline, from either place.
+        alerts
+            .apply_env(env(vec![(
+                "HIE_ALERT_WEBHOOK_SECRET",
+                " from-file\n".into(),
+            )]))
+            .unwrap();
+        assert_eq!(
+            alerts.webhook_secret.as_ref().unwrap().expose_secret(),
+            "from-file"
+        );
+        let block = alerts_from("alerts:\n  webhook_secret: |\n    from-a-block\n").unwrap();
+        assert_eq!(
+            block.webhook_secret.as_ref().unwrap().expose_secret(),
+            "from-a-block"
         );
         #[cfg(unix)]
         {

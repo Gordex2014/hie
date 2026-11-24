@@ -468,12 +468,20 @@ pub fn payload(event_id: &str, event: &str, alert: &AlertRow, source_name: Optio
     .to_string()
 }
 
-/// `sha256=` and the lowercase hex HMAC-SHA256 of `body` under `secret`: the
-/// `X-HIE-Signature` header.
-pub fn signature(secret: &[u8], body: &[u8]) -> String {
+/// The `X-HIE-Signature` header of an attempt sent at `timestamp` (the
+/// `X-HIE-Timestamp` header, Unix seconds): `sha256=` and the lowercase hex
+/// HMAC-SHA256, under `secret`, of the timestamp, a `.` and the raw body.
+pub fn signature(secret: &[u8], timestamp: &str, body: &[u8]) -> String {
+    hmac_sha256_hex(secret, &[timestamp.as_bytes(), b".", body])
+}
+
+/// The lowercase hex HMAC-SHA256 of `parts`, one after the other, with `sha256=`.
+fn hmac_sha256_hex(secret: &[u8], parts: &[&[u8]]) -> String {
     let mut mac =
         hmac::Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts keys of any length");
-    mac.update(body);
+    for part in parts {
+        mac.update(part);
+    }
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
@@ -573,12 +581,21 @@ impl Sender {
             .header("X-HIE-Event-Id", &claim.event_id)
             .header("X-HIE-Event", &claim.event)
             .body(claim.payload.clone());
+        // Each attempt is stamped, and signed, when it leaves: a retry carries
+        // the same body with a fresh timestamp, so a receiver's tolerance never
+        // has to cover the backoff.
+        let timestamp = chrono::Utc::now().timestamp().to_string();
         if let Some(secret) = &self.webhook.secret {
             request = request.header(
                 "X-HIE-Signature",
-                signature(secret.expose_secret().as_bytes(), claim.payload.as_bytes()),
+                signature(
+                    secret.expose_secret().as_bytes(),
+                    &timestamp,
+                    claim.payload.as_bytes(),
+                ),
             );
         }
+        request = request.header("X-HIE-Timestamp", timestamp);
         match request.send().await {
             Ok(response) => {
                 let status = response.status();
@@ -1180,10 +1197,23 @@ mod tests {
 
     #[test]
     fn the_signature_is_hmac_sha256_in_hex() {
-        // RFC 4231, test case 2.
+        // RFC 4231, test case 2, its data given in pieces.
         assert_eq!(
-            signature(b"Jefe", b"what do ya want for nothing?"),
+            hmac_sha256_hex(b"Jefe", &[b"what do ya ", b"want for nothing?"]),
             "sha256=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn the_signature_covers_the_timestamp_a_dot_and_the_body() {
+        // Python: hmac.new(b"Jefe", b'1700000000.{"event":"fired"}', sha256).hexdigest()
+        assert_eq!(
+            signature(b"Jefe", "1700000000", br#"{"event":"fired"}"#),
+            "sha256=0722f7348e182a55af4ded8a8a61167dcd847b9ddc53b77a32b666e371df4b4e"
+        );
+        assert_ne!(
+            signature(b"Jefe", "1700000001", br#"{"event":"fired"}"#),
+            signature(b"Jefe", "1700000000", br#"{"event":"fired"}"#)
         );
     }
 

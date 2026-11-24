@@ -80,7 +80,7 @@ To build the image yourself: `docker build -t hie .`
 | `HIE_DATABASE_URL` | | The store, overriding `database:` in `hie.yaml`: a `postgres://user:password@host/db` URL. Set it here so the password is not in the file |
 | `HIE_INSTANCE_ID` | host, pid and a random tail | This instance's name in the leases, when several share one store; also the owner of its credential registrations (otherwise an id kept in `sources/.hie-instance-id`) |
 | `HIE_ALERT_WEBHOOK_URL` | `alerts.webhook_url` in `hie.yaml` | Where [alert events](sources.md#the-alert-webhook) are posted, `http` or `https`. A chat webhook's URL is itself a credential: set it here rather than in the file |
-| `HIE_ALERT_WEBHOOK_SECRET` | `alerts.webhook_secret` in `hie.yaml` | The secret that signs alert events (`X-HIE-Signature`); unsigned without one |
+| `HIE_ALERT_WEBHOOK_SECRET` | `alerts.webhook_secret` in `hie.yaml` | The secret that signs alert events (`X-HIE-Signature`, over `X-HIE-Timestamp` and the body); unsigned without one. Leading and trailing whitespace is ignored |
 | `HIE_TERMINOLOGY_SERVER` | `terminology_url` in `hie.yaml` | The HTS transforms may ask through `lookup` and `translate` |
 | `HIE_TERMINOLOGY_TOKEN` | | A bearer token for that HTS, when it requires one |
 | `HIE_SECRET_KEY` | | The secret key that seals stored credentials: 32 random bytes in base64, e.g. from `openssl rand -base64 32`. See [Credentials and the secret key](#credentials-and-the-secret-key) |

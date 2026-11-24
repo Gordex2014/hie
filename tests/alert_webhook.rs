@@ -1,10 +1,11 @@
-//! The alert webhook against a local receiver: the signature over the raw body,
-//! retries with one stable `event_id`, giving up after five retries, redirects
-//! refused, two instances on one store sending each event once, an attempt whose
-//! outcome was lost sent again with the same bytes, and events parked while
-//! their URL is not the configured one. Driven through `Alerter` on a store of
-//! its own, no transform involved. A test binary of its own, so its log
-//! subscriber is the process's: no URL, secret or receiver answer may reach it.
+//! The alert webhook against a local receiver: the signature over the
+//! timestamp and the raw body, retries with one stable `event_id`, giving up
+//! after five retries, redirects refused, two instances on one store sending
+//! each event once, an attempt whose outcome was lost sent again with the same
+//! bytes, and events parked while their URL is not the configured one. Driven
+//! through `Alerter` on a store of its own, no transform involved. A test
+//! binary of its own, so its log subscriber is the process's: no URL, secret or
+//! receiver answer may reach it.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -67,6 +68,14 @@ fn assert_no_canary_logged() {
     for canary in [URL_CANARY, SECRET_CANARY, BODY_CANARY] {
         assert!(!logged.contains(canary), "{canary} was logged");
     }
+}
+
+/// What a signature over the body alone, the scheme before timestamps, would be.
+fn body_only_signature(secret: &[u8], body: &[u8]) -> String {
+    use hmac::{KeyInit, Mac};
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).unwrap();
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
 /// One request as the receiver got it.
@@ -227,9 +236,23 @@ async fn fired_and_cleared_events_are_signed_over_the_raw_body() {
 
     let got = receiver.got();
     for r in &got {
+        // Signed over the timestamp, a dot and the raw body; the body alone
+        // does not verify.
+        let timestamp = r.header("x-hie-timestamp").unwrap();
+        assert!(timestamp.bytes().all(|b| b.is_ascii_digit()), "{timestamp}");
+        let sent_at: i64 = timestamp.parse().unwrap();
+        assert!(
+            (chrono::Utc::now().timestamp() - sent_at).abs() <= 5,
+            "a timestamp of the attempt: {sent_at}"
+        );
+        let signed = r.header("x-hie-signature").unwrap();
         assert_eq!(
-            r.header("x-hie-signature").unwrap(),
-            hie::alerts::signature(SECRET_CANARY.as_bytes(), &r.body)
+            signed,
+            hie::alerts::signature(SECRET_CANARY.as_bytes(), &timestamp, &r.body)
+        );
+        assert_ne!(
+            signed,
+            body_only_signature(SECRET_CANARY.as_bytes(), &r.body)
         );
         assert_eq!(r.header("content-type").unwrap(), "application/json");
         assert!(r.header("user-agent").unwrap().starts_with("hie/"));
@@ -286,6 +309,54 @@ async fn fired_and_cleared_events_are_signed_over_the_raw_body() {
 }
 
 #[tokio::test]
+async fn a_signed_retry_is_stamped_and_signed_again_when_it_leaves() {
+    let (receiver, url) = receiver().await;
+    receiver.script.lock().unwrap().push(503);
+    let dir = tempfile::tempdir().unwrap();
+    // A backoff over a second: the retry leaves in a later second than the
+    // first attempt, so a timestamp kept from it would show.
+    let e = engine(
+        &dir.path().join("hie.db"),
+        &settings(Some(&url), Some(SECRET_CANARY), 1100),
+        true,
+    );
+    e.alerts
+        .raise(Some("lab-results"), "unreadable_file", "cannot read r.csv")
+        .unwrap();
+    let alert = last_alert(&e.db);
+    wait_for("delivered on the retry", || {
+        events(&e.db, alert)[0]["state"] == "delivered"
+    })
+    .await;
+    let got = receiver.got();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].body, got[1].body, "one body, byte for byte");
+    assert_eq!(
+        got[0].header("x-hie-event-id"),
+        got[1].header("x-hie-event-id")
+    );
+    let stamps: Vec<String> = got
+        .iter()
+        .map(|r| r.header("x-hie-timestamp").unwrap())
+        .collect();
+    assert!(
+        stamps[0].parse::<i64>().unwrap() < stamps[1].parse::<i64>().unwrap(),
+        "{stamps:?}"
+    );
+    for (r, stamp) in got.iter().zip(&stamps) {
+        assert_eq!(
+            r.header("x-hie-signature").unwrap(),
+            hie::alerts::signature(SECRET_CANARY.as_bytes(), stamp, &r.body)
+        );
+    }
+    assert_ne!(
+        got[0].header("x-hie-signature"),
+        got[1].header("x-hie-signature")
+    );
+    assert_no_canary_logged();
+}
+
+#[tokio::test]
 async fn a_failing_receiver_gets_the_same_event_until_it_answers() {
     let (receiver, url) = receiver().await;
     receiver.script.lock().unwrap().extend([500, 503]);
@@ -314,6 +385,12 @@ async fn a_failing_receiver_gets_the_same_event_until_it_answers() {
         got.iter().all(|r| r.header("x-hie-signature").is_none()),
         "unsigned without a secret"
     );
+    // Each attempt is stamped when it leaves, never earlier than the one before.
+    let stamps: Vec<i64> = got
+        .iter()
+        .map(|r| r.header("x-hie-timestamp").unwrap().parse().unwrap())
+        .collect();
+    assert!(stamps.windows(2).all(|w| w[0] <= w[1]), "{stamps:?}");
     // The receiver's side of de-duplication: one event, however many requests.
     let mut ids: Vec<String> = got
         .iter()
