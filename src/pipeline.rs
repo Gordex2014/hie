@@ -1480,12 +1480,17 @@ impl FeedRunner {
                     // A write slower than its slack (the store was held, by a
                     // large file's rows, say) is taken again from a fresh instant:
                     // the bound only grows, and the second write rarely waits.
+                    // The slack runs from when the store's connection is held,
+                    // not from when it was asked for, and ends here, right
+                    // before the request leaves.
+                    let slack =
+                        std::time::Duration::from_millis(crate::db::UNTAGGED_WRITE_SLACK_MS as u64);
                     for _ in 0..2 {
-                        let start = now_ms();
-                        self.db
-                            .mark_untagged(&self.feed.id, start + crate::db::UNTAGGED_MARGIN_MS)
+                        let started = self
+                            .db
+                            .mark_untagged_from_now(&self.feed.id, crate::db::UNTAGGED_MARGIN_MS)
                             .context("recording an untagged delivery before sending it")?;
-                        if now_ms() - start <= crate::db::UNTAGGED_WRITE_SLACK_MS {
+                        if started.elapsed() <= slack {
                             return Ok(());
                         }
                     }

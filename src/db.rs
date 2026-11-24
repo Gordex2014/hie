@@ -218,6 +218,12 @@ pub const UNTAGGED_WRITE_SLACK_MS: i64 = 10_000;
 pub const UNTAGGED_MARGIN_MS: i64 =
     UNTAGGED_WRITE_SLACK_MS + 2 * crate::fhir::HTTP_TIMEOUT.as_millis() as i64;
 
+/// Moves a source's untagged bound to `$2`, never earlier.
+const MARK_UNTAGGED: &str = "INSERT INTO source_stamping (feed_id, untagged_until) VALUES ($1, $2)
+     ON CONFLICT (feed_id) DO UPDATE SET untagged_until =
+       CASE WHEN excluded.untagged_until > source_stamping.untagged_until
+            THEN excluded.untagged_until ELSE source_stamping.untagged_until END";
+
 /// The `store_meta` key that says since when the store records untagged
 /// deliveries.
 const STAMPING_TRACKED: &str = "stamping_tracked";
@@ -2602,17 +2608,24 @@ impl Db {
         })
     }
 
+    /// Records the bound before an untagged REST request leaves: `margin`
+    /// after an instant taken once this call holds the store's connection, so
+    /// a wait for the connection (another source's large file, a reprocess)
+    /// is not counted. Returns that instant, monotonic, for the caller to
+    /// check the write's slack against right before it sends; the statement's
+    /// own wait (SQLite's write lock, a PostgreSQL row lock) counts.
+    pub fn mark_untagged_from_now(&self, feed: &str, margin: i64) -> Result<std::time::Instant> {
+        self.with(|c| {
+            let started = std::time::Instant::now();
+            c.execute(MARK_UNTAGGED, &params![feed, now_ms() + margin])?;
+            Ok(started)
+        })
+    }
+
     /// HFS may write resources of `feed` without the source tag until `until`.
     /// The bound only ever moves later.
     pub fn mark_untagged(&self, feed: &str, until: i64) -> Result<()> {
-        self.execute(
-            "INSERT INTO source_stamping (feed_id, untagged_until) VALUES ($1, $2)
-             ON CONFLICT (feed_id) DO UPDATE SET untagged_until =
-               CASE WHEN excluded.untagged_until > source_stamping.untagged_until
-                    THEN excluded.untagged_until ELSE source_stamping.untagged_until END",
-            &params![feed, until],
-        )
-        .map(drop)
+        self.execute(MARK_UNTAGGED, &params![feed, until]).map(drop)
     }
 
     /// What the store knows about `feed`'s deliveries without the tag, read in
@@ -4753,6 +4766,48 @@ mod tests {
             &params![token, status, at, stamped],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn the_untagged_slack_starts_once_the_connection_is_held() {
+        let db = std::sync::Arc::new(Db::in_memory().unwrap());
+        let (held, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+        let holder = {
+            let db = db.clone();
+            let held = held.0;
+            std::thread::spawn(move || {
+                let _conn = db.conn.lock().unwrap();
+                held.send(()).unwrap();
+                release.1.recv().unwrap();
+            })
+        };
+        held.1.recv().unwrap();
+        // The caller asks while another holds the connection, which it keeps
+        // for longer than the slack.
+        let caller = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let asked = std::time::Instant::now();
+                let started = db.mark_untagged_from_now("lab", 1_000).unwrap();
+                (asked, started, std::time::Instant::now())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let (released_at, released) = (now_ms(), std::time::Instant::now());
+        release.0.send(()).unwrap();
+        holder.join().unwrap();
+        let (asked, started, done) = caller.join().unwrap();
+        assert!(asked < released, "the caller waited for the connection");
+        assert!(started >= released, "the slack starts once it is held");
+        assert!(
+            done.duration_since(started) < std::time::Duration::from_millis(400),
+            "only the statement counts, not the wait for the connection"
+        );
+        let until = db.stamping("lab", 0).unwrap().untagged_until.unwrap();
+        assert!(
+            until >= released_at + 1_000,
+            "the bound is from after the wait"
+        );
     }
 
     #[test]
