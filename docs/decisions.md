@@ -587,7 +587,7 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - Zone rules change only with an engine release (`cargo update -p jiff-tzdb`, in [RELEASING.md](../RELEASING.md)); until then an instance counts a zone whose rules a government changed by its old rules.
 - Only `stats` and `failures` have days; the monitoring status and the rolling 24 hours of `failures` count the last 24 hours, which no zone changes. Other conditions (`silence`, `rejected_share`, `unreachable`) have no calendar in them and take no zone.
 - An older engine reading a store with zoned rules evaluates them in UTC without a warning, and one that edits such a rule leaves its zone in place, so the zone comes back after the next upgrade.
-- A stored zone that a later database no longer knows is skipped (logged at debug); the IANA database keeps old names as links, so this should not happen.
+- A stored zone that a later database no longer knows is skipped on every pass, logged at `warn` once per rule and zone in each process (amended 2026-11-24; it was `debug` on every pass); the IANA database keeps old names as links, so this should not happen.
 
 *Also counted with these figures (2026-11-20):* rows a transform filtered out on purpose (rejected as `filtered`) are not failures. `rejected` keeps its meaning, every rejected row; `failing` beside it, on `stats` (per local day and today) and the monitoring status (`last_24h`, each source's `failing_last_24h`), leaves them out, and a source is listed under `needs_you` for its failing rows only, so a transform that drops rows by design raises nothing. The reason's sentence is unchanged; its number counts failing rows.
 

@@ -1269,7 +1269,13 @@ async fn missing_by_rules_take_a_time_zone_and_fire_in_it() {
         .await;
     assert_eq!(
         alert_of(&alerts, zoned).unwrap()["cleared_reason"],
-        "Lab results: the file arrived"
+        format!(
+            "Lab results: a file arrived on {}",
+            hie::zone::Zone::parse(zone)
+                .unwrap()
+                .today_bounds(chrono::Utc::now())
+                .0
+        )
     );
 
     // Replacing the rule without a zone puts it back on UTC.
