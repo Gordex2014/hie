@@ -373,8 +373,7 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
 /// Whether what this instance delivers for `feed` carries the source tag, and
 /// what the store knows about its deliveries without it.
 fn stamping(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
-    let direct_bulk = feed.delivery.method == crate::config::DeliveryMethod::BulkSubmit
-        && !feed.bulk_transformed();
+    let direct_bulk = feed.direct_bulk();
     let reason = if !s.manager.stamp_source() {
         Some("off")
     } else if direct_bulk {
@@ -721,34 +720,50 @@ async fn source_failures(
         .source(&id)
         .ok_or_else(|| not_found(&format!("source {id}")))?;
     let now = now_ms();
-    // The log covers what it has recorded since it began here, within the
-    // retention.
-    let since = s.db.events_since()?.unwrap_or(now);
-    let covered_from = since.max(s.retention.cutoff(now));
-    let window = |from: i64, to: i64| -> anyhow::Result<Value> {
+    // The counts first: what they read was in the log when they ran.
+    let windows: Vec<(Option<String>, i64, i64)> = day_windows(&zone, now, days)
+        .into_iter()
+        .map(|(day, from, to)| (Some(day.to_string()), from, to))
+        .chain([(None, now - DAY_MS, now)])
+        .collect();
+    let mut counted = Vec::with_capacity(windows.len());
+    for (day, from, to) in windows {
         let (records, filtered) = s.db.rejected_records(&id, from, to)?;
-        Ok(json!({
-            "from": instant(from),
-            "to": instant(to),
-            "records": records,
-            "filtered": filtered,
-            "complete": covered_from <= from,
-        }))
-    };
+        counted.push((day, from, to, records, filtered));
+    }
+    // Then what the log covers, read after them: since it began, within this
+    // instance's retention and after anything any instance on the store has
+    // purged (one with a shorter retention may share it). A purge between the
+    // counts and this read only makes the coverage later, never wrongly
+    // complete.
+    let since = s.db.events_since()?.unwrap_or(now);
+    let purged = s.db.events_purged_before()?.unwrap_or(i64::MIN);
+    let covered_from = since.max(s.retention.cutoff(now)).max(purged);
+    let mut last_24h = Value::Null;
     let mut by_day = Vec::with_capacity(days);
-    for (day, from, to) in day_windows(&zone, now, days) {
+    for (day, from, to, records, filtered) in counted {
         let mut entry = Map::new();
-        entry.insert("day".into(), json!(day));
-        if let Value::Object(w) = window(from, to)? {
-            entry.extend(w);
+        if let Some(day) = &day {
+            entry.insert("day".into(), json!(day));
         }
-        by_day.push(Value::Object(entry));
+        entry.extend([
+            ("from".to_string(), json!(instant(from))),
+            ("to".to_string(), json!(instant(to))),
+            ("records".to_string(), json!(records)),
+            ("filtered".to_string(), json!(filtered)),
+            ("complete".to_string(), json!(covered_from <= from)),
+        ]);
+        if day.is_some() {
+            by_day.push(Value::Object(entry));
+        } else {
+            last_24h = Value::Object(entry);
+        }
     }
     Ok(Json(json!({
         "source_id": id,
         "tz": zone.name(),
         "covered_from": instant(covered_from),
-        "last_24h": window(now - DAY_MS, now)?,
+        "last_24h": last_24h,
         "days": by_day,
     })))
 }
@@ -876,27 +891,22 @@ const LOAD_COLUMNS: &str = "f.id, f.feed_id AS source_id, f.source_name, f.name,
 /// Every `files` column a load row selects, for its `GROUP BY`.
 const LOAD_GROUP: &str = "GROUP BY f.id, f.feed_id, f.source_name, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived, f.finished_at, f.received_at";
 
-/// The load rows of the files `filter` keeps (a condition on `f`), each with
-/// what became of its records; `tail` orders and limits them, `with` and
-/// `extra` add a `WITH` clause and columns. Every load answer reads its rows
-/// here, so they carry the same fields.
-fn load_rows(
-    s: &AppState,
-    with: &str,
-    extra: &str,
-    filter: &str,
-    tail: &str,
-    p: Vec<Param>,
-) -> Result<Vec<Value>, ApiError> {
-    let mut rows = s.db.query_json(
+/// The load rows of `ids`, in that order, each with what became of its
+/// records. Each load is read in a statement of its own (its file and its
+/// records' counts together, so they agree), and the store's connection is let
+/// go between two: a page of large loads holds it for one load's count at a
+/// time, not for the page. A load gone meanwhile is left out. Every load answer
+/// reads its rows here, so they carry the same fields.
+fn load_rows(s: &AppState, ids: &[i64]) -> Result<Vec<Value>, ApiError> {
+    let mut rows = s.db.query_json_each(
         &format!(
-            "{with} SELECT {LOAD_COLUMNS}{extra}, {} AS received_at, {} AS finished_at
+            "SELECT {LOAD_COLUMNS}, {} AS received_at, {} AS finished_at
              FROM files f LEFT JOIN records r ON r.file_id = f.id
-             WHERE {filter} {LOAD_GROUP} {tail}",
+             WHERE f.id = CAST($1 AS BIGINT) {LOAD_GROUP}",
             s.db.iso("f.received_at"),
             s.db.iso("f.finished_at")
         ),
-        p,
+        ids,
     )?;
     let mut methods: std::collections::HashMap<String, Value> = Default::default();
     for row in &mut rows {
@@ -918,6 +928,9 @@ fn load_rows(
     Ok(rows)
 }
 
+/// The most loads `/api/sources/{id}/loads` lists at once.
+const MAX_SOURCE_LOADS: i64 = 1000;
+
 /// A load is one file (or object) and what became of its rows. The same rows serve
 /// `/files` and `/loads`; the UI calls them loads.
 async fn list_files(
@@ -925,22 +938,35 @@ async fn list_files(
     Path(id): Path<String>,
     Query(q): Query<Limit>,
 ) -> ApiResult {
-    let rows = load_rows(
-        &s,
-        "",
-        "",
-        "f.feed_id = $1",
-        "ORDER BY f.id DESC LIMIT $2",
-        params![id, q.limit.unwrap_or(50)].into(),
-    )?;
-    Ok(Json(json!({"files": rows, "loads": rows})))
+    let limit = q.limit.unwrap_or(50);
+    if !(1..=MAX_SOURCE_LOADS).contains(&limit) {
+        return Err(
+            paging::invalid_query("limit must be a whole number from 1 to 1000")
+                .with("field", "limit"),
+        );
+    }
+    // On a blocking thread, as `/api/loads` reads its page.
+    tokio::task::spawn_blocking(move || {
+        let ids: Vec<i64> =
+            s.db.query_json(
+                "SELECT id FROM files WHERE feed_id = $1 ORDER BY id DESC LIMIT $2",
+                params![id, limit],
+            )?
+            .iter()
+            .filter_map(|row| row["id"].as_i64())
+            .collect();
+        let rows = load_rows(&s, &ids)?;
+        Ok(Json(json!({"files": rows, "loads": rows})))
+    })
+    .await
+    .map_err(anyhow::Error::new)?
 }
 
 /// One load with its rejected rows grouped by reason (those filtered out on
 /// purpose included, as kind `filtered`), each with sample rows, so a
 /// person can see what went wrong and retry the rows after a fix.
 async fn get_load(State(s): State<AppState>, Path(file_id): Path<i64>) -> ApiResult {
-    let mut load = load_rows(&s, "", "", "f.id = $1", "", params![file_id].into())?
+    let mut load = load_rows(&s, &[file_id])?
         .into_iter()
         .next()
         .ok_or_else(|| not_found(&format!("load {file_id}")))?;
@@ -1051,6 +1077,9 @@ struct RuleQuery {
     _open: Option<bool>,
 }
 
+/// The most alerts a page of `GET /api/alerts` holds.
+const MAX_ALERTS_PAGE: i64 = 1000;
+
 /// What `GET /api/alerts` takes: today's filters, a period and a page.
 #[derive(Deserialize)]
 struct AlertListQuery {
@@ -1078,12 +1107,15 @@ async fn list_alerts(
     let after = paging::cursor_id(q.cursor.as_deref())?;
     let (configured, signed) = s.alerts.webhook_status();
     let webhook = json!({"configured": configured, "signed": signed});
-    // A negative limit has always meant every alert on SQLite; so it does on both stores.
-    let limit = match q.limit {
-        Some(n) if n < 0 => i64::MAX,
-        Some(n) => n,
-        None => 100,
-    };
+    // A page is bounded: every alert is read by following `next_cursor`. A
+    // negative limit, which once meant every alert, is refused.
+    let limit = q.limit.unwrap_or(100);
+    if !(0..=MAX_ALERTS_PAGE).contains(&limit) {
+        return Err(
+            paging::invalid_query("limit must be a whole number from 0 to 1000")
+                .with("field", "limit"),
+        );
+    }
     if limit == 0 {
         return Ok(Json(
             json!({"alerts": [], "next_cursor": null, "webhook": webhook}),
@@ -1144,7 +1176,7 @@ async fn list_alerts(
             }
         }
     }
-    let page = usize::try_from(limit).unwrap_or(usize::MAX);
+    let page = usize::try_from(limit).unwrap_or(0);
     let next_cursor = if rows.len() > page {
         rows.truncate(page);
         let last = rows.last().and_then(|row| row["id"].as_i64());
@@ -1317,7 +1349,11 @@ fn event_query(raw: Option<&str>) -> Result<crate::db::EventQuery, ApiError> {
 /// The event log, oldest first: see `docs/api.md` (Events).
 async fn list_events(State(s): State<AppState>, RawQuery(raw): RawQuery) -> ApiResult {
     let q = event_query(raw.as_deref())?;
-    let page = s.db.list_events(&q)?;
+    // A spanned read may go through many events: on a blocking thread, so the
+    // async workers serve other requests meanwhile.
+    let page = tokio::task::spawn_blocking(move || s.db.list_events(&q))
+        .await
+        .map_err(anyhow::Error::new)??;
     Ok(Json(json!({
         "events": page.events,
         "next_cursor": page.next.map(|id| format!("{CURSOR_PREFIX}{id}")),

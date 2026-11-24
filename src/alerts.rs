@@ -3,8 +3,8 @@
 //! it fires and when it clears: one event each, written in the same transaction
 //! as the alert, signed, retried and recorded (see `docs/sources.md`).
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -70,6 +70,9 @@ pub struct Alerter {
     /// Source names by id, for the events' `source.name`.
     names: RwLock<HashMap<String, String>>,
     wake: Arc<Notify>,
+    /// The (rule, zone) pairs already reported as missing from the engine's
+    /// time zone database.
+    unknown_zones: Mutex<HashSet<(i64, String)>>,
 }
 
 /// Owns the sender task: dropping it stops the task.
@@ -111,6 +114,7 @@ impl Alerter {
             webhook,
             names: RwLock::new(HashMap::new()),
             wake: Arc::new(Notify::new()),
+            unknown_zones: Mutex::new(HashSet::new()),
         }
     }
 
@@ -223,13 +227,28 @@ impl Alerter {
             None => Zone::utc(),
             Some(Ok(zone)) => zone,
             Some(Err(_)) => {
-                // Checked when the rule was saved; only a later database that
-                // dropped the name gets here, on every pass.
-                tracing::debug!(
-                    rule = rule.id,
-                    tz = rule.tz.as_deref(),
-                    "missing_by rule skipped: its time zone is not in this engine's database"
-                );
+                // Checked when the rule was saved; only an engine whose
+                // database lacks the name gets here, on every pass: said at
+                // `warn` once per rule and zone in this process.
+                let tz = rule.tz.clone().unwrap_or_default();
+                let first = self
+                    .unknown_zones
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert((rule.id, tz.clone()));
+                if first {
+                    tracing::warn!(
+                        rule = rule.id,
+                        tz,
+                        "missing_by rule skipped: its time zone is not in this engine's database; it is not checked until the rule or the engine changes"
+                    );
+                } else {
+                    tracing::debug!(
+                        rule = rule.id,
+                        tz,
+                        "missing_by rule skipped: its time zone is not in this engine's database"
+                    );
+                }
                 return Ok(());
             }
         };
@@ -273,7 +292,7 @@ impl Alerter {
                 feed,
                 "missing",
                 Some(rule.id),
-                &format!("{feed_name}: the file arrived"),
+                &format!("{feed_name}: a file arrived on {}", check.today.0),
             )?;
         } else if check.due {
             self.fire_once(
@@ -288,6 +307,41 @@ impl Alerter {
             )?;
         }
         Ok(())
+    }
+
+    /// After a delete, once this instance's runner of `feed` has ended: ends
+    /// the open alerts only that runner would clear (`Db::orphan_alerts`:
+    /// `delivery` and `credential`, raised at or before `ended_at`, the
+    /// instant the runner was known to have ended; none while another
+    /// instance holds the source), each with its `cleared` event. Left open, a
+    /// deleted source's outage alert stayed open for good. An alert raised
+    /// later, by a definition created again (whose runner starts only once the
+    /// deleted one has ended), is not touched. Best effort: a failure is logged.
+    pub fn end_orphans(&self, feed: &str, ended_at: i64, owner: &str) {
+        let reason = format!("{feed}: the source was deleted");
+        let open = match self.db.orphan_alerts(feed, ended_at, owner) {
+            Ok(open) => open,
+            Err(e) => {
+                tracing::warn!(feed, "alerts left open: {e:#}");
+                return;
+            }
+        };
+        for (alert, kind) in open {
+            // The lease is asked again as each one clears: another instance
+            // that took the source meanwhile keeps it.
+            match self
+                .db
+                .clear_orphan_with_webhook(alert, owner, &reason, now_ms(), |row| {
+                    self.cleared_event(row)
+                }) {
+                Ok(Some(_)) => {
+                    tracing::info!(alert, feed, kind, "cleared: {reason}");
+                    self.wake.notify_one();
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(feed, alert, "alert left open: {e:#}"),
+            }
+        }
     }
 
     /// Replaces a rule through the API. Turned off, or changed in its
@@ -1144,6 +1198,14 @@ mod tests {
         assert_eq!(lab.check(&at(3)), None);
         assert_eq!(lab.check(&at(4)), None);
         assert_eq!(lab.alerts(), 1);
+        // Cleared by the 29th's file, and the reason says so: not that the
+        // 28th's file arrived.
+        assert_eq!(
+            lab.db
+                .query_json("SELECT cleared_reason FROM alerts", vec![])
+                .unwrap()[0]["cleared_reason"],
+            "Lab: a file arrived on 2026-03-29"
+        );
         // The same when the first pass of the 29th comes after its own deadline.
         let lab = Lab::new("23:30", Some("America/Nuuk"));
         lab.receive(&at(60));

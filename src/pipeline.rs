@@ -64,6 +64,9 @@ pub struct FeedRunner {
     bulk_transformed: bool,
     /// Tag what this runner delivers with its source (`delivery.stamp_source`).
     stamp_source: bool,
+    /// Whether this runner runs its passes under the source's lease
+    /// (`pass`): its submission claims then need that lease still held.
+    leased: std::sync::atomic::AtomicBool,
     /// How the manager drives this runner, once it runs: a halt is seen between records.
     control: std::sync::OnceLock<Arc<RunnerControl>>,
     /// The last record the transform could not finish now, as (id, revision,
@@ -159,6 +162,7 @@ impl FeedRunner {
             bulk_dir: std::env::temp_dir().join("hie-bulk"),
             bulk_transformed: feed_bulk_transformed,
             stamp_source: false,
+            leased: std::sync::atomic::AtomicBool::new(false),
             control: std::sync::OnceLock::new(),
             last_transient: std::sync::Mutex::new(None),
         }
@@ -275,6 +279,8 @@ impl FeedRunner {
             tracing::debug!(feed = %self.feed.id, "held by another instance; standing by");
             return Ok(false);
         }
+        self.leased
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Err(e) = self.source().start().await {
             tracing::error!(feed = %self.feed.id, "{e:#}");
             self.alerts.raise(
@@ -391,12 +397,8 @@ impl FeedRunner {
         };
         let current = (meta.id.clone(), meta.revision);
         if self.loaded.lock().expect("loaded lock").as_ref() == Some(&current) {
-            if self.credential_alert.swap(false, Ordering::AcqRel)
-                && let Err(e) =
-                    self.alerts
-                        .clear_open(&self.feed.id, "credential", None, "credential loaded")
-            {
-                tracing::error!(feed = %self.feed.id, "{e:#}");
+            if self.credential_alert.swap(false, Ordering::AcqRel) {
+                self.credential_loaded();
             }
             return;
         }
@@ -434,10 +436,23 @@ impl FeedRunner {
             "using the credential's current revision"
         );
         self.credential_alert.store(false, Ordering::Release);
-        if let Err(e) =
-            self.alerts
-                .clear_open(&self.feed.id, "credential", None, "credential loaded")
-        {
+        self.credential_loaded();
+    }
+
+    /// Clears every open `credential` alert of the source, an earlier
+    /// definition's included: the credential works.
+    fn credential_loaded(&self) {
+        let cleared = self
+            .db
+            .open_alert_ids(&self.feed.id, "credential")
+            .and_then(|open| {
+                open.into_iter().try_for_each(|id| {
+                    self.alerts
+                        .clear(id, &self.feed.id, "credential", "credential loaded")
+                        .map(drop)
+                })
+            });
+        if let Err(e) = cleared {
             tracing::error!(feed = %self.feed.id, "{e:#}");
         }
     }
@@ -447,8 +462,15 @@ impl FeedRunner {
     fn credential_problem(&self, reference: &str, message: &str) {
         let message = format!("{}: credential {reference}: {message}", self.feed.name);
         tracing::error!(feed = %self.feed.id, "{message}");
-        let open = match self.db.open_alert(&self.feed.id, "credential", None) {
-            Ok(open) => open.is_some(),
+        // A runner stopped (its source deleted or replaced) raises nothing
+        // more: its successor, if any, finds the same problem.
+        if self.halted() {
+            return;
+        }
+        // One an earlier definition of the id left open does not stand for
+        // this one's: the delete that ended it clears it.
+        let open = match self.db.open_alert_since_birth(&self.feed.id, "credential") {
+            Ok(open) => open,
             Err(e) => {
                 tracing::error!(feed = %self.feed.id, "{e:#}");
                 return;
@@ -1062,7 +1084,52 @@ impl FeedRunner {
         let Some(bulk) = &self.bulk else {
             return Ok(());
         };
+        let leased = self.leased.load(std::sync::atomic::Ordering::Acquire);
         for sub in self.db.submissions_due(&self.feed.id)? {
+            // A runner stopped meanwhile (its source deleted or replaced) sends
+            // nothing more, and takes no lease again: its successor, if any,
+            // moves the submissions.
+            if self.halted() {
+                tracing::info!(feed = %self.feed.id, "stopped during the pass; its submissions are left to its successor");
+                return Ok(());
+            }
+            // Under the lease, it is renewed right before each claim: a pass
+            // that ran past it (a large file transformed, a slow answer for
+            // an earlier submission) would otherwise claim nothing more. One
+            // another instance took meanwhile stops here.
+            if leased
+                && !self
+                    .db
+                    .acquire_lease(&self.feed.id, &self.instance, self.lease_ttl_ms())?
+            {
+                tracing::info!(feed = %self.feed.id, "another instance took the source during the pass; its submissions are left to it");
+                return Ok(());
+            }
+            // Claimed before its request: only while it is still as read here,
+            // so a request is never built from a row another runner has moved
+            // on, and the answer to any earlier claim changes nothing.
+            let Some(claim) = self.db.claim_submission(&sub, &self.instance, leased)? else {
+                match self.db.lease(&self.feed.id)? {
+                    Some(l) if l.owner != self.instance => {
+                        tracing::info!(feed = %self.feed.id, submission = %sub.submission_id, "not claimed: another instance holds the source");
+                    }
+                    // Renewed just before, yet run out by the claim (a long
+                    // wait for the store).
+                    None if leased => {
+                        tracing::info!(feed = %self.feed.id, submission = %sub.submission_id, "not claimed: this instance's lease on the source ran out");
+                    }
+                    _ => {
+                        tracing::debug!(feed = %self.feed.id, submission = %sub.submission_id, "not claimed: another runner moved it");
+                    }
+                }
+                continue;
+            };
+            // Stopped while it was claimed: nothing is sent. The claim only
+            // moved the epoch; the successor claims it again.
+            if self.halted() {
+                tracing::info!(feed = %self.feed.id, "stopped during the pass; its submissions are left to its successor");
+                return Ok(());
+            }
             let step = match sub.status.as_str() {
                 "kickoff" => {
                     match bulk
@@ -1092,10 +1159,7 @@ impl FeedRunner {
                     Some(url) => match bulk.poll(url).await {
                         Ok(Poll::InProgress) => Ok(None),
                         Ok(Poll::Done { references, errors }) => {
-                            if self
-                                .settle(&sub.token, sub.attempts, &references, &errors)
-                                .await?
-                            {
+                            if self.settle(&sub.token, claim, &references, &errors).await? {
                                 Ok(Some(("done", None)))
                             } else {
                                 Ok(Some(("stale", None)))
@@ -1105,16 +1169,16 @@ impl FeedRunner {
                     },
                 },
             };
-            // Each write below holds only while the submission still has the
-            // attempt count read before the request: an older runner's answer
-            // (a progress, a failure, a refusal or the receipts) changes nothing.
+            // Each write below holds only while the submission is still under
+            // this request's claim: an older runner's answer (a progress, a
+            // failure, a refusal or the receipts) changes nothing.
             match step {
                 // Answered for an older attempt: the current runner decides.
                 Ok(Some(("stale", _))) => {}
                 Ok(None) => {
                     self.db.progress_submission(
                         &sub.token,
-                        Some(sub.attempts),
+                        Some(claim),
                         &sub.status,
                         None,
                         sub.attempts,
@@ -1123,14 +1187,14 @@ impl FeedRunner {
                     )?;
                 }
                 Ok(Some(("done", _))) => {
-                    if self.db.settle_submission(&sub.token, sub.attempts)? {
+                    if self.db.settle_submission(&sub.token, claim)? {
                         self.recovered()?;
                     }
                 }
                 Ok(Some((status, url))) => {
                     self.db.progress_submission(
                         &sub.token,
-                        Some(sub.attempts),
+                        Some(claim),
                         status,
                         url.as_deref(),
                         0,
@@ -1145,24 +1209,26 @@ impl FeedRunner {
                         &format!("HTTP {status}: {}", fhir::outcome_text(&body)),
                         &sub.token,
                     );
-                    tracing::warn!(feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
                     if self
                         .db
                         .reject_submission(
                             &sub.token,
-                            sub.attempts,
+                            claim,
                             "server",
                             &reason,
                             &bulk::scrub_value(&body, &sub.token),
                         )?
                         .is_some()
                     {
+                        // Logged only when it took: an older request's refusal
+                        // changed nothing.
+                        tracing::warn!(feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
                         self.archive_submission(&sub.token).await?;
                     }
                 }
                 Err(SendError::Transient(reason)) => {
                     let reason = bulk::scrub(&reason, &sub.token);
-                    let attempts = sub.attempts + 1;
+                    let attempts = claim.attempts + 1;
                     let d = &self.feed.delivery;
                     let backoff = d
                         .initial_backoff_ms
@@ -1170,7 +1236,7 @@ impl FeedRunner {
                         .min(d.max_backoff_ms);
                     if self.db.submission_attempt_failed(
                         &sub.token,
-                        sub.attempts,
+                        claim,
                         now_ms() + backoff as i64,
                         &reason,
                     )? {
@@ -1183,14 +1249,13 @@ impl FeedRunner {
     }
 
     /// Gives every submitted record its disposition from the receipts, then archives
-    /// the objects HFS has read. Only while the submission is still at the
-    /// attempt count `captured` read before the poll: `false` when it moved, with
-    /// the pages already applied kept and the rest, and the archive, left to the
-    /// runner that moved it.
+    /// the objects HFS has read. Only while the submission is still under the
+    /// poll's `claim`: `false` when it moved, with the pages already applied
+    /// kept and the rest, and the archive, left to the runner that moved it.
     async fn settle(
         &self,
         token: &str,
-        captured: u32,
+        claim: crate::db::Claim,
         references: &std::collections::HashSet<String>,
         errors: &[String],
     ) -> Result<bool> {
@@ -1230,13 +1295,13 @@ impl FeedRunner {
             // The page's outcomes, its tallies and its events in one transaction.
             if !self
                 .db
-                .settle_page(token, captured, &sent, &missing, &missing_reason)?
+                .settle_page(token, claim, &sent, &missing, &missing_reason)?
             {
                 return Ok(false);
             }
         }
         // Nothing is archived for an answer to an older poll.
-        if !self.db.submission_open_at(token, captured)? {
+        if !self.db.submission_open_at(token, claim)? {
             return Ok(false);
         }
         self.archive_submission(token).await?;
@@ -1480,12 +1545,17 @@ impl FeedRunner {
                     // A write slower than its slack (the store was held, by a
                     // large file's rows, say) is taken again from a fresh instant:
                     // the bound only grows, and the second write rarely waits.
+                    // The slack runs from when the store's connection is held,
+                    // not from when it was asked for, and ends here, right
+                    // before the request leaves.
+                    let slack =
+                        std::time::Duration::from_millis(crate::db::UNTAGGED_WRITE_SLACK_MS as u64);
                     for _ in 0..2 {
-                        let start = now_ms();
-                        self.db
-                            .mark_untagged(&self.feed.id, start + crate::db::UNTAGGED_MARGIN_MS)
+                        let started = self
+                            .db
+                            .mark_untagged_from_now(&self.feed.id, crate::db::UNTAGGED_MARGIN_MS)
                             .context("recording an untagged delivery before sending it")?;
-                        if now_ms() - start <= crate::db::UNTAGGED_WRITE_SLACK_MS {
+                        if started.elapsed() <= slack {
                             return Ok(());
                         }
                     }
@@ -1689,8 +1759,10 @@ impl FeedRunner {
                         "rejected_share",
                         Some(rule.id),
                         &format!(
-                            "{}: {} loaded with {share:.1}% failed, within the limit",
-                            self.feed.name, f.name
+                            "{}: {} loaded with {}% failed, within the limit",
+                            self.feed.name,
+                            f.name,
+                            within(share, limit)
                         ),
                     )?;
                 }
@@ -1712,17 +1784,23 @@ impl FeedRunner {
     /// tell someone; without one, the source's `alert_after_attempts` does, once
     /// per outage: no second alert while one is open, whichever process raised it.
     fn outage(&self, attempts: u32, reason: &str) -> Result<()> {
+        // A runner stopped while its request was in flight (its source
+        // deleted or replaced) raises nothing: a deleted source's alert would
+        // outlive it, and a successor sees the same outage at its next attempt.
+        if self.halted() {
+            return Ok(());
+        }
         let message = format!(
             "{}: cannot deliver to HFS after {attempts} attempts ({reason}); data is kept and retried",
             self.feed.name
         );
         let rules = self.rules("unreachable")?;
         if rules.is_empty() {
+            // An open one left by an earlier definition of this id (deleted
+            // and created again) does not stand for this outage; this
+            // definition's next recovery clears both.
             if attempts >= self.feed.delivery.alert_after_attempts
-                && self
-                    .db
-                    .open_alert(&self.feed.id, "delivery", None)?
-                    .is_none()
+                && !self.db.open_alert_since_birth(&self.feed.id, "delivery")?
             {
                 self.alerts
                     .raise(Some(&self.feed.id), "delivery", &message)?;
@@ -1810,6 +1888,20 @@ enum Decided {
     Deferred(String),
 }
 
+/// A share at or below `limit`, with one decimal or as many more as it takes to
+/// read within it: below the limit unless it is the limit, and above 0 unless
+/// nothing failed. 9.96% against 10% is 9.96, not 10.0.
+fn within(share: f64, limit: f64) -> String {
+    (1..=6)
+        .map(|decimals| format!("{share:.decimals$}"))
+        .find(|shown| {
+            shown.parse::<f64>().is_ok_and(|v| {
+                (v < limit || (v == limit && share == limit)) && (v > 0.0 || share == 0.0)
+            })
+        })
+        .unwrap_or_else(|| share.to_string())
+}
+
 /// A share above `limit`, with one decimal or as many more as it takes to
 /// read above it, and below 100 unless every row failed: 1 in 81 against
 /// 1.23% is 1.235, not 1.2.
@@ -1894,6 +1986,78 @@ mod tests {
             .unwrap();
         let at = url.find("X-Amz-Credential=").unwrap() + "X-Amz-Credential=".len();
         url[at..].split("%2F").next().unwrap().to_string()
+    }
+
+    /// A source created again whose credential is missing raises its own
+    /// `credential` alert, though one an earlier definition of its id left is
+    /// still open; once the credential loads, both are cleared.
+    #[tokio::test]
+    async fn a_source_created_again_raises_its_own_credential_alert() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("hie.yaml"),
+            "fhir_base_url: http://127.0.0.1:9\ndatabase: data/hie.db\n",
+        )
+        .unwrap();
+        let (config, _) = crate::config::load(&dir.path().join("hie.yaml")).unwrap();
+        let db = Arc::new(Db::open(&config.database).unwrap());
+        let key = {
+            let k = crate::crypto::MasterKey::generate().unwrap();
+            String::from_utf8(k.to_line()[..44].to_vec()).unwrap()
+        };
+        let secrets = secrets::open(&config, &db, KeySettings::inline(&key)).unwrap();
+        let feed: FeedConfig = serde_yaml::from_str(
+            "id: s\nname: S\nsource:\n  type: s3\n  bucket: b\n  region: us-east-1\n  endpoint: http://127.0.0.1:9\n  credential: lab\nformat: ndjson\ntransform: t.py\n",
+        )
+        .unwrap();
+        // The earlier definition's alert, open; then the id is born again.
+        let born = now_ms();
+        let earlier = db
+            .query_json(
+                "INSERT INTO alerts (feed_id, kind, message, created_at) VALUES ('s', 'credential', 'old', $1) RETURNING id",
+                vec![crate::db::Param::Int(born - 1000)],
+            )
+            .unwrap()[0]["id"]
+            .as_i64()
+            .unwrap();
+        db.query_json(
+            "INSERT INTO source_births (feed_id, born_at) VALUES ('s', $1) RETURNING feed_id",
+            vec![crate::db::Param::Int(born)],
+        )
+        .unwrap();
+        let runner = FeedRunner::new(
+            feed,
+            db.clone(),
+            Arc::new(FhirClient::with_credentials("http://127.0.0.1:9", None)),
+            Arc::new(Alerter::new(db.clone(), None)),
+            "python3",
+            dir.path(),
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+        )
+        .unwrap()
+        .with_secrets(secrets.clone());
+
+        runner.ensure_credential().await;
+        let open = db.open_alert_ids("s", "credential").unwrap();
+        assert_eq!(open.len(), 2, "its own beside the earlier one: {open:?}");
+        assert_eq!(open[0], earlier);
+        // A second pass raises no more.
+        runner.ensure_credential().await;
+        assert_eq!(db.open_alert_ids("s", "credential").unwrap().len(), 2);
+
+        secrets
+            .store()
+            .unwrap()
+            .create(NewSecret {
+                name: "lab".into(),
+                kind: SecretKind::Aws,
+                value: value("AKIDFIRST"),
+            })
+            .await
+            .unwrap();
+        runner.ensure_credential().await;
+        assert!(db.open_alert_ids("s", "credential").unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2018,7 +2182,19 @@ mod tests {
 
 #[cfg(test)]
 mod share_tests {
-    use super::above;
+    use super::{above, within};
+
+    #[test]
+    fn a_share_reads_within_the_limit_it_keeps() {
+        assert_eq!(within(9.96, 10.0), "9.96");
+        assert_eq!(within(10.0, 10.0), "10.0");
+        assert_eq!(within(0.0, 10.0), "0.0");
+        assert_eq!(within(0.04, 10.0), "0.04");
+        assert_eq!(within(500.0 / 6.0, 90.0), "83.3");
+        // Closer than six decimals: shown in full, still not above.
+        let shown = within(9.999_999_9, 10.0);
+        assert!(shown.parse::<f64>().unwrap() < 10.0, "{shown}");
+    }
 
     #[test]
     fn a_share_reads_above_the_limit_it_exceeds() {

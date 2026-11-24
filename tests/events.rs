@@ -1524,9 +1524,9 @@ fn reported(db: &Db, file: i64) -> (i64, i64) {
 }
 
 /// A finish reports the rows that fail, not those filtered out, and only
-/// beyond the most failing rows an earlier finish of the load saw.
+/// beyond the failing rows the previous finish of the load left.
 #[test]
-fn a_finish_reports_failing_rows_beyond_the_most_seen_before() {
+fn a_finish_reports_failing_rows_beyond_the_previous_finish() {
     let db = Db::in_memory().unwrap();
     // Two rows that could not be parsed, one filtered out.
     let file = load(&db, "s", "a", 2, 1);
@@ -1550,7 +1550,7 @@ fn a_finish_reports_failing_rows_beyond_the_most_seen_before() {
     let done = db.finish_files("s").unwrap();
     assert_eq!((done[0].failing, done[0].newly_failing), (2, 0));
 
-    // The filtered row fails once reprocessed: one more than ever seen.
+    // The filtered row fails once reprocessed: one more than before.
     assert!(db.reprocess(ids[2], None).unwrap());
     db.mark_rejected(ids[2], "data", "a bad value", None)
         .unwrap();
@@ -1561,14 +1561,15 @@ fn a_finish_reports_failing_rows_beyond_the_most_seen_before() {
     );
     assert_eq!(reported(&db, file), (3, 3));
 
-    // Fewer failing rows after a fix leave the mark where it was.
+    // Fewer failing rows after a fix lower the failing mark (the rejected
+    // one, kept for earlier versions, stays).
     assert!(db.reprocess(ids[0], None).unwrap());
     db.mark_rejected(ids[0], "filtered", "transform returned no resources", None)
         .unwrap();
     let done = db.finish_files("s").unwrap();
     assert_eq!((done[0].failing, done[0].newly_failing), (2, -1));
     assert_eq!(done[0].first_failure.as_ref().unwrap().0, 2);
-    assert_eq!(reported(&db, file), (3, 3));
+    assert_eq!(reported(&db, file), (3, 2));
     let last = events(&db)
         .into_iter()
         .rfind(|e| e["kind"] == "load.finished")
@@ -1577,6 +1578,14 @@ fn a_finish_reports_failing_rows_beyond_the_most_seen_before() {
         last["detail"],
         json!({"records": 3, "sent": 0, "rejected": 3, "failing": 2})
     );
+
+    // So the same row failing again is reported again: one more than the
+    // finish before, though no more than an earlier finish once saw.
+    assert!(db.reprocess(ids[0], None).unwrap());
+    db.mark_rejected(ids[0], "parse", "not JSON", None).unwrap();
+    let done = db.finish_files("s").unwrap();
+    assert_eq!((done[0].failing, done[0].newly_failing), (3, 1));
+    assert_eq!(reported(&db, file), (3, 3));
 }
 
 #[test]
@@ -1767,7 +1776,7 @@ fn set_writes_over_more_than_one_chunk_change_and_log_every_row_once() {
     );
     let before = events(&db).len();
     assert_eq!(
-        db.reject_submission("t", 0, "server", "HTTP 400", &json!({}))
+        db.reject_submission("t", claim(&db, "t"), "server", "HTTP 400", &json!({}))
             .unwrap(),
         Some(450)
     );
@@ -2165,6 +2174,15 @@ fn an_open_alert_is_not_kept_by_a_rule_made_after_it() {
     assert!(!alert_ids(&db).contains(&open));
 }
 
+/// The claim a runner of this instance takes before a request: on the
+/// submission as it is now.
+fn claim(db: &Db, token: &str) -> hie::db::Claim {
+    let sub = db.submission(token).unwrap().unwrap();
+    db.claim_submission(&sub, hie::pipeline::instance_id(), false)
+        .unwrap()
+        .unwrap()
+}
+
 #[test]
 fn an_older_poll_answer_cannot_move_a_submission() {
     let db = Db::in_memory().unwrap();
@@ -2175,11 +2193,18 @@ fn an_older_poll_answer_cannot_move_a_submission() {
             .unwrap()
     );
     // A poll failed once: the submission is at attempt 1.
-    assert!(db.submission_attempt_failed("t", 0, 0, "HTTP 503").unwrap());
-    // Answers to requests made at attempt 0 change nothing.
-    assert!(!db.submission_attempt_failed("t", 0, 0, "HTTP 503").unwrap());
+    let first = claim(&db, "t");
     assert!(
-        !db.progress_submission("t", Some(0), "running", None, 0, 0, None)
+        db.submission_attempt_failed("t", first, 0, "HTTP 503")
+            .unwrap()
+    );
+    // Answers to requests claimed before change nothing.
+    assert!(
+        !db.submission_attempt_failed("t", first, 0, "HTTP 503")
+            .unwrap()
+    );
+    assert!(
+        !db.progress_submission("t", Some(first), "running", None, 0, 0, None)
             .unwrap()
     );
     let row = db
@@ -2194,9 +2219,243 @@ fn an_older_poll_answer_cannot_move_a_submission() {
         .filter(|e| e["kind"] == "submission.attempt_failed")
         .count();
     assert_eq!(failed, 1);
+    let next = claim(&db, "t");
+    assert_ne!(next.epoch, next.attempts as i64, "the two are told apart");
     assert!(
-        db.progress_submission("t", Some(1), "running", None, 0, 0, None)
+        db.progress_submission("t", Some(next), "running", None, 0, 0, None)
             .unwrap()
+    );
+}
+
+/// The kick-off a runner sent before its lease lapsed is answered after another
+/// runner's kick-off failed and then succeeded: attempts went 0, 1, 0, but the
+/// late answer changes nothing, whatever it says.
+#[test]
+fn a_late_kickoff_answer_after_attempts_went_back_to_zero_changes_nothing() {
+    /// A late answer, written under the claim its request took.
+    type Answer = fn(&Db, hie::db::Claim) -> bool;
+    let late_answers: [(&str, Answer); 5] = [
+        ("refusal", |db, c| {
+            db.reject_submission("t", c, "server", "HTTP 400", &json!({}))
+                .unwrap()
+                .is_some()
+        }),
+        ("failure", |db, c| {
+            db.submission_attempt_failed("t", c, 0, "HTTP 503").unwrap()
+        }),
+        ("success", |db, c| {
+            db.progress_submission("t", Some(c), "running", Some("https://h/late"), 0, 0, None)
+                .unwrap()
+        }),
+        ("settlement", |db, c| db.settle_submission("t", c).unwrap()),
+        ("receipts", |db, c| {
+            let record = record_id(db, "s", 1);
+            db.settle_page("t", c, &[(record, json!([]))], &[], "")
+                .unwrap()
+                || db.submission_open_at("t", c).unwrap()
+        }),
+    ];
+    for (what, answer) in late_answers {
+        let db = Db::in_memory().unwrap();
+        let file = load(&db, "s", "a", 0, 1);
+        db.mark_passthrough(&[(record_id(&db, "s", 1), 0)]).unwrap();
+        assert!(
+            db.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
+                .unwrap()
+        );
+        // Runner A claims its kick-off at attempts 0, and its answer is late.
+        let a = claim(&db, "t");
+        // Runner B takes over: its kick-off fails, then succeeds.
+        let b = claim(&db, "t");
+        assert!(db.submission_attempt_failed("t", b, 0, "HTTP 503").unwrap());
+        let b = claim(&db, "t");
+        assert!(
+            db.progress_submission("t", Some(b), "running", Some("https://h/b"), 0, 0, None)
+                .unwrap()
+        );
+        let before = db
+            .query_json(
+                "SELECT status, status_url, attempts, failures, epoch FROM submissions",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            before[0]["attempts"], 0,
+            "back at zero, as a kick-off leaves it"
+        );
+        assert_eq!(before[0]["status"], "running");
+        let events_before = events(&db).len();
+        assert!(!answer(&db, a), "A's late {what} took");
+        assert_eq!(
+            db.query_json(
+                "SELECT status, status_url, attempts, failures, epoch FROM submissions",
+                [],
+            )
+            .unwrap(),
+            before,
+            "{what}"
+        );
+        assert_eq!(events(&db).len(), events_before, "{what}");
+        assert_eq!(status(&db, record_id(&db, "s", 1)), "submitted", "{what}");
+    }
+}
+
+/// Two runners in flight at once (a lease lapsed mid-request): the one that
+/// claimed last decides, even when the other's answer comes first; and a claim
+/// on a row read before another runner moved it is refused, so no second
+/// request is built from it.
+#[test]
+fn the_last_claim_decides_and_a_stale_read_cannot_claim() {
+    let db = Db::in_memory().unwrap();
+    let file = load(&db, "s", "a", 0, 1);
+    db.mark_passthrough(&[(record_id(&db, "s", 1), 0)]).unwrap();
+    assert!(
+        db.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
+            .unwrap()
+    );
+    let read_by_b = db.submission("t").unwrap().unwrap();
+    let a = claim(&db, "t");
+    // B read the row before A's claim: it cannot claim on it.
+    assert_eq!(db.claim_submission(&read_by_b, "me", false).unwrap(), None);
+    let b = claim(&db, "t");
+    // A's refusal arrives before B's answer: it changes nothing.
+    assert_eq!(
+        db.reject_submission("t", a, "server", "HTTP 400", &json!({}))
+            .unwrap(),
+        None
+    );
+    // B's own success lands; a row read just before it is stale after it.
+    let read_before_success = db.submission("t").unwrap().unwrap();
+    assert!(
+        db.progress_submission("t", Some(b), "running", Some("https://h/b"), 0, 0, None)
+            .unwrap()
+    );
+    // A row read before that success (status still `kickoff`) cannot be
+    // claimed for a second kick-off.
+    assert_eq!(
+        db.claim_submission(&read_before_success, "me", false)
+            .unwrap(),
+        None
+    );
+    // Nor can a claim be taken before the submission is due.
+    db.progress_submission(
+        "t",
+        None,
+        "running",
+        None,
+        0,
+        hie::db::now_ms() + 60_000,
+        None,
+    )
+    .unwrap();
+    let not_due = db.submission("t").unwrap().unwrap();
+    assert_eq!(db.claim_submission(&not_due, "me", false).unwrap(), None);
+    db.progress_submission("t", None, "running", None, 0, 0, None)
+        .unwrap();
+    let due = db.submission("t").unwrap().unwrap();
+    assert!(db.claim_submission(&due, "me", false).unwrap().is_some());
+}
+
+/// A runner whose lease lapsed mid-pass reads the submission after the runner
+/// that took the source over claimed it: it cannot claim it in turn, so the
+/// current holder's answer stands; nor can it claim once nobody holds the
+/// lease, until it takes the lease again.
+#[test]
+fn a_runner_whose_lease_lapsed_cannot_claim_from_the_holder() {
+    let db = Db::in_memory().unwrap();
+    let file = load(&db, "s", "a", 0, 1);
+    db.mark_passthrough(&[(record_id(&db, "s", 1), 0)]).unwrap();
+    assert!(
+        db.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
+            .unwrap()
+    );
+    // B holds the source now and claims its kick-off.
+    assert!(db.acquire_lease("s", "b", 60_000).unwrap());
+    let read = db.submission("t").unwrap().unwrap();
+    let b = db.claim_submission(&read, "b", true).unwrap().unwrap();
+    // A, whose lease lapsed, reads the row as B left it, and cannot claim.
+    let read_by_a = db.submission("t").unwrap().unwrap();
+    assert_eq!(db.claim_submission(&read_by_a, "a", true).unwrap(), None);
+    assert!(
+        db.progress_submission("t", Some(b), "running", Some("https://h/b"), 0, 0, None)
+            .unwrap()
+    );
+    // B's lease runs out: A still holds none, and cannot claim until it takes
+    // the lease again.
+    db.query_json("UPDATE source_leases SET until = 0 RETURNING feed_id", [])
+        .unwrap();
+    let read_by_a = db.submission("t").unwrap().unwrap();
+    assert_eq!(db.claim_submission(&read_by_a, "a", true).unwrap(), None);
+    assert!(db.acquire_lease("s", "a", 60_000).unwrap());
+    assert!(
+        db.claim_submission(&read_by_a, "a", true)
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// Two instances on one store claim the same submission at once, from the
+/// same read: one claim takes, the other finds the row moved.
+#[test]
+fn two_instances_claiming_at_once_get_one_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hie.db");
+    let a = Arc::new(Db::open(&path).unwrap());
+    let b = Arc::new(Db::open(&path).unwrap());
+    let file = load(&a, "s", "a", 0, 1);
+    a.mark_passthrough(&[(record_id(&a, "s", 1), 0)]).unwrap();
+    assert!(
+        a.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
+            .unwrap()
+    );
+    for round in 0..20 {
+        let read = a.submission("t").unwrap().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let claims: Vec<_> = [a.clone(), b.clone()]
+            .into_iter()
+            .map(|db| {
+                let (read, barrier) = (read.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.claim_submission(&read, "me", false).unwrap()
+                })
+            })
+            .collect();
+        let got: Vec<_> = claims.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(
+            got.iter().filter(|c| c.is_some()).count(),
+            1,
+            "round {round}: {got:?}"
+        );
+    }
+}
+
+/// An earlier version sharing the store moves attempts but not the epoch: a
+/// claim taken before its write is still fenced, by the attempts it read.
+#[test]
+fn an_earlier_versions_write_still_fences_a_claim() {
+    let db = Db::in_memory().unwrap();
+    let file = load(&db, "s", "a", 0, 1);
+    db.mark_passthrough(&[(record_id(&db, "s", 1), 0)]).unwrap();
+    assert!(
+        db.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
+            .unwrap()
+    );
+    let mine = claim(&db, "t");
+    // What an earlier version writes for a failed attempt: no epoch.
+    db.query_json(
+        "UPDATE submissions SET attempts = attempts + 1 WHERE token = 't' RETURNING token",
+        [],
+    )
+    .unwrap();
+    assert!(
+        !db.submission_attempt_failed("t", mine, 0, "HTTP 503")
+            .unwrap()
+    );
+    assert_eq!(
+        db.reject_submission("t", mine, "server", "HTTP 400", &json!({}))
+            .unwrap(),
+        None
     );
 }
 
@@ -2282,8 +2541,10 @@ async fn an_old_terminal_answer_changes_nothing(refuse: bool) {
         async move { runner.tick().await }
     });
     held.polled.notified().await;
+    // Another runner, meanwhile: its own claim, and a failed attempt.
+    let newer = claim(&db, &token);
     assert!(
-        db.submission_attempt_failed(&token, 0, 0, "HTTP 503")
+        db.submission_attempt_failed(&token, newer, 0, "HTTP 503")
             .unwrap()
     );
     held.release.notify_one();
@@ -2316,6 +2577,87 @@ async fn an_old_empty_settlement_after_a_newer_failure_changes_nothing() {
     an_old_terminal_answer_changes_nothing(false).await;
 }
 
+/// One submission's status poll answers after the source's lease has run out:
+/// the pass renews the lease before its next claim, so the submissions after
+/// it are still kicked off in the same pass.
+#[tokio::test]
+async fn a_slow_answer_does_not_keep_the_next_submissions_from_being_claimed() {
+    slow_answer(false).await;
+}
+
+/// The same, with the source deleted while the answer is slow: the stopped
+/// runner takes no lease again and sends nothing more.
+#[tokio::test]
+async fn a_runner_stopped_during_a_slow_answer_claims_nothing_more() {
+    slow_answer(true).await;
+}
+
+async fn slow_answer(deleted: bool) {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let (hfs, held) = held_poll_server(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, state) = engine(
+        dir.path(),
+        &format!("fhir_base_url: {hfs}\npublic_url: http://engine.test\npython: {python}\n"),
+        &[("drops", bulk_source())],
+    );
+    let db = state.db.clone();
+    let runner = manager.runner("drops").unwrap();
+    // The engine starts its sources paused: this pass takes the lease and runs
+    // nothing; the ticks below run under it.
+    assert!(runner.pass().await.unwrap());
+    // The first submission is opened and kicked off.
+    std::fs::write(dir.path().join("inbox/a.ndjson"), patients(&["a"])).unwrap();
+    runner.tick().await.unwrap();
+    let first = token(&db);
+
+    // The next pass opens a second one, then polls the first: that answer is
+    // held until the lease has run out.
+    std::fs::write(dir.path().join("inbox/b.ndjson"), patients(&["b"])).unwrap();
+    let passing = tokio::spawn({
+        let runner = runner.clone();
+        async move { runner.tick().await }
+    });
+    held.polled.notified().await;
+    db.query_json("UPDATE source_leases SET until = 0 RETURNING feed_id", [])
+        .unwrap();
+    if deleted {
+        manager.delete("drops").await.unwrap();
+    }
+    held.release.notify_one();
+    passing.await.unwrap().unwrap();
+
+    let subs = db
+        .query_json(
+            "SELECT token, status FROM submissions ORDER BY created_at",
+            [],
+        )
+        .unwrap();
+    assert_eq!(subs.len(), 2, "{subs:?}");
+    assert_eq!(subs[0]["token"], first);
+    assert_eq!(subs[0]["status"], "done", "{subs:?}");
+    if deleted {
+        assert_eq!(
+            subs[1]["status"], "kickoff",
+            "a stopped runner kicks nothing off: {subs:?}"
+        );
+        assert!(db.lease("drops").unwrap().is_none(), "no lease taken again");
+        return;
+    }
+    assert_eq!(
+        subs[1]["status"], "running",
+        "the second submission is claimed and kicked off: {subs:?}"
+    );
+    let lease = db
+        .lease("drops")
+        .unwrap()
+        .expect("the lease was taken again");
+    assert_eq!(lease.owner, hie::pipeline::instance_id());
+}
+
 #[test]
 fn an_older_answer_cannot_settle_or_refuse_a_submission() {
     let db = Db::in_memory().unwrap();
@@ -2326,26 +2668,32 @@ fn an_older_answer_cannot_settle_or_refuse_a_submission() {
         db.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
             .unwrap()
     );
-    assert!(db.submission_attempt_failed("t", 0, 0, "HTTP 503").unwrap());
-    // Answers to the poll made at attempt 0.
+    let first = claim(&db, "t");
+    assert!(
+        db.submission_attempt_failed("t", first, 0, "HTTP 503")
+            .unwrap()
+    );
+    // Answers to the poll claimed before that failure.
     assert_eq!(
-        db.reject_submission("t", 0, "server", "HTTP 400", &json!({}))
+        db.reject_submission("t", first, "server", "HTTP 400", &json!({}))
             .unwrap(),
         None
     );
     assert!(
-        !db.settle_page("t", 0, &[(record, json!([]))], &[], "")
+        !db.settle_page("t", first, &[(record, json!([]))], &[], "")
             .unwrap()
     );
-    assert!(!db.settle_submission("t", 0).unwrap());
-    assert!(!db.submission_open_at("t", 0).unwrap());
+    assert!(!db.settle_submission("t", first).unwrap());
+    assert!(!db.submission_open_at("t", first).unwrap());
     assert_eq!(status(&db, record), "submitted");
-    // The current attempt's answer settles it.
+    // The current claim's answer settles it.
+    let current = claim(&db, "t");
     assert!(
-        db.settle_page("t", 1, &[(record, json!([]))], &[], "")
+        db.settle_page("t", current, &[(record, json!([]))], &[], "")
             .unwrap()
     );
-    assert!(db.settle_submission("t", 1).unwrap());
+    assert!(db.submission_open_at("t", current).unwrap());
+    assert!(db.settle_submission("t", current).unwrap());
     assert_eq!(status(&db, record), "sent");
 }
 
@@ -2520,6 +2868,38 @@ async fn rejected_records_are_counted_once_per_day_with_their_coverage() {
     assert_eq!(day_of(&answer, today - 39 * day)["records"], 0);
     let (_, answer) = get_json(&format!("{url}?days=90")).await;
     assert_eq!(answer["days"].as_array().unwrap().len(), 90);
+
+    // Another instance on the store keeps five days: its purge removes a
+    // rejection of ten days ago, and the days before its cutoff are no longer
+    // complete here, whatever this instance's own retention.
+    db.query_json(
+        "INSERT INTO events (at, source_id, kind, record_id, error_kind) VALUES ($1, 'one', 'record.rejected', 999999, 'data') RETURNING id",
+        hie::db::params![today - 10 * day],
+    )
+    .unwrap();
+    let (_, before) = get_json(&format!("{url}?days=14")).await;
+    assert_eq!(day_of(&before, today - 10 * day)["records"], 1);
+    assert_eq!(day_of(&before, today - 10 * day)["complete"], true);
+    assert!(db.purge_events(today - 5 * day, 1000).unwrap() >= 1);
+    let (_, answer) = get_json(&format!("{url}?days=14")).await;
+    assert_eq!(day_of(&answer, today - 10 * day)["records"], 0);
+    assert_eq!(day_of(&answer, today - 10 * day)["complete"], false);
+    assert_eq!(day_of(&answer, today - 4 * day)["complete"], true);
+    assert_eq!(
+        answer["covered_from"],
+        chrono::DateTime::from_timestamp_millis(today - 5 * day)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    );
+    // A purge with a longer retention after it moves nothing back.
+    db.query_json(
+        "INSERT INTO events (at, source_id, kind) VALUES ($1, 'one', 'load.received') RETURNING id",
+        hie::db::params![today - 25 * day],
+    )
+    .unwrap();
+    assert_eq!(db.purge_events(today - 20 * day, 1000).unwrap(), 1);
+    let (_, again) = get_json(&format!("{url}?days=14")).await;
+    assert_eq!(again["covered_from"], answer["covered_from"]);
 
     for (query, field) in [
         ("days=0", "days"),

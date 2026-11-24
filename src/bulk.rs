@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::credentials::Credentials;
-use crate::destination::{Destination, InFlight};
+use crate::destination::Destination;
 use crate::fhir::{self, SendError};
 
 /// Whether `path` lies inside `dir`, as the filesystem resolves both (symbolic
@@ -175,6 +175,30 @@ pub enum Poll {
     },
 }
 
+/// The most of a refusal's body kept: an OperationOutcome is far smaller,
+/// and a longer body (a proxy's page) is drained but not kept.
+const KEPT_BODY: usize = 1 << 20;
+
+/// Reads an answer's body to its end, keeping up to `KEPT_BODY` of it only
+/// when `keep`: the engine reads nothing from a success, a `429` or a `5xx`
+/// but its status and headers.
+async fn read_whole(mut response: reqwest::Response, keep: bool) -> reqwest::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if keep && body.len() + chunk.len() <= KEPT_BODY {
+            body.extend_from_slice(&chunk);
+        }
+    }
+    Ok(body)
+}
+
+/// An answer of HFS to a post, read whole (its body kept only for a refusal).
+struct Answer {
+    status: u16,
+    headers: reqwest::header::HeaderMap,
+    body: Vec<u8>,
+}
+
 pub struct BulkSubmitter {
     http: reqwest::Client,
     fhir_base: String,
@@ -252,13 +276,11 @@ impl BulkSubmitter {
         json!({"resourceType": "Parameters", "parameter": parameter})
     }
 
-    /// Posts to HFS under the base. The returned exchange is held until the
-    /// answer has been read.
-    async fn post(
-        &self,
-        path: &str,
-        body: &Value,
-    ) -> Result<(reqwest::Response, Option<InFlight>), SendError> {
+    /// Posts to HFS under the base and reads the answer whole. The answer
+    /// counts for the destination once its body has arrived: a connection
+    /// that breaks or times out while it is read is the server not
+    /// answering, and the attempt may pass.
+    async fn post(&self, path: &str, body: &Value) -> Result<Answer, SendError> {
         let request = self
             .http
             .post(format!("{}/{path}", self.fhir_base))
@@ -276,9 +298,13 @@ impl BulkSubmitter {
                     crate::destination::send_detail(&e)
                 ))
             })?;
+        // Held until the answer has been read: the destination is not idle
+        // while it downloads.
         let exchange = self.destination.as_ref().map(|d| d.start());
         let sent = self.http.execute(request).await;
-        if let Some(exchange) = &exchange {
+        if sent.is_err()
+            && let Some(exchange) = &exchange
+        {
             exchange.observe_send(&sent);
         }
         let response = sent.map_err(|e| {
@@ -288,7 +314,41 @@ impl BulkSubmitter {
                 e.without_url()
             ))
         })?;
-        Ok((response, exchange))
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        // Only a refusal's body is read by the engine (`classify`).
+        let used = !matches!(status, 200..=299 | 429 | 500..=599);
+        match read_whole(response, used).await {
+            Ok(body) => {
+                if let Some(exchange) = &exchange {
+                    exchange.observe(
+                        crate::destination::status_outcome(status),
+                        &format!("HTTP {status}"),
+                    );
+                }
+                Ok(Answer {
+                    status,
+                    headers,
+                    body,
+                })
+            }
+            Err(e) => {
+                let failure = crate::destination::send_failure(&e)
+                    .unwrap_or(crate::destination::Failure::Lost);
+                if let Some(exchange) = exchange {
+                    exchange.observe(Err(failure), &crate::destination::send_detail(&e));
+                }
+                // The status line still said the token was refused.
+                if matches!(status, 401 | 403) && self.credentials.is_some() {
+                    return Err(fhir::refused_token(status, &self.credentials).await);
+                }
+                Err(SendError::Transient(format!(
+                    "reading the answer of {}: {}",
+                    shown(&self.fhir_base),
+                    failure.sentence()
+                )))
+            }
+        }
     }
 
     async fn get(&self, url: &str, accept: &str) -> Result<reqwest::Response, SendError> {
@@ -302,16 +362,15 @@ impl BulkSubmitter {
             })
     }
 
-    async fn classify(&self, response: reqwest::Response) -> Result<reqwest::Response, SendError> {
-        let status = response.status().as_u16();
-        match status {
-            200..=299 => Ok(response),
-            429 | 500..=599 => Err(SendError::Transient(format!("HTTP {status}"))),
-            401 | 403 if self.credentials.is_some() => {
+    async fn classify(&self, answer: Answer) -> Result<Answer, SendError> {
+        match answer.status {
+            200..=299 => Ok(answer),
+            status @ (429 | 500..=599) => Err(SendError::Transient(format!("HTTP {status}"))),
+            status @ (401 | 403) if self.credentials.is_some() => {
                 Err(fhir::refused_token(status, &self.credentials).await)
             }
-            _ => {
-                let body: Value = response.json().await.unwrap_or(Value::Null);
+            status => {
+                let body: Value = serde_json::from_slice(&answer.body).unwrap_or(Value::Null);
                 Err(SendError::Refused(status, body))
             }
         }
@@ -333,8 +392,8 @@ impl BulkSubmitter {
                 json!({"name": "submissionStatus", "valueCoding": {"system": "http://hl7.org/fhir/event-status", "code": "completed"}}),
             ],
         );
-        let (response, _exchange) = self.post("$bulk-submit", &body).await?;
-        self.classify(response).await?;
+        let answer = self.post("$bulk-submit", &body).await?;
+        self.classify(answer).await?;
         Ok(())
     }
 
@@ -345,10 +404,10 @@ impl BulkSubmitter {
         submission_id: &str,
     ) -> Result<String, SendError> {
         let body = Self::parameters(source_id, submission_id, vec![]);
-        let (response, _exchange) = self.post("$bulk-submit-status", &body).await?;
-        let response = self.classify(response).await?;
-        response
-            .headers()
+        let answer = self.post("$bulk-submit-status", &body).await?;
+        let answer = self.classify(answer).await?;
+        answer
+            .headers
             .get("content-location")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
@@ -476,6 +535,91 @@ pub fn token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that answers every request with `answer`, then closes.
+    async fn cut_off_server(answer: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = socket.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&request);
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let length = text[..end]
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    let _ = socket.write_all(answer.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A kick-off whose answer is cut off while its body is read is the server
+    /// not answering: the destination counts it as lost, and the attempt may
+    /// pass. One read whole counts as an answer.
+    #[tokio::test]
+    async fn a_kickoff_answer_counts_once_read_whole() {
+        let base = cut_off_server(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/fhir+json\r\nContent-Length: 5000\r\n\r\n{\"resourceType\": \"OperationOutcome\"",
+        )
+        .await;
+        let destination = Arc::new(Destination::new(&base));
+        let bulk =
+            BulkSubmitter::new(&base, "http://engine.test").with_destination(destination.clone());
+        let sent = bulk.kickoff("lab", "sub", "http://engine.test/m").await;
+        assert!(matches!(sent, Err(SendError::Transient(_))), "{sent:?}");
+        let d = destination.snapshot();
+        assert_eq!(d.reachable, Some(false));
+        assert_eq!(
+            d.last_error,
+            Some(crate::destination::Failure::Lost.sentence())
+        );
+
+        let base = cut_off_server(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/fhir+json\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        let destination = Arc::new(Destination::new(&base));
+        let bulk =
+            BulkSubmitter::new(&base, "http://engine.test").with_destination(destination.clone());
+        let sent = bulk.kickoff("lab", "sub", "http://engine.test/m").await;
+        assert!(matches!(sent, Err(SendError::Refused(400, _))), "{sent:?}");
+        assert_eq!(destination.snapshot().reachable, Some(true));
+
+        // A success is drained without being kept, and still counts only
+        // once it has arrived whole.
+        let base = cut_off_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/fhir+json\r\nContent-Length: 5000\r\n\r\n{\"resourceType\": \"OperationOutcome\"",
+        )
+        .await;
+        let destination = Arc::new(Destination::new(&base));
+        let bulk =
+            BulkSubmitter::new(&base, "http://engine.test").with_destination(destination.clone());
+        let sent = bulk.kickoff("lab", "sub", "http://engine.test/m").await;
+        assert!(matches!(sent, Err(SendError::Transient(_))), "{sent:?}");
+        assert_eq!(destination.snapshot().reachable, Some(false));
+    }
 
     #[test]
     fn submission_ids_are_stable_for_the_same_drop() {

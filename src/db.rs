@@ -185,8 +185,8 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("files", "archived", "INTEGER NOT NULL DEFAULT 0"),
     ("files", "origin", "TEXT"),
     ("files", "source_name", "TEXT"),
-    // The most failing rows (rejected, not `filtered`) a finish of the file has
-    // seen: a load's alert is raised again only when more rows fail than that.
+    // The failing rows (rejected, not `filtered`) of the file's last finish: a
+    // load's alert is raised again only when more rows fail than that.
     // `rejected_reported` counted filtered rows too; it is kept up to date for
     // earlier versions sharing the store, and no longer read.
     ("files", "failing_reported", "INTEGER NOT NULL DEFAULT 0"),
@@ -205,6 +205,10 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("alerts", "channels", "TEXT"),
     ("alert_rules", "tz", "TEXT"),
     ("submissions", "stamped", "INTEGER NOT NULL DEFAULT 0"),
+    // Bumped by every change of a submission's state, and by the claim before
+    // each kick-off or poll: an answer to a request claimed before the latest
+    // change, by this runner or another, changes nothing.
+    ("submissions", "epoch", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// How long the store write before an untagged REST request may take: a
@@ -217,6 +221,12 @@ pub const UNTAGGED_WRITE_SLACK_MS: i64 = 10_000;
 /// engine stopped waiting.
 pub const UNTAGGED_MARGIN_MS: i64 =
     UNTAGGED_WRITE_SLACK_MS + 2 * crate::fhir::HTTP_TIMEOUT.as_millis() as i64;
+
+/// Moves a source's untagged bound to `$2`, never earlier.
+const MARK_UNTAGGED: &str = "INSERT INTO source_stamping (feed_id, untagged_until) VALUES ($1, $2)
+     ON CONFLICT (feed_id) DO UPDATE SET untagged_until =
+       CASE WHEN excluded.untagged_until > source_stamping.untagged_until
+            THEN excluded.untagged_until ELSE source_stamping.untagged_until END";
 
 /// The `store_meta` key that says since when the store records untagged
 /// deliveries.
@@ -417,6 +427,20 @@ pub struct Submission {
     pub attempts: u32,
     /// Its NDJSON carries the source tag (a transformed submission only).
     pub stamped: bool,
+    /// Moves with every change of its state; see `claim_submission`.
+    pub epoch: i64,
+}
+
+/// A runner's claim on a submission for one request (a kick-off or a poll):
+/// the epoch it set, and the attempts it read. Every write of the request's
+/// answer holds only while the submission still has both, so the answer to a
+/// request claimed before another runner's claim, or before any change since,
+/// changes nothing. `attempts` keeps an earlier version, which changes
+/// attempts but not the epoch, fenced as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Claim {
+    pub epoch: i64,
+    pub attempts: u32,
 }
 
 /// A file with records waiting to be submitted, and what they are.
@@ -537,6 +561,42 @@ pub struct EventQuery {
     /// Events after this id.
     pub cursor: Option<i64>,
     pub limit: usize,
+    /// The most events a request reads past where it starts; `None` is
+    /// `EVENT_SCAN_SPAN`. Tests make it small.
+    #[doc(hidden)]
+    pub scan: Option<usize>,
+}
+
+/// The most events one `GET /api/events` reads past where it starts when no
+/// index serves its filters (a source and a kind together, or several kinds):
+/// a page whose filters match rarely stops there, with `has_more`, rather
+/// than walking the whole log under the store's only connection.
+pub const EVENT_SCAN_SPAN: usize = 50_000;
+
+/// How far an event's `at` may be behind that of one stored before it: the
+/// clocks of the instances sharing a store (`at` is taken under the write
+/// lock). A read with `since` starts at the lowest id among the events from
+/// `since` to the first of them plus this margin.
+pub const EVENT_CLOCK_MARGIN_MS: i64 = 5 * 60_000;
+
+/// The exact kinds a filter asks for, each once: a family is its exact kinds,
+/// which `events_kind` serves (`LIKE` is case-insensitive in SQLite and
+/// cannot use it).
+fn exact_kinds(kinds: &[String]) -> Vec<&str> {
+    let mut exact: Vec<&str> = Vec::new();
+    for kind in kinds {
+        if crate::events::FAMILIES.contains(&kind.as_str()) {
+            exact.extend(crate::events::KINDS.iter().copied().filter(|k| {
+                k.strip_prefix(kind.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
+            }));
+        } else {
+            exact.push(kind);
+        }
+    }
+    exact.sort_unstable();
+    exact.dedup();
+    exact
 }
 
 /// A page of events, oldest first, and where the next poll starts.
@@ -559,7 +619,7 @@ pub struct FinishedFile {
     pub rejected: i64,
     /// The rejected rows that fail the load: every one but the `filtered`.
     pub failing: i64,
-    /// Failing rows beyond the most any earlier finish of the file saw.
+    /// Failing rows beyond those the previous finish of the file left.
     pub newly_failing: i64,
     /// The failing row with the lowest line, and its error.
     pub first_failure: Option<(i64, String)>,
@@ -1993,8 +2053,12 @@ impl Db {
                 let Some(file) = tx.query_one(&lock, &params![candidate])? else {
                     return Ok(None);
                 };
-                // The marks are raised by the statement that checks no row is in
-                // progress, so they count the rows as they are finished.
+                // The marks are set by the statement that checks no row is in
+                // progress, so they count the rows as they are finished. The
+                // failing mark is this finish's count, lower too: once a Retry
+                // fixed rows, a later finish with more failing than this one
+                // alerts again. The rejected mark, kept for earlier versions,
+                // only goes up.
                 let moved = tx.query_one(
                     &format!(
                         "UPDATE files SET status = 'done', finished_at = $2,
@@ -2002,10 +2066,7 @@ impl Db {
                                   WHEN rejected_reported > (SELECT COUNT(*) FROM records WHERE file_id = $1 AND status = 'rejected')
                                   THEN rejected_reported
                                   ELSE (SELECT COUNT(*) FROM records WHERE file_id = $1 AND status = 'rejected') END,
-                                failing_reported = CASE
-                                  WHEN failing_reported > (SELECT COUNT(*) FROM records WHERE file_id = $1 AND {FAILING})
-                                  THEN failing_reported
-                                  ELSE (SELECT COUNT(*) FROM records WHERE file_id = $1 AND {FAILING}) END
+                                failing_reported = (SELECT COUNT(*) FROM records WHERE file_id = $1 AND {FAILING})
                          WHERE id = $1 AND status IN ('processing', 'unpacked')
                            AND NOT EXISTS (SELECT 1 FROM records WHERE file_id = $1 AND status IN ('received', 'pending', 'submitted'))
                          RETURNING id"
@@ -2538,6 +2599,7 @@ impl Db {
                 status_url: r.opt_string(5),
                 attempts: r.i64(6) as u32,
                 stamped: r.i64(7) != 0,
+                epoch: r.i64(8),
             })
             .collect())
     }
@@ -2545,7 +2607,7 @@ impl Db {
     pub fn submission(&self, token: &str) -> Result<Option<Submission>> {
         Ok(self
             .submissions(
-                "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts, stamped FROM submissions WHERE token = $1",
+                "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts, stamped, epoch FROM submissions WHERE token = $1",
                 &params![token],
             )?
             .into_iter()
@@ -2555,7 +2617,7 @@ impl Db {
     /// Open submissions of a feed whose next attempt is due.
     pub fn submissions_due(&self, feed: &str) -> Result<Vec<Submission>> {
         self.submissions(
-            "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts, stamped FROM submissions
+            "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts, stamped, epoch FROM submissions
              WHERE feed_id = $1 AND status IN ('kickoff', 'running') AND next_attempt_at <= $2 ORDER BY created_at",
             &params![feed, now_ms()],
         )
@@ -2601,17 +2663,24 @@ impl Db {
         })
     }
 
+    /// Records the bound before an untagged REST request leaves: `margin`
+    /// after an instant taken once this call holds the store's connection, so
+    /// a wait for the connection (another source's large file, a reprocess)
+    /// is not counted. Returns that instant, monotonic, for the caller to
+    /// check the write's slack against right before it sends; the statement's
+    /// own wait (SQLite's write lock, a PostgreSQL row lock) counts.
+    pub fn mark_untagged_from_now(&self, feed: &str, margin: i64) -> Result<std::time::Instant> {
+        self.with(|c| {
+            let started = std::time::Instant::now();
+            c.execute(MARK_UNTAGGED, &params![feed, now_ms() + margin])?;
+            Ok(started)
+        })
+    }
+
     /// HFS may write resources of `feed` without the source tag until `until`.
     /// The bound only ever moves later.
     pub fn mark_untagged(&self, feed: &str, until: i64) -> Result<()> {
-        self.execute(
-            "INSERT INTO source_stamping (feed_id, untagged_until) VALUES ($1, $2)
-             ON CONFLICT (feed_id) DO UPDATE SET untagged_until =
-               CASE WHEN excluded.untagged_until > source_stamping.untagged_until
-                    THEN excluded.untagged_until ELSE source_stamping.untagged_until END",
-            &params![feed, until],
-        )
-        .map(drop)
+        self.execute(MARK_UNTAGGED, &params![feed, until]).map(drop)
     }
 
     /// What the store knows about `feed`'s deliveries without the tag, read in
@@ -2671,15 +2740,15 @@ impl Db {
         .map(drop)
     }
 
-    /// `update_submission`, only while the submission still has the attempt
-    /// count `captured` read before its request: the answer to an older request
-    /// (a runner that held the source before a lease lapsed) changes nothing.
-    /// Returns whether it changed.
+    /// `update_submission`, only while the submission is still under `claim`,
+    /// the claim of the request it answers: the answer to a request claimed
+    /// before (by a runner that held the source before a lease lapsed, or
+    /// before any change since) changes nothing. Returns whether it changed.
     #[allow(clippy::too_many_arguments)]
     pub fn progress_submission(
         &self,
         token: &str,
-        captured: Option<u32>,
+        claim: Option<Claim>,
         status: &str,
         status_url: Option<&str>,
         attempts: u32,
@@ -2689,9 +2758,10 @@ impl Db {
         Ok(self.execute(
             "UPDATE submissions SET status = $2,
                     status_url = COALESCE(CAST($3 AS TEXT), status_url),
-                    attempts = $4, next_attempt_at = $5, error = $6, updated_at = $7
+                    attempts = $4, next_attempt_at = $5, error = $6, updated_at = $7, epoch = epoch + 1
              WHERE token = $1 AND status IN ('kickoff', 'running')
-               AND (CAST($8 AS BIGINT) IS NULL OR attempts = CAST($8 AS BIGINT))",
+               AND (CAST($8 AS BIGINT) IS NULL
+                    OR (epoch = CAST($8 AS BIGINT) AND attempts = CAST($9 AS BIGINT)))",
             &params![
                 token,
                 status,
@@ -2700,30 +2770,88 @@ impl Db {
                 next_attempt_at,
                 error,
                 now_ms(),
-                captured
+                claim.map(|c| c.epoch),
+                claim.map(|c| c.attempts)
             ],
         )? > 0)
+    }
+
+    /// Claims an open submission for one request, before it is sent: only
+    /// while it is still as `read` it (the same epoch, attempts and status, so
+    /// no answer and no other claim came in between, from this version or an
+    /// earlier one) and due at `now`; for a runner that `leased` its source,
+    /// only while `owner` still holds that lease, so a runner whose lease
+    /// lapsed mid-pass cannot take the submission from the one that took the
+    /// source over; otherwise (a runner driven without a lease), only while no
+    /// other instance holds it. The claim moves the epoch, so the answer to
+    /// any request claimed before it changes nothing. `None`: another runner
+    /// moved it or holds the source; this pass leaves it.
+    pub fn claim_submission(
+        &self,
+        read: &Submission,
+        owner: &str,
+        leased: bool,
+    ) -> Result<Option<Claim>> {
+        let lease = if leased {
+            "EXISTS (SELECT 1 FROM source_leases l
+                     WHERE l.feed_id = submissions.feed_id AND l.owner = $6 AND l.until >= $4)"
+        } else {
+            "NOT EXISTS (SELECT 1 FROM source_leases l
+                         WHERE l.feed_id = submissions.feed_id AND l.owner <> $6 AND l.until >= $4)"
+        };
+        let sql = format!(
+            "UPDATE submissions SET epoch = epoch + 1
+             WHERE token = $1 AND status IN ('kickoff', 'running') AND status = $5
+               AND epoch = $2 AND attempts = $3 AND next_attempt_at <= $4
+               AND {lease}
+             RETURNING epoch, attempts"
+        );
+        // The instant is taken once the store's connection is held: a claim
+        // that waited for it is judged against the lease, and the due time,
+        // as they are when it runs.
+        Ok(self
+            .with(|c| {
+                let now = now_ms();
+                Ok(c.query(
+                    &sql,
+                    &params![
+                        read.token,
+                        read.epoch,
+                        read.attempts,
+                        now,
+                        read.status,
+                        owner
+                    ],
+                )?
+                .into_iter()
+                .next())
+            })?
+            .map(|r: Row| Claim {
+                epoch: r.i64(0),
+                attempts: r.i64(1) as u32,
+            }))
     }
 
     /// A kick-off or status poll failed for a reason that may pass: the next
     /// attempt is due at `next_attempt_at`, with `submission.attempt_failed`.
     /// `reason` is already scrubbed of URLs and the token. Only while the
-    /// submission still has the attempt count `captured` read before the
-    /// request; returns whether it changed.
+    /// submission is still under the request's `claim`; returns whether it
+    /// changed.
     pub fn submission_attempt_failed(
         &self,
         token: &str,
-        captured: u32,
+        claim: Claim,
         next_attempt_at: i64,
         reason: &str,
     ) -> Result<bool> {
-        let attempts = captured + 1;
+        let attempts = claim.attempts + 1;
         self.transaction(|tx| {
             let Some(r) = tx.query_one(
-                "UPDATE submissions SET attempts = $2, next_attempt_at = $3, error = $4, failures = failures + 1, updated_at = $5
-                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $6
+                "UPDATE submissions SET attempts = $2, next_attempt_at = $3, error = $4, failures = failures + 1, updated_at = $5,
+                        epoch = epoch + 1
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND epoch = $6 AND attempts = $7
                  RETURNING feed_id, submission_id",
-                &params![token, attempts, next_attempt_at, reason, now_ms(), captured],
+                &params![token, attempts, next_attempt_at, reason, now_ms(), claim.epoch, claim.attempts],
             )?
             else {
                 return Ok(false);
@@ -2743,25 +2871,26 @@ impl Db {
     /// that changed are added to the submission's tallies, and each gets
     /// `record.delivered` (`record.recovered` when the submission had failed
     /// attempts) or `record.rejected`. Only while the submission is still open
-    /// at the attempt count `captured` read before the poll: otherwise nothing
-    /// changes and `false` comes back.
+    /// under the poll's `claim`: otherwise nothing changes and `false` comes
+    /// back.
     pub fn settle_page(
         &self,
         token: &str,
-        captured: u32,
+        claim: Claim,
         sent: &[(i64, Value)],
         missing: &[i64],
         error: &str,
     ) -> Result<bool> {
         self.transaction(|tx| {
-            // The submission's row first, still open at the attempt count read
-            // before the poll, as a refusal takes it: then its records.
+            // The submission's row first, still under the poll's claim, as a
+            // refusal takes it: then its records. Pages leave the epoch as it
+            // is: one poll settles several.
             let lock = format!(
                 "SELECT feed_id, submission_id, failures FROM submissions
-                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $2{}",
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND epoch = $2 AND attempts = $3{}",
                 tx.for_update()
             );
-            let Some(sub) = tx.query_one(&lock, &params![token, captured])? else {
+            let Some(sub) = tx.query_one(&lock, &params![token, claim.epoch, claim.attempts])? else {
                 return Ok(false);
             };
             let (feed, submission_id, failures) = (sub.string(0), sub.string(1), sub.i64(2));
@@ -2845,22 +2974,26 @@ impl Db {
     }
 
     /// Closes a submission whose receipts are all applied, with
-    /// `submission.settled` and its tallies. Only a submission still open at the
-    /// attempt count `captured` read before the poll moves, so the event is
-    /// written once and an older poll's answer changes nothing. Returns whether
+    /// `submission.settled` and its tallies. Only a submission still open under
+    /// the poll's `claim` moves, so the event is written once and an older
+    /// poll's answer changes nothing. Returns whether
     /// it moved.
-    pub fn settle_submission(&self, token: &str, captured: u32) -> Result<bool> {
+    pub fn settle_submission(&self, token: &str, claim: Claim) -> Result<bool> {
         self.transaction(|tx| {
             let lock = format!(
                 "SELECT token FROM submissions
-                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $2{}",
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND epoch = $2 AND attempts = $3{}",
                 tx.for_update()
             );
-            if tx.query_one(&lock, &params![token, captured])?.is_none() {
+            if tx
+                .query_one(&lock, &params![token, claim.epoch, claim.attempts])?
+                .is_none()
+            {
                 return Ok(false);
             }
             let Some(r) = tx.query_one(
-                "UPDATE submissions SET status = 'done', attempts = 0, next_attempt_at = 0, error = NULL, updated_at = $2
+                "UPDATE submissions SET status = 'done', attempts = 0, next_attempt_at = 0, error = NULL, updated_at = $2,
+                        epoch = epoch + 1
                  WHERE token = $1 AND status IN ('kickoff', 'running')
                  RETURNING feed_id, submission_id, sent, rejected, failures",
                 &params![token, now_ms()],
@@ -2883,13 +3016,12 @@ impl Db {
     /// holds is rejected with `reason` and the server's `response`, in one
     /// transaction, with a `record.rejected` each and one `submission.refused`.
     /// `reason` and `response` are already scrubbed; the events never carry the
-    /// response. Nothing happens unless the submission is open at the attempt
-    /// count `captured` read before the request (an older request's answer
-    /// changes nothing). Returns how many records were rejected, or `None`.
+    /// response. Nothing happens unless the submission is open under the
+    /// request's `claim` (an older request's answer changes nothing). Returns how many records were rejected, or `None`.
     pub fn reject_submission(
         &self,
         token: &str,
-        captured: u32,
+        claim: Claim,
         kind: &str,
         reason: &str,
         response: &Value,
@@ -2897,10 +3029,10 @@ impl Db {
         self.transaction(|tx| {
             let now = now_ms();
             let Some(sub) = tx.query_one(
-                "UPDATE submissions SET status = 'failed', next_attempt_at = 0, error = $2, updated_at = $3
-                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $4
+                "UPDATE submissions SET status = 'failed', next_attempt_at = 0, error = $2, updated_at = $3, epoch = epoch + 1
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND epoch = $4 AND attempts = $5
                  RETURNING feed_id, submission_id",
-                &params![token, reason, now, captured],
+                &params![token, reason, now, claim.epoch, claim.attempts],
             )?
             else {
                 return Ok(None);
@@ -3305,6 +3437,47 @@ impl Db {
         })
     }
 
+    /// Whether source `feed` has an open alert of `kind` without a rule
+    /// (its outage, its credential) raised since its current definition was
+    /// born (a create through the API sets the birth again): one an earlier
+    /// definition of its id left open does not stand for this one's.
+    pub fn open_alert_since_birth(&self, feed: &str, kind: &str) -> Result<bool> {
+        Ok(self
+            .query_one(
+                "SELECT 1 FROM alerts
+                 WHERE feed_id = $1 AND kind = $2 AND rule_id IS NULL AND cleared_at IS NULL
+                   AND created_at >= COALESCE((SELECT born_at FROM source_births WHERE feed_id = $1), 0)
+                 LIMIT 1",
+                &params![feed, kind],
+            )?
+            .is_some())
+    }
+
+    /// The open alerts of source `feed` that only its runner would clear,
+    /// `delivery` (with a rule or without) and `credential`, raised at or
+    /// before `before`: none while an instance other than `owner` holds the
+    /// source's lease, read in the same statement.
+    pub fn orphan_alerts(
+        &self,
+        feed: &str,
+        before: i64,
+        owner: &str,
+    ) -> Result<Vec<(i64, String)>> {
+        Ok(self
+            .query(
+                "SELECT id, kind FROM alerts
+                 WHERE feed_id = $1 AND kind IN ('delivery', 'credential') AND cleared_at IS NULL
+                   AND created_at <= $2
+                   AND NOT EXISTS (SELECT 1 FROM source_leases l
+                                   WHERE l.feed_id = $1 AND l.owner <> $3 AND l.until >= $4)
+                 ORDER BY id",
+                &params![feed, before, owner, now_ms()],
+            )?
+            .iter()
+            .map(|r| (r.i64(0), r.string(1)))
+            .collect())
+    }
+
     /// The open alert (not cleared) of this kind for a source and rule, if any.
     pub fn open_alert(
         &self,
@@ -3332,6 +3505,31 @@ impl Db {
         now: i64,
         webhook: impl FnOnce(&AlertRow) -> NewWebhook,
     ) -> Result<Option<AlertRow>> {
+        self.clear_alert_guarded(id, reason, now, None, webhook)
+    }
+
+    /// `clear_alert_with_webhook`, only while no instance but `owner` holds
+    /// the lease of the alert's source, checked in the clearing statement: a
+    /// deleted source's alert is not cleared once another instance runs it.
+    pub fn clear_orphan_with_webhook(
+        &self,
+        id: i64,
+        owner: &str,
+        reason: &str,
+        now: i64,
+        webhook: impl FnOnce(&AlertRow) -> NewWebhook,
+    ) -> Result<Option<AlertRow>> {
+        self.clear_alert_guarded(id, reason, now, Some(owner), webhook)
+    }
+
+    fn clear_alert_guarded(
+        &self,
+        id: i64,
+        reason: &str,
+        now: i64,
+        owner: Option<&str>,
+        webhook: impl FnOnce(&AlertRow) -> NewWebhook,
+    ) -> Result<Option<AlertRow>> {
         let columns = self.alert_columns();
         self.with(|c| {
             c.batch("BEGIN")?;
@@ -3340,9 +3538,14 @@ impl Db {
                     .query(
                         &format!(
                             "UPDATE alerts SET cleared_at = $2, cleared_reason = $3
-                             WHERE id = $1 AND cleared_at IS NULL RETURNING {columns}"
+                             WHERE id = $1 AND cleared_at IS NULL
+                               AND (CAST($4 AS TEXT) IS NULL OR NOT EXISTS (
+                                     SELECT 1 FROM source_leases l
+                                     WHERE l.feed_id = alerts.feed_id AND l.owner <> CAST($4 AS TEXT)
+                                       AND l.until >= $2))
+                             RETURNING {columns}"
                         ),
-                        &params![id, now, reason],
+                        &params![id, now, reason, owner],
                     )?
                     .first()
                     .map(Self::alert_row)
@@ -3620,12 +3823,12 @@ impl Db {
 
     // ---- history: events and their retention --------------------------------
 
-    /// Whether a submission is still open at the attempt count `captured`.
-    pub fn submission_open_at(&self, token: &str, captured: u32) -> Result<bool> {
+    /// Whether a submission is still open under `claim`.
+    pub fn submission_open_at(&self, token: &str, claim: Claim) -> Result<bool> {
         Ok(self
             .query_one(
-                "SELECT 1 FROM submissions WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $2",
-                &params![token, captured],
+                "SELECT 1 FROM submissions WHERE token = $1 AND status IN ('kickoff', 'running') AND epoch = $2 AND attempts = $3",
+                &params![token, claim.epoch, claim.attempts],
             )?
             .is_some())
     }
@@ -3670,53 +3873,53 @@ impl Db {
             });
         };
         let forward = |next: i64| Some(q.cursor.map_or(next, |c| c.max(next)));
-        // Without a cursor, `since` gives where to start, itself included.
-        let (start, inclusive) = match (q.cursor, q.since) {
-            (Some(cursor), _) => (cursor, false),
-            (None, Some(since)) => match self
-                .query_one("SELECT MIN(id) FROM events WHERE at >= $1", &params![since])?
-                .and_then(|r| r.opt_i64(0))
-            {
-                Some(first) => (first, true),
+        // From the cursor; without one, from where `since` starts, or from
+        // the start of the log. A cursor is never moved by `since`: an event
+        // stored after it is listed, whatever the clock of its instance.
+        let start = match (q.cursor, q.since) {
+            (Some(cursor), _) => cursor,
+            (None, Some(since)) => match self.since_start(since)? {
+                Some(start) => start,
+                // Nothing stored at or after `since`.
                 None => {
                     return Ok(EventPage {
                         events: vec![],
-                        next: forward(mark),
+                        next: Some(mark),
                         has_more: false,
                     });
                 }
             },
-            (None, None) => (0, false),
+            (None, None) => 0,
         };
-        let mut sql = format!(
-            "SELECT id, {} AS at, source_id, kind, load_id, record_id, attempt, error_kind, reason, detail
-             FROM events WHERE id {} $1 AND id <= $2",
-            self.iso("at"),
-            if inclusive { ">=" } else { ">" }
-        );
-        let mut values = params![start, mark].to_vec();
-        if let Some(source) = &q.source {
-            values.push(Param::Text(source.clone()));
-            sql.push_str(&format!(" AND source_id = ${}", values.len()));
-        }
-        if let Some(since) = q.since {
-            values.push(Param::Int(since));
-            sql.push_str(&format!(" AND at >= ${}", values.len()));
-        }
-        if !q.kinds.is_empty() {
-            let mut any = Vec::new();
-            for kind in &q.kinds {
-                if crate::events::FAMILIES.contains(&kind.as_str()) {
-                    any.push(format!("kind LIKE '{kind}.%'"));
-                } else {
-                    values.push(Param::Text(kind.clone()));
-                    any.push(format!("kind = ${}", values.len()));
-                }
-            }
-            sql.push_str(&format!(" AND ({})", any.join(" OR ")));
-        }
-        values.push(Param::Int(q.limit as i64 + 1));
-        sql.push_str(&format!(" ORDER BY id LIMIT ${}", values.len()));
+        // Filters that no index serves in id order (`since`, a source and a
+        // kind together, or several kinds) read at most `span` events past
+        // the start, whatever they keep; a gap left by the purge costs
+        // nothing. Otherwise the page's own `LIMIT` bounds the read: without a
+        // filter every event read is listed; a source alone, or one kind, is
+        // read through `events_source` or `events_kind`.
+        let kinds = exact_kinds(&q.kinds);
+        let spanned =
+            q.since.is_some() || kinds.len() > 1 || (q.source.is_some() && !kinds.is_empty());
+        let span = q.scan.unwrap_or(EVENT_SCAN_SPAN).max(1);
+        let end = if spanned {
+            self.query_one(
+                "SELECT MAX(id) FROM (SELECT id FROM events WHERE id > $1 AND id <= $2 ORDER BY id LIMIT $3) span",
+                &params![start, mark, span as i64],
+            )?
+            .and_then(|r| r.opt_i64(0))
+        } else {
+            (start < mark).then_some(mark)
+        };
+        let Some(end) = end else {
+            // Nothing past the start (an empty log after a purge, a cursor
+            // at or past the newest id).
+            return Ok(EventPage {
+                events: vec![],
+                next: forward(mark),
+                has_more: false,
+            });
+        };
+        let (sql, values) = self.event_page_sql(q, start, end);
         let mut events: Vec<Value> = self
             .query(&sql, &values)?
             .iter()
@@ -3728,11 +3931,15 @@ impl Db {
                 e
             })
             .collect();
-        let has_more = events.len() > q.limit;
+        let full = events.len() > q.limit;
         events.truncate(q.limit);
-        let next = match events.last() {
-            Some(last) if has_more => last["id"].as_i64(),
-            _ => forward(mark),
+        // A full page goes on after its last event; one that stopped at the
+        // end of its span, before the newest id, goes on from there, even
+        // with nothing listed; otherwise the log was read to the newest id.
+        let (next, has_more) = match events.last() {
+            Some(last) if full => (last["id"].as_i64(), true),
+            _ if end < mark => (forward(end), true),
+            _ => (forward(mark), false),
         };
         Ok(EventPage {
             events,
@@ -3741,18 +3948,142 @@ impl Db {
         })
     }
 
+    /// Where a read of the events at or after `since` starts without a cursor:
+    /// just before the lowest id among the events from `since` to the first
+    /// of them plus `EVENT_CLOCK_MARGIN_MS`, read through `events_at`. An
+    /// event stored after another carries an `at` at most the margin behind
+    /// it, so no event at or after `since` has a lower id. `None` when no
+    /// event is at or after `since`.
+    fn since_start(&self, since: i64) -> Result<Option<i64>> {
+        Ok(self
+            .query_one(
+                &self.since_start_sql(),
+                &params![since, EVENT_CLOCK_MARGIN_MS],
+            )?
+            .and_then(|r| r.opt_i64(0)))
+    }
+
+    /// The statement of `since_start`. The window is read through `events_at`
+    /// on both stores: `id + 0` keeps either planner from finding the lowest
+    /// id by walking the primary key from the start of the log until an
+    /// event of the window, and SQLite is told the index.
+    fn since_start_sql(&self) -> String {
+        let index = if self.is_postgres() {
+            ""
+        } else {
+            " INDEXED BY events_at"
+        };
+        format!(
+            "SELECT MIN(id + 0) - 1 FROM events{index}
+             WHERE at >= $1 AND at <= (SELECT MIN(at) FROM events WHERE at >= $1) + $2"
+        )
+    }
+
+    /// The statement of a page of events in `(start, end]` with `q`'s filters,
+    /// and its parameters.
+    fn event_page_sql(&self, q: &EventQuery, start: i64, end: i64) -> (String, Vec<Param>) {
+        let kinds = exact_kinds(&q.kinds);
+        let mut values = params![start, end].to_vec();
+        // A source alone, or one kind, is read through its index in id order,
+        // however its events lie in the log: SQLite is told the index (its
+        // statistics weigh an average source or kind), and PostgreSQL gets
+        // the range as a row value over the index's columns, which the
+        // primary key cannot serve (with an equality on the first column it
+        // would walk the primary key towards events far from the start).
+        let served = match (q.source.as_deref(), kinds.as_slice()) {
+            (Some(source), []) => Some(("source_id", "events_source", source)),
+            (None, [kind]) => Some(("kind", "events_kind", *kind)),
+            _ => None,
+        };
+        let (index, range, order) = match served {
+            Some((column, index, value)) => {
+                values.push(Param::Text(value.to_string()));
+                let v = values.len();
+                if self.is_postgres() {
+                    (
+                        String::new(),
+                        format!("({column}, id) > (${v}, $1) AND ({column}, id) <= (${v}, $2)"),
+                        format!("{column}, id"),
+                    )
+                } else {
+                    (
+                        format!(" INDEXED BY {index}"),
+                        format!("id > $1 AND id <= $2 AND {column} = ${v}"),
+                        "id".to_string(),
+                    )
+                }
+            }
+            None => (
+                String::new(),
+                "id > $1 AND id <= $2".to_string(),
+                "id".to_string(),
+            ),
+        };
+        let mut sql = format!(
+            "SELECT id, {} AS at, source_id, kind, load_id, record_id, attempt, error_kind, reason, detail
+             FROM events{index} WHERE {range}",
+            self.iso("at"),
+        );
+        if served.is_none() {
+            if let Some(source) = &q.source {
+                values.push(Param::Text(source.clone()));
+                sql.push_str(&format!(" AND source_id = ${}", values.len()));
+            }
+            if !kinds.is_empty() {
+                let mut marks = Vec::with_capacity(kinds.len());
+                for kind in &kinds {
+                    values.push(Param::Text(kind.to_string()));
+                    marks.push(format!("${}", values.len()));
+                }
+                sql.push_str(&format!(" AND kind IN ({})", marks.join(", ")));
+            }
+        }
+        if let Some(since) = q.since {
+            values.push(Param::Int(since));
+            sql.push_str(&format!(" AND at >= ${}", values.len()));
+        }
+        values.push(Param::Int(q.limit as i64 + 1));
+        sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", values.len()));
+        (sql, values)
+    }
+
     /// Removes up to `limit` events older than `cutoff_ms` in one transaction.
     /// Returns how many went.
+    /// Whatever the instance's retention, the store records the latest cutoff
+    /// any purge removed events under (`events_purged_before`), so a reader on
+    /// a store shared with an instance of shorter retention knows the log no
+    /// longer covers what came before it.
     pub fn purge_events(&self, cutoff_ms: i64, limit: usize) -> Result<usize> {
         self.transaction(|tx| {
-            Ok(tx
+            let gone = tx
                 .query(
                     "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE at < $1 ORDER BY id LIMIT $2)
                      RETURNING id",
                     &params![cutoff_ms, limit],
                 )?
-                .len())
+                .len();
+            if gone > 0 {
+                tx.execute(
+                    "INSERT INTO store_meta (key, value) VALUES ('events_purged_before', $1)
+                     ON CONFLICT (key) DO UPDATE SET value = CASE
+                       WHEN CAST(excluded.value AS BIGINT) > CAST(store_meta.value AS BIGINT)
+                       THEN excluded.value ELSE store_meta.value END",
+                    &params![cutoff_ms.to_string()],
+                )?;
+            }
+            Ok(gone)
         })
+    }
+
+    /// The latest cutoff a purge removed events under, by any instance of this
+    /// version on the store: the log holds nothing stored before it.
+    pub fn events_purged_before(&self) -> Result<Option<i64>> {
+        Ok(self
+            .query_one(
+                "SELECT value FROM store_meta WHERE key = 'events_purged_before'",
+                &[],
+            )?
+            .and_then(|r| r.string(0).parse().ok()))
     }
 
     /// Removes up to `limit` alerts older than `cutoff_ms` (since they cleared, or
@@ -4180,6 +4511,20 @@ impl Db {
             .source_id
             .as_deref()
             .context("a default rule names its source")?;
+        // A start of a source the store has seen is the common case: answered
+        // by a read, with no write transaction, so a start does not wait for
+        // the write lock of a SQLite file another instance holds. Births are
+        // never removed, so a row read here stays.
+        if !force
+            && self
+                .query_one(
+                    "SELECT 1 FROM source_births WHERE feed_id = $1",
+                    &params![feed],
+                )?
+                .is_some()
+        {
+            return Ok(None);
+        }
         self.with(|c| {
             c.batch(match c {
                 Conn::Postgres(_) => "BEGIN ISOLATION LEVEL READ COMMITTED",
@@ -4278,6 +4623,26 @@ impl Db {
     pub fn query_json(&self, sql: &str, p: impl Into<Vec<Param>>) -> Result<Vec<Value>> {
         let p = p.into();
         Ok(self.query(sql, &p)?.iter().map(Row::object).collect())
+    }
+
+    /// `query_json` once for each id, as `$1`, each in a store call of its
+    /// own, in order: the store's only connection is let go between two, and
+    /// the thread yields, so another source or API call waits for one id's
+    /// statement, not for all of them. Each row agrees with itself; rows of
+    /// different ids may have been read at different moments.
+    pub fn query_json_each(&self, sql: &str, ids: &[i64]) -> Result<Vec<Value>> {
+        let mut rows = Vec::with_capacity(ids.len());
+        for (n, id) in ids.iter().enumerate() {
+            if n > 0 {
+                pause_point!(self, "each:between");
+                // The mutex is not fair: unlocked and locked again at once, it
+                // would stay this thread's. A moment off it lets a caller
+                // waiting for it in.
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            rows.extend(self.query_json(sql, vec![Param::Int(*id)])?);
+        }
+        Ok(rows)
     }
 }
 
@@ -4740,6 +5105,426 @@ mod tests {
         .unwrap();
     }
 
+    /// Between two ids the store's connection is free: another caller's write
+    /// lands there, and the next id's row sees it. A page of loads read this
+    /// way holds the connection for one load at a time.
+    #[cfg(feature = "secrets-native")]
+    #[test]
+    fn each_id_is_read_with_the_connection_let_go_between() {
+        let db = std::sync::Arc::new(Db::in_memory().unwrap());
+        let other = db.clone();
+        let once = std::sync::atomic::AtomicBool::new(false);
+        db.on_pause(std::sync::Arc::new(move |at| {
+            if at == "each:between" && !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let other = other.clone();
+                let (done, landed) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    other
+                        .execute_for_test(
+                            "INSERT INTO store_meta (key, value) VALUES ('probe', '1')",
+                            &[],
+                        )
+                        .unwrap();
+                    done.send(()).unwrap();
+                });
+                landed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("another caller got the connection between two ids");
+            }
+        }));
+        let rows = db
+            .query_json_each(
+                "SELECT CAST($1 AS BIGINT) AS id,
+                        (SELECT COUNT(*) FROM store_meta WHERE key = 'probe') AS seen",
+                &[7, 8, 9],
+            )
+            .unwrap();
+        let seen: Vec<(i64, i64)> = rows
+            .iter()
+            .map(|r| (r["id"].as_i64().unwrap(), r["seen"].as_i64().unwrap()))
+            .collect();
+        assert_eq!(seen, [(7, 0), (8, 1), (9, 1)]);
+    }
+
+    /// Events with `at` and `kind`, in that order; their ids.
+    fn log(db: &Db, events: &[(i64, &str)]) -> Vec<i64> {
+        events
+            .iter()
+            .map(|(at, kind)| {
+                db.query_one(
+                    "INSERT INTO events (at, source_id, kind) VALUES ($1, 's', $2) RETURNING id",
+                    &params![*at, *kind],
+                )
+                .unwrap()
+                .unwrap()
+                .i64(0)
+            })
+            .collect()
+    }
+
+    fn page(
+        db: &Db,
+        kinds: &[&str],
+        since: Option<i64>,
+        cursor: Option<i64>,
+        limit: usize,
+    ) -> EventPage {
+        db.list_events(&EventQuery {
+            kinds: kinds.iter().map(|k| k.to_string()).collect(),
+            since,
+            cursor,
+            limit,
+            scan: Some(10),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn listed(page: &EventPage) -> Vec<i64> {
+        page.events
+            .iter()
+            .map(|e| e["id"].as_i64().unwrap())
+            .collect()
+    }
+
+    /// A request reads at most its span of the log, whatever its filters keep:
+    /// one that matches rarely stops at the end of the span with `has_more`
+    /// and goes on from there, and following it reaches the match.
+    #[test]
+    fn a_rare_filter_reads_one_span_per_request() {
+        let db = Db::in_memory().unwrap();
+        let mut events = vec![(1, "load.received"); 25];
+        events.push((1, "submission.opened"));
+        let ids = log(&db, &events);
+        let first = page(&db, &["submission"], None, None, 100);
+        assert!(first.events.is_empty());
+        assert!(first.has_more);
+        assert_eq!(first.next, Some(ids[9]), "the end of the first span");
+        let second = page(&db, &["submission"], None, first.next, 100);
+        assert!(second.events.is_empty() && second.has_more);
+        assert_eq!(second.next, Some(ids[19]));
+        let third = page(&db, &["submission"], None, second.next, 100);
+        assert_eq!(listed(&third), [ids[25]]);
+        assert!(!third.has_more);
+        assert_eq!(third.next, Some(ids[25]));
+        // Read to the newest id: nothing more, and the cursor stays.
+        let after = page(&db, &["submission"], None, third.next, 100);
+        assert!(after.events.is_empty() && !after.has_more);
+        assert_eq!(after.next, third.next);
+        // A cursor past the log does not move back.
+        let ahead = page(&db, &[], None, Some(ids[25] + 50), 100);
+        assert_eq!((ahead.next, ahead.has_more), (Some(ids[25] + 50), false));
+    }
+
+    /// Matches inside a span page by `limit`, from the last one listed.
+    #[test]
+    fn dense_matches_page_by_limit_inside_a_span() {
+        let db = Db::in_memory().unwrap();
+        let ids = log(&db, &[(1, "record.delivered"); 8]);
+        let first = page(&db, &["record"], None, None, 3);
+        assert_eq!(listed(&first), ids[..3]);
+        assert_eq!((first.next, first.has_more), (Some(ids[2]), true));
+        let second = page(&db, &["record.delivered"], None, first.next, 3);
+        assert_eq!(listed(&second), ids[3..6]);
+        let third = page(&db, &["record"], None, second.next, 3);
+        assert_eq!(listed(&third), ids[6..]);
+        assert!(!third.has_more);
+    }
+
+    /// A span counts events, not ids: a gap the purge left costs nothing.
+    #[test]
+    fn a_purged_gap_is_not_a_span() {
+        let db = Db::in_memory().unwrap();
+        let ids = log(&db, &[(1, "load.received"); 30]);
+        db.execute_for_test("DELETE FROM events WHERE id <= $1", &params![ids[24]])
+            .unwrap();
+        let all = page(&db, &[], None, None, 100);
+        assert_eq!(listed(&all), ids[25..]);
+        assert!(!all.has_more);
+    }
+
+    /// A family is its exact kinds, which SQLite reads through `events_kind`;
+    /// a `LIKE` could not use it.
+    #[test]
+    fn a_family_filter_reads_the_kind_index() {
+        let db = Db::in_memory().unwrap();
+        if db.is_postgres() {
+            return;
+        }
+        let mut events = vec![(1, "load.received"); 3000];
+        events.push((1, "submission.opened"));
+        log(&db, &events);
+        db.execute_for_test("ANALYZE", &[]).unwrap();
+        // The statement `list_events` runs for `kind=submission`.
+        let (sql, p) = db.event_page_sql(
+            &EventQuery {
+                kinds: vec!["submission".into()],
+                limit: 100,
+                ..Default::default()
+            },
+            0,
+            i64::MAX,
+        );
+        let plan: Vec<String> = db
+            .query_json(&format!("EXPLAIN QUERY PLAN {sql}"), p)
+            .unwrap()
+            .iter()
+            .map(|r| r["detail"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            plan.iter().any(|line| line.contains("events_kind")),
+            "{plan:#?}"
+        );
+        // And a request with the default span lists it.
+        let found = db
+            .list_events(&EventQuery {
+                kinds: vec!["submission".into()],
+                limit: 100,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(found.events.len(), 1);
+        assert!(!found.has_more);
+    }
+
+    /// `since` without a cursor starts within the margin of its first event:
+    /// an event at or after it is listed even when later ids were stored
+    /// earlier (another instance's clock behind), more than a span of them.
+    #[test]
+    fn since_never_passes_over_an_earlier_id_stored_after_it() {
+        let db = Db::in_memory().unwrap();
+        let mut events = vec![(99, "load.received"), (101, "load.received")];
+        events.extend(vec![(100, "load.received"); 30]);
+        let ids = log(&db, &events);
+        let mut got = Vec::new();
+        let mut cursor = None;
+        loop {
+            let p = page(&db, &[], Some(100), cursor, 100);
+            got.extend(listed(&p));
+            cursor = p.next;
+            if !p.has_more {
+                break;
+            }
+        }
+        assert_eq!(got, ids[1..]);
+    }
+
+    /// `since` without a cursor starts at its first event, however long the
+    /// log before it: the first page lists it.
+    #[test]
+    fn since_starts_at_its_first_event() {
+        let db = Db::in_memory().unwrap();
+        let mut events = vec![(1, "load.received"); 25];
+        events.push((1_000_000, "load.received"));
+        let ids = log(&db, &events);
+        let first = page(&db, &[], Some(1_000_000), None, 100);
+        assert_eq!(listed(&first), [ids[25]]);
+        assert_eq!((first.next, first.has_more), (Some(ids[25]), false));
+        // A poll from its cursor lists every event stored since at or after
+        // `since`, an earlier `at` stored after a later one included.
+        let more = log(
+            &db,
+            &[
+                (1_000_000 + 2 * EVENT_CLOCK_MARGIN_MS, "load.received"),
+                (1_000_001, "load.received"),
+            ],
+        );
+        let next = page(&db, &[], Some(1_000_000), first.next, 100);
+        assert_eq!(listed(&next), more);
+        // Nothing at or after it: an empty page at the newest id.
+        let none = page(
+            &db,
+            &[],
+            Some(1_000_000 + 3 * EVENT_CLOCK_MARGIN_MS),
+            None,
+            100,
+        );
+        assert!(none.events.is_empty() && !none.has_more);
+        assert_eq!(none.next, Some(more[1]));
+    }
+
+    /// An event stored before the first one at or after `since`, whose clock
+    /// was ahead by less than the margin, is listed too; one before `since`
+    /// stored in between is not.
+    #[test]
+    fn since_lists_an_earlier_id_within_the_clock_margin() {
+        let db = Db::in_memory().unwrap();
+        let since = 10 * EVENT_CLOCK_MARGIN_MS;
+        // More than a span of events before `since`, then the window.
+        let mut events = vec![(1, "load.received"); 25];
+        events.extend([
+            (since + EVENT_CLOCK_MARGIN_MS / 2, "load.received"),
+            (since - 10, "load.received"),
+            (since + 1, "load.received"),
+        ]);
+        let ids = log(&db, &events);
+        let first = page(&db, &[], Some(since), None, 100);
+        assert_eq!(listed(&first), [ids[25], ids[27]]);
+        assert!(!first.has_more);
+    }
+
+    /// A source alone, or one kind, is read through its index in id order:
+    /// a rare match is listed on the first page, past more than a span.
+    #[test]
+    fn an_indexed_filter_reads_past_the_span() {
+        let db = Db::in_memory().unwrap();
+        let mut events = vec![(1, "load.received"); 25];
+        events.push((1, "submission.opened"));
+        let ids = log(&db, &events);
+        let other = db
+            .query_one(
+                "INSERT INTO events (at, source_id, kind) VALUES (1, 'other', 'load.received') RETURNING id",
+                &[],
+            )
+            .unwrap()
+            .unwrap()
+            .i64(0);
+        let one_kind = page(&db, &["submission.opened"], None, None, 100);
+        assert_eq!(listed(&one_kind), [ids[25]]);
+        assert!(!one_kind.has_more);
+        let source = db
+            .list_events(&EventQuery {
+                source: Some("other".into()),
+                limit: 100,
+                scan: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(listed(&source), [other]);
+        assert!(!source.has_more);
+        // A source and a kind together are still read a span at a time.
+        let both = db
+            .list_events(&EventQuery {
+                source: Some("s".into()),
+                kinds: vec!["submission.opened".into()],
+                limit: 100,
+                scan: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(both.events.is_empty() && both.has_more);
+    }
+
+    /// The plan of a statement, one line per step, on either store.
+    fn plan(db: &Db, sql: &str, p: Vec<Param>) -> Vec<String> {
+        let (explain, column) = if db.is_postgres() {
+            ("EXPLAIN", "QUERY PLAN")
+        } else {
+            ("EXPLAIN QUERY PLAN", "detail")
+        };
+        db.query_json(&format!("{explain} {sql}"), p)
+            .unwrap()
+            .iter()
+            .map(|r| r[column].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The statements an unspanned read runs are served by an index in id
+    /// order, and where `since` starts is found through `events_at`, on a log
+    /// with a long stretch before what they look for.
+    #[test]
+    fn unspanned_reads_use_an_index() {
+        let db = Db::in_memory().unwrap();
+        // The source and the kind looked for first appear late in the log,
+        // and are not rare from there on.
+        let events: Vec<(i64, &str)> = (0..3000).map(|i| (i, "load.received")).collect();
+        log(&db, &events);
+        for at in 3000..4000 {
+            db.execute_for_test(
+                "INSERT INTO events (at, source_id, kind) VALUES ($1, 'other', 'submission.opened')",
+                &params![at],
+            )
+            .unwrap();
+        }
+        // As the engine leaves the store (it never analyzes it), then with
+        // statistics.
+        for analyzed in [false, true] {
+            if analyzed {
+                db.execute_for_test("ANALYZE", &[]).unwrap();
+            }
+            plans_use_an_index(&db);
+        }
+    }
+
+    fn plans_use_an_index(db: &Db) {
+        let page_plan = |q: EventQuery| {
+            let (sql, p) = db.event_page_sql(&EventQuery { limit: 100, ..q }, 0, i64::MAX);
+            plan(db, &sql, p)
+        };
+        let kind = page_plan(EventQuery {
+            kinds: vec!["submission.opened".into()],
+            ..Default::default()
+        });
+        assert!(kind.iter().any(|l| l.contains("events_kind")), "{kind:#?}");
+        let source = page_plan(EventQuery {
+            source: Some("other".into()),
+            ..Default::default()
+        });
+        assert!(
+            source.iter().any(|l| l.contains("events_source")),
+            "{source:#?}"
+        );
+        // Where `since` starts: its window is read through `events_at`, never
+        // by walking the primary key from the start of the log.
+        let start = plan(
+            db,
+            &db.since_start_sql(),
+            params![2990, EVENT_CLOCK_MARGIN_MS].to_vec(),
+        );
+        assert!(
+            start.iter().filter(|l| l.contains("events_at")).count() >= 2,
+            "{start:#?}"
+        );
+        assert!(
+            !start
+                .iter()
+                .any(|l| l.contains("PRIMARY KEY") || l.contains("events_pkey")),
+            "{start:#?}"
+        );
+    }
+
+    #[test]
+    fn the_untagged_slack_starts_once_the_connection_is_held() {
+        let db = std::sync::Arc::new(Db::in_memory().unwrap());
+        let (held, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+        let holder = {
+            let db = db.clone();
+            let held = held.0;
+            std::thread::spawn(move || {
+                let _conn = db.conn.lock().unwrap();
+                held.send(()).unwrap();
+                release.1.recv().unwrap();
+            })
+        };
+        held.1.recv().unwrap();
+        // The caller asks while another holds the connection, which it keeps
+        // for longer than the slack.
+        let caller = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let asked = std::time::Instant::now();
+                let started = db.mark_untagged_from_now("lab", 1_000).unwrap();
+                (asked, started, std::time::Instant::now())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let (released_at, released) = (now_ms(), std::time::Instant::now());
+        release.0.send(()).unwrap();
+        holder.join().unwrap();
+        let (asked, started, done) = caller.join().unwrap();
+        assert!(asked < released, "the caller waited for the connection");
+        assert!(started >= released, "the slack starts once it is held");
+        assert!(
+            done.duration_since(started) < std::time::Duration::from_millis(400),
+            "only the statement counts, not the wait for the connection"
+        );
+        let until = db.stamping("lab", 0).unwrap().untagged_until.unwrap();
+        assert!(
+            until >= released_at + 1_000,
+            "the bound is from after the wait"
+        );
+    }
+
     #[test]
     fn the_rest_bound_only_moves_later_and_is_open_while_in_the_future() {
         let db = Db::in_memory().unwrap();
@@ -4966,6 +5751,36 @@ mod tests {
         assert_eq!(
             db.give_default_rule(&default_rule("new"), false).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn a_born_sources_default_rule_is_answered_without_a_write_lock() {
+        let (_dir, a, b) = two_handles();
+        if a.is_postgres() {
+            return;
+        }
+        assert!(
+            a.give_default_rule(&default_rule("lab"), false)
+                .unwrap()
+                .is_some()
+        );
+        // Another instance holds SQLite's write lock; this one waits for it at
+        // most briefly.
+        a.set_busy_timeout(std::time::Duration::from_millis(50));
+        b.with(|c| c.batch("BEGIN IMMEDIATE")).unwrap();
+        assert_eq!(
+            a.give_default_rule(&default_rule("lab"), false).unwrap(),
+            None,
+            "a born source is answered without the write lock"
+        );
+        // A source never seen still needs it, and waits.
+        assert!(a.give_default_rule(&default_rule("new"), false).is_err());
+        b.with(|c| c.batch("ROLLBACK")).unwrap();
+        assert!(
+            a.give_default_rule(&default_rule("new"), false)
+                .unwrap()
+                .is_some()
         );
     }
 

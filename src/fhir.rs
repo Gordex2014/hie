@@ -113,7 +113,9 @@ impl FhirClient {
         // while it downloads.
         let exchange = self.destination.start();
         let sent = self.http.execute(request).await;
-        exchange.observe_send(&sent);
+        if sent.is_err() {
+            exchange.observe_send(&sent);
+        }
         let resp = sent.map_err(|e| {
             SendError::Transient(
                 crate::destination::send_failure(&e)
@@ -122,7 +124,30 @@ impl FhirClient {
             )
         })?;
         let status = resp.status().as_u16();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        // The answer counts once it has been read whole: a connection that
+        // breaks or times out while the body arrives is the server not
+        // answering, and the attempt may pass. A body that arrived whole but
+        // is not JSON (a proxy's page) is still an answer.
+        let body: Value = match resp.bytes().await {
+            Ok(bytes) => {
+                exchange.observe(
+                    crate::destination::status_outcome(status),
+                    &format!("HTTP {status}"),
+                );
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+            }
+            Err(e) => {
+                let failure = crate::destination::send_failure(&e)
+                    .unwrap_or(crate::destination::Failure::Lost);
+                exchange.observe(Err(failure), &crate::destination::send_detail(&e));
+                // The status line still said the token was refused.
+                if matches!(status, 401 | 403) && self.credentials.is_some() {
+                    drop(exchange);
+                    return Err(refused_token(status, &self.credentials).await);
+                }
+                return Err(SendError::Transient(failure.sentence().into()));
+            }
+        };
         drop(exchange);
         match status {
             200..=299 => Ok(body),

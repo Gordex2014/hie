@@ -857,7 +857,15 @@ async fn a_source_contact_is_read_kept_and_cleared() {
         "id: blank\nname: Blank\ncontact: \"  \"\nsource:\n  type: folder\n  path: inbox\n  poll_seconds: 3600\ntransform: transforms/lab_results.py\n",
     )
     .unwrap();
+    // One saved by a build that took invisible format characters: it loads,
+    // as it is, and the engine starts with every source.
+    std::fs::write(
+        root.join("sources/hidden.yaml"),
+        "id: hidden\nname: Hidden\ncontact: \"Lab\\u200BIT\"\nsource:\n  type: folder\n  path: inbox\n  poll_seconds: 3600\ntransform: transforms/lab_results.py\n",
+    )
+    .unwrap();
     let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    assert_eq!(feeds.len(), 3);
     let (_manager, state) =
         hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
     let api = serve(hie::api::router(state)).await;
@@ -875,6 +883,8 @@ async fn a_source_contact_is_read_kept_and_cleared() {
         }
     };
 
+    let hidden = get("/api/sources/hidden".into()).await;
+    assert_eq!(hidden["contact"], "Lab\u{200b}IT");
     let from_file = get("/api/sources/from-file".into()).await;
     assert_eq!(from_file["contact"], "5550100");
     assert_eq!(from_file["definition"]["contact"], "5550100");
@@ -969,9 +979,14 @@ async fn a_source_contact_is_read_kept_and_cleared() {
         .unwrap();
     assert_eq!(needs["contact"], contact);
 
-    // Refused: too long, or more than one line. Nothing changes.
+    // Refused: too long, more than one line, or an invisible character.
+    // Nothing changes.
     let saved = file();
-    for bad in ["x".repeat(501), "Lab IT\n+1 555 0100".to_string()] {
+    for bad in [
+        "x".repeat(501),
+        "Lab IT\n+1 555 0100".to_string(),
+        "Lab\u{feff}IT".to_string(),
+    ] {
         let mut body = read.clone();
         body["contact"] = json!(bad);
         let refused = replace(body.clone()).await;
@@ -1016,4 +1031,278 @@ async fn a_source_contact_is_read_kept_and_cleared() {
         );
         assert!(!file().contains("contact"), "{cleared:?}: {}", file());
     }
+}
+
+/// The alerts only a source's runner clears (its outage, its credential) end
+/// with the source once its runner has ended after a delete. Another kind
+/// stays, an alert raised after the delete (by a source created again) stays,
+/// and nothing ends while another instance holds the source.
+#[tokio::test]
+async fn a_deleted_sources_outage_ends_with_it() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let urls: Urls = Arc::default();
+    let fhir = serve(Router::new().route("/", post(batch)).with_state(urls)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::create_dir_all(root.join("inbox")).unwrap();
+    std::fs::copy(
+        repo().join("transforms/lab_results.py"),
+        root.join("transforms/lab_results.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {fhir}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (_manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let db = state.db.clone();
+    let api = serve(hie::api::router(state)).await;
+    let http = reqwest::Client::new();
+    let definition = json!({
+        "id": "lab", "name": "Lab",
+        "source": {"type": "folder", "path": "inbox", "pattern": "*.csv", "poll_seconds": 3600},
+        "transform": "transforms/lab_results.py"
+    });
+    let create = || async {
+        let r = http
+            .post(format!("{api}/api/sources"))
+            .json(&definition)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 201);
+    };
+    let delete = || async {
+        let r = http
+            .delete(format!("{api}/api/sources/lab"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+    };
+    let raise = |kind: &str, at: i64| -> i64 {
+        db.query_json(
+            "INSERT INTO alerts (feed_id, kind, message, created_at) VALUES ('lab', $1, 'open', $2) RETURNING id",
+            vec![hie::db::Param::Text(kind.into()), hie::db::Param::Int(at)],
+        )
+        .unwrap()[0]["id"]
+            .as_i64()
+            .unwrap()
+    };
+    let cleared = |id: i64| -> Option<String> {
+        db.query_json(
+            "SELECT cleared_reason FROM alerts WHERE id = $1",
+            vec![hie::db::Param::Int(id)],
+        )
+        .unwrap()[0]["cleared_reason"]
+            .as_str()
+            .map(str::to_string)
+    };
+    let wait_cleared = |id: i64, what: &'static str| {
+        let cleared = &cleared;
+        async move {
+            let started = Instant::now();
+            loop {
+                if let Some(reason) = cleared(id) {
+                    return reason;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "timed out waiting for {what}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+
+    create().await;
+    let before = hie::db::now_ms();
+    let outage = raise("delivery", before);
+    let credential = raise("credential", before);
+    let other = raise("unreadable_file", before);
+    delete().await;
+    assert_eq!(
+        wait_cleared(outage, "the outage to end").await,
+        "lab: the source was deleted"
+    );
+    assert_eq!(
+        wait_cleared(credential, "the credential alert to end").await,
+        "lab: the source was deleted"
+    );
+    assert_eq!(
+        cleared(other),
+        None,
+        "another kind is left to its own clearing"
+    );
+
+    // Created again, and deleted again: that delete's sweep ends what was
+    // raised before it, and leaves an alert raised after it (by a definition
+    // created after the delete) alone.
+    create().await;
+    let marker = raise("delivery", hie::db::now_ms());
+    let later = raise("delivery", hie::db::now_ms() + 600_000);
+    delete().await;
+    wait_cleared(marker, "the second delete's sweep").await;
+    assert_eq!(
+        cleared(later),
+        None,
+        "raised after the delete: not its sweep's"
+    );
+
+    // While another instance holds the source, its alerts are its own.
+    create().await;
+    let peer = raise("delivery", hie::db::now_ms());
+    db.query_json(
+        "UPDATE source_leases SET owner = 'peer', until = 9000000000000000 WHERE feed_id = 'lab' RETURNING feed_id",
+        vec![],
+    )
+    .unwrap();
+    db.query_json(
+        "INSERT INTO source_leases (feed_id, owner, until) VALUES ('lab', 'peer', 9000000000000000) ON CONFLICT (feed_id) DO NOTHING RETURNING feed_id",
+        vec![],
+    )
+    .unwrap();
+    delete().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(cleared(peer), None, "the peer's outage stays");
+}
+
+/// A delivery still in flight when its source is deleted, which fails once
+/// the source was created again: the stopped runner raises no outage alert (it
+/// would outlive its source, and stand for the new one's outage). The new
+/// source delivers, and no outage alert was ever raised.
+#[tokio::test]
+async fn a_stopped_runner_raises_no_outage_for_its_deleted_source() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    #[derive(Clone, Default)]
+    struct Gate {
+        arrived: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        held: Arc<std::sync::atomic::AtomicBool>,
+    }
+    async fn held_batch(
+        State(g): State<Gate>,
+        Json(bundle): Json<Value>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        if g.held.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            g.arrived.notify_one();
+            g.release.notified().await;
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        batch(State(Urls::default()), Json(bundle))
+            .await
+            .into_response()
+    }
+    let gate = Gate::default();
+    gate.held.store(true, std::sync::atomic::Ordering::SeqCst);
+    let fhir = serve(
+        Router::new()
+            .route("/", post(held_batch))
+            .with_state(gate.clone()),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::create_dir_all(root.join("inbox")).unwrap();
+    std::fs::copy(
+        repo().join("transforms/lab_results.py"),
+        root.join("transforms/lab_results.py"),
+    )
+    .unwrap();
+    std::fs::copy(
+        repo().join("examples/data/labs.csv"),
+        root.join("inbox/labs.csv"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {fhir}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    manager.set_handover_grace(Duration::from_secs(30));
+    let db = state.db.clone();
+    let api = serve(hie::api::router(state)).await;
+    let http = reqwest::Client::new();
+    let definition = json!({
+        "id": "lab", "name": "Lab",
+        "source": {"type": "folder", "path": "inbox", "pattern": "*.csv", "poll_seconds": 3600, "min_file_age_ms": 0},
+        "transform": "transforms/lab_results.py",
+        "delivery": {"alert_after_attempts": 1}
+    });
+    let post_source = || async {
+        let r = http
+            .post(format!("{api}/api/sources"))
+            .json(&definition)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 201);
+    };
+    let outages = || -> Vec<(i64, Option<String>)> {
+        db.query_json(
+            "SELECT id, cleared_reason FROM alerts WHERE feed_id = 'lab' AND kind = 'delivery' ORDER BY id",
+            vec![],
+        )
+        .unwrap()
+        .iter()
+        .map(|a| (a["id"].as_i64().unwrap(), a["cleared_reason"].as_str().map(str::to_string)))
+        .collect()
+    };
+
+    post_source().await;
+    // The first runner's batch is held at the server.
+    tokio::time::timeout(Duration::from_secs(30), gate.arrived.notified())
+        .await
+        .expect("the first batch reaches the server");
+    let r = http
+        .delete(format!("{api}/api/sources/lab"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    post_source().await;
+    // Now the deleted runner's batch fails, after the delete and after the new
+    // source's birth; the new source's own batch goes through.
+    gate.release.notify_one();
+    let started = Instant::now();
+    loop {
+        let sent = db
+            .query_json(
+                "SELECT COUNT(*) AS n FROM records WHERE feed_id = 'lab' AND status = 'sent'",
+                vec![],
+            )
+            .unwrap()[0]["n"]
+            .as_i64()
+            .unwrap();
+        if sent > 0 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the new source never delivered"
+        );
+        let _ = http
+            .post(format!("{api}/api/sources/lab/check-now"))
+            .send()
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(outages(), [], "the stopped runner raised an outage alert");
 }

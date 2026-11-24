@@ -300,6 +300,12 @@ impl SourceManager {
             ),
             &self.bulk_dir,
         )?;
+        if self.stamp_source && feed.direct_bulk() {
+            tracing::warn!(
+                feed = %feed.id,
+                "delivery.stamp_source is on, but this source hands HFS its objects untouched ($bulk-submit from the source objects): what it delivers is not tagged; use bulk_from: transformed to tag it"
+            );
+        }
         let runner = FeedRunner::new(
             feed.clone(),
             self.db.clone(),
@@ -421,6 +427,9 @@ impl SourceManager {
     fn parse(&self, body: &Value) -> Result<(FeedConfig, FeedConfig), ManagerError> {
         let submitted: FeedConfig = serde_json::from_value(body.clone())
             .map_err(|e| ManagerError::InvalidDefinition(e.to_string()))?;
+        submitted
+            .check_written()
+            .map_err(|e| ManagerError::InvalidDefinition(format!("{e:#}")))?;
         let mut resolved = submitted.clone();
         resolved
             .resolve(&self.base_dir)
@@ -644,6 +653,11 @@ impl SourceManager {
         }
         let lock = self.source_lock(id);
         let _changing = lock.lock().await;
+        // Deleted while this waited for the lock: a replace would publish it
+        // again without its birth.
+        if self.source(id).is_none() {
+            return Err(ManagerError::NotFound(format!("source {id} not found")));
+        }
         let secret = self.credential_of(&resolved).await?;
         pause_point!(await self, "manager:after-find");
         // The old registrations and definition stay untouched when this fails.
@@ -716,8 +730,15 @@ impl SourceManager {
         let id = id.to_string();
         tokio::spawn(async move {
             hand_over(&id, halted, grace).await;
+            // The runner has ended, alerts it raised while it drained
+            // included; a runner of a source created again starts only now.
+            let ended_at = crate::db::now_ms();
             if let Some(manager) = manager.upgrade() {
                 manager.cleanup_refs(&id).await;
+                // What only the ended runner would clear is no one's any more.
+                manager
+                    .alerts
+                    .end_orphans(&id, ended_at, crate::pipeline::instance_id());
             }
         });
         Ok(())

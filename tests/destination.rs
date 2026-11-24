@@ -315,6 +315,44 @@ async fn an_unreachable_server_is_reported_with_a_fixed_reason_and_no_url() {
     }
 }
 
+/// An outage alert an earlier definition of the id left open (the source was
+/// deleted and created again) does not stand for this one's outage: a new one
+/// is raised, and the recovery clears both.
+#[tokio::test]
+async fn an_outage_alert_left_from_before_the_source_was_born_does_not_hide_its_outage() {
+    let (origin, hfs) = hfs().await;
+    hfs.lock().unwrap().post_status = Some(503);
+    let e = engine(&format!("{origin}/fhir"), 0).await;
+    e.state
+        .db
+        .query_json(
+            "INSERT INTO alerts (feed_id, kind, message, created_at) VALUES ('lab-results', 'delivery', 'from before', 1) RETURNING id",
+            [],
+        )
+        .unwrap();
+    e.seed();
+    e.runner.tick().await.unwrap();
+    assert_eq!(
+        e.alerts("lab-results"),
+        [
+            ("delivery".into(), None, false, None),
+            ("delivery".into(), None, false, None)
+        ],
+        "a new outage alert beside the old one"
+    );
+    hfs.lock().unwrap().post_status = None;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    e.make_due();
+    e.runner.tick().await.unwrap();
+    assert_eq!(
+        e.alerts("lab-results"),
+        [
+            ("delivery".into(), None, true, Some(RECOVERED.into())),
+            ("delivery".into(), None, true, Some(RECOVERED.into()))
+        ]
+    );
+}
+
 #[tokio::test]
 async fn a_server_that_answers_503_and_comes_back() {
     let (origin, hfs) = hfs().await;
@@ -804,4 +842,75 @@ async fn the_webhook_hears_one_clear_per_recovered_outage_and_nothing_at_start()
     assert_eq!(hooks[1]["alert"]["id"], outage[0]["id"]);
     drop(e);
     drop(legacy);
+}
+
+/// A server that answers every request with `head` and `body` as raw bytes,
+/// then closes the connection: a body shorter than its `Content-Length` is a
+/// connection lost while the answer was read.
+async fn raw_server(answer: &'static str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                // The request's head and its body, as far as it says.
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let _ = socket.write_all(answer.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn a_connection_lost_while_the_answer_is_read_is_not_an_answer() {
+    let base = raw_server(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/fhir+json\r\nContent-Length: 5000\r\n\r\n{\"resourceType\": \"Bundle\", \"entry\": [",
+    )
+    .await;
+    let e = engine(&base, 0).await;
+    e.seed();
+    e.runner.tick().await.unwrap();
+    let d = e.destination().await;
+    assert_eq!(d["reachable"], false, "{d}");
+    assert_eq!(
+        d["last_error"],
+        "the connection to the FHIR server was lost"
+    );
+    assert_eq!(e.pending(), 1, "the record waits for its next attempt");
+
+    // An answer read whole that is not JSON is still an answer.
+    let base = raw_server(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\n<html></html>",
+    )
+    .await;
+    let e = engine(&base, 0).await;
+    e.seed();
+    e.runner.tick().await.unwrap();
+    let d = e.destination().await;
+    assert_eq!(d["reachable"], true, "{d}");
 }

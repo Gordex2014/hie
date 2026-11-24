@@ -612,6 +612,49 @@ async fn rows_filtered_out_raise_no_load_alert() {
         ),
         "{alerts:?}"
     );
+
+    // Every failing row fixed: the load finishes with none failing, and
+    // nothing is raised. A later regression to fewer failing rows than the
+    // most ever seen alerts again: it is more than the finish before it.
+    let reprocess_line = |line: i64, kind: &str| {
+        let row = state
+            .db
+            .query_json(
+                "SELECT id, raw FROM records WHERE file_id = $1 AND line = $2",
+                hie::db::params![mixed.as_i64().unwrap(), line],
+            )
+            .unwrap();
+        let mut raw = row[0]["raw"].clone();
+        raw["kind"] = json!(kind);
+        assert!(
+            state
+                .db
+                .reprocess(row[0]["id"].as_i64().unwrap(), Some(&raw))
+                .unwrap()
+        );
+    };
+    for line in [2, 4, 5] {
+        reprocess_line(line, "keep");
+    }
+    runner.tick().await.unwrap();
+    let finished = finishes(&state, &mixed);
+    assert_eq!(finished.len(), 4);
+    assert_eq!(
+        finished[3]["detail"],
+        json!({"records": 5, "sent": 4, "rejected": 1, "failing": 0})
+    );
+    assert_eq!(load_alerts(&state).len(), 2);
+    reprocess_line(5, "bad");
+    runner.tick().await.unwrap();
+    let finished = finishes(&state, &mixed);
+    assert_eq!(finished.len(), 5);
+    assert_eq!(finished[4]["detail"]["failing"], 1);
+    let alerts = load_alerts(&state);
+    assert_eq!(alerts.len(), 3, "{alerts:?}");
+    assert!(
+        alerts[2].starts_with("Sieve: 1 of 5 records failed in mixed.csv."),
+        "{alerts:?}"
+    );
 }
 
 // ---- the transform worker's failures, as the pipeline sees them ----------
