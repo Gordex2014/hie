@@ -309,6 +309,54 @@ async fn fired_and_cleared_events_are_signed_over_the_raw_body() {
 }
 
 #[tokio::test]
+async fn a_signed_retry_is_stamped_and_signed_again_when_it_leaves() {
+    let (receiver, url) = receiver().await;
+    receiver.script.lock().unwrap().push(503);
+    let dir = tempfile::tempdir().unwrap();
+    // A backoff over a second: the retry leaves in a later second than the
+    // first attempt, so a timestamp kept from it would show.
+    let e = engine(
+        &dir.path().join("hie.db"),
+        &settings(Some(&url), Some(SECRET_CANARY), 1100),
+        true,
+    );
+    e.alerts
+        .raise(Some("lab-results"), "unreadable_file", "cannot read r.csv")
+        .unwrap();
+    let alert = last_alert(&e.db);
+    wait_for("delivered on the retry", || {
+        events(&e.db, alert)[0]["state"] == "delivered"
+    })
+    .await;
+    let got = receiver.got();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].body, got[1].body, "one body, byte for byte");
+    assert_eq!(
+        got[0].header("x-hie-event-id"),
+        got[1].header("x-hie-event-id")
+    );
+    let stamps: Vec<String> = got
+        .iter()
+        .map(|r| r.header("x-hie-timestamp").unwrap())
+        .collect();
+    assert!(
+        stamps[0].parse::<i64>().unwrap() < stamps[1].parse::<i64>().unwrap(),
+        "{stamps:?}"
+    );
+    for (r, stamp) in got.iter().zip(&stamps) {
+        assert_eq!(
+            r.header("x-hie-signature").unwrap(),
+            hie::alerts::signature(SECRET_CANARY.as_bytes(), stamp, &r.body)
+        );
+    }
+    assert_ne!(
+        got[0].header("x-hie-signature"),
+        got[1].header("x-hie-signature")
+    );
+    assert_no_canary_logged();
+}
+
+#[tokio::test]
 async fn a_failing_receiver_gets_the_same_event_until_it_answers() {
     let (receiver, url) = receiver().await;
     receiver.script.lock().unwrap().extend([500, 503]);
