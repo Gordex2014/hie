@@ -186,6 +186,16 @@ fn is_http_url(text: &str) -> bool {
         .is_some_and(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some())
 }
 
+/// `text` without the whitespace around it, in place: the secret it holds is
+/// moved on, not copied, so the one copy is wiped with the `SecretString`.
+fn trimmed(mut text: String) -> String {
+    let end = text.trim_end().len();
+    text.truncate(end);
+    let start = text.len() - text.trim_start().len();
+    text.drain(..start);
+    text
+}
+
 /// What a malformed `alerts:` block is refused with: the keys it may have and
 /// nothing of the values it has.
 const ALERTS_SHAPE: &str = "alerts: expected a mapping with webhook_url (an http or https URL), webhook_secret (text) and webhook_backoff_ms (milliseconds)";
@@ -222,7 +232,7 @@ impl<'de> Deserialize<'de> for AlertConfig {
                         }
                         // A secret file with a trailing newline signs with
                         // the secret it holds, not with the newline too.
-                        other => other.map(|s| secrecy::SecretString::from(s.trim().to_string())),
+                        other => other.map(|s| secrecy::SecretString::from(trimmed(s))),
                     };
                 }
                 Some("webhook_backoff_ms") => {
@@ -296,7 +306,7 @@ impl AlertConfig {
             self.webhook_url = Some(url);
         }
         if let Some(secret) = read("HIE_ALERT_WEBHOOK_SECRET")? {
-            self.webhook_secret = Some(secrecy::SecretString::from(secret.trim().to_string()));
+            self.webhook_secret = Some(secrecy::SecretString::from(trimmed(secret)));
         }
         Ok(())
     }
