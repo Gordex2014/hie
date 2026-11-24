@@ -4,7 +4,7 @@
 
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Query, State};
+use axum::extract::{Query, RawQuery, State};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -13,8 +13,8 @@ use crate::db::{IntoParam, Param};
 
 /// How many loads a page holds unless asked: the per-source list's default.
 const DEFAULT_LIMIT: i64 = 50;
-/// The most a page holds. Its counts read every row of every load listed, in
-/// one call that holds the store.
+/// The most a page holds. Each load's counts read every row of it, one load at
+/// a time.
 const MAX_LIMIT: i64 = 200;
 
 /// The statuses a load is stored with.
@@ -27,6 +27,31 @@ pub(super) struct LoadQuery {
     limit: Option<i64>,
     /// The previous page's `next_cursor`.
     cursor: Option<String>,
+}
+
+/// The parameters `GET /api/loads` reads.
+const PARAMETERS: [&str; 4] = ["source", "status", "limit", "cursor"];
+
+/// A parameter the list does not read is refused, rather than ignored: a
+/// misspelt filter (`?state=failed`) would otherwise list every load. The
+/// sentence is fixed; `field` names the parameter only when it reads as one.
+fn refuse_unknown(raw: Option<&str>) -> Result<(), ApiError> {
+    for (key, _) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        if PARAMETERS.contains(&key.as_ref()) {
+            continue;
+        }
+        let error =
+            paging::invalid_query("unknown parameter (use source, status, limit or cursor)");
+        let named = !key.is_empty()
+            && key.len() <= 32
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        return Err(if named {
+            error.with("field", key.as_ref())
+        } else {
+            error
+        });
+    }
+    Ok(())
 }
 
 /// What a page keeps, besides the cursor.
@@ -146,39 +171,37 @@ impl Ask {
 
 /// Newest first, a page at a time: `next_cursor` is set only when more loads
 /// match, and the next page holds those older (by id) than the last one here.
-/// The page, whether more match, and the counts come from one statement, so
-/// they agree with each other.
+/// The page and whether more match come from one statement; each load's fields
+/// are then read on their own (`load_rows`), so they may be newer than the
+/// choice of the page: a load chosen as failed may show `failed: false` if a
+/// Retry fixed it in between.
 pub(super) async fn list_loads(
     State(s): State<AppState>,
+    RawQuery(raw): RawQuery,
     q: Result<Query<LoadQuery>, QueryRejection>,
 ) -> ApiResult {
+    refuse_unknown(raw.as_deref())?;
     let Query(q) = q.map_err(paging::rejected)?;
     let ask = Ask::read(q)?;
     let (with, mut p) = ask.candidates();
     p.push(ask.limit.to_param());
     let page = p.len();
-    let mut rows = load_rows(
-        &s,
-        &with,
-        // The page and the load after it: more than a page means more follow.
-        ", (SELECT COUNT(*) FROM candidates) AS matched",
+    // The page and the load after it: more than a page means more follow.
+    let chosen = s.db.query_json(
         &format!(
-            "f.id IN (SELECT id FROM candidates ORDER BY id DESC LIMIT CAST(${page} AS BIGINT))"
+            "{with} SELECT id, (SELECT COUNT(*) FROM candidates) AS matched
+             FROM candidates ORDER BY id DESC LIMIT CAST(${page} AS BIGINT)"
         ),
-        "ORDER BY f.id DESC",
         p,
     )?;
-    let more = rows
+    let more = chosen
         .first()
         .and_then(|row| row["matched"].as_i64())
         .is_some_and(|n| n > ask.limit);
-    for row in &mut rows {
-        if let Some(row) = row.as_object_mut() {
-            row.remove("matched");
-        }
-    }
+    let ids: Vec<i64> = chosen.iter().filter_map(|row| row["id"].as_i64()).collect();
+    let rows = load_rows(&s, &ids)?;
     let next_cursor = if more {
-        let last = rows.last().and_then(|row| row["id"].as_i64());
+        let last = ids.last().copied();
         Some(paging::next_cursor(last.ok_or_else(|| {
             anyhow::anyhow!("a load row without an id")
         })?))

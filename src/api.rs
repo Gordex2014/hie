@@ -875,27 +875,22 @@ const LOAD_COLUMNS: &str = "f.id, f.feed_id AS source_id, f.source_name, f.name,
 /// Every `files` column a load row selects, for its `GROUP BY`.
 const LOAD_GROUP: &str = "GROUP BY f.id, f.feed_id, f.source_name, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived, f.finished_at, f.received_at";
 
-/// The load rows of the files `filter` keeps (a condition on `f`), each with
-/// what became of its records; `tail` orders and limits them, `with` and
-/// `extra` add a `WITH` clause and columns. Every load answer reads its rows
-/// here, so they carry the same fields.
-fn load_rows(
-    s: &AppState,
-    with: &str,
-    extra: &str,
-    filter: &str,
-    tail: &str,
-    p: Vec<Param>,
-) -> Result<Vec<Value>, ApiError> {
-    let mut rows = s.db.query_json(
+/// The load rows of `ids`, in that order, each with what became of its
+/// records. Each load is read in a statement of its own (its file and its
+/// records' counts together, so they agree), and the store's connection is let
+/// go between two: a page of large loads holds it for one load's count at a
+/// time, not for the page. A load gone meanwhile is left out. Every load answer
+/// reads its rows here, so they carry the same fields.
+fn load_rows(s: &AppState, ids: &[i64]) -> Result<Vec<Value>, ApiError> {
+    let mut rows = s.db.query_json_each(
         &format!(
-            "{with} SELECT {LOAD_COLUMNS}{extra}, {} AS received_at, {} AS finished_at
+            "SELECT {LOAD_COLUMNS}, {} AS received_at, {} AS finished_at
              FROM files f LEFT JOIN records r ON r.file_id = f.id
-             WHERE {filter} {LOAD_GROUP} {tail}",
+             WHERE f.id = CAST($1 AS BIGINT) {LOAD_GROUP}",
             s.db.iso("f.received_at"),
             s.db.iso("f.finished_at")
         ),
-        p,
+        ids,
     )?;
     let mut methods: std::collections::HashMap<String, Value> = Default::default();
     for row in &mut rows {
@@ -917,6 +912,9 @@ fn load_rows(
     Ok(rows)
 }
 
+/// The most loads `/api/sources/{id}/loads` lists at once.
+const MAX_SOURCE_LOADS: i64 = 1000;
+
 /// A load is one file (or object) and what became of its rows. The same rows serve
 /// `/files` and `/loads`; the UI calls them loads.
 async fn list_files(
@@ -924,14 +922,22 @@ async fn list_files(
     Path(id): Path<String>,
     Query(q): Query<Limit>,
 ) -> ApiResult {
-    let rows = load_rows(
-        &s,
-        "",
-        "",
-        "f.feed_id = $1",
-        "ORDER BY f.id DESC LIMIT $2",
-        params![id, q.limit.unwrap_or(50)].into(),
-    )?;
+    let limit = q.limit.unwrap_or(50);
+    if !(1..=MAX_SOURCE_LOADS).contains(&limit) {
+        return Err(
+            paging::invalid_query("limit must be a whole number from 1 to 1000")
+                .with("field", "limit"),
+        );
+    }
+    let ids: Vec<i64> =
+        s.db.query_json(
+            "SELECT id FROM files WHERE feed_id = $1 ORDER BY id DESC LIMIT $2",
+            params![id, limit],
+        )?
+        .iter()
+        .filter_map(|row| row["id"].as_i64())
+        .collect();
+    let rows = load_rows(&s, &ids)?;
     Ok(Json(json!({"files": rows, "loads": rows})))
 }
 
@@ -939,7 +945,7 @@ async fn list_files(
 /// purpose included, as kind `filtered`), each with sample rows, so a
 /// person can see what went wrong and retry the rows after a fix.
 async fn get_load(State(s): State<AppState>, Path(file_id): Path<i64>) -> ApiResult {
-    let mut load = load_rows(&s, "", "", "f.id = $1", "", params![file_id].into())?
+    let mut load = load_rows(&s, &[file_id])?
         .into_iter()
         .next()
         .ok_or_else(|| not_found(&format!("load {file_id}")))?;

@@ -4354,6 +4354,26 @@ impl Db {
         let p = p.into();
         Ok(self.query(sql, &p)?.iter().map(Row::object).collect())
     }
+
+    /// `query_json` once for each id, as `$1`, each in a store call of its
+    /// own, in order: the store's only connection is let go between two, and
+    /// the thread yields, so another source or API call waits for one id's
+    /// statement, not for all of them. Each row agrees with itself; rows of
+    /// different ids may have been read at different moments.
+    pub fn query_json_each(&self, sql: &str, ids: &[i64]) -> Result<Vec<Value>> {
+        let mut rows = Vec::with_capacity(ids.len());
+        for (n, id) in ids.iter().enumerate() {
+            if n > 0 {
+                pause_point!(self, "each:between");
+                // The mutex is not fair: unlocked and locked again at once, it
+                // would stay this thread's. A moment off it lets a caller
+                // waiting for it in.
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            rows.extend(self.query_json(sql, vec![Param::Int(*id)])?);
+        }
+        Ok(rows)
+    }
 }
 
 impl Drop for Db {
@@ -4813,6 +4833,47 @@ mod tests {
             &params![token, status, at, stamped],
         )
         .unwrap();
+    }
+
+    /// Between two ids the store's connection is free: another caller's write
+    /// lands there, and the next id's row sees it. A page of loads read this
+    /// way holds the connection for one load at a time.
+    #[cfg(feature = "secrets-native")]
+    #[test]
+    fn each_id_is_read_with_the_connection_let_go_between() {
+        let db = std::sync::Arc::new(Db::in_memory().unwrap());
+        let other = db.clone();
+        let once = std::sync::atomic::AtomicBool::new(false);
+        db.on_pause(std::sync::Arc::new(move |at| {
+            if at == "each:between" && !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let other = other.clone();
+                let (done, landed) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    other
+                        .execute_for_test(
+                            "INSERT INTO store_meta (key, value) VALUES ('probe', '1')",
+                            &[],
+                        )
+                        .unwrap();
+                    done.send(()).unwrap();
+                });
+                landed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("another caller got the connection between two ids");
+            }
+        }));
+        let rows = db
+            .query_json_each(
+                "SELECT CAST($1 AS BIGINT) AS id,
+                        (SELECT COUNT(*) FROM store_meta WHERE key = 'probe') AS seen",
+                &[7, 8, 9],
+            )
+            .unwrap();
+        let seen: Vec<(i64, i64)> = rows
+            .iter()
+            .map(|r| (r["id"].as_i64().unwrap(), r["seen"].as_i64().unwrap()))
+            .collect();
+        assert_eq!(seen, [(7, 0), (8, 1), (9, 1)]);
     }
 
     #[test]

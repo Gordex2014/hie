@@ -624,6 +624,10 @@ async fn limits_and_malformed_queries() {
         ("limit=abc", None),
         ("limit=1&limit=2", None),
         ("source=lab%00", Some("source")),
+        // A parameter the list does not read is refused, not ignored.
+        ("state=failed", Some("state")),
+        ("status=failed&extra=1", Some("extra")),
+        ("a%20b=1", None),
     ] {
         let (status, body) = e.get(&format!("/api/loads?{query}")).await;
         assert_eq!(status, 400, "{query}");
@@ -635,6 +639,35 @@ async fn limits_and_malformed_queries() {
             !sentence.contains(&format!(" {value}")),
             "{query} echoed: {sentence}"
         );
+    }
+}
+
+/// A source's own list is bounded too: from 1 to 1000 loads, 50 by default.
+#[tokio::test]
+async fn a_sources_list_is_bounded() {
+    let e = engine().await;
+    for n in 0..3 {
+        e.load("alpha", &format!("{n}.csv"), 0, &[]);
+    }
+    for path in ["loads", "files"] {
+        let (status, body) = e.get(&format!("/api/sources/alpha/{path}")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["loads"].as_array().unwrap().len(), 3);
+        let (status, body) = e
+            .get(&format!("/api/sources/alpha/{path}?limit=1000"))
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = e.get(&format!("/api/sources/alpha/{path}?limit=2")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["loads"].as_array().unwrap().len(), 2);
+        for limit in ["0", "1001", "-1"] {
+            let (status, body) = e
+                .get(&format!("/api/sources/alpha/{path}?limit={limit}"))
+                .await;
+            assert_eq!(status, 400, "{path} {limit}");
+            assert_eq!(body["code"], "invalid_query");
+            assert_eq!(body["field"], "limit");
+        }
     }
 }
 
