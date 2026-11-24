@@ -1086,6 +1086,13 @@ impl FeedRunner {
         };
         let leased = self.leased.load(std::sync::atomic::Ordering::Acquire);
         for sub in self.db.submissions_due(&self.feed.id)? {
+            // A runner stopped meanwhile (its source deleted or replaced) sends
+            // nothing more, and takes no lease again: its successor, if any,
+            // moves the submissions.
+            if self.halted() {
+                tracing::info!(feed = %self.feed.id, "stopped during the pass; its submissions are left to its successor");
+                return Ok(());
+            }
             // Under the lease, it is renewed right before each claim: a pass
             // that ran past it (a large file transformed, a slow answer for
             // an earlier submission) would otherwise claim nothing more. One

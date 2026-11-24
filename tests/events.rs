@@ -2582,6 +2582,17 @@ async fn an_old_empty_settlement_after_a_newer_failure_changes_nothing() {
 /// it are still kicked off in the same pass.
 #[tokio::test]
 async fn a_slow_answer_does_not_keep_the_next_submissions_from_being_claimed() {
+    slow_answer(false).await;
+}
+
+/// The same, with the source deleted while the answer is slow: the stopped
+/// runner takes no lease again and sends nothing more.
+#[tokio::test]
+async fn a_runner_stopped_during_a_slow_answer_claims_nothing_more() {
+    slow_answer(true).await;
+}
+
+async fn slow_answer(deleted: bool) {
     let Some(python) = python() else {
         eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
@@ -2613,6 +2624,9 @@ async fn a_slow_answer_does_not_keep_the_next_submissions_from_being_claimed() {
     held.polled.notified().await;
     db.query_json("UPDATE source_leases SET until = 0 RETURNING feed_id", [])
         .unwrap();
+    if deleted {
+        manager.delete("drops").await.unwrap();
+    }
     held.release.notify_one();
     passing.await.unwrap().unwrap();
 
@@ -2625,6 +2639,14 @@ async fn a_slow_answer_does_not_keep_the_next_submissions_from_being_claimed() {
     assert_eq!(subs.len(), 2, "{subs:?}");
     assert_eq!(subs[0]["token"], first);
     assert_eq!(subs[0]["status"], "done", "{subs:?}");
+    if deleted {
+        assert_eq!(
+            subs[1]["status"], "kickoff",
+            "a stopped runner kicks nothing off: {subs:?}"
+        );
+        assert!(db.lease("drops").unwrap().is_none(), "no lease taken again");
+        return;
+    }
     assert_eq!(
         subs[1]["status"], "running",
         "the second submission is claimed and kicked off: {subs:?}"

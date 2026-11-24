@@ -3890,15 +3890,15 @@ impl Db {
             },
             (None, None) => 0,
         };
-        // Filters that no index serves in id order (a source and a kind
-        // together, or several kinds) read at most `span` events past the
-        // start, whatever they keep; a gap left by the purge costs nothing.
-        // Otherwise the page's own `LIMIT` bounds the read: without a filter
-        // every event read is listed; a source alone, or one kind, is read
-        // through `events_source` or `events_kind`; `since` skips only the
-        // events stored after the start with an earlier `at`.
+        // Filters that no index serves in id order (`since`, a source and a
+        // kind together, or several kinds) read at most `span` events past
+        // the start, whatever they keep; a gap left by the purge costs
+        // nothing. Otherwise the page's own `LIMIT` bounds the read: without a
+        // filter every event read is listed; a source alone, or one kind, is
+        // read through `events_source` or `events_kind`.
         let kinds = exact_kinds(&q.kinds);
-        let spanned = kinds.len() > 1 || (q.source.is_some() && !kinds.is_empty());
+        let spanned =
+            q.since.is_some() || kinds.len() > 1 || (q.source.is_some() && !kinds.is_empty());
         let span = q.scan.unwrap_or(EVENT_SCAN_SPAN).max(1);
         let end = if spanned {
             self.query_one(
@@ -3956,11 +3956,26 @@ impl Db {
     fn since_start(&self, since: i64) -> Result<Option<i64>> {
         Ok(self
             .query_one(
-                "SELECT MIN(id) - 1 FROM events
-                 WHERE at >= $1 AND at <= (SELECT MIN(at) FROM events WHERE at >= $1) + $2",
+                &self.since_start_sql(),
                 &params![since, EVENT_CLOCK_MARGIN_MS],
             )?
             .and_then(|r| r.opt_i64(0)))
+    }
+
+    /// The statement of `since_start`. The window is read through `events_at`
+    /// on both stores: `id + 0` keeps either planner from finding the lowest
+    /// id by walking the primary key from the start of the log until an
+    /// event of the window, and SQLite is told the index.
+    fn since_start_sql(&self) -> String {
+        let index = if self.is_postgres() {
+            ""
+        } else {
+            " INDEXED BY events_at"
+        };
+        format!(
+            "SELECT MIN(id + 0) - 1 FROM events{index}
+             WHERE at >= $1 AND at <= (SELECT MIN(at) FROM events WHERE at >= $1) + $2"
+        )
     }
 
     /// The statement of a page of events in `(start, end]` with `q`'s filters,
@@ -3970,13 +3985,17 @@ impl Db {
         // whatever SQLite's statistics say of an average source or kind: a
         // rare one would otherwise be looked for along the whole log.
         // PostgreSQL's statistics know the rare values.
+        // Ordered by the index's own columns (the first one is fixed by the
+        // filter, so the order is still by id), which PostgreSQL then reads
+        // rather than walking the primary key for a source or kind whose
+        // events lie far from where it starts.
         let kinds = exact_kinds(&q.kinds);
-        let index = match (q.source.is_some(), kinds.len()) {
-            _ if self.is_postgres() => "",
-            (true, 0) => " INDEXED BY events_source",
-            (false, 1) => " INDEXED BY events_kind",
-            _ => "",
+        let (index, order) = match (q.source.is_some(), kinds.len()) {
+            (true, 0) => (" INDEXED BY events_source", "source_id, id"),
+            (false, 1) => (" INDEXED BY events_kind", "kind, id"),
+            _ => ("", "id"),
         };
+        let index = if self.is_postgres() { "" } else { index };
         let mut sql = format!(
             "SELECT id, {} AS at, source_id, kind, load_id, record_id, attempt, error_kind, reason, detail
              FROM events{index} WHERE id > $1 AND id <= $2",
@@ -4000,7 +4019,7 @@ impl Db {
             sql.push_str(&format!(" AND kind IN ({})", marks.join(", ")));
         }
         values.push(Param::Int(q.limit as i64 + 1));
-        sql.push_str(&format!(" ORDER BY id LIMIT ${}", values.len()));
+        sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", values.len()));
         (sql, values)
     }
 
@@ -5290,17 +5309,16 @@ mod tests {
     fn since_lists_an_earlier_id_within_the_clock_margin() {
         let db = Db::in_memory().unwrap();
         let since = 10 * EVENT_CLOCK_MARGIN_MS;
-        let ids = log(
-            &db,
-            &[
-                (1, "load.received"),
-                (since + EVENT_CLOCK_MARGIN_MS / 2, "load.received"),
-                (since - 10, "load.received"),
-                (since + 1, "load.received"),
-            ],
-        );
+        // More than a span of events before `since`, then the window.
+        let mut events = vec![(1, "load.received"); 25];
+        events.extend([
+            (since + EVENT_CLOCK_MARGIN_MS / 2, "load.received"),
+            (since - 10, "load.received"),
+            (since + 1, "load.received"),
+        ]);
+        let ids = log(&db, &events);
         let first = page(&db, &[], Some(since), None, 100);
-        assert_eq!(listed(&first), [ids[1], ids[3]]);
+        assert_eq!(listed(&first), [ids[25], ids[27]]);
         assert!(!first.has_more);
     }
 
@@ -5346,25 +5364,34 @@ mod tests {
         assert!(both.events.is_empty() && both.has_more);
     }
 
+    /// The plan of a statement, one line per step, on either store.
     fn plan(db: &Db, sql: &str, p: Vec<Param>) -> Vec<String> {
-        db.query_json(&format!("EXPLAIN QUERY PLAN {sql}"), p)
+        let (explain, column) = if db.is_postgres() {
+            ("EXPLAIN", "QUERY PLAN")
+        } else {
+            ("EXPLAIN QUERY PLAN", "detail")
+        };
+        db.query_json(&format!("{explain} {sql}"), p)
             .unwrap()
             .iter()
-            .map(|r| r["detail"].as_str().unwrap_or_default().to_string())
+            .map(|r| r[column].as_str().unwrap_or_default().to_string())
             .collect()
     }
 
     /// The statements an unspanned read runs are served by an index in id
-    /// order, and where `since` starts is found through `events_at`.
+    /// order, and where `since` starts is found through `events_at`, on a log
+    /// with a long stretch before what they look for.
     #[test]
     fn unspanned_reads_use_an_index() {
         let db = Db::in_memory().unwrap();
-        if db.is_postgres() {
-            return;
-        }
         let mut events: Vec<(i64, &str)> = (0..3000).map(|i| (i, "load.received")).collect();
         events.push((3000, "submission.opened"));
         log(&db, &events);
+        db.execute_for_test(
+            "INSERT INTO events (at, source_id, kind) VALUES (3001, 'other', 'load.received')",
+            &[],
+        )
+        .unwrap();
         db.execute_for_test("ANALYZE", &[]).unwrap();
         let page_plan = |q: EventQuery| {
             let (sql, p) = db.event_page_sql(&EventQuery { limit: 100, ..q }, 0, i64::MAX);
@@ -5376,31 +5403,28 @@ mod tests {
         });
         assert!(kind.iter().any(|l| l.contains("events_kind")), "{kind:#?}");
         let source = page_plan(EventQuery {
-            source: Some("s".into()),
+            source: Some("other".into()),
             ..Default::default()
         });
         assert!(
             source.iter().any(|l| l.contains("events_source")),
             "{source:#?}"
         );
-        // `since` reads the rows after its start in id order, without sorting
-        // every event at or after it.
-        let since = page_plan(EventQuery {
-            since: Some(2990),
-            ..Default::default()
-        });
-        assert!(
-            !since.iter().any(|l| l.contains("TEMP B-TREE")),
-            "{since:#?}"
-        );
+        // Where `since` starts: its window is read through `events_at`, never
+        // by walking the primary key from the start of the log.
         let start = plan(
             &db,
-            "SELECT MIN(id) - 1 FROM events
-             WHERE at >= $1 AND at <= (SELECT MIN(at) FROM events WHERE at >= $1) + $2",
+            &db.since_start_sql(),
             params![2990, EVENT_CLOCK_MARGIN_MS].to_vec(),
         );
         assert!(
             start.iter().filter(|l| l.contains("events_at")).count() >= 2,
+            "{start:#?}"
+        );
+        assert!(
+            !start
+                .iter()
+                .any(|l| l.contains("PRIMARY KEY") || l.contains("events_pkey")),
             "{start:#?}"
         );
     }

@@ -175,7 +175,20 @@ pub enum Poll {
     },
 }
 
-/// An answer of HFS to a post, read whole.
+/// Reads an answer's body to its end, keeping it only when `keep`: the
+/// engine reads nothing from a success but its status and headers.
+async fn read_whole(mut response: reqwest::Response, keep: bool) -> reqwest::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if keep {
+            body.extend_from_slice(&chunk);
+        }
+    }
+    Ok(body)
+}
+
+/// An answer of HFS to a post, read whole (its body kept only when it is not
+/// a success).
 struct Answer {
     status: u16,
     headers: reqwest::header::HeaderMap,
@@ -299,7 +312,7 @@ impl BulkSubmitter {
         })?;
         let status = response.status().as_u16();
         let headers = response.headers().clone();
-        match response.bytes().await {
+        match read_whole(response, !(200..=299).contains(&status)).await {
             Ok(body) => {
                 if let Some(exchange) = &exchange {
                     exchange.observe(
@@ -310,7 +323,7 @@ impl BulkSubmitter {
                 Ok(Answer {
                     status,
                     headers,
-                    body: body.to_vec(),
+                    body,
                 })
             }
             Err(e) => {
@@ -587,6 +600,19 @@ mod tests {
         let sent = bulk.kickoff("lab", "sub", "http://engine.test/m").await;
         assert!(matches!(sent, Err(SendError::Refused(400, _))), "{sent:?}");
         assert_eq!(destination.snapshot().reachable, Some(true));
+
+        // A success is drained without being kept, and still counts only
+        // once it has arrived whole.
+        let base = cut_off_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/fhir+json\r\nContent-Length: 5000\r\n\r\n{\"resourceType\": \"OperationOutcome\"",
+        )
+        .await;
+        let destination = Arc::new(Destination::new(&base));
+        let bulk =
+            BulkSubmitter::new(&base, "http://engine.test").with_destination(destination.clone());
+        let sent = bulk.kickoff("lab", "sub", "http://engine.test/m").await;
+        assert!(matches!(sent, Err(SendError::Transient(_))), "{sent:?}");
+        assert_eq!(destination.snapshot().reachable, Some(false));
     }
 
     #[test]
