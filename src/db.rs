@@ -2753,27 +2753,44 @@ impl Db {
     /// Claims an open submission for one request, before it is sent: only
     /// while it is still as `read` it (the same epoch, attempts and status, so
     /// no answer and no other claim came in between, from this version or an
-    /// earlier one) and due at `now`, and only while no other instance than
-    /// `owner` holds the source's lease: a runner whose lease lapsed mid-pass
-    /// cannot take the submission from the one that took the source over. The
-    /// claim moves the epoch, so the answer to any request claimed before it
-    /// changes nothing. `None`: another runner moved it or holds the source;
-    /// this pass leaves it.
+    /// earlier one) and due at `now`; for a runner that `leased` its source,
+    /// only while `owner` still holds that lease, so a runner whose lease
+    /// lapsed mid-pass cannot take the submission from the one that took the
+    /// source over; otherwise (a runner driven without a lease), only while no
+    /// other instance holds it. The claim moves the epoch, so the answer to
+    /// any request claimed before it changes nothing. `None`: another runner
+    /// moved it or holds the source; this pass leaves it.
     pub fn claim_submission(
         &self,
         read: &Submission,
         owner: &str,
+        leased: bool,
         now: i64,
     ) -> Result<Option<Claim>> {
+        let lease = if leased {
+            "EXISTS (SELECT 1 FROM source_leases l
+                     WHERE l.feed_id = submissions.feed_id AND l.owner = $6 AND l.until >= $4)"
+        } else {
+            "NOT EXISTS (SELECT 1 FROM source_leases l
+                         WHERE l.feed_id = submissions.feed_id AND l.owner <> $6 AND l.until >= $4)"
+        };
         Ok(self
             .query_one(
-                "UPDATE submissions SET epoch = epoch + 1
-                 WHERE token = $1 AND status IN ('kickoff', 'running') AND status = $5
-                   AND epoch = $2 AND attempts = $3 AND next_attempt_at <= $4
-                   AND NOT EXISTS (SELECT 1 FROM source_leases l
-                                   WHERE l.feed_id = submissions.feed_id AND l.owner <> $6 AND l.until >= $4)
-                 RETURNING epoch, attempts",
-                &params![read.token, read.epoch, read.attempts, now, read.status, owner],
+                &format!(
+                    "UPDATE submissions SET epoch = epoch + 1
+                     WHERE token = $1 AND status IN ('kickoff', 'running') AND status = $5
+                       AND epoch = $2 AND attempts = $3 AND next_attempt_at <= $4
+                       AND {lease}
+                     RETURNING epoch, attempts"
+                ),
+                &params![
+                    read.token,
+                    read.epoch,
+                    read.attempts,
+                    now,
+                    read.status,
+                    owner
+                ],
             )?
             .map(|r| Claim {
                 epoch: r.i64(0),
@@ -3387,6 +3404,47 @@ impl Db {
     }
 
     /// The open alert (not cleared) of this kind for a source and rule, if any.
+    /// Whether source `feed` has an open outage alert without a rule raised
+    /// since its current definition was born (a create through the API sets
+    /// the birth again): one an earlier definition of its id left open does
+    /// not stand for this one's outage.
+    pub fn open_outage_since_birth(&self, feed: &str) -> Result<bool> {
+        Ok(self
+            .query_one(
+                "SELECT 1 FROM alerts
+                 WHERE feed_id = $1 AND kind = 'delivery' AND rule_id IS NULL AND cleared_at IS NULL
+                   AND created_at >= COALESCE((SELECT born_at FROM source_births WHERE feed_id = $1), 0)
+                 LIMIT 1",
+                &params![feed],
+            )?
+            .is_some())
+    }
+
+    /// The open alerts of source `feed` that only its runner would clear,
+    /// `delivery` (with a rule or without) and `credential`, raised at or
+    /// before `before`: none while an instance other than `owner` holds the
+    /// source's lease, read in the same statement.
+    pub fn orphan_alerts(
+        &self,
+        feed: &str,
+        before: i64,
+        owner: &str,
+    ) -> Result<Vec<(i64, String)>> {
+        Ok(self
+            .query(
+                "SELECT id, kind FROM alerts
+                 WHERE feed_id = $1 AND kind IN ('delivery', 'credential') AND cleared_at IS NULL
+                   AND created_at <= $2
+                   AND NOT EXISTS (SELECT 1 FROM source_leases l
+                                   WHERE l.feed_id = $1 AND l.owner <> $3 AND l.until >= $4)
+                 ORDER BY id",
+                &params![feed, before, owner, now_ms()],
+            )?
+            .iter()
+            .map(|r| (r.i64(0), r.string(1)))
+            .collect())
+    }
+
     pub fn open_alert(
         &self,
         feed: &str,
@@ -3780,6 +3838,38 @@ impl Db {
                 has_more: false,
             });
         };
+        let (sql, values) = self.event_page_sql(q, start, end);
+        let mut events: Vec<Value> = self
+            .query(&sql, &values)?
+            .iter()
+            .map(|r| {
+                let mut e = r.object();
+                if let Some(Value::String(text)) = e.get("detail") {
+                    e["detail"] = serde_json::from_str(text).unwrap_or(Value::Null);
+                }
+                e
+            })
+            .collect();
+        let full = events.len() > q.limit;
+        events.truncate(q.limit);
+        // A full page goes on after its last event; one that stopped at the
+        // end of its span, before the newest id, goes on from there, even
+        // with nothing listed; otherwise the log was read to the newest id.
+        let (next, has_more) = match events.last() {
+            Some(last) if full => (last["id"].as_i64(), true),
+            _ if end < mark => (forward(end), true),
+            _ => (forward(mark), false),
+        };
+        Ok(EventPage {
+            events,
+            next,
+            has_more,
+        })
+    }
+
+    /// The statement of a page of events in `(start, end]` with `q`'s filters,
+    /// and its parameters.
+    fn event_page_sql(&self, q: &EventQuery, start: i64, end: i64) -> (String, Vec<Param>) {
         let mut sql = format!(
             "SELECT id, {} AS at, source_id, kind, load_id, record_id, attempt, error_kind, reason, detail
              FROM events WHERE id > $1 AND id <= $2",
@@ -3819,32 +3909,7 @@ impl Db {
         }
         values.push(Param::Int(q.limit as i64 + 1));
         sql.push_str(&format!(" ORDER BY id LIMIT ${}", values.len()));
-        let mut events: Vec<Value> = self
-            .query(&sql, &values)?
-            .iter()
-            .map(|r| {
-                let mut e = r.object();
-                if let Some(Value::String(text)) = e.get("detail") {
-                    e["detail"] = serde_json::from_str(text).unwrap_or(Value::Null);
-                }
-                e
-            })
-            .collect();
-        let full = events.len() > q.limit;
-        events.truncate(q.limit);
-        // A full page goes on after its last event; one that stopped at the
-        // end of its span, before the newest id, goes on from there, even
-        // with nothing listed; otherwise the log was read to the newest id.
-        let (next, has_more) = match events.last() {
-            Some(last) if full => (last["id"].as_i64(), true),
-            _ if end < mark => (forward(end), true),
-            _ => (forward(mark), false),
-        };
-        Ok(EventPage {
-            events,
-            next,
-            has_more,
-        })
+        (sql, values)
     }
 
     /// Removes up to `limit` events older than `cutoff_ms` in one transaction.
@@ -5055,22 +5120,18 @@ mod tests {
         events.push((1, "submission.opened"));
         log(&db, &events);
         db.execute_for_test("ANALYZE", &[]).unwrap();
-        let kinds: Vec<&str> = crate::events::KINDS
-            .iter()
-            .copied()
-            .filter(|k| k.starts_with("submission."))
-            .collect();
-        let marks: Vec<String> = (0..kinds.len()).map(|i| format!("${}", i + 3)).collect();
-        let mut p = params![0, i64::MAX].to_vec();
-        p.extend(kinds.iter().map(|k| Param::Text(k.to_string())));
+        // The statement `list_events` runs for `kind=submission`.
+        let (sql, p) = db.event_page_sql(
+            &EventQuery {
+                kinds: vec!["submission".into()],
+                limit: 100,
+                ..Default::default()
+            },
+            0,
+            i64::MAX,
+        );
         let plan: Vec<String> = db
-            .query_json(
-                &format!(
-                    "EXPLAIN QUERY PLAN SELECT id FROM events WHERE id > $1 AND id <= $2 AND kind IN ({}) ORDER BY id LIMIT 101",
-                    marks.join(", ")
-                ),
-                p,
-            )
+            .query_json(&format!("EXPLAIN QUERY PLAN {sql}"), p)
             .unwrap()
             .iter()
             .map(|r| r["detail"].as_str().unwrap_or_default().to_string())

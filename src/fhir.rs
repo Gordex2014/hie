@@ -142,6 +142,7 @@ impl FhirClient {
                 exchange.observe(Err(failure), &crate::destination::send_detail(&e));
                 // The status line still said the token was refused.
                 if matches!(status, 401 | 403) && self.credentials.is_some() {
+                    drop(exchange);
                     return Err(refused_token(status, &self.credentials).await);
                 }
                 return Err(SendError::Transient(failure.sentence().into()));

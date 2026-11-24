@@ -2178,7 +2178,7 @@ fn an_open_alert_is_not_kept_by_a_rule_made_after_it() {
 /// submission as it is now.
 fn claim(db: &Db, token: &str) -> hie::db::Claim {
     let sub = db.submission(token).unwrap().unwrap();
-    db.claim_submission(&sub, hie::pipeline::instance_id(), hie::db::now_ms())
+    db.claim_submission(&sub, hie::pipeline::instance_id(), false, hie::db::now_ms())
         .unwrap()
         .unwrap()
 }
@@ -2317,7 +2317,7 @@ fn the_last_claim_decides_and_a_stale_read_cannot_claim() {
     let a = claim(&db, "t");
     // B read the row before A's claim: it cannot claim on it.
     assert_eq!(
-        db.claim_submission(&read_by_b, "me", hie::db::now_ms())
+        db.claim_submission(&read_by_b, "me", false, hie::db::now_ms())
             .unwrap(),
         None
     );
@@ -2337,7 +2337,7 @@ fn the_last_claim_decides_and_a_stale_read_cannot_claim() {
     // A row read before that success (status still `kickoff`) cannot be
     // claimed for a second kick-off.
     assert_eq!(
-        db.claim_submission(&read_before_success, "me", hie::db::now_ms())
+        db.claim_submission(&read_before_success, "me", false, hie::db::now_ms())
             .unwrap(),
         None
     );
@@ -2345,9 +2345,12 @@ fn the_last_claim_decides_and_a_stale_read_cannot_claim() {
     db.progress_submission("t", None, "running", None, 0, 5_000, None)
         .unwrap();
     let not_due = db.submission("t").unwrap().unwrap();
-    assert_eq!(db.claim_submission(&not_due, "me", 4_999).unwrap(), None);
+    assert_eq!(
+        db.claim_submission(&not_due, "me", false, 4_999).unwrap(),
+        None
+    );
     assert!(
-        db.claim_submission(&not_due, "me", 5_000)
+        db.claim_submission(&not_due, "me", false, 5_000)
             .unwrap()
             .is_some()
     );
@@ -2355,7 +2358,8 @@ fn the_last_claim_decides_and_a_stale_read_cannot_claim() {
 
 /// A runner whose lease lapsed mid-pass reads the submission after the runner
 /// that took the source over claimed it: it cannot claim it in turn, so the
-/// current holder's answer stands.
+/// current holder's answer stands; nor can it claim once nobody holds the
+/// lease, until it takes the lease again.
 #[test]
 fn a_runner_whose_lease_lapsed_cannot_claim_from_the_holder() {
     let db = Db::in_memory().unwrap();
@@ -2369,13 +2373,13 @@ fn a_runner_whose_lease_lapsed_cannot_claim_from_the_holder() {
     assert!(db.acquire_lease("s", "b", 60_000).unwrap());
     let read = db.submission("t").unwrap().unwrap();
     let b = db
-        .claim_submission(&read, "b", hie::db::now_ms())
+        .claim_submission(&read, "b", true, hie::db::now_ms())
         .unwrap()
         .unwrap();
     // A, whose lease lapsed, reads the row as B left it, and cannot claim.
     let read_by_a = db.submission("t").unwrap().unwrap();
     assert_eq!(
-        db.claim_submission(&read_by_a, "a", hie::db::now_ms())
+        db.claim_submission(&read_by_a, "a", true, hie::db::now_ms())
             .unwrap(),
         None
     );
@@ -2383,12 +2387,19 @@ fn a_runner_whose_lease_lapsed_cannot_claim_from_the_holder() {
         db.progress_submission("t", Some(b), "running", Some("https://h/b"), 0, 0, None)
             .unwrap()
     );
-    // Once B's lease has run out, A may claim again.
+    // B's lease runs out: A still holds none, and cannot claim until it takes
+    // the lease again.
     db.query_json("UPDATE source_leases SET until = 0 RETURNING feed_id", [])
         .unwrap();
     let read_by_a = db.submission("t").unwrap().unwrap();
+    assert_eq!(
+        db.claim_submission(&read_by_a, "a", true, hie::db::now_ms())
+            .unwrap(),
+        None
+    );
+    assert!(db.acquire_lease("s", "a", 60_000).unwrap());
     assert!(
-        db.claim_submission(&read_by_a, "a", hie::db::now_ms())
+        db.claim_submission(&read_by_a, "a", true, hie::db::now_ms())
             .unwrap()
             .is_some()
     );
@@ -2417,7 +2428,8 @@ fn two_instances_claiming_at_once_get_one_claim() {
                 let (read, barrier) = (read.clone(), barrier.clone());
                 std::thread::spawn(move || {
                     barrier.wait();
-                    db.claim_submission(&read, "me", hie::db::now_ms()).unwrap()
+                    db.claim_submission(&read, "me", false, hie::db::now_ms())
+                        .unwrap()
                 })
             })
             .collect();

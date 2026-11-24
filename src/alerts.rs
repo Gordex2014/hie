@@ -309,26 +309,25 @@ impl Alerter {
         Ok(())
     }
 
-    /// Ends the open alerts of source `feed` that only its runner would clear,
-    /// `delivery` (with a rule or without) and `credential`, each with its
-    /// `cleared` event. Called only while no runner runs the source: holding
-    /// its lease, after a delete or before the first pass of a source created
-    /// again. Left open, a deleted source's outage alert stayed open for good
-    /// and kept a source created again with that id from raising its own. Best
-    /// effort: a failure is logged.
-    pub fn end_orphans(&self, feed: &str, reason: &str) {
-        for kind in ["delivery", "credential"] {
-            let open = match self.db.open_alert_ids(feed, kind) {
-                Ok(open) => open,
-                Err(e) => {
-                    tracing::warn!(feed, kind, "alerts left open: {e:#}");
-                    continue;
-                }
-            };
-            for alert in open {
-                if let Err(e) = self.clear(alert, feed, kind, reason) {
-                    tracing::warn!(feed, alert, "alert left open: {e:#}");
-                }
+    /// After a delete, once this instance's runner of `feed` has ended: ends
+    /// the open alerts only that runner would clear (`Db::orphan_alerts`:
+    /// `delivery` and `credential`, raised at or before `deleted_at`, none
+    /// while another instance holds the source), each with its `cleared`
+    /// event. Left open, a deleted source's outage alert stayed open for good.
+    /// An alert raised after the delete, by a definition created again, is not
+    /// touched. Best effort: a failure is logged.
+    pub fn end_orphans(&self, feed: &str, deleted_at: i64, owner: &str) {
+        let reason = format!("{feed}: the source was deleted");
+        let open = match self.db.orphan_alerts(feed, deleted_at, owner) {
+            Ok(open) => open,
+            Err(e) => {
+                tracing::warn!(feed, "alerts left open: {e:#}");
+                return;
+            }
+        };
+        for (alert, kind) in open {
+            if let Err(e) = self.clear(alert, feed, &kind, &reason) {
+                tracing::warn!(feed, alert, "alert left open: {e:#}");
             }
         }
     }

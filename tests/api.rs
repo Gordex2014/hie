@@ -1019,12 +1019,11 @@ async fn a_source_contact_is_read_kept_and_cleared() {
 }
 
 /// The alerts only a source's runner clears (its outage, its credential) end
-/// with the source: once its runner has ended after a delete, or before the
-/// runner of a source created again with its id starts. Another kind stays,
-/// an alert raised after the create stays, and nothing ends while another
-/// instance holds the source.
+/// with the source once its runner has ended after a delete. Another kind
+/// stays, an alert raised after the delete (by a source created again) stays,
+/// and nothing ends while another instance holds the source.
 #[tokio::test]
-async fn a_deleted_sources_outage_ends_with_it_and_does_not_block_its_successor() {
+async fn a_deleted_sources_outage_ends_with_it() {
     let Some(python) = python() else {
         eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
         return;
@@ -1073,10 +1072,10 @@ async fn a_deleted_sources_outage_ends_with_it_and_does_not_block_its_successor(
             .unwrap();
         assert_eq!(r.status(), 204);
     };
-    let raise = |kind: &str| -> i64 {
+    let raise = |kind: &str, at: i64| -> i64 {
         db.query_json(
-            "INSERT INTO alerts (feed_id, kind, message, created_at) VALUES ('lab', $1, 'open', 1700000000000) RETURNING id",
-            vec![hie::db::Param::Text(kind.into())],
+            "INSERT INTO alerts (feed_id, kind, message, created_at) VALUES ('lab', $1, 'open', $2) RETURNING id",
+            vec![hie::db::Param::Text(kind.into()), hie::db::Param::Int(at)],
         )
         .unwrap()[0]["id"]
             .as_i64()
@@ -1109,9 +1108,10 @@ async fn a_deleted_sources_outage_ends_with_it_and_does_not_block_its_successor(
     };
 
     create().await;
-    let outage = raise("delivery");
-    let credential = raise("credential");
-    let other = raise("unreadable_file");
+    let before = hie::db::now_ms();
+    let outage = raise("delivery", before);
+    let credential = raise("credential", before);
+    let other = raise("unreadable_file", before);
     delete().await;
     assert_eq!(
         wait_cleared(outage, "the outage to end").await,
@@ -1127,20 +1127,23 @@ async fn a_deleted_sources_outage_ends_with_it_and_does_not_block_its_successor(
         "another kind is left to its own clearing"
     );
 
-    // Left by an earlier definition after the delete (another instance's
-    // runner, a stale one): ended before the new runner runs.
-    let left = raise("delivery");
+    // Created again, and deleted again: that delete's sweep ends what was
+    // raised before it, and leaves an alert raised after it (by a definition
+    // created after the delete) alone.
     create().await;
+    let marker = raise("delivery", hie::db::now_ms());
+    let later = raise("delivery", hie::db::now_ms() + 600_000);
+    delete().await;
+    wait_cleared(marker, "the second delete's sweep").await;
     assert_eq!(
-        wait_cleared(left, "the left alert to end").await,
-        "lab: the source was created again; this alert was left by its earlier definition"
+        cleared(later),
+        None,
+        "raised after the delete: not its sweep's"
     );
-    // The new definition's own outage stays open: neither sweep reaches it.
-    let current = raise("delivery");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(cleared(current), None);
 
     // While another instance holds the source, its alerts are its own.
+    create().await;
+    let peer = raise("delivery", hie::db::now_ms());
     db.query_json(
         "UPDATE source_leases SET owner = 'peer', until = 9000000000000000 WHERE feed_id = 'lab' RETURNING feed_id",
         vec![],
@@ -1153,30 +1156,5 @@ async fn a_deleted_sources_outage_ends_with_it_and_does_not_block_its_successor(
     .unwrap();
     delete().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(cleared(current), None, "the peer's outage stays");
-    // Created again while the peer still holds it: the new runner stands by
-    // and ends nothing; once the peer lets go, its first pass ends what the
-    // earlier definition left.
-    create().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        cleared(current),
-        None,
-        "not while the peer holds the source"
-    );
-    db.query_json(
-        "UPDATE source_leases SET until = 0 WHERE feed_id = 'lab' RETURNING feed_id",
-        vec![],
-    )
-    .unwrap();
-    let resume = http
-        .post(format!("{api}/api/sources/lab/check-now"))
-        .send()
-        .await
-        .unwrap();
-    assert!(resume.status().is_success(), "{}", resume.status());
-    assert_eq!(
-        wait_cleared(current, "the successor to end it").await,
-        "lab: the source was created again; this alert was left by its earlier definition"
-    );
+    assert_eq!(cleared(peer), None, "the peer's outage stays");
 }

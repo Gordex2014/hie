@@ -315,6 +315,44 @@ async fn an_unreachable_server_is_reported_with_a_fixed_reason_and_no_url() {
     }
 }
 
+/// An outage alert an earlier definition of the id left open (the source was
+/// deleted and created again) does not stand for this one's outage: a new one
+/// is raised, and the recovery clears both.
+#[tokio::test]
+async fn an_outage_alert_left_from_before_the_source_was_born_does_not_hide_its_outage() {
+    let (origin, hfs) = hfs().await;
+    hfs.lock().unwrap().post_status = Some(503);
+    let e = engine(&format!("{origin}/fhir"), 0).await;
+    e.state
+        .db
+        .query_json(
+            "INSERT INTO alerts (feed_id, kind, message, created_at) VALUES ('lab-results', 'delivery', 'from before', 1) RETURNING id",
+            [],
+        )
+        .unwrap();
+    e.seed();
+    e.runner.tick().await.unwrap();
+    assert_eq!(
+        e.alerts("lab-results"),
+        [
+            ("delivery".into(), None, false, None),
+            ("delivery".into(), None, false, None)
+        ],
+        "a new outage alert beside the old one"
+    );
+    hfs.lock().unwrap().post_status = None;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    e.make_due();
+    e.runner.tick().await.unwrap();
+    assert_eq!(
+        e.alerts("lab-results"),
+        [
+            ("delivery".into(), None, true, Some(RECOVERED.into())),
+            ("delivery".into(), None, true, Some(RECOVERED.into()))
+        ]
+    );
+}
+
 #[tokio::test]
 async fn a_server_that_answers_503_and_comes_back() {
     let (origin, hfs) = hfs().await;

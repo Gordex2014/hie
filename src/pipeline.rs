@@ -64,10 +64,9 @@ pub struct FeedRunner {
     bulk_transformed: bool,
     /// Tag what this runner delivers with its source (`delivery.stamp_source`).
     stamp_source: bool,
-    /// A source created again through the API: the alerts an earlier
-    /// definition of its id left open are ended at the first pass that holds
-    /// its lease (`Alerter::end_orphans`).
-    sweep_orphans: std::sync::atomic::AtomicBool,
+    /// Whether this runner runs its passes under the source's lease
+    /// (`pass`): its submission claims then need that lease still held.
+    leased: std::sync::atomic::AtomicBool,
     /// How the manager drives this runner, once it runs: a halt is seen between records.
     control: std::sync::OnceLock<Arc<RunnerControl>>,
     /// The last record the transform could not finish now, as (id, revision,
@@ -163,7 +162,7 @@ impl FeedRunner {
             bulk_dir: std::env::temp_dir().join("hie-bulk"),
             bulk_transformed: feed_bulk_transformed,
             stamp_source: false,
-            sweep_orphans: std::sync::atomic::AtomicBool::new(false),
+            leased: std::sync::atomic::AtomicBool::new(false),
             control: std::sync::OnceLock::new(),
             last_transient: std::sync::Mutex::new(None),
         }
@@ -236,14 +235,6 @@ impl FeedRunner {
         self
     }
 
-    /// Ends the alerts an earlier definition of this source's id left open, at
-    /// the first pass that holds the source (see `sweep_orphans`).
-    pub fn with_orphan_sweep(self, on: bool) -> Self {
-        self.sweep_orphans
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-        self
-    }
-
     /// The resources of one record as they are sent: tagged copies when
     /// stamping is on, the stored ones, borrowed, otherwise.
     fn outgoing<'a>(
@@ -288,20 +279,8 @@ impl FeedRunner {
             tracing::debug!(feed = %self.feed.id, "held by another instance; standing by");
             return Ok(false);
         }
-        // Holding the lease, no other instance runs the source: what an
-        // earlier definition left open is no one's any more.
-        if self
-            .sweep_orphans
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
-            self.alerts.end_orphans(
-                &self.feed.id,
-                &format!(
-                    "{}: the source was created again; this alert was left by its earlier definition",
-                    self.feed.id
-                ),
-            );
-        }
+        self.leased
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Err(e) = self.source().start().await {
             tracing::error!(feed = %self.feed.id, "{e:#}");
             self.alerts.raise(
@@ -1093,7 +1072,13 @@ impl FeedRunner {
             // Claimed before its request: only while it is still as read here,
             // so a request is never built from a row another runner has moved
             // on, and the answer to any earlier claim changes nothing.
-            let Some(claim) = self.db.claim_submission(&sub, &self.instance, now_ms())? else {
+            let Some(claim) = self.db.claim_submission(
+                &sub,
+                &self.instance,
+                self.leased.load(std::sync::atomic::Ordering::Acquire),
+                now_ms(),
+            )?
+            else {
                 continue;
             };
             let step = match sub.status.as_str() {
@@ -1756,11 +1741,11 @@ impl FeedRunner {
         );
         let rules = self.rules("unreachable")?;
         if rules.is_empty() {
+            // An open one left by an earlier definition of this id (deleted
+            // and created again) does not stand for this outage; this
+            // definition's next recovery clears both.
             if attempts >= self.feed.delivery.alert_after_attempts
-                && self
-                    .db
-                    .open_alert(&self.feed.id, "delivery", None)?
-                    .is_none()
+                && !self.db.open_outage_since_birth(&self.feed.id)?
             {
                 self.alerts
                     .raise(Some(&self.feed.id), "delivery", &message)?;
