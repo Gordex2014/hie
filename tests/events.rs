@@ -2577,6 +2577,62 @@ async fn an_old_empty_settlement_after_a_newer_failure_changes_nothing() {
     an_old_terminal_answer_changes_nothing(false).await;
 }
 
+/// One submission's status poll answers after the source's lease has run out:
+/// the pass renews the lease before its next claim, so the submissions after
+/// it are still kicked off in the same pass.
+#[tokio::test]
+async fn a_slow_answer_does_not_keep_the_next_submissions_from_being_claimed() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let (hfs, held) = held_poll_server(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, state) = engine(
+        dir.path(),
+        &format!("fhir_base_url: {hfs}\npublic_url: http://engine.test\npython: {python}\n"),
+        &[("drops", bulk_source())],
+    );
+    let db = state.db.clone();
+    let runner = manager.runner("drops").unwrap();
+    // The engine starts its sources paused: this pass takes the lease and runs
+    // nothing; the ticks below run under it.
+    assert!(runner.pass().await.unwrap());
+    // The first submission is opened and kicked off.
+    std::fs::write(dir.path().join("inbox/a.ndjson"), patients(&["a"])).unwrap();
+    runner.tick().await.unwrap();
+    let first = token(&db);
+
+    // The next pass opens a second one, then polls the first: that answer is
+    // held until the lease has run out.
+    std::fs::write(dir.path().join("inbox/b.ndjson"), patients(&["b"])).unwrap();
+    let passing = tokio::spawn({
+        let runner = runner.clone();
+        async move { runner.tick().await }
+    });
+    held.polled.notified().await;
+    db.query_json(
+        "UPDATE source_leases SET until = 0 RETURNING feed_id",
+        [],
+    )
+    .unwrap();
+    held.release.notify_one();
+    passing.await.unwrap().unwrap();
+
+    let subs = db
+        .query_json("SELECT token, status FROM submissions ORDER BY created_at", [])
+        .unwrap();
+    assert_eq!(subs.len(), 2, "{subs:?}");
+    assert_eq!(subs[0]["token"], first);
+    assert_eq!(subs[0]["status"], "done", "{subs:?}");
+    assert_eq!(
+        subs[1]["status"], "running",
+        "the second submission is claimed and kicked off: {subs:?}"
+    );
+    let lease = db.lease("drops").unwrap().expect("the lease was taken again");
+    assert_eq!(lease.owner, hie::pipeline::instance_id());
+}
+
 #[test]
 fn an_older_answer_cannot_settle_or_refuse_a_submission() {
     let db = Db::in_memory().unwrap();

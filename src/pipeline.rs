@@ -1073,27 +1073,35 @@ impl FeedRunner {
         let Some(bulk) = &self.bulk else {
             return Ok(());
         };
-        // Under the lease, it is renewed first: a pass that ran past it (a
-        // large file transformed) would otherwise claim nothing; one another
-        // instance took meanwhile stops here.
-        if self.leased.load(std::sync::atomic::Ordering::Acquire)
-            && !self
-                .db
-                .acquire_lease(&self.feed.id, &self.instance, self.lease_ttl_ms())?
-        {
-            tracing::info!(feed = %self.feed.id, "another instance took the source during the pass; its submissions are left to it");
-            return Ok(());
-        }
+        let leased = self.leased.load(std::sync::atomic::Ordering::Acquire);
         for sub in self.db.submissions_due(&self.feed.id)? {
+            // Under the lease, it is renewed right before each claim: a pass
+            // that ran past it (a large file transformed, a slow answer for
+            // an earlier submission) would otherwise claim nothing more. One
+            // another instance took meanwhile stops here.
+            if leased
+                && !self
+                    .db
+                    .acquire_lease(&self.feed.id, &self.instance, self.lease_ttl_ms())?
+            {
+                tracing::info!(feed = %self.feed.id, "another instance took the source during the pass; its submissions are left to it");
+                return Ok(());
+            }
             // Claimed before its request: only while it is still as read here,
             // so a request is never built from a row another runner has moved
             // on, and the answer to any earlier claim changes nothing.
-            let Some(claim) = self.db.claim_submission(
-                &sub,
-                &self.instance,
-                self.leased.load(std::sync::atomic::Ordering::Acquire),
-            )?
-            else {
+            let Some(claim) = self.db.claim_submission(&sub, &self.instance, leased)? else {
+                match self.db.lease(&self.feed.id)? {
+                    Some(l) if l.owner != self.instance => {
+                        tracing::info!(feed = %self.feed.id, submission = %sub.submission_id, "not claimed: another instance holds the source");
+                    }
+                    None if leased => {
+                        tracing::info!(feed = %self.feed.id, submission = %sub.submission_id, "not claimed: this instance's lease on the source ran out");
+                    }
+                    _ => {
+                        tracing::debug!(feed = %self.feed.id, submission = %sub.submission_id, "not claimed: another runner moved it");
+                    }
+                }
                 continue;
             };
             let step = match sub.status.as_str() {
