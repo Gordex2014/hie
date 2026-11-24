@@ -2229,7 +2229,9 @@ fn an_older_poll_answer_cannot_move_a_submission() {
 /// late answer changes nothing, whatever it says.
 #[test]
 fn a_late_kickoff_answer_after_attempts_went_back_to_zero_changes_nothing() {
-    let late_answers: [(&str, fn(&Db, hie::db::Claim) -> bool); 5] = [
+    /// A late answer, written under the claim its request took.
+    type Answer = fn(&Db, hie::db::Claim) -> bool;
+    let late_answers: [(&str, Answer); 5] = [
         ("refusal", |db, c| {
             db.reject_submission("t", c, "server", "HTTP 400", &json!({}))
                 .unwrap()
