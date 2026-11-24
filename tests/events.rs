@@ -1494,7 +1494,10 @@ fn an_alert_cleared_while_the_purge_waits_for_it_is_kept_on_postgres() {
     let db = Arc::new(Db::open(&dir.path().join("hie.db")).unwrap());
     let day = 86_400_000i64;
     let now = hie::db::now_ms();
-    let open = db.insert_alert(Some("s"), "delivery", "m", None).unwrap();
+    // Open and without a rule: purged by age (an outage alert would be kept).
+    let open = db
+        .insert_alert(Some("s"), "unreadable_file", "m", None)
+        .unwrap();
     let cleared = db.insert_alert(Some("s"), "delivery", "m", None).unwrap();
     db.clear_alert(cleared, "done").unwrap();
     let newest = db.insert_alert(Some("s"), "delivery", "m", None).unwrap();
@@ -1839,7 +1842,9 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
     let definition = raise("definition", None);
     let open_disabled = raise("silence", Some(&disabled));
     let open_deleted = raise("silence", Some(&deleted));
-    let open_no_rule = raise("delivery", None);
+    let open_no_rule = raise("unreadable_file", None);
+    // An outage still going on: what stops a second alert for it.
+    let open_outage = raise("delivery", None);
     let cleared_old = raise("delivery_recovered", None);
     db.clear_alert(cleared_old, "done").unwrap();
     let cleared_recent = db.insert_alert(None, "listener", "m", None).unwrap();
@@ -1890,6 +1895,7 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
             open_enabled,
             credential,
             definition,
+            open_outage,
             cleared_recent,
             highest
         ]
@@ -1905,7 +1911,7 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
 
     // Everything old, every alert cleared: all go but the one with the highest
     // id, and the next alert gets an id above every one purged.
-    for id in [open_enabled, credential, definition] {
+    for id in [open_enabled, credential, definition, open_outage] {
         db.clear_alert(id, "done").unwrap();
     }
     db.query_json(
@@ -1920,7 +1926,7 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
     .unwrap();
     let last_event = events(&db)[0]["id"].as_i64().unwrap();
     let purged = hie::retention::purge(&db, cutoff).unwrap();
-    assert_eq!((purged.events, purged.alerts), (1, 4));
+    assert_eq!((purged.events, purged.alerts), (1, 5));
     assert_eq!(alert_ids(&db), [highest]);
     assert_eq!(alert_totals(&api).await, totals);
     let next_alert = db.insert_alert(Some("s"), "delivery", "m", None).unwrap();

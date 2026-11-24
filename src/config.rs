@@ -32,6 +32,9 @@ pub struct Config {
     pub transforms_dir: PathBuf,
     #[serde(default)]
     pub alerts: AlertConfig,
+    /// How the engine watches whether the FHIR server answers.
+    #[serde(default)]
+    pub destination: DestinationConfig,
     /// What each transform's worker process may use and how long it may take.
     #[serde(default)]
     pub worker: WorkerConfig,
@@ -303,6 +306,38 @@ impl AlertConfig {
             );
         }
         Ok(())
+    }
+}
+
+/// The `destination:` block.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DestinationConfig {
+    /// Seconds without any request to the FHIR server after which the engine
+    /// probes its `/metadata`; `0` turns the probe off.
+    pub probe_seconds: u64,
+}
+
+impl Default for DestinationConfig {
+    fn default() -> Self {
+        Self { probe_seconds: 60 }
+    }
+}
+
+impl DestinationConfig {
+    pub fn check(&self) -> Result<()> {
+        if self.probe_seconds > crate::destination::MAX_PROBE_SECONDS {
+            bail!(
+                "destination.probe_seconds must be at most {} (0 turns the probe off)",
+                crate::destination::MAX_PROBE_SECONDS
+            );
+        }
+        Ok(())
+    }
+
+    /// How long the destination stays idle before a probe; zero when off.
+    pub fn probe_every(&self) -> Duration {
+        Duration::from_secs(self.probe_seconds)
     }
 }
 
@@ -957,6 +992,10 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
         .with_context(|| format!("checking {}", path.display()))?;
     config
         .retention
+        .check()
+        .with_context(|| format!("checking {}", path.display()))?;
+    config
+        .destination
         .check()
         .with_context(|| format!("checking {}", path.display()))?;
     let base = path.parent().map(Path::to_path_buf).unwrap_or_default();

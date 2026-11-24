@@ -8,10 +8,12 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
 use crate::credentials::Credentials;
+use crate::destination::{Destination, InFlight};
 use crate::fhir::{self, SendError};
 
 /// Whether `path` lies inside `dir`, as the filesystem resolves both (symbolic
@@ -178,6 +180,9 @@ pub struct BulkSubmitter {
     fhir_base: String,
     public_url: String,
     credentials: Credentials,
+    /// Told how each request under the base went; the status pages and receipt
+    /// files, whose URLs HFS chooses, are not observed.
+    destination: Option<Arc<Destination>>,
 }
 
 /// The identifier system the engine submits under; the value is the source id.
@@ -194,7 +199,14 @@ impl BulkSubmitter {
             fhir_base: fhir_base.trim_end_matches('/').to_string(),
             public_url: public_url.trim_end_matches('/').to_string(),
             credentials: None,
+            destination: None,
         }
+    }
+
+    /// The same submitter, telling `destination` how its requests to HFS went.
+    pub fn with_destination(mut self, destination: Arc<Destination>) -> Self {
+        self.destination = Some(destination);
+        self
     }
 
     /// The same submitter, calling HFS with the engine's token.
@@ -237,24 +249,43 @@ impl BulkSubmitter {
         json!({"resourceType": "Parameters", "parameter": parameter})
     }
 
-    async fn post(&self, path: &str, body: &Value) -> Result<reqwest::Response, SendError> {
+    /// Posts to HFS under the base. The returned exchange is held until the
+    /// answer has been read.
+    async fn post(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<(reqwest::Response, Option<InFlight>), SendError> {
         let request = self
             .http
             .post(format!("{}/{path}", self.fhir_base))
             .header("Content-Type", "application/fhir+json")
             .header("Accept", "application/fhir+json")
             .json(body);
-        fhir::authorize(request, &self.credentials)
+        // Built before it counts as a request to the server.
+        let request = fhir::authorize(request, &self.credentials)
             .await?
-            .send()
-            .await
+            .build()
             .map_err(|e| {
                 SendError::Transient(format!(
-                    "cannot reach {}: {}",
+                    "the request to {} could not be built: {}",
                     shown(&self.fhir_base),
-                    e.without_url()
+                    crate::destination::send_detail(&e)
                 ))
-            })
+            })?;
+        let exchange = self.destination.as_ref().map(|d| d.start());
+        let sent = self.http.execute(request).await;
+        if let Some(exchange) = &exchange {
+            exchange.observe_send(&sent);
+        }
+        let response = sent.map_err(|e| {
+            SendError::Transient(format!(
+                "cannot reach {}: {}",
+                shown(&self.fhir_base),
+                e.without_url()
+            ))
+        })?;
+        Ok((response, exchange))
     }
 
     async fn get(&self, url: &str, accept: &str) -> Result<reqwest::Response, SendError> {
@@ -299,8 +330,8 @@ impl BulkSubmitter {
                 json!({"name": "submissionStatus", "valueCoding": {"system": "http://hl7.org/fhir/event-status", "code": "completed"}}),
             ],
         );
-        self.classify(self.post("$bulk-submit", &body).await?)
-            .await?;
+        let (response, _exchange) = self.post("$bulk-submit", &body).await?;
+        self.classify(response).await?;
         Ok(())
     }
 
@@ -311,9 +342,8 @@ impl BulkSubmitter {
         submission_id: &str,
     ) -> Result<String, SendError> {
         let body = Self::parameters(source_id, submission_id, vec![]);
-        let response = self
-            .classify(self.post("$bulk-submit-status", &body).await?)
-            .await?;
+        let (response, _exchange) = self.post("$bulk-submit-status", &body).await?;
+        let response = self.classify(response).await?;
         response
             .headers()
             .get("content-location")

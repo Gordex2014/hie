@@ -26,14 +26,14 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /api/transforms/{name}` | The transform's code |
 | `PUT /api/transforms/{name}` | Saves the code (`{"code": "..."}`); the sources using it restart their Python worker. `201` when new |
 | `POST /api/transforms/{name}/try` | Runs the transform on `{"records": [...]}` (up to 100) without loading: per record, the resources it became or the rejection reason. At most four tries run at once; `503` when one cannot start within 10 s |
-| `GET /api/monitoring/status` | What the monitoring page opens on: `needs_you` (late, paused, or rejecting sources with the reason), `last_24h` (files, sent, rejected, alerts), every source |
+| `GET /api/monitoring/status` | What the monitoring page opens on: `needs_you` (late, paused, or rejecting sources with the reason), `last_24h` (files, sent, rejected, alerts), `destination` (whether the FHIR server answers, see [The destination](#the-destination)), every source with its `last_alert` (`kind`, `message`, `created_at`, `cleared_at`) |
 | `GET /api/records?source=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
 | `GET /api/records/{id}` | One record: file, line, original and corrected row, resources sent, HFS response |
 | `POST /api/records/{id}/reprocess` | Runs a record again; body `{"raw": {...}}` replaces the row and keeps the original |
 | `GET /api/alerts?source=&open=true&since=&limit=100&cursor=` | Alerts, newest first, each with its rule, recipients, channels, when and why it cleared, and `webhook`: the delivery of its latest webhook event (`event`, `event_id`, `state`, `attempts`, `last_error`, `last_status`, `delivered_at`; null for alerts from before events were recorded); `open=true` lists only those not cleared. `since` and `cursor` read a period page by page (see [Reading alerts by period](#reading-alerts-by-period)). Kept for `retention.history` (see [Alerts and retention](#alerts-and-retention)). Also `webhook: {configured, signed}`, this instance's webhook settings (see [the alert webhook](sources.md#the-alert-webhook)) |
 | `GET /api/events?source=&kind=&since=&cursor=&limit=` | The event log, oldest first: each record's attempts and outcomes, each load's steps, each submission's steps (see [Events](#events)) |
 | `GET /api/alert-rules?source=` | Every rule, each with its `created_at`; `POST` creates one (`400` names what is wrong with it). `created_at` is set by the engine, never by the body. A rule id is never given again, like alert and event ids |
-| `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove |
+| `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove. A `PUT` that turns the rule off (`enabled: false`) or changes its `condition`, `threshold` or `source_id`, and a `DELETE`, clear the rule's open alerts in the same transaction, each with its webhook `cleared` event; a change of `notify` or `channels` alone does not |
 | `GET /api/secrets` | Every stored credential, by name, without its value |
 | `POST /api/secrets` | Stores a credential: `{"name", "kind": "aws", "value": {"access_key_id", "secret_access_key"}}`. `201` |
 | `GET /api/secrets/{id}` | One credential, without its value |
@@ -136,9 +136,10 @@ A poller pages with `cursor`: the first request may give `since`, and each next 
 Stored alerts follow `retention.history` too. An alert is purged that long after it cleared, or after it was raised if it is still open, except:
 - open alerts of a rule that exists, is enabled and was created before the alert (on SQLite a deleted rule's id may be given to a new rule);
 - open `credential` and `definition` alerts, which the engine clears itself;
+- open `delivery` alerts without a rule: an outage still going on, which its recovery clears;
 - the alert with the highest id.
 
-Open alerts of a deleted or disabled rule, and other open alerts without a rule, are purged by age. An alert id is never given again after a purge: the newest alert is always kept, so a SQLite store never reuses one, and PostgreSQL ids come from a sequence. Rule ids are never given again either: SQLite rules take their ids from `AUTOINCREMENT` (a store made before is rebuilt to it once, at its first start with this version), PostgreSQL's from a sequence. `hie_alerts_total` in `/metrics` adds the purged alerts to the stored ones, so it never goes down. A purged alert's [webhook events](sources.md#the-alert-webhook) go with it, any still waiting included.
+Turning a rule off, deleting it or changing what it watches clears its open alerts (see the rules above); other open alerts without a rule are purged by age. An alert id is never given again after a purge: the newest alert is always kept, so a SQLite store never reuses one, and PostgreSQL ids come from a sequence. Rule ids are never given again either: SQLite rules take their ids from `AUTOINCREMENT` (a store made before is rebuilt to it once, at its first start with this version), PostgreSQL's from a sequence. `hie_alerts_total` in `/metrics` adds the purged alerts to the stored ones, so it never goes down. A purged alert's [webhook events](sources.md#the-alert-webhook) go with it, any still waiting included.
 
 ### Reading alerts by period
 
@@ -228,6 +229,38 @@ GET /api/loads?status=failed&limit=50&cursor=a1.812
 - its files, for deduplication: a file or object whose content the earlier source took is recorded as a `duplicate` of the earlier load by a source that moves what it reads, skipped without a load by a `read_only` source (which knows a non-empty file it took by its name and size, so a different file with the same name and size is skipped too), and skipped while the earlier object still waits to be fetched on the `$bulk-submit` path; an entry of a new zip whose content was taken before is recorded as a `duplicate` by either kind.
 
 To keep two histories apart, give the new source a new id. `source_name` and `received_at` tell the earlier loads apart when the name changed. `GET /api/sources` says whether a source is registered under an id now, on the instance that answers; it cannot say whether that is the definition that recorded a given load. `DELETE` removes `sources/{id}.yaml` only: a definition kept under another file name in the sources directory starts again with the engine.
+
+### The destination
+
+`destination` in `GET /api/monitoring/status` says whether the FHIR server at `fhir_base_url` answers, as this engine process saw it:
+
+```json
+"destination": {
+  "reachable": false,
+  "since": "2026-11-20T10:00:00.123+00:00",
+  "last_error": "could not connect to the FHIR server",
+  "consecutive_failures": 7,
+  "observed_at": "2026-11-20T10:06:00.456+00:00"
+}
+```
+
+| Member | Meaning |
+|---|---|
+| `reachable` | `true`, `false`, or `null` while nothing has been observed since the engine started |
+| `since` | When `reachable` took its current value: the first failure of the current outage, or the first answer after one |
+| `last_error` | While unreachable, why, as one of these fixed sentences; `null` otherwise: `could not connect to the FHIR server`, `the FHIR server did not answer in time`, `the connection to the FHIR server was lost`, `the FHIR server answered HTTP 502` (or `503`, `504`). Never a URL, a host or a library's error text; the engine log has the detail |
+| `consecutive_failures` | Failed observations in a row, every source's deliveries and the probe together, so several failing sources add up quickly; `0` while reachable. It is not a source's attempt count and is not compared with `alert_after_attempts` |
+| `observed_at` | The latest observation that counted: "last checked" |
+
+Timestamps are RFC 3339 in UTC, as everywhere in the API.
+
+**What is observed.** Each request a delivery sends under the base (a batch Bundle, a `$bulk-submit` kick-off or status request), and the **idle probe**: once nothing has reached the server for `destination.probe_seconds` (60 by default; see [running](running.md#the-destination-probe)), a `GET {base}/metadata`, anonymous (no token, and no user information from the base URL), without following redirects. Requests that deliveries send push the probe back, so an engine that keeps sending does not probe; one that is only waiting on a long bulk submission still does. Bulk status pages and receipt files, whose URLs HFS chooses, are not observed; neither are the token endpoint, the terminology server, sources that read another FHIR server, or the alert webhook. A request the server redirects counts as the server's.
+
+**What counts.** No connection, no answer in time, a connection lost before the answer, or an answer of `502`, `503` or `504` is a failure. Any other answer, `4xx` (`401`, `403`, `429` included) and `500` included, means the server answers. So `reachable` says the server's HTTP route answers, not that delivery works: an HFS answering `500` to every batch, a batch whose every entry is to be retried, or a token the server refuses all leave it `true`. A token that cannot be fetched records nothing: the state stays what it was (`null` if nothing was observed yet), and the probe, which needs no token, keeps it current. Each source's records, loads and `delivery` alerts say what failed.
+
+**Order.** A request that started before the latest observation does not overwrite it, and a probe gives way to a delivery that started after it. While deliveries see `502` to `504`, a probe that gets an answer does not end the outage (the server may serve `/metadata` and still be unable to store); a delivery's answer does, or the probe's once no delivery has seen `502` to `504` for ten minutes. A source retrying less often than that (a `max_backoff_ms` above ten minutes) can see the state turn `true` between its retries. In that state `observed_at` advances with the probe's failures and the deliveries' retries, which back off up to `max_backoff_ms`.
+
+**Per process.** The state is kept in memory: it starts unknown at every start of the engine (`since` is not kept across a restart), and with several instances on one store each answers with what it observed itself. An instance that holds no source answers from its probe only.
 
 ### Secrets
 

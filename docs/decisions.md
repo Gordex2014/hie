@@ -96,7 +96,7 @@ A complete .NET 10 port of the engine exists in the history (commit `c3272d4`), 
 | Kind | Examples | Handling |
 |---|---|---|
 | Data | Wrong column count, non-numeric value, unknown code or unit, missing identifier, a 4xx from HFS for that entry | Rejected at once. Kept with file, line, original row and reason. Reprocessable after a fix. |
-| Transient | HFS unreachable, timeout, 429, 5xx | Retried with exponential backoff (2 s doubling to 5 min), never dropped. One alert after `alert_after_attempts`, one when delivery recovers. |
+| Transient | HFS unreachable, timeout, 429, 5xx | Retried with exponential backoff (2 s doubling to 5 min), never dropped. One alert after `alert_after_attempts`, cleared when delivery recovers (decision 43). |
 
 **Why:**
 - In the exercise, retrying a bad row only multiplied writes, and treating an outage as a bad file stopped good data.
@@ -142,7 +142,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 ## 12. Alerts for data events in the engine; routing left to a product
 
 **Chosen:**
-- HIE raises alerts for rejected records, unreadable files, delivery outages and recovery, and **silence**: no data within the feed's `expect_every`.
+- HIE raises alerts for rejected records, unreadable files, delivery outages and recovery, and **silence**: no data within the feed's `expect_every`. (Recovery now clears the outage alert instead of raising one: decision 43.)
 - Alerts are stored, logged, and posted to a webhook (`text` field, the shape Slack and Teams accept). (Superseded in part by decision 40: the webhook gets a signed, retried and recorded event per change, and keeps `text`.)
 - A repeated condition alerts once. (Superseded in part by decision 22: conditions are rules, and an alert clears itself.)
 
@@ -455,7 +455,7 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - On PostgreSQL, writers of events across instances take turns on one lock, held through each insert to commit; a file with many unparsable rows, or a large refusal, holds it while its events go in.
 - The purge runs hourly, so history can outlive the setting by up to an hour; instances sharing a store purge to the shortest setting among them.
 - Records, loads and submissions are still not purged (decision 5 keeps a records retention open).
-- The newest alert is always kept, whatever its age. An open alert of a rule whose source was deleted while it was open stays until the rule is deleted.
+- The newest alert is always kept, whatever its age. An open alert of a rule whose source was deleted while it was open stays until the rule is deleted (or, since decision 43, turned off, which clears it).
 - An outcome computed for a superseded revision of a record is discarded, and the record is transformed and sent again; so is a submission whose records changed while it was built.
 - A zip entry whose content turns out to be taken already, after it was staged in the source's store for `$bulk-submit`, leaves that copy under the store's `unpacked/` prefix: the source has no way to remove one object, and the name is not used again.
 - A transform that cannot finish a record now is logged once per record and reason while its runner runs, not on every pass, so a long wait on a terminology server is one event per record, not one per poll. A record reprocessed while held by a submission keeps that submission, as before, and is not picked up again by the bulk path.
@@ -489,7 +489,7 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - Redirects are refused because a redirected POST becomes a GET without the body, and would carry the signature to another host.
 
 **Cost / not yet:**
-- The body changed: the old `feed`, `kind`, `alert_id`, `notify` and `cleared` keys are gone (`text` stays), and a clear is now posted only when the channels recorded on the alert when it fired include the webhook (a later edit of the rule does not change that; a rule turned off or deleted leaves its open alert open, with no clear). `alerts:` refuses unknown keys, so a misspelt `webhook_secret` cannot send unsigned; a file with stray keys there no longer starts. While instances of an earlier version share the store, those still post the old body, unsigned. In the library, an `Alerter` now only records events: they are sent by the task `Alerter::start` returns, which `build` keeps with the source manager.
+- The body changed: the old `feed`, `kind`, `alert_id`, `notify` and `cleared` keys are gone (`text` stays), and a clear is now posted only when the channels recorded on the alert when it fired include the webhook (a later edit of the rule does not change that; a rule turned off or deleted left its open alert open, with no clear, until decision 43 made it clear the alert). `alerts:` refuses unknown keys, so a misspelt `webhook_secret` cannot send unsigned; a file with stray keys there no longer starts. While instances of an earlier version share the store, those still post the old body, unsigned. In the library, an `Alerter` now only records events: they are sent by the task `Alerter::start` returns, which `build` keeps with the source manager.
 - A receiver can still get an event twice, and a late `fired` after its `cleared`; it must de-duplicate. `event_id` covers retries of one event, not a second alert raised for one condition. Receivers match the two events of an alert by its `id`, which is never given again (decision 38).
 - No timestamp is signed: a receiver that forgets the `event_id`s it has seen accepts a replay of an old event. Use HTTPS.
 - Sends are sequential, one per instance at a time: with a receiver that times out, waiting events queue behind each other. Claims and due times use each instance's clock, as source leases do: instances on one store need synchronised clocks. All instances on a store need the same `alerts:` settings.
@@ -533,6 +533,38 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - A reused id shares history: the new source's lists, stats, events and failure figures, pending checks, pause state, rules, alerts, cursors, unfinished rows and deduplication include the earlier source's. A new source should get a new id. Loads recorded before this version have no `source_name`.
 - The first start of this version builds the new indexes; each partial one reads `records` once. On a large store that is a pause at start (see [running](running.md#the-store-and-more-than-one-instance)).
 - `limit` here is 1 to 200; `/api/alerts` keeps its older meaning of `0` and negative values. There is no `since` on loads; other parameters are ignored.
+
+## 43. The destination's reachability, from deliveries and an idle probe
+
+**Chosen:**
+- `GET /api/monitoring/status` carries `destination`: `{reachable, since, last_error, consecutive_failures, observed_at}`, kept in memory per engine process.
+- Observed: every request a delivery sends under the base URL (batch Bundles, `$bulk-submit` kick-off and status requests), and a probe, `GET {base}/metadata`, once nothing has reached the server for `destination.probe_seconds` (60 by default, `0` off). The probe sends no token and no user information, and follows no redirect.
+- No connection, a timeout, a lost connection, or `502`/`503`/`504` is a failure; any other answer means the server answers. `last_error` is one of a few fixed sentences, and a REST delivery that cannot reach the server stores the same sentence as its reason; the detail, with the error chain and without the URL, goes to the log.
+- A request that started before the latest observation does not overwrite it; a probe gives way to a delivery started after it; a probe's answer does not end an outage deliveries see as `502`–`504` until none has for ten minutes.
+- Recovery clears every open `delivery` alert of the source, with a rule or without, and `delivery_recovered` is no longer raised. A rule-less outage alert is raised once per outage, checked in the store. REST recovery needs HFS to decide at least one entry of a batch. The first start of this version on a store closes, in the store only, the `delivery_recovered` alerts earlier versions left open, and the rule-less outage alerts that a later `delivery_recovered`, or a record of the source delivered after them, shows to be over; a marker in the store keeps later starts from doing it again, so an outage alert this version raised ends only with its recovery and its `cleared` event. Retention keeps an open rule-less outage alert whatever its age, since it is what stops a second alert for the same outage.
+- An open alert ends with its rule. Turning a rule off, deleting it, or changing its condition, threshold or source through the API clears its open alerts in the same transaction as the change, each with its `cleared` event for the channels recorded when it fired. If the changed rule still finds the condition, its next evaluation raises a new alert with its own id: the next pass for `silence` and `missing_by`, the next failed delivery for `unreachable`, the next finished load for `rejected_share` (loads already weighed are not weighed again). A change of recipients or channels alone clears nothing. An alert of a rule is written only while the rule is on and has the condition, threshold and source the pass read; on PostgreSQL the rule's row is locked until the alert commits, so a change either waits and clears it or is seen and nothing is raised. A start clears the open alerts whose rule an earlier version turned off, deleted, or moved to another condition or source.
+- On PostgreSQL every index, old or new, is checked or built in a transaction of its own after the tables and their added columns, as the loads indexes already were (decision 42). This replaces the single batch that held the indexes of #28 and #31 (and the schema's own) in one transaction.
+
+**Why:**
+- When the FHIR server is down, every source fails on its own; one shared answer says the destination is the cause, and since when.
+- Deliveries are the best evidence and cost nothing; the probe only fills the silence, so an idle engine does not report a state hours old, and a busy one never probes. `/metadata` is the one read every FHIR server serves, usually without a token.
+- `502`–`504` are what a server or its proxy answers when the service is down; a `500` or a `4xx` is about the request. Counting a payload-specific `500` would make the state flap against the probe. Keeping the token endpoint out keeps the answer about the server.
+- Fixed sentences can be shown to anyone: the failure text a REST delivery stored named the server's URL and a library's error. A `$bulk-submit` failure keeps naming the server's origin (`scheme://host:port/…`, never a path or query) in record errors and alerts, as it did before.
+- A rule turned off or deleted is no longer evaluated, so its open alert stayed open for good, though nothing watched it any more; a rule changed in what it watches left an alert that described the old rule. Ending the alert with the rule keeps the open alerts to what the rules in force say, and the new alert's id tells a receiver it is a new condition.
+- `CREATE INDEX IF NOT EXISTS` takes a `SHARE` lock on its table even when the index exists. A start holding that lock on one table while it waits for a running instance's write to another, which that write held while it waited for the first, deadlocked with it; one transaction per index holds one table at a time.
+- The rule-less outage alert stayed open after recovery, beside a `delivery_recovered` alert that never cleared either, so a list of open alerts showed outages that were over. Clearing it is what rule-governed outage alerts already did, and the clear is posted to the webhook like any other.
+
+**Cost / not yet:**
+- `reachable: true` is not "delivering": a server answering `500` to every batch, a batch whose every entry is retried, or a token problem leaves it `true`. The sources' records and alerts say that.
+- The state starts unknown at each start, and each instance on a shared store has its own. With the probe off and nothing delivered, it stays unknown.
+- While deliveries see `502`–`504`, `observed_at` advances only with the probe's failures and the retries, which back off up to `max_backoff_ms`; and if the retrying source is paused, the probe takes over only after ten minutes. A source whose `max_backoff_ms` is above ten minutes lets the probe's answer show `true` between its retries, and each retry starts a new outage with a new `since`.
+- `delivery_recovered` disappears: a consumer that counted it (`hie_alerts_total{kind="delivery_recovered"}` stops growing) reads cleared `delivery` alerts instead. An old outage alert with no recovery and no delivery after it stays open until the source's next successful delivery, and until then stands for a new outage of that source too.
+- Alert transitions are not fenced by the source's lease: two instances overlapping in a hand-over can each raise an outage alert, as for every other alert. A store failure at the clear leaves the alert open until the next recovery; on the bulk path that is the next completed submission.
+- A rule changed in the store by hand, or by an instance of an earlier version during a rolling upgrade, leaves its alerts to the next start, which tells a rule that is off, gone or moved to another condition or source, but not one whose threshold alone changed. While an earlier version still runs on the store, the `delivery_recovered` alerts it raises after the first start of this one stay open.
+- An alert raised under a rule records the rule's recipients and channels as the pass read them; a change of those alone, committed meanwhile, is not reflected in that alert. A load that finishes while its `rejected_share` rule changes is weighed under the rule the pass read: if the old alert was still open then, it raises nothing, and the change then clears that alert.
+- The first start of this version clears every open alert whose rule an earlier version turned off, deleted or moved, however old, and each one fired with the webhook gets its `cleared` event then.
+- An index check per table per start is a short lock per index rather than one long one; a start on a store in use waits for each. Every start also runs `ALTER TABLE … ADD COLUMN IF NOT EXISTS` for each added column, which takes an exclusive lock on its table even when the column exists: it cannot deadlock, one table at a time, but it waits behind a running instance's longest transaction on that table and holds that instance's next statements on it meanwhile.
+- Delivery failure reasons that are not about reaching the server (a token endpoint's answer, HFS's own OperationOutcome text) reach records and alerts as before.
 
 ## Not in the prototype
 
