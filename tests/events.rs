@@ -1524,9 +1524,9 @@ fn reported(db: &Db, file: i64) -> (i64, i64) {
 }
 
 /// A finish reports the rows that fail, not those filtered out, and only
-/// beyond the most failing rows an earlier finish of the load saw.
+/// beyond the failing rows the previous finish of the load left.
 #[test]
-fn a_finish_reports_failing_rows_beyond_the_most_seen_before() {
+fn a_finish_reports_failing_rows_beyond_the_previous_finish() {
     let db = Db::in_memory().unwrap();
     // Two rows that could not be parsed, one filtered out.
     let file = load(&db, "s", "a", 2, 1);
@@ -1550,7 +1550,7 @@ fn a_finish_reports_failing_rows_beyond_the_most_seen_before() {
     let done = db.finish_files("s").unwrap();
     assert_eq!((done[0].failing, done[0].newly_failing), (2, 0));
 
-    // The filtered row fails once reprocessed: one more than ever seen.
+    // The filtered row fails once reprocessed: one more than before.
     assert!(db.reprocess(ids[2], None).unwrap());
     db.mark_rejected(ids[2], "data", "a bad value", None)
         .unwrap();
@@ -1561,14 +1561,15 @@ fn a_finish_reports_failing_rows_beyond_the_most_seen_before() {
     );
     assert_eq!(reported(&db, file), (3, 3));
 
-    // Fewer failing rows after a fix leave the mark where it was.
+    // Fewer failing rows after a fix lower the failing mark (the rejected
+    // one, kept for earlier versions, stays).
     assert!(db.reprocess(ids[0], None).unwrap());
     db.mark_rejected(ids[0], "filtered", "transform returned no resources", None)
         .unwrap();
     let done = db.finish_files("s").unwrap();
     assert_eq!((done[0].failing, done[0].newly_failing), (2, -1));
     assert_eq!(done[0].first_failure.as_ref().unwrap().0, 2);
-    assert_eq!(reported(&db, file), (3, 3));
+    assert_eq!(reported(&db, file), (3, 2));
     let last = events(&db)
         .into_iter()
         .rfind(|e| e["kind"] == "load.finished")
@@ -1577,6 +1578,14 @@ fn a_finish_reports_failing_rows_beyond_the_most_seen_before() {
         last["detail"],
         json!({"records": 3, "sent": 0, "rejected": 3, "failing": 2})
     );
+
+    // So the same row failing again is reported again: one more than the
+    // finish before, though no more than an earlier finish once saw.
+    assert!(db.reprocess(ids[0], None).unwrap());
+    db.mark_rejected(ids[0], "parse", "not JSON", None).unwrap();
+    let done = db.finish_files("s").unwrap();
+    assert_eq!((done[0].failing, done[0].newly_failing), (3, 1));
+    assert_eq!(reported(&db, file), (3, 3));
 }
 
 #[test]
@@ -1767,7 +1776,7 @@ fn set_writes_over_more_than_one_chunk_change_and_log_every_row_once() {
     );
     let before = events(&db).len();
     assert_eq!(
-        db.reject_submission("t", 0, "server", "HTTP 400", &json!({}))
+        db.reject_submission("t", claim(&db, "t"), "server", "HTTP 400", &json!({}))
             .unwrap(),
         Some(450)
     );
@@ -2165,6 +2174,12 @@ fn an_open_alert_is_not_kept_by_a_rule_made_after_it() {
     assert!(!alert_ids(&db).contains(&open));
 }
 
+/// The claim a runner takes before a request: on the submission as it is now.
+fn claim(db: &Db, token: &str) -> hie::db::Claim {
+    let sub = db.submission(token).unwrap().unwrap();
+    db.claim_submission(&sub, i64::MAX).unwrap().unwrap()
+}
+
 #[test]
 fn an_older_poll_answer_cannot_move_a_submission() {
     let db = Db::in_memory().unwrap();
@@ -2175,11 +2190,18 @@ fn an_older_poll_answer_cannot_move_a_submission() {
             .unwrap()
     );
     // A poll failed once: the submission is at attempt 1.
-    assert!(db.submission_attempt_failed("t", 0, 0, "HTTP 503").unwrap());
-    // Answers to requests made at attempt 0 change nothing.
-    assert!(!db.submission_attempt_failed("t", 0, 0, "HTTP 503").unwrap());
+    let first = claim(&db, "t");
     assert!(
-        !db.progress_submission("t", Some(0), "running", None, 0, 0, None)
+        db.submission_attempt_failed("t", first, 0, "HTTP 503")
+            .unwrap()
+    );
+    // Answers to requests claimed before change nothing.
+    assert!(
+        !db.submission_attempt_failed("t", first, 0, "HTTP 503")
+            .unwrap()
+    );
+    assert!(
+        !db.progress_submission("t", Some(first), "running", None, 0, 0, None)
             .unwrap()
     );
     let row = db
@@ -2194,9 +2216,155 @@ fn an_older_poll_answer_cannot_move_a_submission() {
         .filter(|e| e["kind"] == "submission.attempt_failed")
         .count();
     assert_eq!(failed, 1);
+    let next = claim(&db, "t");
+    assert_ne!(next.epoch, next.attempts as i64, "the two are told apart");
     assert!(
-        db.progress_submission("t", Some(1), "running", None, 0, 0, None)
+        db.progress_submission("t", Some(next), "running", None, 0, 0, None)
             .unwrap()
+    );
+}
+
+/// The kick-off a runner sent before its lease lapsed is answered after another
+/// runner's kick-off failed and then succeeded: attempts went 0, 1, 0, but the
+/// late answer changes nothing, whatever it says.
+#[test]
+fn a_late_kickoff_answer_after_attempts_went_back_to_zero_changes_nothing() {
+    let late_answers: [(&str, fn(&Db, hie::db::Claim) -> bool); 5] = [
+        ("refusal", |db, c| {
+            db.reject_submission("t", c, "server", "HTTP 400", &json!({}))
+                .unwrap()
+                .is_some()
+        }),
+        ("failure", |db, c| {
+            db.submission_attempt_failed("t", c, 0, "HTTP 503").unwrap()
+        }),
+        ("success", |db, c| {
+            db.progress_submission("t", Some(c), "running", Some("https://h/late"), 0, 0, None)
+                .unwrap()
+        }),
+        ("settlement", |db, c| db.settle_submission("t", c).unwrap()),
+        ("receipts", |db, c| {
+            let record = record_id(db, "s", 1);
+            db.settle_page("t", c, &[(record, json!([]))], &[], "")
+                .unwrap()
+                || db.submission_open_at("t", c).unwrap()
+        }),
+    ];
+    for (what, answer) in late_answers {
+        let db = Db::in_memory().unwrap();
+        let file = load(&db, "s", "a", 0, 1);
+        db.mark_passthrough(&[(record_id(&db, "s", 1), 0)]).unwrap();
+        assert!(
+            db.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
+                .unwrap()
+        );
+        // Runner A claims its kick-off at attempts 0, and its answer is late.
+        let a = claim(&db, "t");
+        // Runner B takes over: its kick-off fails, then succeeds.
+        let b = claim(&db, "t");
+        assert!(db.submission_attempt_failed("t", b, 0, "HTTP 503").unwrap());
+        let b = claim(&db, "t");
+        assert!(
+            db.progress_submission("t", Some(b), "running", Some("https://h/b"), 0, 0, None)
+                .unwrap()
+        );
+        let before = db
+            .query_json(
+                "SELECT status, status_url, attempts, failures, epoch FROM submissions",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            before[0]["attempts"], 0,
+            "back at zero, as a kick-off leaves it"
+        );
+        assert_eq!(before[0]["status"], "running");
+        let events_before = events(&db).len();
+        assert!(!answer(&db, a), "A's late {what} took");
+        assert_eq!(
+            db.query_json(
+                "SELECT status, status_url, attempts, failures, epoch FROM submissions",
+                [],
+            )
+            .unwrap(),
+            before,
+            "{what}"
+        );
+        assert_eq!(events(&db).len(), events_before, "{what}");
+        assert_eq!(status(&db, record_id(&db, "s", 1)), "submitted", "{what}");
+    }
+}
+
+/// Two runners in flight at once (a lease lapsed mid-request): the one that
+/// claimed last decides, even when the other's answer comes first; and a claim
+/// on a row read before another runner moved it is refused, so no second
+/// request is built from it.
+#[test]
+fn the_last_claim_decides_and_a_stale_read_cannot_claim() {
+    let db = Db::in_memory().unwrap();
+    let file = load(&db, "s", "a", 0, 1);
+    db.mark_passthrough(&[(record_id(&db, "s", 1), 0)]).unwrap();
+    assert!(
+        db.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
+            .unwrap()
+    );
+    let read_by_b = db.submission("t").unwrap().unwrap();
+    let a = claim(&db, "t");
+    // B read the row before A's claim: it cannot claim on it.
+    assert_eq!(db.claim_submission(&read_by_b, i64::MAX).unwrap(), None);
+    let b = claim(&db, "t");
+    // A's refusal arrives before B's answer: it changes nothing.
+    assert_eq!(
+        db.reject_submission("t", a, "server", "HTTP 400", &json!({}))
+            .unwrap(),
+        None
+    );
+    // B's own success lands; a row read just before it is stale after it.
+    let read_before_success = db.submission("t").unwrap().unwrap();
+    assert!(
+        db.progress_submission("t", Some(b), "running", Some("https://h/b"), 0, 0, None)
+            .unwrap()
+    );
+    // A row read before that success (status still `kickoff`) cannot be
+    // claimed for a second kick-off.
+    assert_eq!(
+        db.claim_submission(&read_before_success, i64::MAX).unwrap(),
+        None
+    );
+    // Nor can a claim be taken before the submission is due.
+    db.progress_submission("t", None, "running", None, 0, 5_000, None)
+        .unwrap();
+    let not_due = db.submission("t").unwrap().unwrap();
+    assert_eq!(db.claim_submission(&not_due, 4_999).unwrap(), None);
+    assert!(db.claim_submission(&not_due, 5_000).unwrap().is_some());
+}
+
+/// An earlier version sharing the store moves attempts but not the epoch: a
+/// claim taken before its write is still fenced, by the attempts it read.
+#[test]
+fn an_earlier_versions_write_still_fences_a_claim() {
+    let db = Db::in_memory().unwrap();
+    let file = load(&db, "s", "a", 0, 1);
+    db.mark_passthrough(&[(record_id(&db, "s", 1), 0)]).unwrap();
+    assert!(
+        db.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
+            .unwrap()
+    );
+    let mine = claim(&db, "t");
+    // What an earlier version writes for a failed attempt: no epoch.
+    db.query_json(
+        "UPDATE submissions SET attempts = attempts + 1 WHERE token = 't' RETURNING token",
+        [],
+    )
+    .unwrap();
+    assert!(
+        !db.submission_attempt_failed("t", mine, 0, "HTTP 503")
+            .unwrap()
+    );
+    assert_eq!(
+        db.reject_submission("t", mine, "server", "HTTP 400", &json!({}))
+            .unwrap(),
+        None
     );
 }
 
@@ -2282,8 +2450,10 @@ async fn an_old_terminal_answer_changes_nothing(refuse: bool) {
         async move { runner.tick().await }
     });
     held.polled.notified().await;
+    // Another runner, meanwhile: its own claim, and a failed attempt.
+    let newer = claim(&db, &token);
     assert!(
-        db.submission_attempt_failed(&token, 0, 0, "HTTP 503")
+        db.submission_attempt_failed(&token, newer, 0, "HTTP 503")
             .unwrap()
     );
     held.release.notify_one();
@@ -2326,26 +2496,32 @@ fn an_older_answer_cannot_settle_or_refuse_a_submission() {
         db.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
             .unwrap()
     );
-    assert!(db.submission_attempt_failed("t", 0, 0, "HTTP 503").unwrap());
-    // Answers to the poll made at attempt 0.
+    let first = claim(&db, "t");
+    assert!(
+        db.submission_attempt_failed("t", first, 0, "HTTP 503")
+            .unwrap()
+    );
+    // Answers to the poll claimed before that failure.
     assert_eq!(
-        db.reject_submission("t", 0, "server", "HTTP 400", &json!({}))
+        db.reject_submission("t", first, "server", "HTTP 400", &json!({}))
             .unwrap(),
         None
     );
     assert!(
-        !db.settle_page("t", 0, &[(record, json!([]))], &[], "")
+        !db.settle_page("t", first, &[(record, json!([]))], &[], "")
             .unwrap()
     );
-    assert!(!db.settle_submission("t", 0).unwrap());
-    assert!(!db.submission_open_at("t", 0).unwrap());
+    assert!(!db.settle_submission("t", first).unwrap());
+    assert!(!db.submission_open_at("t", first).unwrap());
     assert_eq!(status(&db, record), "submitted");
-    // The current attempt's answer settles it.
+    // The current claim's answer settles it.
+    let current = claim(&db, "t");
     assert!(
-        db.settle_page("t", 1, &[(record, json!([]))], &[], "")
+        db.settle_page("t", current, &[(record, json!([]))], &[], "")
             .unwrap()
     );
-    assert!(db.settle_submission("t", 1).unwrap());
+    assert!(db.submission_open_at("t", current).unwrap());
+    assert!(db.settle_submission("t", current).unwrap());
     assert_eq!(status(&db, record), "sent");
 }
 

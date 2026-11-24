@@ -185,8 +185,8 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("files", "archived", "INTEGER NOT NULL DEFAULT 0"),
     ("files", "origin", "TEXT"),
     ("files", "source_name", "TEXT"),
-    // The most failing rows (rejected, not `filtered`) a finish of the file has
-    // seen: a load's alert is raised again only when more rows fail than that.
+    // The failing rows (rejected, not `filtered`) of the file's last finish: a
+    // load's alert is raised again only when more rows fail than that.
     // `rejected_reported` counted filtered rows too; it is kept up to date for
     // earlier versions sharing the store, and no longer read.
     ("files", "failing_reported", "INTEGER NOT NULL DEFAULT 0"),
@@ -205,6 +205,10 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("alerts", "channels", "TEXT"),
     ("alert_rules", "tz", "TEXT"),
     ("submissions", "stamped", "INTEGER NOT NULL DEFAULT 0"),
+    // Bumped by every change of a submission's state, and by the claim before
+    // each kick-off or poll: an answer to a request claimed before the latest
+    // change, by this runner or another, changes nothing.
+    ("submissions", "epoch", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// How long the store write before an untagged REST request may take: a
@@ -423,6 +427,20 @@ pub struct Submission {
     pub attempts: u32,
     /// Its NDJSON carries the source tag (a transformed submission only).
     pub stamped: bool,
+    /// Moves with every change of its state; see `claim_submission`.
+    pub epoch: i64,
+}
+
+/// A runner's claim on a submission for one request (a kick-off or a poll):
+/// the epoch it set, and the attempts it read. Every write of the request's
+/// answer holds only while the submission still has both, so the answer to a
+/// request claimed before another runner's claim, or before any change since,
+/// changes nothing. `attempts` keeps an earlier version, which changes
+/// attempts but not the epoch, fenced as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Claim {
+    pub epoch: i64,
+    pub attempts: u32,
 }
 
 /// A file with records waiting to be submitted, and what they are.
@@ -2545,6 +2563,7 @@ impl Db {
                 status_url: r.opt_string(5),
                 attempts: r.i64(6) as u32,
                 stamped: r.i64(7) != 0,
+                epoch: r.i64(8),
             })
             .collect())
     }
@@ -2552,7 +2571,7 @@ impl Db {
     pub fn submission(&self, token: &str) -> Result<Option<Submission>> {
         Ok(self
             .submissions(
-                "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts, stamped FROM submissions WHERE token = $1",
+                "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts, stamped, epoch FROM submissions WHERE token = $1",
                 &params![token],
             )?
             .into_iter()
@@ -2562,7 +2581,7 @@ impl Db {
     /// Open submissions of a feed whose next attempt is due.
     pub fn submissions_due(&self, feed: &str) -> Result<Vec<Submission>> {
         self.submissions(
-            "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts, stamped FROM submissions
+            "SELECT token, feed_id, submission_id, status, manifest, status_url, attempts, stamped, epoch FROM submissions
              WHERE feed_id = $1 AND status IN ('kickoff', 'running') AND next_attempt_at <= $2 ORDER BY created_at",
             &params![feed, now_ms()],
         )
@@ -2685,15 +2704,15 @@ impl Db {
         .map(drop)
     }
 
-    /// `update_submission`, only while the submission still has the attempt
-    /// count `captured` read before its request: the answer to an older request
-    /// (a runner that held the source before a lease lapsed) changes nothing.
-    /// Returns whether it changed.
+    /// `update_submission`, only while the submission is still under `claim`,
+    /// the claim of the request it answers: the answer to a request claimed
+    /// before (by a runner that held the source before a lease lapsed, or
+    /// before any change since) changes nothing. Returns whether it changed.
     #[allow(clippy::too_many_arguments)]
     pub fn progress_submission(
         &self,
         token: &str,
-        captured: Option<u32>,
+        claim: Option<Claim>,
         status: &str,
         status_url: Option<&str>,
         attempts: u32,
@@ -2703,9 +2722,10 @@ impl Db {
         Ok(self.execute(
             "UPDATE submissions SET status = $2,
                     status_url = COALESCE(CAST($3 AS TEXT), status_url),
-                    attempts = $4, next_attempt_at = $5, error = $6, updated_at = $7
+                    attempts = $4, next_attempt_at = $5, error = $6, updated_at = $7, epoch = epoch + 1
              WHERE token = $1 AND status IN ('kickoff', 'running')
-               AND (CAST($8 AS BIGINT) IS NULL OR attempts = CAST($8 AS BIGINT))",
+               AND (CAST($8 AS BIGINT) IS NULL
+                    OR (epoch = CAST($8 AS BIGINT) AND attempts = CAST($9 AS BIGINT)))",
             &params![
                 token,
                 status,
@@ -2714,30 +2734,53 @@ impl Db {
                 next_attempt_at,
                 error,
                 now_ms(),
-                captured
+                claim.map(|c| c.epoch),
+                claim.map(|c| c.attempts)
             ],
         )? > 0)
+    }
+
+    /// Claims an open submission for one request, before it is sent: only
+    /// while it is still as `read` it (the same epoch, attempts and status, so
+    /// no answer and no other claim came in between, from this version or an
+    /// earlier one) and due at `now`. The claim
+    /// moves the epoch, so the answer to any request claimed before it changes
+    /// nothing. `None`: another runner moved it; this pass leaves it.
+    pub fn claim_submission(&self, read: &Submission, now: i64) -> Result<Option<Claim>> {
+        Ok(self
+            .query_one(
+                "UPDATE submissions SET epoch = epoch + 1
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND status = $5
+                   AND epoch = $2 AND attempts = $3 AND next_attempt_at <= $4
+                 RETURNING epoch, attempts",
+                &params![read.token, read.epoch, read.attempts, now, read.status],
+            )?
+            .map(|r| Claim {
+                epoch: r.i64(0),
+                attempts: r.i64(1) as u32,
+            }))
     }
 
     /// A kick-off or status poll failed for a reason that may pass: the next
     /// attempt is due at `next_attempt_at`, with `submission.attempt_failed`.
     /// `reason` is already scrubbed of URLs and the token. Only while the
-    /// submission still has the attempt count `captured` read before the
-    /// request; returns whether it changed.
+    /// submission is still under the request's `claim`; returns whether it
+    /// changed.
     pub fn submission_attempt_failed(
         &self,
         token: &str,
-        captured: u32,
+        claim: Claim,
         next_attempt_at: i64,
         reason: &str,
     ) -> Result<bool> {
-        let attempts = captured + 1;
+        let attempts = claim.attempts + 1;
         self.transaction(|tx| {
             let Some(r) = tx.query_one(
-                "UPDATE submissions SET attempts = $2, next_attempt_at = $3, error = $4, failures = failures + 1, updated_at = $5
-                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $6
+                "UPDATE submissions SET attempts = $2, next_attempt_at = $3, error = $4, failures = failures + 1, updated_at = $5,
+                        epoch = epoch + 1
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND epoch = $6 AND attempts = $7
                  RETURNING feed_id, submission_id",
-                &params![token, attempts, next_attempt_at, reason, now_ms(), captured],
+                &params![token, attempts, next_attempt_at, reason, now_ms(), claim.epoch, claim.attempts],
             )?
             else {
                 return Ok(false);
@@ -2757,25 +2800,26 @@ impl Db {
     /// that changed are added to the submission's tallies, and each gets
     /// `record.delivered` (`record.recovered` when the submission had failed
     /// attempts) or `record.rejected`. Only while the submission is still open
-    /// at the attempt count `captured` read before the poll: otherwise nothing
-    /// changes and `false` comes back.
+    /// under the poll's `claim`: otherwise nothing changes and `false` comes
+    /// back.
     pub fn settle_page(
         &self,
         token: &str,
-        captured: u32,
+        claim: Claim,
         sent: &[(i64, Value)],
         missing: &[i64],
         error: &str,
     ) -> Result<bool> {
         self.transaction(|tx| {
-            // The submission's row first, still open at the attempt count read
-            // before the poll, as a refusal takes it: then its records.
+            // The submission's row first, still under the poll's claim, as a
+            // refusal takes it: then its records. Pages leave the epoch as it
+            // is: one poll settles several.
             let lock = format!(
                 "SELECT feed_id, submission_id, failures FROM submissions
-                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $2{}",
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND epoch = $2 AND attempts = $3{}",
                 tx.for_update()
             );
-            let Some(sub) = tx.query_one(&lock, &params![token, captured])? else {
+            let Some(sub) = tx.query_one(&lock, &params![token, claim.epoch, claim.attempts])? else {
                 return Ok(false);
             };
             let (feed, submission_id, failures) = (sub.string(0), sub.string(1), sub.i64(2));
@@ -2859,22 +2903,26 @@ impl Db {
     }
 
     /// Closes a submission whose receipts are all applied, with
-    /// `submission.settled` and its tallies. Only a submission still open at the
-    /// attempt count `captured` read before the poll moves, so the event is
-    /// written once and an older poll's answer changes nothing. Returns whether
+    /// `submission.settled` and its tallies. Only a submission still open under
+    /// the poll's `claim` moves, so the event is written once and an older
+    /// poll's answer changes nothing. Returns whether
     /// it moved.
-    pub fn settle_submission(&self, token: &str, captured: u32) -> Result<bool> {
+    pub fn settle_submission(&self, token: &str, claim: Claim) -> Result<bool> {
         self.transaction(|tx| {
             let lock = format!(
                 "SELECT token FROM submissions
-                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $2{}",
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND epoch = $2 AND attempts = $3{}",
                 tx.for_update()
             );
-            if tx.query_one(&lock, &params![token, captured])?.is_none() {
+            if tx
+                .query_one(&lock, &params![token, claim.epoch, claim.attempts])?
+                .is_none()
+            {
                 return Ok(false);
             }
             let Some(r) = tx.query_one(
-                "UPDATE submissions SET status = 'done', attempts = 0, next_attempt_at = 0, error = NULL, updated_at = $2
+                "UPDATE submissions SET status = 'done', attempts = 0, next_attempt_at = 0, error = NULL, updated_at = $2,
+                        epoch = epoch + 1
                  WHERE token = $1 AND status IN ('kickoff', 'running')
                  RETURNING feed_id, submission_id, sent, rejected, failures",
                 &params![token, now_ms()],
@@ -2897,13 +2945,12 @@ impl Db {
     /// holds is rejected with `reason` and the server's `response`, in one
     /// transaction, with a `record.rejected` each and one `submission.refused`.
     /// `reason` and `response` are already scrubbed; the events never carry the
-    /// response. Nothing happens unless the submission is open at the attempt
-    /// count `captured` read before the request (an older request's answer
-    /// changes nothing). Returns how many records were rejected, or `None`.
+    /// response. Nothing happens unless the submission is open under the
+    /// request's `claim` (an older request's answer changes nothing). Returns how many records were rejected, or `None`.
     pub fn reject_submission(
         &self,
         token: &str,
-        captured: u32,
+        claim: Claim,
         kind: &str,
         reason: &str,
         response: &Value,
@@ -2911,10 +2958,10 @@ impl Db {
         self.transaction(|tx| {
             let now = now_ms();
             let Some(sub) = tx.query_one(
-                "UPDATE submissions SET status = 'failed', next_attempt_at = 0, error = $2, updated_at = $3
-                 WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $4
+                "UPDATE submissions SET status = 'failed', next_attempt_at = 0, error = $2, updated_at = $3, epoch = epoch + 1
+                 WHERE token = $1 AND status IN ('kickoff', 'running') AND epoch = $4 AND attempts = $5
                  RETURNING feed_id, submission_id",
-                &params![token, reason, now, captured],
+                &params![token, reason, now, claim.epoch, claim.attempts],
             )?
             else {
                 return Ok(None);
@@ -3634,12 +3681,12 @@ impl Db {
 
     // ---- history: events and their retention --------------------------------
 
-    /// Whether a submission is still open at the attempt count `captured`.
-    pub fn submission_open_at(&self, token: &str, captured: u32) -> Result<bool> {
+    /// Whether a submission is still open under `claim`.
+    pub fn submission_open_at(&self, token: &str, claim: Claim) -> Result<bool> {
         Ok(self
             .query_one(
-                "SELECT 1 FROM submissions WHERE token = $1 AND status IN ('kickoff', 'running') AND attempts = $2",
-                &params![token, captured],
+                "SELECT 1 FROM submissions WHERE token = $1 AND status IN ('kickoff', 'running') AND epoch = $2 AND attempts = $3",
+                &params![token, claim.epoch, claim.attempts],
             )?
             .is_some())
     }

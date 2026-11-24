@@ -1063,6 +1063,12 @@ impl FeedRunner {
             return Ok(());
         };
         for sub in self.db.submissions_due(&self.feed.id)? {
+            // Claimed before its request: only while it is still as read here,
+            // so a request is never built from a row another runner has moved
+            // on, and the answer to any earlier claim changes nothing.
+            let Some(claim) = self.db.claim_submission(&sub, now_ms())? else {
+                continue;
+            };
             let step = match sub.status.as_str() {
                 "kickoff" => {
                     match bulk
@@ -1092,10 +1098,7 @@ impl FeedRunner {
                     Some(url) => match bulk.poll(url).await {
                         Ok(Poll::InProgress) => Ok(None),
                         Ok(Poll::Done { references, errors }) => {
-                            if self
-                                .settle(&sub.token, sub.attempts, &references, &errors)
-                                .await?
-                            {
+                            if self.settle(&sub.token, claim, &references, &errors).await? {
                                 Ok(Some(("done", None)))
                             } else {
                                 Ok(Some(("stale", None)))
@@ -1105,16 +1108,16 @@ impl FeedRunner {
                     },
                 },
             };
-            // Each write below holds only while the submission still has the
-            // attempt count read before the request: an older runner's answer
-            // (a progress, a failure, a refusal or the receipts) changes nothing.
+            // Each write below holds only while the submission is still under
+            // this request's claim: an older runner's answer (a progress, a
+            // failure, a refusal or the receipts) changes nothing.
             match step {
                 // Answered for an older attempt: the current runner decides.
                 Ok(Some(("stale", _))) => {}
                 Ok(None) => {
                     self.db.progress_submission(
                         &sub.token,
-                        Some(sub.attempts),
+                        Some(claim),
                         &sub.status,
                         None,
                         sub.attempts,
@@ -1123,14 +1126,14 @@ impl FeedRunner {
                     )?;
                 }
                 Ok(Some(("done", _))) => {
-                    if self.db.settle_submission(&sub.token, sub.attempts)? {
+                    if self.db.settle_submission(&sub.token, claim)? {
                         self.recovered()?;
                     }
                 }
                 Ok(Some((status, url))) => {
                     self.db.progress_submission(
                         &sub.token,
-                        Some(sub.attempts),
+                        Some(claim),
                         status,
                         url.as_deref(),
                         0,
@@ -1145,24 +1148,26 @@ impl FeedRunner {
                         &format!("HTTP {status}: {}", fhir::outcome_text(&body)),
                         &sub.token,
                     );
-                    tracing::warn!(feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
                     if self
                         .db
                         .reject_submission(
                             &sub.token,
-                            sub.attempts,
+                            claim,
                             "server",
                             &reason,
                             &bulk::scrub_value(&body, &sub.token),
                         )?
                         .is_some()
                     {
+                        // Logged only when it took: an older request's refusal
+                        // changed nothing.
+                        tracing::warn!(feed = %self.feed.id, submission = %sub.submission_id, "refused: {reason}");
                         self.archive_submission(&sub.token).await?;
                     }
                 }
                 Err(SendError::Transient(reason)) => {
                     let reason = bulk::scrub(&reason, &sub.token);
-                    let attempts = sub.attempts + 1;
+                    let attempts = claim.attempts + 1;
                     let d = &self.feed.delivery;
                     let backoff = d
                         .initial_backoff_ms
@@ -1170,7 +1175,7 @@ impl FeedRunner {
                         .min(d.max_backoff_ms);
                     if self.db.submission_attempt_failed(
                         &sub.token,
-                        sub.attempts,
+                        claim,
                         now_ms() + backoff as i64,
                         &reason,
                     )? {
@@ -1183,14 +1188,13 @@ impl FeedRunner {
     }
 
     /// Gives every submitted record its disposition from the receipts, then archives
-    /// the objects HFS has read. Only while the submission is still at the
-    /// attempt count `captured` read before the poll: `false` when it moved, with
-    /// the pages already applied kept and the rest, and the archive, left to the
-    /// runner that moved it.
+    /// the objects HFS has read. Only while the submission is still under the
+    /// poll's `claim`: `false` when it moved, with the pages already applied
+    /// kept and the rest, and the archive, left to the runner that moved it.
     async fn settle(
         &self,
         token: &str,
-        captured: u32,
+        claim: crate::db::Claim,
         references: &std::collections::HashSet<String>,
         errors: &[String],
     ) -> Result<bool> {
@@ -1230,13 +1234,13 @@ impl FeedRunner {
             // The page's outcomes, its tallies and its events in one transaction.
             if !self
                 .db
-                .settle_page(token, captured, &sent, &missing, &missing_reason)?
+                .settle_page(token, claim, &sent, &missing, &missing_reason)?
             {
                 return Ok(false);
             }
         }
         // Nothing is archived for an answer to an older poll.
-        if !self.db.submission_open_at(token, captured)? {
+        if !self.db.submission_open_at(token, claim)? {
             return Ok(false);
         }
         self.archive_submission(token).await?;
