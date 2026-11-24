@@ -857,7 +857,15 @@ async fn a_source_contact_is_read_kept_and_cleared() {
         "id: blank\nname: Blank\ncontact: \"  \"\nsource:\n  type: folder\n  path: inbox\n  poll_seconds: 3600\ntransform: transforms/lab_results.py\n",
     )
     .unwrap();
+    // One saved by a build that took invisible format characters: it loads,
+    // as it is, and the engine starts with every source.
+    std::fs::write(
+        root.join("sources/hidden.yaml"),
+        "id: hidden\nname: Hidden\ncontact: \"Lab\\u200BIT\"\nsource:\n  type: folder\n  path: inbox\n  poll_seconds: 3600\ntransform: transforms/lab_results.py\n",
+    )
+    .unwrap();
     let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    assert_eq!(feeds.len(), 3);
     let (_manager, state) =
         hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
     let api = serve(hie::api::router(state)).await;
@@ -875,6 +883,8 @@ async fn a_source_contact_is_read_kept_and_cleared() {
         }
     };
 
+    let hidden = get("/api/sources/hidden".into()).await;
+    assert_eq!(hidden["contact"], "Lab\u{200b}IT");
     let from_file = get("/api/sources/from-file".into()).await;
     assert_eq!(from_file["contact"], "5550100");
     assert_eq!(from_file["definition"]["contact"], "5550100");
@@ -969,9 +979,14 @@ async fn a_source_contact_is_read_kept_and_cleared() {
         .unwrap();
     assert_eq!(needs["contact"], contact);
 
-    // Refused: too long, or more than one line. Nothing changes.
+    // Refused: too long, more than one line, or an invisible character.
+    // Nothing changes.
     let saved = file();
-    for bad in ["x".repeat(501), "Lab IT\n+1 555 0100".to_string()] {
+    for bad in [
+        "x".repeat(501),
+        "Lab IT\n+1 555 0100".to_string(),
+        "Lab\u{feff}IT".to_string(),
+    ] {
         let mut body = read.clone();
         body["contact"] = json!(bad);
         let refused = replace(body.clone()).await;

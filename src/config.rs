@@ -591,28 +591,35 @@ fn contact_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>
     d.deserialize_any(Text)
 }
 
-/// Whether a character would break a contact's single line, reorder the text
-/// around it or hide in it: control characters, the Unicode line and paragraph
+/// Whether a character would break a contact's single line or reorder the
+/// text around it: control characters, the Unicode line and paragraph
 /// separators, the bidirectional marks and embedding, override and isolate
-/// controls, and the invisible format characters (zero width space, word
-/// joiner and invisible operators, the deprecated shaping controls, the byte
-/// order mark). The zero width joiner and non-joiner stay: scripts and emoji
-/// need them.
+/// controls. Refused wherever a contact is read.
 fn breaks_contact_line(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
             '\u{061C}'
-                | '\u{200B}'
                 | '\u{200E}'
                 | '\u{200F}'
                 | '\u{2028}'
                 | '\u{2029}'
                 | '\u{202A}'..='\u{202E}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{206F}'
-                | '\u{FEFF}'
+                | '\u{2066}'..='\u{2069}'
         )
+}
+
+/// Whether a character would hide in a contact: the invisible format
+/// characters (zero width space, word joiner and invisible operators, the
+/// deprecated shaping controls, the byte order mark). The zero width joiner
+/// and non-joiner stay: scripts and emoji need them. Refused when a contact
+/// is written through the API; a source file that already holds one is
+/// loaded, with a warning, so that one saved contact does not stop the start.
+fn hides_in_contact(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}' | '\u{2060}'..='\u{2064}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}'
+    )
 }
 
 fn default_spool() -> PathBuf {
@@ -959,6 +966,22 @@ impl SourceConfig {
 }
 
 impl FeedConfig {
+    /// What a definition written through the API must meet beyond what a load
+    /// checks: its contact holds no invisible format character.
+    pub fn check_written(&self) -> Result<()> {
+        if self
+            .contact
+            .as_deref()
+            .is_some_and(|c| c.chars().any(hides_in_contact))
+        {
+            bail!(
+                "source {}: contact must be one line of plain text, without invisible format characters (such as U+200B or U+FEFF)",
+                self.id
+            );
+        }
+        Ok(())
+    }
+
     /// Makes the paths absolute, checks the transform exists and parses `expect_every`.
     pub fn resolve(&mut self, base: &Path) -> Result<()> {
         if self.id.is_empty()
@@ -994,6 +1017,12 @@ impl FeedConfig {
                 bail!(
                     "source {}: contact must be one line of plain text, without control, line separator or text direction characters",
                     self.id
+                );
+            }
+            if contact.chars().any(hides_in_contact) {
+                tracing::warn!(
+                    source = %self.id,
+                    "the source's contact holds an invisible format character (such as U+200B or U+FEFF): it is kept as saved, and a change through the API refuses it until it is removed"
                 );
             }
         }
@@ -1681,12 +1710,7 @@ mod tests {
             "a\u{061c}b",
             "a\u{200e}b",
             "a\u{200f}b",
-            "a\u{200b}b",
-            "a\u{2060}b",
-            "a\u{2064}b",
-            "a\u{206a}b",
-            "a\u{206f}b",
-            "a\u{feff}b",
+            "a\u{2069}b",
         ] {
             let err = format!(
                 "{:#}",
@@ -1695,6 +1719,24 @@ mod tests {
             assert!(
                 err.contains("contact must be one line of plain text"),
                 "{bad:?}: {err}"
+            );
+        }
+        // The invisible format characters: a saved file that holds one loads,
+        // as it is; a definition written through the API is refused.
+        for hidden in [
+            "a\u{200b}b",
+            "a\u{2060}b",
+            "a\u{2064}b",
+            "a\u{206a}b",
+            "a\u{206f}b",
+            "a\u{feff}b",
+        ] {
+            let feed = resolved(contact_json(json!(hidden)).unwrap()).unwrap();
+            assert_eq!(feed.contact.as_deref(), Some(hidden));
+            let err = format!("{:#}", feed.check_written().unwrap_err());
+            assert!(
+                err.contains("source lab: contact must be one line of plain text"),
+                "{hidden:?}: {err}"
             );
         }
         // The joiners scripts and emoji need are text.

@@ -427,6 +427,9 @@ impl SourceManager {
     fn parse(&self, body: &Value) -> Result<(FeedConfig, FeedConfig), ManagerError> {
         let submitted: FeedConfig = serde_json::from_value(body.clone())
             .map_err(|e| ManagerError::InvalidDefinition(e.to_string()))?;
+        submitted
+            .check_written()
+            .map_err(|e| ManagerError::InvalidDefinition(format!("{e:#}")))?;
         let mut resolved = submitted.clone();
         resolved
             .resolve(&self.base_dir)
