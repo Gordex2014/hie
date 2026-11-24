@@ -5379,14 +5379,20 @@ mod tests {
             source: Some("s".into()),
             ..Default::default()
         });
-        assert!(source.iter().any(|l| l.contains("events_source")), "{source:#?}");
+        assert!(
+            source.iter().any(|l| l.contains("events_source")),
+            "{source:#?}"
+        );
         // `since` reads the rows after its start in id order, without sorting
         // every event at or after it.
         let since = page_plan(EventQuery {
             since: Some(2990),
             ..Default::default()
         });
-        assert!(!since.iter().any(|l| l.contains("TEMP B-TREE")), "{since:#?}");
+        assert!(
+            !since.iter().any(|l| l.contains("TEMP B-TREE")),
+            "{since:#?}"
+        );
         let start = plan(
             &db,
             "SELECT MIN(id) - 1 FROM events

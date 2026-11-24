@@ -2611,16 +2611,16 @@ async fn a_slow_answer_does_not_keep_the_next_submissions_from_being_claimed() {
         async move { runner.tick().await }
     });
     held.polled.notified().await;
-    db.query_json(
-        "UPDATE source_leases SET until = 0 RETURNING feed_id",
-        [],
-    )
-    .unwrap();
+    db.query_json("UPDATE source_leases SET until = 0 RETURNING feed_id", [])
+        .unwrap();
     held.release.notify_one();
     passing.await.unwrap().unwrap();
 
     let subs = db
-        .query_json("SELECT token, status FROM submissions ORDER BY created_at", [])
+        .query_json(
+            "SELECT token, status FROM submissions ORDER BY created_at",
+            [],
+        )
         .unwrap();
     assert_eq!(subs.len(), 2, "{subs:?}");
     assert_eq!(subs[0]["token"], first);
@@ -2629,7 +2629,10 @@ async fn a_slow_answer_does_not_keep_the_next_submissions_from_being_claimed() {
         subs[1]["status"], "running",
         "the second submission is claimed and kicked off: {subs:?}"
     );
-    let lease = db.lease("drops").unwrap().expect("the lease was taken again");
+    let lease = db
+        .lease("drops")
+        .unwrap()
+        .expect("the lease was taken again");
     assert_eq!(lease.owner, hie::pipeline::instance_id());
 }
 

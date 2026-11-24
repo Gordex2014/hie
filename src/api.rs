@@ -1349,7 +1349,11 @@ fn event_query(raw: Option<&str>) -> Result<crate::db::EventQuery, ApiError> {
 /// The event log, oldest first: see `docs/api.md` (Events).
 async fn list_events(State(s): State<AppState>, RawQuery(raw): RawQuery) -> ApiResult {
     let q = event_query(raw.as_deref())?;
-    let page = s.db.list_events(&q)?;
+    // A spanned read may go through many events: on a blocking thread, so the
+    // async workers serve other requests meanwhile.
+    let page = tokio::task::spawn_blocking(move || s.db.list_events(&q))
+        .await
+        .map_err(anyhow::Error::new)??;
     Ok(Json(json!({
         "events": page.events,
         "next_cursor": page.next.map(|id| format!("{CURSOR_PREFIX}{id}")),
