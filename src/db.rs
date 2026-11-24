@@ -567,11 +567,37 @@ pub struct EventQuery {
     pub scan: Option<usize>,
 }
 
-/// The most events one `GET /api/events` reads past where it starts, whatever
-/// its filters: a page whose filters match rarely stops there, with
-/// `has_more`, rather than walking the whole log under the store's only
-/// connection.
+/// The most events one `GET /api/events` reads past where it starts when no
+/// index serves its filters (a source and a kind together, or several kinds):
+/// a page whose filters match rarely stops there, with `has_more`, rather
+/// than walking the whole log under the store's only connection.
 pub const EVENT_SCAN_SPAN: usize = 50_000;
+
+/// How far an event's `at` may be behind that of one stored before it (the
+/// clocks of the instances sharing a store, and the time between taking `at`
+/// and committing). `since` without a cursor starts at the lowest id among
+/// the events from `since` to the first of them plus this margin.
+pub const EVENT_CLOCK_MARGIN_MS: i64 = 5 * 60_000;
+
+/// The exact kinds a filter asks for, each once: a family is its exact kinds,
+/// which `events_kind` serves (`LIKE` is case-insensitive in SQLite and
+/// cannot use it).
+fn exact_kinds(kinds: &[String]) -> Vec<&str> {
+    let mut exact: Vec<&str> = Vec::new();
+    for kind in kinds {
+        if crate::events::FAMILIES.contains(&kind.as_str()) {
+            exact.extend(crate::events::KINDS.iter().copied().filter(|k| {
+                k.strip_prefix(kind.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
+            }));
+        } else {
+            exact.push(kind);
+        }
+    }
+    exact.sort_unstable();
+    exact.dedup();
+    exact
+}
 
 /// A page of events, oldest first, and where the next poll starts.
 #[derive(Debug, Clone)]
@@ -3847,18 +3873,34 @@ impl Db {
             });
         };
         let forward = |next: i64| Some(q.cursor.map_or(next, |c| c.max(next)));
-        // From the cursor, or from the start of the log: `since` filters, and
-        // never sets where the walk starts, as `at` may be out of order with
-        // the ids (another instance's clock), so a start found by time could
-        // pass over an earlier id stored at or after it.
-        let start = q.cursor.unwrap_or(0);
-        // With a filter, at most `span` events past the start are read, by id,
-        // whatever the filter keeps; a gap left by the purge costs nothing.
-        // Without one every event read is listed, so the page's own `LIMIT`
-        // bounds it.
-        let filtered = q.source.is_some() || q.since.is_some() || !q.kinds.is_empty();
+        // From the cursor; without one, from where `since` starts, or from
+        // the start of the log.
+        let start = match (q.cursor, q.since) {
+            (Some(cursor), _) => cursor,
+            (None, Some(since)) => match self.since_start(since)? {
+                Some(start) => start,
+                // Nothing stored at or after `since`.
+                None => {
+                    return Ok(EventPage {
+                        events: vec![],
+                        next: Some(mark),
+                        has_more: false,
+                    });
+                }
+            },
+            (None, None) => 0,
+        };
+        // Filters that no index serves in id order (a source and a kind
+        // together, or several kinds) read at most `span` events past the
+        // start, whatever they keep; a gap left by the purge costs nothing.
+        // Otherwise the page's own `LIMIT` bounds the read: without a filter
+        // every event read is listed; a source alone, or one kind, is read
+        // through `events_source` or `events_kind`; `since` skips only the
+        // events stored after the start with an earlier `at`.
+        let kinds = exact_kinds(&q.kinds);
+        let spanned = kinds.len() > 1 || (q.source.is_some() && !kinds.is_empty());
         let span = q.scan.unwrap_or(EVENT_SCAN_SPAN).max(1);
-        let end = if filtered {
+        let end = if spanned {
             self.query_one(
                 "SELECT MAX(id) FROM (SELECT id FROM events WHERE id > $1 AND id <= $2 ORDER BY id LIMIT $3) span",
                 &params![start, mark, span as i64],
@@ -3905,12 +3947,39 @@ impl Db {
         })
     }
 
+    /// Where a read of the events at or after `since` starts without a cursor:
+    /// just before the lowest id among the events from `since` to the first
+    /// of them plus `EVENT_CLOCK_MARGIN_MS`, read through `events_at`. An
+    /// event stored after another carries an `at` at most the margin behind
+    /// it, so no event at or after `since` has a lower id. `None` when no
+    /// event is at or after `since`.
+    fn since_start(&self, since: i64) -> Result<Option<i64>> {
+        Ok(self
+            .query_one(
+                "SELECT MIN(id) - 1 FROM events
+                 WHERE at >= $1 AND at <= (SELECT MIN(at) FROM events WHERE at >= $1) + $2",
+                &params![since, EVENT_CLOCK_MARGIN_MS],
+            )?
+            .and_then(|r| r.opt_i64(0)))
+    }
+
     /// The statement of a page of events in `(start, end]` with `q`'s filters,
     /// and its parameters.
     fn event_page_sql(&self, q: &EventQuery, start: i64, end: i64) -> (String, Vec<Param>) {
+        // A source alone, or one kind, is read through its index in id order,
+        // whatever SQLite's statistics say of an average source or kind: a
+        // rare one would otherwise be looked for along the whole log.
+        // PostgreSQL's statistics know the rare values.
+        let kinds = exact_kinds(&q.kinds);
+        let index = match (q.source.is_some(), kinds.len()) {
+            _ if self.is_postgres() => "",
+            (true, 0) => " INDEXED BY events_source",
+            (false, 1) => " INDEXED BY events_kind",
+            _ => "",
+        };
         let mut sql = format!(
             "SELECT id, {} AS at, source_id, kind, load_id, record_id, attempt, error_kind, reason, detail
-             FROM events WHERE id > $1 AND id <= $2",
+             FROM events{index} WHERE id > $1 AND id <= $2",
             self.iso("at"),
         );
         let mut values = params![start, end].to_vec();
@@ -3922,24 +3991,9 @@ impl Db {
             values.push(Param::Int(since));
             sql.push_str(&format!(" AND at >= ${}", values.len()));
         }
-        if !q.kinds.is_empty() {
-            // A family is its exact kinds, which `events_kind` serves (`LIKE`
-            // is case-insensitive in SQLite and cannot use it).
-            let mut exact: Vec<&str> = Vec::new();
-            for kind in &q.kinds {
-                if crate::events::FAMILIES.contains(&kind.as_str()) {
-                    exact.extend(crate::events::KINDS.iter().copied().filter(|k| {
-                        k.strip_prefix(kind.as_str())
-                            .is_some_and(|rest| rest.starts_with('.'))
-                    }));
-                } else {
-                    exact.push(kind);
-                }
-            }
-            exact.sort_unstable();
-            exact.dedup();
-            let mut marks = Vec::with_capacity(exact.len());
-            for kind in exact {
+        if !kinds.is_empty() {
+            let mut marks = Vec::with_capacity(kinds.len());
+            for kind in kinds {
                 values.push(Param::Text(kind.to_string()));
                 marks.push(format!("${}", values.len()));
             }
@@ -5190,8 +5244,8 @@ mod tests {
         assert!(!found.has_more);
     }
 
-    /// `since` without a cursor filters from the start of the log: an event
-    /// stored at or after it is listed even when later ids were stored
+    /// `since` without a cursor starts within the margin of its first event:
+    /// an event at or after it is listed even when later ids were stored
     /// earlier (another instance's clock behind), more than a span of them.
     #[test]
     fn since_never_passes_over_an_earlier_id_stored_after_it() {
@@ -5210,6 +5264,139 @@ mod tests {
             }
         }
         assert_eq!(got, ids[1..]);
+    }
+
+    /// `since` without a cursor starts at its first event, however long the
+    /// log before it: the first page lists it.
+    #[test]
+    fn since_starts_at_its_first_event() {
+        let db = Db::in_memory().unwrap();
+        let mut events = vec![(1, "load.received"); 25];
+        events.push((1_000_000, "load.received"));
+        let ids = log(&db, &events);
+        let first = page(&db, &[], Some(1_000_000), None, 100);
+        assert_eq!(listed(&first), [ids[25]]);
+        assert_eq!((first.next, first.has_more), (Some(ids[25]), false));
+        // Nothing at or after it: an empty page at the newest id.
+        let none = page(&db, &[], Some(2_000_000), None, 100);
+        assert!(none.events.is_empty() && !none.has_more);
+        assert_eq!(none.next, Some(ids[25]));
+    }
+
+    /// An event stored before the first one at or after `since`, whose clock
+    /// was ahead by less than the margin, is listed too; one before `since`
+    /// stored in between is not.
+    #[test]
+    fn since_lists_an_earlier_id_within_the_clock_margin() {
+        let db = Db::in_memory().unwrap();
+        let since = 10 * EVENT_CLOCK_MARGIN_MS;
+        let ids = log(
+            &db,
+            &[
+                (1, "load.received"),
+                (since + EVENT_CLOCK_MARGIN_MS / 2, "load.received"),
+                (since - 10, "load.received"),
+                (since + 1, "load.received"),
+            ],
+        );
+        let first = page(&db, &[], Some(since), None, 100);
+        assert_eq!(listed(&first), [ids[1], ids[3]]);
+        assert!(!first.has_more);
+    }
+
+    /// A source alone, or one kind, is read through its index in id order:
+    /// a rare match is listed on the first page, past more than a span.
+    #[test]
+    fn an_indexed_filter_reads_past_the_span() {
+        let db = Db::in_memory().unwrap();
+        let mut events = vec![(1, "load.received"); 25];
+        events.push((1, "submission.opened"));
+        let ids = log(&db, &events);
+        let other = db
+            .query_one(
+                "INSERT INTO events (at, source_id, kind) VALUES (1, 'other', 'load.received') RETURNING id",
+                &[],
+            )
+            .unwrap()
+            .unwrap()
+            .i64(0);
+        let one_kind = page(&db, &["submission.opened"], None, None, 100);
+        assert_eq!(listed(&one_kind), [ids[25]]);
+        assert!(!one_kind.has_more);
+        let source = db
+            .list_events(&EventQuery {
+                source: Some("other".into()),
+                limit: 100,
+                scan: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(listed(&source), [other]);
+        assert!(!source.has_more);
+        // A source and a kind together are still read a span at a time.
+        let both = db
+            .list_events(&EventQuery {
+                source: Some("s".into()),
+                kinds: vec!["submission.opened".into()],
+                limit: 100,
+                scan: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(both.events.is_empty() && both.has_more);
+    }
+
+    fn plan(db: &Db, sql: &str, p: Vec<Param>) -> Vec<String> {
+        db.query_json(&format!("EXPLAIN QUERY PLAN {sql}"), p)
+            .unwrap()
+            .iter()
+            .map(|r| r["detail"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The statements an unspanned read runs are served by an index in id
+    /// order, and where `since` starts is found through `events_at`.
+    #[test]
+    fn unspanned_reads_use_an_index() {
+        let db = Db::in_memory().unwrap();
+        if db.is_postgres() {
+            return;
+        }
+        let mut events: Vec<(i64, &str)> = (0..3000).map(|i| (i, "load.received")).collect();
+        events.push((3000, "submission.opened"));
+        log(&db, &events);
+        db.execute_for_test("ANALYZE", &[]).unwrap();
+        let page_plan = |q: EventQuery| {
+            let (sql, p) = db.event_page_sql(&EventQuery { limit: 100, ..q }, 0, i64::MAX);
+            plan(&db, &sql, p)
+        };
+        let kind = page_plan(EventQuery {
+            kinds: vec!["submission.opened".into()],
+            ..Default::default()
+        });
+        assert!(kind.iter().any(|l| l.contains("events_kind")), "{kind:#?}");
+        let source = page_plan(EventQuery {
+            source: Some("s".into()),
+            ..Default::default()
+        });
+        assert!(source.iter().any(|l| l.contains("events_source")), "{source:#?}");
+        // `since` reads the rows after its start in id order, without sorting
+        // every event at or after it.
+        let since = page_plan(EventQuery {
+            since: Some(2990),
+            ..Default::default()
+        });
+        assert!(!since.iter().any(|l| l.contains("TEMP B-TREE")), "{since:#?}");
+        let start = plan(
+            &db,
+            "SELECT MIN(id) - 1 FROM events
+             WHERE at >= $1 AND at <= (SELECT MIN(at) FROM events WHERE at >= $1) + $2",
+            params![2990, EVENT_CLOCK_MARGIN_MS].to_vec(),
+        );
+        assert!(
+            start.iter().filter(|l| l.contains("events_at")).count() >= 2,
+            "{start:#?}"
+        );
     }
 
     #[test]
