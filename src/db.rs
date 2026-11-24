@@ -561,7 +561,17 @@ pub struct EventQuery {
     /// Events after this id.
     pub cursor: Option<i64>,
     pub limit: usize,
+    /// The most events a request reads past where it starts; `None` is
+    /// `EVENT_SCAN_SPAN`. Tests make it small.
+    #[doc(hidden)]
+    pub scan: Option<usize>,
 }
+
+/// The most events one `GET /api/events` reads past where it starts, whatever
+/// its filters: a page whose filters match rarely stops there, with
+/// `has_more`, rather than walking the whole log under the store's only
+/// connection.
+pub const EVENT_SCAN_SPAN: usize = 50_000;
 
 /// A page of events, oldest first, and where the next poll starts.
 #[derive(Debug, Clone)]
@@ -3731,31 +3741,35 @@ impl Db {
             });
         };
         let forward = |next: i64| Some(q.cursor.map_or(next, |c| c.max(next)));
-        // Without a cursor, `since` gives where to start, itself included.
-        let (start, inclusive) = match (q.cursor, q.since) {
-            (Some(cursor), _) => (cursor, false),
-            (None, Some(since)) => match self
-                .query_one("SELECT MIN(id) FROM events WHERE at >= $1", &params![since])?
-                .and_then(|r| r.opt_i64(0))
-            {
-                Some(first) => (first, true),
-                None => {
-                    return Ok(EventPage {
-                        events: vec![],
-                        next: forward(mark),
-                        has_more: false,
-                    });
-                }
-            },
-            (None, None) => (0, false),
+        // From the cursor, or from the start of the log: `since` filters, and
+        // never sets where the walk starts, as `at` may be out of order with
+        // the ids (another instance's clock), so a start found by time could
+        // pass over an earlier id stored at or after it.
+        let start = q.cursor.unwrap_or(0);
+        // At most `span` events past the start are read, by id, whatever the
+        // filters keep; a gap left by the purge costs nothing.
+        let span = q.scan.unwrap_or(EVENT_SCAN_SPAN).max(1);
+        let Some(end) = self
+            .query_one(
+                "SELECT MAX(id) FROM (SELECT id FROM events WHERE id > $1 AND id <= $2 ORDER BY id LIMIT $3) span",
+                &params![start, mark, span as i64],
+            )?
+            .and_then(|r| r.opt_i64(0))
+        else {
+            // Nothing past the start (an empty log after a purge, a cursor
+            // at or past the newest id).
+            return Ok(EventPage {
+                events: vec![],
+                next: forward(mark),
+                has_more: false,
+            });
         };
         let mut sql = format!(
             "SELECT id, {} AS at, source_id, kind, load_id, record_id, attempt, error_kind, reason, detail
-             FROM events WHERE id {} $1 AND id <= $2",
+             FROM events WHERE id > $1 AND id <= $2",
             self.iso("at"),
-            if inclusive { ">=" } else { ">" }
         );
-        let mut values = params![start, mark].to_vec();
+        let mut values = params![start, end].to_vec();
         if let Some(source) = &q.source {
             values.push(Param::Text(source.clone()));
             sql.push_str(&format!(" AND source_id = ${}", values.len()));
@@ -3765,16 +3779,27 @@ impl Db {
             sql.push_str(&format!(" AND at >= ${}", values.len()));
         }
         if !q.kinds.is_empty() {
-            let mut any = Vec::new();
+            // A family is its exact kinds, which `events_kind` serves (`LIKE`
+            // is case-insensitive in SQLite and cannot use it).
+            let mut exact: Vec<&str> = Vec::new();
             for kind in &q.kinds {
                 if crate::events::FAMILIES.contains(&kind.as_str()) {
-                    any.push(format!("kind LIKE '{kind}.%'"));
+                    exact.extend(crate::events::KINDS.iter().copied().filter(|k| {
+                        k.strip_prefix(kind.as_str())
+                            .is_some_and(|rest| rest.starts_with('.'))
+                    }));
                 } else {
-                    values.push(Param::Text(kind.clone()));
-                    any.push(format!("kind = ${}", values.len()));
+                    exact.push(kind);
                 }
             }
-            sql.push_str(&format!(" AND ({})", any.join(" OR ")));
+            exact.sort_unstable();
+            exact.dedup();
+            let mut marks = Vec::with_capacity(exact.len());
+            for kind in exact {
+                values.push(Param::Text(kind.to_string()));
+                marks.push(format!("${}", values.len()));
+            }
+            sql.push_str(&format!(" AND kind IN ({})", marks.join(", ")));
         }
         values.push(Param::Int(q.limit as i64 + 1));
         sql.push_str(&format!(" ORDER BY id LIMIT ${}", values.len()));
@@ -3789,11 +3814,15 @@ impl Db {
                 e
             })
             .collect();
-        let has_more = events.len() > q.limit;
+        let full = events.len() > q.limit;
         events.truncate(q.limit);
-        let next = match events.last() {
-            Some(last) if has_more => last["id"].as_i64(),
-            _ => forward(mark),
+        // A full page goes on after its last event; one that stopped at the
+        // end of its span, before the newest id, goes on from there, even
+        // with nothing listed; otherwise the log was read to the newest id.
+        let (next, has_more) = match events.last() {
+            Some(last) if full => (last["id"].as_i64(), true),
+            _ if end < mark => (forward(end), true),
+            _ => (forward(mark), false),
         };
         Ok(EventPage {
             events,
@@ -4874,6 +4903,125 @@ mod tests {
             .map(|r| (r["id"].as_i64().unwrap(), r["seen"].as_i64().unwrap()))
             .collect();
         assert_eq!(seen, [(7, 0), (8, 1), (9, 1)]);
+    }
+
+    /// Events with `at` and `kind`, in that order; their ids.
+    fn log(db: &Db, events: &[(i64, &str)]) -> Vec<i64> {
+        events
+            .iter()
+            .map(|(at, kind)| {
+                db.query_one(
+                    "INSERT INTO events (at, source_id, kind) VALUES ($1, 's', $2) RETURNING id",
+                    &params![*at, *kind],
+                )
+                .unwrap()
+                .unwrap()
+                .i64(0)
+            })
+            .collect()
+    }
+
+    fn page(
+        db: &Db,
+        kinds: &[&str],
+        since: Option<i64>,
+        cursor: Option<i64>,
+        limit: usize,
+    ) -> EventPage {
+        db.list_events(&EventQuery {
+            kinds: kinds.iter().map(|k| k.to_string()).collect(),
+            since,
+            cursor,
+            limit,
+            scan: Some(10),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn listed(page: &EventPage) -> Vec<i64> {
+        page.events
+            .iter()
+            .map(|e| e["id"].as_i64().unwrap())
+            .collect()
+    }
+
+    /// A request reads at most its span of the log, whatever its filters keep:
+    /// one that matches rarely stops at the end of the span with `has_more`
+    /// and goes on from there, and following it reaches the match.
+    #[test]
+    fn a_rare_filter_reads_one_span_per_request() {
+        let db = Db::in_memory().unwrap();
+        let mut events = vec![(1, "load.received"); 25];
+        events.push((1, "submission.opened"));
+        let ids = log(&db, &events);
+        let first = page(&db, &["submission"], None, None, 100);
+        assert!(first.events.is_empty());
+        assert!(first.has_more);
+        assert_eq!(first.next, Some(ids[9]), "the end of the first span");
+        let second = page(&db, &["submission"], None, first.next, 100);
+        assert!(second.events.is_empty() && second.has_more);
+        assert_eq!(second.next, Some(ids[19]));
+        let third = page(&db, &["submission"], None, second.next, 100);
+        assert_eq!(listed(&third), [ids[25]]);
+        assert!(!third.has_more);
+        assert_eq!(third.next, Some(ids[25]));
+        // Read to the newest id: nothing more, and the cursor stays.
+        let after = page(&db, &["submission"], None, third.next, 100);
+        assert!(after.events.is_empty() && !after.has_more);
+        assert_eq!(after.next, third.next);
+        // A cursor past the log does not move back.
+        let ahead = page(&db, &[], None, Some(ids[25] + 50), 100);
+        assert_eq!((ahead.next, ahead.has_more), (Some(ids[25] + 50), false));
+    }
+
+    /// Matches inside a span page by `limit`, from the last one listed.
+    #[test]
+    fn dense_matches_page_by_limit_inside_a_span() {
+        let db = Db::in_memory().unwrap();
+        let ids = log(&db, &[(1, "record.delivered"); 8]);
+        let first = page(&db, &["record"], None, None, 3);
+        assert_eq!(listed(&first), ids[..3]);
+        assert_eq!((first.next, first.has_more), (Some(ids[2]), true));
+        let second = page(&db, &["record.delivered"], None, first.next, 3);
+        assert_eq!(listed(&second), ids[3..6]);
+        let third = page(&db, &["record"], None, second.next, 3);
+        assert_eq!(listed(&third), ids[6..]);
+        assert!(!third.has_more);
+    }
+
+    /// A span counts events, not ids: a gap the purge left costs nothing.
+    #[test]
+    fn a_purged_gap_is_not_a_span() {
+        let db = Db::in_memory().unwrap();
+        let ids = log(&db, &[(1, "load.received"); 30]);
+        db.execute_for_test("DELETE FROM events WHERE id <= $1", &params![ids[24]])
+            .unwrap();
+        let all = page(&db, &[], None, None, 100);
+        assert_eq!(listed(&all), ids[25..]);
+        assert!(!all.has_more);
+    }
+
+    /// `since` without a cursor filters from the start of the log: an event
+    /// stored at or after it is listed even when later ids were stored
+    /// earlier (another instance's clock behind), more than a span of them.
+    #[test]
+    fn since_never_passes_over_an_earlier_id_stored_after_it() {
+        let db = Db::in_memory().unwrap();
+        let mut events = vec![(99, "load.received"), (101, "load.received")];
+        events.extend(vec![(100, "load.received"); 30]);
+        let ids = log(&db, &events);
+        let mut got = Vec::new();
+        let mut cursor = None;
+        loop {
+            let p = page(&db, &[], Some(100), cursor, 100);
+            got.extend(listed(&p));
+            cursor = p.next;
+            if !p.has_more {
+                break;
+            }
+        }
+        assert_eq!(got, ids[1..]);
     }
 
     #[test]

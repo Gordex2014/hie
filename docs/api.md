@@ -110,8 +110,8 @@ Nothing else is an event: a Try, a worker that cannot start (no record is involv
 **Reading.** `GET /api/events` lists events oldest first, by `id`:
 
 - `source`: one source id.
-- `kind`: one or more kinds or families (`record`, `load`, `submission`), separated by commas.
-- `since`: an RFC 3339 instant (`2026-11-20T08:00:00Z`). Only events stored at or after it (`at >= since`) are listed, with or without a cursor. Events are stored to the millisecond, so a finer instant counts from the next millisecond. Without a cursor it also sets where the page starts: at the first event, by id, stored at or after it.
+- `kind`: one or more kinds or families (`record`, `load`, `submission`), separated by commas. A family stands for the kinds of it this version knows, those in the tables above.
+- `since`: an RFC 3339 instant (`2026-11-20T08:00:00Z`). Only events stored at or after it (`at >= since`) are listed, with or without a cursor. Events are stored to the millisecond, so a finer instant counts from the next millisecond. It never sets where the reading starts: without a cursor that is the oldest event kept, since an event stored after `since` can have a lower id than one stored before it (clocks of two instances).
 - `cursor`: the `next_cursor` of an earlier answer, to continue after it. Its text is opaque (today `e1.` and a number). Give the same filters again with it. A cursor stays valid after its event is purged.
 - `limit`: 1 to 1000, 100 by default.
 
@@ -119,11 +119,11 @@ Nothing else is an event: a Try, a worker that cannot start (no record is involv
 {"events": [ ... ], "next_cursor": "e1.41", "has_more": false}
 ```
 
-`has_more` says another page is ready now. `next_cursor` is where the next request continues: after the last event listed when `has_more`, otherwise the newest position of the log when the request was read, or the cursor given if that is later. A poller whose filters matched nothing still moves forward, and a cursor never moves back, even after a purge. It is `null` only when the log is empty and no cursor was given. Ids are given in commit order (on PostgreSQL every instance writes events under one lock, in turn), and a page never lists past the newest id committed when it was read, so polling from `next_cursor` never skips an event.
+Each request reads at most 50 000 events of the log past where it starts, whatever its filters keep, so a request on a large log never holds the store for long. `has_more` says to ask again now: the page is full, or the request stopped at the end of what it reads before the newest event, **possibly with no event listed**; keep reading while `has_more` is `true`, and stop on `false`, not on an empty page. `next_cursor` is where the next request continues: after the last event listed when the page is full, after the last event read when the request stopped there, otherwise the newest position of the log when the request was read, or the cursor given if that is later. A poller whose filters matched nothing still moves forward, and a cursor never moves back, even after a purge. It is `null` only when the log is empty and no cursor was given. Ids are given in commit order (on PostgreSQL every instance writes events under one lock, in turn), and a page never lists past the newest id committed when it was read, so polling from `next_cursor` never skips an event.
 
 Every parameter that cannot be read is refused with `400`, `code: "invalid_query"` and `field` naming it: a value that does not parse (`limit` is digits only), a parameter given twice, or one that is not `source`, `kind`, `since`, `cursor` or `limit`.
 
-A poller pages with `cursor`: the first request may give `since`, and each next one the `next_cursor` it got (with the same filters). A `since` without a cursor reads a range of the log by time on every request, which costs more on a large log.
+A poller pages with `cursor`: the first request may give `since`, and each next one the `next_cursor` it got (with the same filters). A `since` without a cursor reads from the oldest event kept on every request, so on a large log its first requests may come back empty with `has_more` while they reach the period; follow `next_cursor` rather than asking with `since` again. `/api/events` is in no release yet: these rules break no released client.
 
 ### Rejected records over a period
 
