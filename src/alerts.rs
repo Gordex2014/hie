@@ -167,6 +167,7 @@ mod tests {
             channels: vec!["app".into()],
             enabled: true,
             created_by: None,
+            created_at: None,
         }
     }
 

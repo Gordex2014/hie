@@ -100,6 +100,19 @@ worker:
 
 Every value must be at least 1. A transform that imports a heavy library may need a larger `memory_mib`. A reply line is at most 32 MiB. Each worker process gets a fresh run directory under the system temporary directory, deleted when it ends.
 
+### Retention
+
+The engine keeps an event log (see [Events](api.md#events)) and its alerts for a time set by the `retention:` block in `hie.yaml`:
+
+```yaml
+retention:
+  history: 30d   # events and stored alerts; from 1d to 3650d
+```
+
+Older events and alerts are purged at start and every hour after, in chunks of 5,000 rows. The alerts the engine still tracks stay whatever their age: open alerts of an enabled rule, and open `credential` and `definition` alerts (see [Alerts and retention](api.md#alerts-and-retention)). An open alert of a rule whose source was deleted while it was open stays until the rule is deleted. Records, loads and submissions are not purged: `history` covers what the engine logs about them, not the data. Instances sharing one store each purge with their own setting, so the shortest one applies. A value outside 1d to 3650d, or a key other than `history`, is refused at start and by `hie check`.
+
+The first start after the upgrade that brings the event log builds new indexes on `records` (one on SQLite, two on PostgreSQL), which blocks writes to `records` while it runs: on a large store, plan for it. Instances starting together on one PostgreSQL schema build it in turn.
+
 ### Credentials and the secret key
 
 S3 sources sign with credentials stored in the engine (`/api/secrets`, see [Secrets](api.md#secrets)), sealed in its database with XChaCha20-Poly1305 under a key derived from one **secret key**. Only metadata is ever answered; values never leave the engine except to sign requests.
@@ -133,6 +146,6 @@ A build without the `secrets-native` feature has no secret store: it skips sourc
 
 ### The store, and more than one instance
 
-`database:` in `hie.yaml` is where the engine keeps files, records, alerts, rules, cursors and leases: a SQLite file (the default, `data/hie.db`, no setup) or a `postgres://` URL. The SQL is the same on both; the test suite runs on either (`HIE_TEST_DATABASE_URL=postgres://... cargo test` runs every test on PostgreSQL, each in a schema of its own).
+`database:` in `hie.yaml` is where the engine keeps files, records, events, alerts, rules, cursors and leases: a SQLite file (the default, `data/hie.db`, no setup) or a `postgres://` URL. The SQL is the same on both; the test suite runs on either (`HIE_TEST_DATABASE_URL=postgres://... cargo test` runs every test on PostgreSQL, each in a schema of its own).
 
 With PostgreSQL, several instances may share one store. A source is run by the instance that holds its **lease**: each pass takes or renews it for three poll intervals (at least 30 s); another instance that finds it held stands by; when the holder dies, its lease lapses and the next pass elsewhere takes the source over, with the cursors, pause state and rules it left in the store. A clean stop releases the lease at once. `GET /api/sources/{id}` shows `lease` (owner, until, whether it is this instance's) and `instance`, and reports a source held elsewhere as `standby`. `POST .../check-now` reaches the instance it was sent to, so send it to the holder.
