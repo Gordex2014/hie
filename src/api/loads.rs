@@ -183,6 +183,14 @@ pub(super) async fn list_loads(
     refuse_unknown(raw.as_deref())?;
     let Query(q) = q.map_err(paging::rejected)?;
     let ask = Ask::read(q)?;
+    // The page is read one load at a time, with pauses between them: on a
+    // blocking thread, so the async workers serve other requests meanwhile.
+    tokio::task::spawn_blocking(move || page_of_loads(&s, &ask))
+        .await
+        .map_err(anyhow::Error::new)?
+}
+
+fn page_of_loads(s: &AppState, ask: &Ask) -> ApiResult {
     let (with, mut p) = ask.candidates();
     p.push(ask.limit.to_param());
     let page = p.len();
@@ -199,7 +207,7 @@ pub(super) async fn list_loads(
         .and_then(|row| row["matched"].as_i64())
         .is_some_and(|n| n > ask.limit);
     let ids: Vec<i64> = chosen.iter().filter_map(|row| row["id"].as_i64()).collect();
-    let rows = load_rows(&s, &ids)?;
+    let rows = load_rows(s, &ids)?;
     let next_cursor = if more {
         let last = ids.last().copied();
         Some(paging::next_cursor(last.ok_or_else(|| {

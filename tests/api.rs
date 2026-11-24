@@ -1154,4 +1154,29 @@ async fn a_deleted_sources_outage_ends_with_it_and_does_not_block_its_successor(
     delete().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(cleared(current), None, "the peer's outage stays");
+    // Created again while the peer still holds it: the new runner stands by
+    // and ends nothing; once the peer lets go, its first pass ends what the
+    // earlier definition left.
+    create().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        cleared(current),
+        None,
+        "not while the peer holds the source"
+    );
+    db.query_json(
+        "UPDATE source_leases SET until = 0 WHERE feed_id = 'lab' RETURNING feed_id",
+        vec![],
+    )
+    .unwrap();
+    let resume = http
+        .post(format!("{api}/api/sources/lab/check-now"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resume.status().is_success(), "{}", resume.status());
+    assert_eq!(
+        wait_cleared(current, "the successor to end it").await,
+        "lab: the source was created again; this alert was left by its earlier definition"
+    );
 }

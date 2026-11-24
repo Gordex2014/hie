@@ -2753,17 +2753,27 @@ impl Db {
     /// Claims an open submission for one request, before it is sent: only
     /// while it is still as `read` it (the same epoch, attempts and status, so
     /// no answer and no other claim came in between, from this version or an
-    /// earlier one) and due at `now`. The claim
-    /// moves the epoch, so the answer to any request claimed before it changes
-    /// nothing. `None`: another runner moved it; this pass leaves it.
-    pub fn claim_submission(&self, read: &Submission, now: i64) -> Result<Option<Claim>> {
+    /// earlier one) and due at `now`, and only while no other instance than
+    /// `owner` holds the source's lease: a runner whose lease lapsed mid-pass
+    /// cannot take the submission from the one that took the source over. The
+    /// claim moves the epoch, so the answer to any request claimed before it
+    /// changes nothing. `None`: another runner moved it or holds the source;
+    /// this pass leaves it.
+    pub fn claim_submission(
+        &self,
+        read: &Submission,
+        owner: &str,
+        now: i64,
+    ) -> Result<Option<Claim>> {
         Ok(self
             .query_one(
                 "UPDATE submissions SET epoch = epoch + 1
                  WHERE token = $1 AND status IN ('kickoff', 'running') AND status = $5
                    AND epoch = $2 AND attempts = $3 AND next_attempt_at <= $4
+                   AND NOT EXISTS (SELECT 1 FROM source_leases l
+                                   WHERE l.feed_id = submissions.feed_id AND l.owner <> $6 AND l.until >= $4)
                  RETURNING epoch, attempts",
-                &params![read.token, read.epoch, read.attempts, now, read.status],
+                &params![read.token, read.epoch, read.attempts, now, read.status, owner],
             )?
             .map(|r| Claim {
                 epoch: r.i64(0),
@@ -3746,16 +3756,22 @@ impl Db {
         // the ids (another instance's clock), so a start found by time could
         // pass over an earlier id stored at or after it.
         let start = q.cursor.unwrap_or(0);
-        // At most `span` events past the start are read, by id, whatever the
-        // filters keep; a gap left by the purge costs nothing.
+        // With a filter, at most `span` events past the start are read, by id,
+        // whatever the filter keeps; a gap left by the purge costs nothing.
+        // Without one every event read is listed, so the page's own `LIMIT`
+        // bounds it.
+        let filtered = q.source.is_some() || q.since.is_some() || !q.kinds.is_empty();
         let span = q.scan.unwrap_or(EVENT_SCAN_SPAN).max(1);
-        let Some(end) = self
-            .query_one(
+        let end = if filtered {
+            self.query_one(
                 "SELECT MAX(id) FROM (SELECT id FROM events WHERE id > $1 AND id <= $2 ORDER BY id LIMIT $3) span",
                 &params![start, mark, span as i64],
             )?
             .and_then(|r| r.opt_i64(0))
-        else {
+        } else {
+            (start < mark).then_some(mark)
+        };
+        let Some(end) = end else {
             // Nothing past the start (an empty log after a purge, a cursor
             // at or past the newest id).
             return Ok(EventPage {
@@ -5027,6 +5043,54 @@ mod tests {
         assert!(!all.has_more);
     }
 
+    /// A family is its exact kinds, which SQLite reads through `events_kind`;
+    /// a `LIKE` could not use it.
+    #[test]
+    fn a_family_filter_reads_the_kind_index() {
+        let db = Db::in_memory().unwrap();
+        if db.is_postgres() {
+            return;
+        }
+        let mut events = vec![(1, "load.received"); 3000];
+        events.push((1, "submission.opened"));
+        log(&db, &events);
+        db.execute_for_test("ANALYZE", &[]).unwrap();
+        let kinds: Vec<&str> = crate::events::KINDS
+            .iter()
+            .copied()
+            .filter(|k| k.starts_with("submission."))
+            .collect();
+        let marks: Vec<String> = (0..kinds.len()).map(|i| format!("${}", i + 3)).collect();
+        let mut p = params![0, i64::MAX].to_vec();
+        p.extend(kinds.iter().map(|k| Param::Text(k.to_string())));
+        let plan: Vec<String> = db
+            .query_json(
+                &format!(
+                    "EXPLAIN QUERY PLAN SELECT id FROM events WHERE id > $1 AND id <= $2 AND kind IN ({}) ORDER BY id LIMIT 101",
+                    marks.join(", ")
+                ),
+                p,
+            )
+            .unwrap()
+            .iter()
+            .map(|r| r["detail"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            plan.iter().any(|line| line.contains("events_kind")),
+            "{plan:#?}"
+        );
+        // And a request with the default span lists it.
+        let found = db
+            .list_events(&EventQuery {
+                kinds: vec!["submission".into()],
+                limit: 100,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(found.events.len(), 1);
+        assert!(!found.has_more);
+    }
+
     /// `since` without a cursor filters from the start of the log: an event
     /// stored at or after it is listed even when later ids were stored
     /// earlier (another instance's clock behind), more than a span of them.
@@ -5321,7 +5385,7 @@ mod tests {
     }
 
     #[test]
-    fn a_start_of_a_born_source_takes_no_write_lock() {
+    fn a_born_sources_default_rule_is_answered_without_a_write_lock() {
         let (_dir, a, b) = two_handles();
         if a.is_postgres() {
             return;

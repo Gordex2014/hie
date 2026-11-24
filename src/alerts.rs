@@ -309,6 +309,30 @@ impl Alerter {
         Ok(())
     }
 
+    /// Ends the open alerts of source `feed` that only its runner would clear,
+    /// `delivery` (with a rule or without) and `credential`, each with its
+    /// `cleared` event. Called only while no runner runs the source: holding
+    /// its lease, after a delete or before the first pass of a source created
+    /// again. Left open, a deleted source's outage alert stayed open for good
+    /// and kept a source created again with that id from raising its own. Best
+    /// effort: a failure is logged.
+    pub fn end_orphans(&self, feed: &str, reason: &str) {
+        for kind in ["delivery", "credential"] {
+            let open = match self.db.open_alert_ids(feed, kind) {
+                Ok(open) => open,
+                Err(e) => {
+                    tracing::warn!(feed, kind, "alerts left open: {e:#}");
+                    continue;
+                }
+            };
+            for alert in open {
+                if let Err(e) = self.clear(alert, feed, kind, reason) {
+                    tracing::warn!(feed, alert, "alert left open: {e:#}");
+                }
+            }
+        }
+    }
+
     /// Replaces a rule through the API. Turned off, or changed in its
     /// condition, threshold, time zone or source, the rule ends its open alerts in the
     /// same transaction, each with its `cleared` event for the channels

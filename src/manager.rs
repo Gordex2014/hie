@@ -293,8 +293,8 @@ impl SourceManager {
     }
 
     /// `start`; for a source `created` through the API, the alerts an earlier
-    /// definition of its id left open are ended once every earlier runner has
-    /// ended and before the new one runs (`end_orphan_alerts`).
+    /// definition of its id left open are ended by the new runner, at its first
+    /// pass that holds the source's lease (`Alerter::end_orphans`).
     fn start_as(self: &Arc<Self>, feed: FeedConfig, created: bool) -> Result<()> {
         // Files recorded before origins were: decided once, here, before
         // the runner can hand any of them over. A stored origin never follows
@@ -327,6 +327,7 @@ impl SourceManager {
         .with_terminology(self.terminology_url.as_deref())
         .with_worker_limits(self.worker_limits.clone())
         .with_stamp_source(self.stamp_source)
+        .with_orphan_sweep(created)
         .with_secrets(self.secrets.clone());
         #[cfg(all(test, feature = "secrets-native"))]
         let runner = runner.with_pause(self.pause.lock().expect("pause mutex").clone());
@@ -362,12 +363,6 @@ impl SourceManager {
             // definition does not need can go.
             if let Some(manager) = manager.upgrade() {
                 manager.cleanup_refs(&id).await;
-                if created {
-                    manager.end_orphan_alerts(
-                        &id,
-                        &format!("{id}: the source was created again; this alert was left by its earlier definition"),
-                    );
-                }
             }
             runner.run(control).await;
         });
@@ -756,45 +751,35 @@ impl SourceManager {
                 let lock = manager.source_lock(&id);
                 let _changing = lock.lock().await;
                 if manager.source(&id).is_none() {
-                    manager.end_orphan_alerts(&id, &format!("{id}: the source was deleted"));
+                    manager.end_orphans_after_delete(&id);
                 }
             }
         });
         Ok(())
     }
 
-    /// Ends the open alerts of source `id` that only its runner would clear,
-    /// once no runner of this instance runs it: `delivery` (with a rule or
-    /// without) and `credential`. Left open, a deleted source's outage alert
-    /// stayed open for good and kept a source created again with that id from
-    /// raising its own. Each gets its `cleared` event. Nothing is ended while
-    /// another instance holds the source: it still runs its own definition, and
-    /// raises and clears its own alerts. Best effort: a failure is logged.
-    fn end_orphan_alerts(&self, id: &str, reason: &str) {
-        match self.db.lease(id) {
-            Ok(Some(lease)) if lease.owner != crate::pipeline::instance_id() => {
+    /// After a delete, once this instance's runner of `id` has ended: ends the
+    /// alerts only that runner would clear (`Alerter::end_orphans`), holding the
+    /// source's lease meanwhile, so no other instance takes the source between
+    /// the check and the clear. Nothing ends while another instance holds it:
+    /// that one still runs its own definition.
+    fn end_orphans_after_delete(&self, id: &str) {
+        let owner = crate::pipeline::instance_id();
+        match self.db.acquire_lease(id, owner, 60_000) {
+            Ok(true) => {}
+            Ok(false) => {
                 tracing::info!(feed = %id, "alerts left open: another instance holds the source");
                 return;
             }
-            Ok(_) => {}
             Err(e) => {
-                tracing::warn!(feed = %id, "alerts left open: reading the source's lease: {e:#}");
+                tracing::warn!(feed = %id, "alerts left open: taking the source's lease: {e:#}");
                 return;
             }
         }
-        for kind in ["delivery", "credential"] {
-            let open = match self.db.open_alert_ids(id, kind) {
-                Ok(open) => open,
-                Err(e) => {
-                    tracing::warn!(feed = %id, kind, "alerts left open: {e:#}");
-                    continue;
-                }
-            };
-            for alert in open {
-                if let Err(e) = self.alerts.clear(alert, id, kind, reason) {
-                    tracing::warn!(feed = %id, alert, "alert left open: {e:#}");
-                }
-            }
+        self.alerts
+            .end_orphans(id, &format!("{id}: the source was deleted"));
+        if let Err(e) = self.db.release_lease(id, owner) {
+            tracing::warn!(feed = %id, "releasing the source's lease: {e:#}");
         }
     }
 

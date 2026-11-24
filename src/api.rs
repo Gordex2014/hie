@@ -945,16 +945,21 @@ async fn list_files(
                 .with("field", "limit"),
         );
     }
-    let ids: Vec<i64> =
-        s.db.query_json(
-            "SELECT id FROM files WHERE feed_id = $1 ORDER BY id DESC LIMIT $2",
-            params![id, limit],
-        )?
-        .iter()
-        .filter_map(|row| row["id"].as_i64())
-        .collect();
-    let rows = load_rows(&s, &ids)?;
-    Ok(Json(json!({"files": rows, "loads": rows})))
+    // On a blocking thread, as `/api/loads` reads its page.
+    tokio::task::spawn_blocking(move || {
+        let ids: Vec<i64> =
+            s.db.query_json(
+                "SELECT id FROM files WHERE feed_id = $1 ORDER BY id DESC LIMIT $2",
+                params![id, limit],
+            )?
+            .iter()
+            .filter_map(|row| row["id"].as_i64())
+            .collect();
+        let rows = load_rows(&s, &ids)?;
+        Ok(Json(json!({"files": rows, "loads": rows})))
+    })
+    .await
+    .map_err(anyhow::Error::new)?
 }
 
 /// One load with its rejected rows grouped by reason (those filtered out on

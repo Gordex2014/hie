@@ -2174,10 +2174,13 @@ fn an_open_alert_is_not_kept_by_a_rule_made_after_it() {
     assert!(!alert_ids(&db).contains(&open));
 }
 
-/// The claim a runner takes before a request: on the submission as it is now.
+/// The claim a runner of this instance takes before a request: on the
+/// submission as it is now.
 fn claim(db: &Db, token: &str) -> hie::db::Claim {
     let sub = db.submission(token).unwrap().unwrap();
-    db.claim_submission(&sub, i64::MAX).unwrap().unwrap()
+    db.claim_submission(&sub, hie::pipeline::instance_id(), hie::db::now_ms())
+        .unwrap()
+        .unwrap()
 }
 
 #[test]
@@ -2313,7 +2316,11 @@ fn the_last_claim_decides_and_a_stale_read_cannot_claim() {
     let read_by_b = db.submission("t").unwrap().unwrap();
     let a = claim(&db, "t");
     // B read the row before A's claim: it cannot claim on it.
-    assert_eq!(db.claim_submission(&read_by_b, i64::MAX).unwrap(), None);
+    assert_eq!(
+        db.claim_submission(&read_by_b, "me", hie::db::now_ms())
+            .unwrap(),
+        None
+    );
     let b = claim(&db, "t");
     // A's refusal arrives before B's answer: it changes nothing.
     assert_eq!(
@@ -2330,15 +2337,97 @@ fn the_last_claim_decides_and_a_stale_read_cannot_claim() {
     // A row read before that success (status still `kickoff`) cannot be
     // claimed for a second kick-off.
     assert_eq!(
-        db.claim_submission(&read_before_success, i64::MAX).unwrap(),
+        db.claim_submission(&read_before_success, "me", hie::db::now_ms())
+            .unwrap(),
         None
     );
     // Nor can a claim be taken before the submission is due.
     db.progress_submission("t", None, "running", None, 0, 5_000, None)
         .unwrap();
     let not_due = db.submission("t").unwrap().unwrap();
-    assert_eq!(db.claim_submission(&not_due, 4_999).unwrap(), None);
-    assert!(db.claim_submission(&not_due, 5_000).unwrap().is_some());
+    assert_eq!(db.claim_submission(&not_due, "me", 4_999).unwrap(), None);
+    assert!(
+        db.claim_submission(&not_due, "me", 5_000)
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// A runner whose lease lapsed mid-pass reads the submission after the runner
+/// that took the source over claimed it: it cannot claim it in turn, so the
+/// current holder's answer stands.
+#[test]
+fn a_runner_whose_lease_lapsed_cannot_claim_from_the_holder() {
+    let db = Db::in_memory().unwrap();
+    let file = load(&db, "s", "a", 0, 1);
+    db.mark_passthrough(&[(record_id(&db, "s", 1), 0)]).unwrap();
+    assert!(
+        db.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
+            .unwrap()
+    );
+    // B holds the source now and claims its kick-off.
+    assert!(db.acquire_lease("s", "b", 60_000).unwrap());
+    let read = db.submission("t").unwrap().unwrap();
+    let b = db
+        .claim_submission(&read, "b", hie::db::now_ms())
+        .unwrap()
+        .unwrap();
+    // A, whose lease lapsed, reads the row as B left it, and cannot claim.
+    let read_by_a = db.submission("t").unwrap().unwrap();
+    assert_eq!(
+        db.claim_submission(&read_by_a, "a", hie::db::now_ms())
+            .unwrap(),
+        None
+    );
+    assert!(
+        db.progress_submission("t", Some(b), "running", Some("https://h/b"), 0, 0, None)
+            .unwrap()
+    );
+    // Once B's lease has run out, A may claim again.
+    db.query_json("UPDATE source_leases SET until = 0 RETURNING feed_id", [])
+        .unwrap();
+    let read_by_a = db.submission("t").unwrap().unwrap();
+    assert!(
+        db.claim_submission(&read_by_a, "a", hie::db::now_ms())
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// Two instances on one store claim the same submission at once, from the
+/// same read: one claim takes, the other finds the row moved.
+#[test]
+fn two_instances_claiming_at_once_get_one_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hie.db");
+    let a = Arc::new(Db::open(&path).unwrap());
+    let b = Arc::new(Db::open(&path).unwrap());
+    let file = load(&a, "s", "a", 0, 1);
+    a.mark_passthrough(&[(record_id(&a, "s", 1), 0)]).unwrap();
+    assert!(
+        a.create_submission_for_files("t", "s", "sub", &json!({}), &[(file, 1)])
+            .unwrap()
+    );
+    for round in 0..20 {
+        let read = a.submission("t").unwrap().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let claims: Vec<_> = [a.clone(), b.clone()]
+            .into_iter()
+            .map(|db| {
+                let (read, barrier) = (read.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.claim_submission(&read, "me", hie::db::now_ms()).unwrap()
+                })
+            })
+            .collect();
+        let got: Vec<_> = claims.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(
+            got.iter().filter(|c| c.is_some()).count(),
+            1,
+            "round {round}: {got:?}"
+        );
+    }
 }
 
 /// An earlier version sharing the store moves attempts but not the epoch: a
