@@ -300,6 +300,12 @@ impl SourceManager {
             ),
             &self.bulk_dir,
         )?;
+        if self.stamp_source && feed.direct_bulk() {
+            tracing::warn!(
+                feed = %feed.id,
+                "delivery.stamp_source is on, but this source hands HFS its objects untouched ($bulk-submit from the source objects): what it delivers is not tagged; use bulk_from: transformed to tag it"
+            );
+        }
         let runner = FeedRunner::new(
             feed.clone(),
             self.db.clone(),

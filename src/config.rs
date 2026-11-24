@@ -1064,6 +1064,12 @@ impl Config {
 }
 
 impl FeedConfig {
+    /// Whether `$bulk-submit` hands HFS the source objects themselves, which
+    /// the engine cannot tag with the source.
+    pub fn direct_bulk(&self) -> bool {
+        self.delivery.method == DeliveryMethod::BulkSubmit && !self.bulk_transformed()
+    }
+
     /// Whether `$bulk-submit` hands HFS the engine's transformed NDJSON rather
     /// than the source objects.
     pub fn bulk_transformed(&self) -> bool {
@@ -1542,6 +1548,30 @@ mod tests {
 
     fn contact_yaml(line: &str) -> Result<FeedConfig, serde_yaml::Error> {
         serde_yaml::from_str(&format!("{CONTACT_BASE}{line}"))
+    }
+
+    #[test]
+    fn a_source_hands_over_its_objects_with_auto_for_passthrough_ndjson_and_bundles() {
+        let feed = |format: &str, transform: &str, delivery: Value| -> FeedConfig {
+            serde_json::from_value(json!({
+                "id": "lab", "name": "Lab",
+                "source": {"type": "folder", "path": "inbox"}, "format": format,
+                "transform": transform, "delivery": delivery,
+            }))
+            .unwrap()
+        };
+        let bulk = |from: Option<&str>| match from {
+            Some(from) => json!({"method": "bulk_submit", "bulk_from": from}),
+            None => json!({"method": "bulk_submit"}),
+        };
+        let passthrough = "transforms/fhir_passthrough.py";
+        assert!(feed("ndjson", passthrough, bulk(None)).direct_bulk());
+        assert!(feed("fhir_bundle", passthrough, bulk(None)).direct_bulk());
+        assert!(feed("ndjson", "t.py", bulk(Some("source_objects"))).direct_bulk());
+        assert!(!feed("ndjson", "t.py", bulk(None)).direct_bulk());
+        assert!(!feed("ndjson", passthrough, bulk(Some("transformed"))).direct_bulk());
+        assert!(!feed("csv", passthrough, bulk(None)).direct_bulk());
+        assert!(!feed("ndjson", passthrough, json!({"method": "rest"})).direct_bulk());
     }
 
     fn contact_json(contact: Value) -> Result<FeedConfig, serde_json::Error> {

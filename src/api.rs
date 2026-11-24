@@ -373,8 +373,7 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
 /// Whether what this instance delivers for `feed` carries the source tag, and
 /// what the store knows about its deliveries without it.
 fn stamping(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
-    let direct_bulk = feed.delivery.method == crate::config::DeliveryMethod::BulkSubmit
-        && !feed.bulk_transformed();
+    let direct_bulk = feed.direct_bulk();
     let reason = if !s.manager.stamp_source() {
         Some("off")
     } else if direct_bulk {
