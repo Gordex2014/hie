@@ -601,6 +601,7 @@ impl FeedRunner {
         let (admission, readable) = self.admit(
             &NewFile {
                 feed,
+                source_name: &self.feed.name,
                 name: &name,
                 sha: &sha,
                 size: bytes.len() as u64,
@@ -646,7 +647,9 @@ impl FeedRunner {
             // The same object, still waiting for HFS to fetch it: leave it alone.
             return Ok(());
         }
-        let id = self.db.insert_duplicate(feed, name, sha, size, original)?;
+        let id = self
+            .db
+            .insert_duplicate(feed, &self.feed.name, name, sha, size, original)?;
         tracing::info!(feed, file = %name, duplicate_of = original, "same content already received; not reprocessed");
         let archived = self
             .source()
@@ -692,9 +695,9 @@ impl FeedRunner {
     /// zip is recorded as `unpacked` (so it is not read twice) and archived.
     async fn unpack(&self, key: &str, name: &str, sha: &str, bytes: Vec<u8>) -> Result<()> {
         let feed = &self.feed.id;
-        let container = self
-            .db
-            .insert_container(feed, name, sha, bytes.len() as u64)?;
+        let container =
+            self.db
+                .insert_container(feed, &self.feed.name, name, sha, bytes.len() as u64)?;
         let wanted = match self.feed.format {
             Format::Csv => &["csv"][..],
             Format::Ndjson => &["ndjson", "jsonl"][..],
@@ -751,6 +754,7 @@ impl FeedRunner {
             if let Some(original) = self.db.find_file_by_hash(feed, &entry_sha)? {
                 self.db.insert_duplicate(
                     feed,
+                    &self.feed.name,
                     &entry_name,
                     &entry_sha,
                     data.len() as u64,
@@ -785,6 +789,7 @@ impl FeedRunner {
             let (admission, _) = self.admit(
                 &NewFile {
                     feed,
+                    source_name: &self.feed.name,
                     name: &entry_name,
                     sha: &entry_sha,
                     size: data.len() as u64,
@@ -802,6 +807,7 @@ impl FeedRunner {
                 }
                 self.db.insert_duplicate(
                     feed,
+                    &self.feed.name,
                     &entry_name,
                     &entry_sha,
                     data.len() as u64,

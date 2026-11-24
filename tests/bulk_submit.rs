@@ -1456,6 +1456,7 @@ async fn staged_by_an_earlier_version(relative_config: bool) {
             let id = db
                 .insert_file(
                     "open",
+                    "open",
                     name,
                     &format!("sha-{name}"),
                     body.len() as u64,
@@ -1623,6 +1624,7 @@ async fn an_archived_folder_file_from_an_earlier_version_is_served_on_retry() {
     let seed = seed_store(&config);
     let file = seed
         .insert_file(
+            "open",
             "open",
             "export.ndjson",
             "sha-export",

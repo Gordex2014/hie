@@ -175,6 +175,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("files", "source_key", "TEXT"),
     ("files", "archived", "INTEGER NOT NULL DEFAULT 0"),
     ("files", "origin", "TEXT"),
+    ("files", "source_name", "TEXT"),
     ("records", "submission", "TEXT"),
     // Bumped when a person puts a record back: an outcome computed for an older
     // revision changes nothing.
@@ -195,6 +196,17 @@ const ADDED_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS records_submission_id ON records(submission, id);
 CREATE INDEX IF NOT EXISTS events_source_kind_at ON events(source_id, kind, at);
 ";
+
+/// The indexes the loads list chooses its pages through, each built in a
+/// transaction of its own: a build over a large `records` locks that table
+/// alone, and never holds `files` while it waits for another instance's
+/// writes. The failing ones hold only the rows that make a load fail.
+const LOAD_INDEXES: [&str; 4] = [
+    "CREATE INDEX IF NOT EXISTS files_status_id ON files(status, id)",
+    "CREATE INDEX IF NOT EXISTS files_feed_status_id ON files(feed_id, status, id)",
+    "CREATE INDEX IF NOT EXISTS records_failing_file ON records(file_id) WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'",
+    "CREATE INDEX IF NOT EXISTS records_failing_feed_file ON records(feed_id, file_id) WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'",
+];
 
 /// On PostgreSQL only: on SQLite `records_file` already orders by id, the rowid.
 const ADDED_INDEXES_POSTGRES: &str = "
@@ -362,11 +374,19 @@ pub struct WorkItem {
 /// parsed, if it could not.
 pub type ReadRow = (i64, Value, Option<String>);
 
+/// A source's name as a load keeps it: a name PostgreSQL cannot hold as text
+/// (with a NUL) is not kept, so that it never stops a load.
+fn storable_name(name: &str) -> Option<&str> {
+    Some(name).filter(|n| !n.contains('\0'))
+}
+
 /// A file as it is recorded on arrival: see `Db::insert_file` for `source_key`
 /// and `origin`.
 #[derive(Debug, Clone, Copy)]
 pub struct NewFile<'a> {
     pub feed: &'a str,
+    /// The source's name as the load is recorded: see `Db::insert_file`.
+    pub source_name: &'a str,
     pub name: &'a str,
     pub sha: &'a str,
     pub size: u64,
@@ -1257,6 +1277,9 @@ impl Db {
             }
         }
         conn.execute_batch(ADDED_INDEXES)?;
+        for index in LOAD_INDEXES {
+            conn.execute(index, [])?;
+        }
         never_reuse_rule_ids(&conn)?;
         conn.execute(
             &EVENTS_SINCE.replace('$', "?"),
@@ -1311,6 +1334,9 @@ impl Db {
             }
             client.batch(ADDED_INDEXES)?;
             client.batch(ADDED_INDEXES_POSTGRES)?;
+            for index in LOAD_INDEXES {
+                client.batch(index)?;
+            }
             client.execute(EVENTS_SINCE, &params![now_ms().to_string()])?;
             Ok::<_, anyhow::Error>(())
         })();
@@ -1469,11 +1495,14 @@ impl Db {
     ///   by the engine and removed once settled.
     ///
     /// A row without one (written by an earlier version and not backfilled) is
-    /// never served by the engine.
+    /// never served by the engine. `source_name` is the source's name as the
+    /// load is recorded, kept with it after the source is renamed or deleted
+    /// (see `storable_name`).
     #[allow(clippy::too_many_arguments)]
     pub fn insert_file(
         &self,
         feed: &str,
+        source_name: &str,
         name: &str,
         sha: &str,
         size: u64,
@@ -1483,15 +1512,16 @@ impl Db {
         origin: Option<&str>,
     ) -> Result<i64> {
         let now = now_ms();
+        let source_name = storable_name(source_name);
         let finished_at = if status == "processing" {
             None
         } else {
             Some(now)
         };
         self.insert_returning_id(
-            "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at, source_key, origin)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-            &params![feed, name, sha, size, status, duplicate_of, now, finished_at, source_key, origin],
+            "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at, source_key, origin, source_name)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            &params![feed, name, sha, size, status, duplicate_of, now, finished_at, source_key, origin, source_name],
         )
     }
 
@@ -1634,8 +1664,8 @@ impl Db {
             };
             let file_id = tx
                 .query_one(
-                    "INSERT INTO files (feed_id, name, sha256, size, status, received_at, finished_at, error, source_key, origin)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
+                    "INSERT INTO files (feed_id, name, sha256, size, status, received_at, finished_at, error, source_key, origin, source_name)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
                     &params![
                         file.feed,
                         file.name,
@@ -1646,7 +1676,8 @@ impl Db {
                         finished_at,
                         error,
                         file.source_key,
-                        file.origin
+                        file.origin,
+                        storable_name(file.source_name)
                     ],
                 )?
                 .map(|r| r.i64(0))
@@ -1680,6 +1711,7 @@ impl Db {
     pub fn insert_duplicate(
         &self,
         feed: &str,
+        source_name: &str,
         name: &str,
         sha: &str,
         size: u64,
@@ -1689,9 +1721,9 @@ impl Db {
             let now = now_ms();
             let id = tx
                 .query_one(
-                    "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at)
-                     VALUES ($1, $2, $3, $4, 'duplicate', $5, $6, $7) RETURNING id",
-                    &params![feed, name, sha, size, original, now, now],
+                    "INSERT INTO files (feed_id, name, sha256, size, status, duplicate_of, received_at, finished_at, source_name)
+                     VALUES ($1, $2, $3, $4, 'duplicate', $5, $6, $7, $8) RETURNING id",
+                    &params![feed, name, sha, size, original, now, now, storable_name(source_name)],
                 )?
                 .map(|r| r.i64(0))
                 .context("INSERT returned no id")?;
@@ -1704,14 +1736,21 @@ impl Db {
 
     /// Records a zip as `unpacked`, with `load.received` marked as a container;
     /// its entries are loads of their own.
-    pub fn insert_container(&self, feed: &str, name: &str, sha: &str, size: u64) -> Result<i64> {
+    pub fn insert_container(
+        &self,
+        feed: &str,
+        source_name: &str,
+        name: &str,
+        sha: &str,
+        size: u64,
+    ) -> Result<i64> {
         self.transaction(|tx| {
             let now = now_ms();
             let id = tx
                 .query_one(
-                    "INSERT INTO files (feed_id, name, sha256, size, status, received_at, finished_at)
-                     VALUES ($1, $2, $3, $4, 'unpacked', $5, $6) RETURNING id",
-                    &params![feed, name, sha, size, now, now],
+                    "INSERT INTO files (feed_id, name, sha256, size, status, received_at, finished_at, source_name)
+                     VALUES ($1, $2, $3, $4, 'unpacked', $5, $6, $7) RETURNING id",
+                    &params![feed, name, sha, size, now, now, storable_name(source_name)],
                 )?
                 .map(|r| r.i64(0))
                 .context("INSERT returned no id")?;
@@ -4027,7 +4066,7 @@ mod tests {
     }
 
     fn file(db: &Db, feed: &str, name: &str) -> i64 {
-        db.insert_file(feed, name, name, 1, "processing", None, None, None)
+        db.insert_file(feed, feed, name, name, 1, "processing", None, None, None)
             .unwrap()
     }
 

@@ -1016,6 +1016,7 @@ async fn a_refused_submission_rejects_its_records_and_keeps_what_was_echoed_out(
 fn new_file<'a>(feed: &'a str, name: &'a str) -> NewFile<'a> {
     NewFile {
         feed,
+        source_name: feed,
         name,
         sha: name,
         size: 1,
@@ -1143,7 +1144,7 @@ async fn events_are_paged_in_order_and_a_cursor_only_moves_forward() {
     // Six events over two sources: a's load and two rejections, b's duplicate,
     // b's load and one rejection.
     let a = load(&db, "a", "a1", 2, 1);
-    db.insert_duplicate("b", "copy", "a1", 1, a).unwrap();
+    db.insert_duplicate("b", "b", "copy", "a1", 1, a).unwrap();
     load(&db, "b", "b1", 1, 0);
 
     let mut cursor = String::new();

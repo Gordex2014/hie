@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 
 use super::ApiError;
 
-fn invalid_query(sentence: &str) -> ApiError {
+pub(super) fn invalid_query(sentence: &str) -> ApiError {
     ApiError::new(StatusCode::BAD_REQUEST, sentence).code("invalid_query")
 }
 
