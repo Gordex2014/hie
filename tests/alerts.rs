@@ -1061,7 +1061,11 @@ async fn the_webhook_gets_each_alert_change_and_the_api_shows_its_delivery() {
     let (headers, body) = &got[0];
     assert_eq!(
         headers["x-hie-signature"].to_str().unwrap(),
-        hie::alerts::signature(b"secretcanary", body)
+        hie::alerts::signature(
+            b"secretcanary",
+            headers["x-hie-timestamp"].to_str().unwrap(),
+            body
+        )
     );
     let payload: Value = serde_json::from_slice(body).unwrap();
     assert_eq!(payload["event_id"], hook["event_id"]);
