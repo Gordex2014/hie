@@ -403,6 +403,14 @@ impl WorkerConfig {
 pub struct FeedConfig {
     pub id: String,
     pub name: String,
+    /// Who to call about this source: one line of display text, never
+    /// interpreted. Blank means none.
+    #[serde(
+        default,
+        deserialize_with = "contact_text",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub contact: Option<String>,
     pub source: SourceConfig,
     #[serde(default)]
     pub format: Format,
@@ -525,6 +533,53 @@ pub enum SourceConfig {
         #[serde(default = "default_mllp_poll_seconds")]
         poll_seconds: u64,
     },
+}
+
+/// The longest contact a source may have, in characters.
+pub const CONTACT_MAX_CHARS: usize = 500;
+
+/// A contact as text, or none: a string, or null. A blank one (empty or only
+/// whitespace) is none, so it is never written. Anything else is refused,
+/// whatever the format: a bare `5550100` in YAML is a number, not text, and
+/// would come back as a number in `definition`.
+fn contact_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    struct Text;
+    impl<'de> serde::de::Visitor<'de> for Text {
+        type Value = Option<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a contact as text, or null (in a YAML file, quote one that reads as a number or true/false)")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok((!v.trim().is_empty()).then(|| v.to_string()))
+        }
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok((!v.trim().is_empty()).then_some(v))
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+    d.deserialize_any(Text)
+}
+
+/// Whether a character would break a contact's single line or reorder the text
+/// around it: control characters, the Unicode line and paragraph separators,
+/// and the bidirectional marks and embedding, override and isolate controls.
+fn breaks_contact_line(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 fn default_spool() -> PathBuf {
@@ -870,6 +925,22 @@ impl FeedConfig {
         if self.name.trim().is_empty() {
             bail!("source {}: name is required", self.id);
         }
+        // Before anything that can skip the file, so an invalid contact is
+        // refused in every build.
+        if let Some(contact) = &self.contact {
+            if contact.chars().count() > CONTACT_MAX_CHARS {
+                bail!(
+                    "source {}: contact must be at most {CONTACT_MAX_CHARS} characters",
+                    self.id
+                );
+            }
+            if contact.chars().any(breaks_contact_line) {
+                bail!(
+                    "source {}: contact must be one line of plain text, without control, line separator or text direction characters",
+                    self.id
+                );
+            }
+        }
         self.source.resolve(base);
         self.source
             .check()
@@ -1184,6 +1255,7 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
 
     fn alerts_from(yaml: &str) -> Result<AlertConfig, String> {
         serde_yaml::from_str::<Config>(&format!("fhir_base_url: http://hfs\n{yaml}"))
@@ -1391,6 +1463,136 @@ mod tests {
         feed.id = "good-id".into();
         feed.resolve(dir.path()).unwrap();
         assert!(feed.transform.is_absolute());
+    }
+
+    const CONTACT_BASE: &str =
+        "id: lab\nname: Lab\nsource:\n  type: folder\n  path: inbox\ntransform: t.py\n";
+
+    fn contact_yaml(line: &str) -> Result<FeedConfig, serde_yaml::Error> {
+        serde_yaml::from_str(&format!("{CONTACT_BASE}{line}"))
+    }
+
+    fn contact_json(contact: Value) -> Result<FeedConfig, serde_json::Error> {
+        serde_json::from_value(json!({
+            "id": "lab", "name": "Lab",
+            "source": {"type": "folder", "path": "inbox"},
+            "transform": "t.py", "contact": contact,
+        }))
+    }
+
+    fn resolved(mut feed: FeedConfig) -> Result<FeedConfig> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.py"), "def transform(r, c): return r\n").unwrap();
+        feed.resolve(dir.path()).map(|()| feed)
+    }
+
+    #[test]
+    fn a_contact_is_read_kept_as_given_and_written_only_when_there_is_one() {
+        let feed = contact_yaml("contact: \" Lab IT on-call, +1 555 0100 \"\n").unwrap();
+        assert_eq!(
+            feed.contact.as_deref(),
+            Some(" Lab IT on-call, +1 555 0100 ")
+        );
+        let yaml = feed.to_yaml().unwrap();
+        let again: FeedConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(again.contact, feed.contact);
+        // A quoted number is text, and stays text through YAML and JSON.
+        let feed = contact_yaml("contact: \"5550100\"\n").unwrap();
+        assert_eq!(feed.contact.as_deref(), Some("5550100"));
+        let again: FeedConfig = serde_yaml::from_str(&feed.to_yaml().unwrap()).unwrap();
+        assert_eq!(again.contact.as_deref(), Some("5550100"));
+        let as_json = serde_json::to_value(
+            serde_yaml::from_str::<serde_yaml::Value>(&feed.to_yaml().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(as_json["contact"], "5550100");
+        // None, null and blank are all no contact, and no key is written.
+        for line in [
+            "",
+            "contact: null\n",
+            "contact: ~\n",
+            "contact: \"\"\n",
+            "contact: \"   \"\n",
+            "contact: \"\\n\\t\"\n",
+        ] {
+            let feed = contact_yaml(line).unwrap();
+            assert_eq!(feed.contact, None, "{line:?}");
+            assert!(!feed.to_yaml().unwrap().contains("contact"), "{line:?}");
+        }
+        for blank in [Value::Null, json!(""), json!("  "), json!("\n")] {
+            assert_eq!(
+                contact_json(blank.clone()).unwrap().contact,
+                None,
+                "{blank}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_contact_that_is_not_text_is_refused() {
+        for line in [
+            "contact: 5550100\n",
+            "contact: true\n",
+            "contact: [a]\n",
+            "contact:\n  name: x\n",
+        ] {
+            let err = contact_yaml(line).unwrap_err().to_string();
+            assert!(err.starts_with("contact: invalid type"), "{line:?}: {err}");
+        }
+        for value in [
+            json!(5550100),
+            json!(true),
+            json!(["a"]),
+            json!({"name": "x"}),
+        ] {
+            let err = contact_json(value.clone()).unwrap_err().to_string();
+            assert!(
+                err.starts_with("invalid type") && err.contains("a contact as text, or null"),
+                "{value}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_contact_is_bounded_and_one_line_of_plain_text() {
+        let longest = "é".repeat(CONTACT_MAX_CHARS);
+        assert!(resolved(contact_json(json!(longest)).unwrap()).is_ok());
+        let err = format!(
+            "{:#}",
+            resolved(contact_json(json!(format!("{longest}x"))).unwrap()).unwrap_err()
+        );
+        assert!(
+            err.contains("source lab: contact must be at most 500 characters"),
+            "{err}"
+        );
+        for bad in [
+            "a\nb",
+            "a\rb",
+            "a\tb",
+            "a\u{1b}[31mb",
+            "a\u{85}b",
+            "a\u{7f}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{202e}b",
+            "a\u{2066}b",
+            "a\u{061c}b",
+            "a\u{200e}b",
+            "a\u{200f}b",
+        ] {
+            let err = format!(
+                "{:#}",
+                resolved(contact_json(json!(bad)).unwrap()).unwrap_err()
+            );
+            assert!(
+                err.contains("contact must be one line of plain text"),
+                "{bad:?}: {err}"
+            );
+        }
+        // A block scalar keeps its line breaks; a plain one folded over lines is one line.
+        assert!(resolved(contact_yaml("contact: |\n  Lab IT\n  +1 555 0100\n").unwrap()).is_err());
+        let folded = resolved(contact_yaml("contact: Lab IT\n  +1 555 0100\n").unwrap()).unwrap();
+        assert_eq!(folded.contact.as_deref(), Some("Lab IT +1 555 0100"));
     }
 
     fn load_engine_yaml(yaml: &str) -> Result<(Config, Vec<FeedConfig>)> {

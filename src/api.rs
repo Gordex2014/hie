@@ -349,6 +349,7 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
     Ok(json!({
         "id": feed.id,
         "name": feed.name,
+        "contact": feed.contact,
         "source": feed.source.describe(),
         "format": feed.format,
         "transform": feed.transform.display().to_string(),
@@ -803,7 +804,7 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
             _ => None,
         };
         if let Some(reason) = reason {
-            needs_you.push(json!({"id": feed.id, "name": feed.name, "state": status["state"], "reason": reason}));
+            needs_you.push(json!({"id": feed.id, "name": feed.name, "contact": feed.contact, "state": status["state"], "reason": reason}));
         }
         sources.push(status);
     }

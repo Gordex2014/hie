@@ -157,6 +157,9 @@ pub struct SourceManager {
     /// Makes the next definition write fail, for tests.
     #[cfg(all(test, feature = "secrets-native"))]
     fail_next_write: std::sync::atomic::AtomicBool,
+    /// Makes the next record of a source's birth fail, for tests.
+    #[cfg(all(test, feature = "secrets-native"))]
+    fail_next_birth: std::sync::atomic::AtomicBool,
 }
 
 impl SourceManager {
@@ -194,6 +197,8 @@ impl SourceManager {
             fail_next_start: std::sync::atomic::AtomicBool::new(false),
             #[cfg(all(test, feature = "secrets-native"))]
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(test, feature = "secrets-native"))]
+            fail_next_birth: std::sync::atomic::AtomicBool::new(false),
             handover_grace_ms: AtomicU64::new(
                 (config
                     .worker
@@ -354,7 +359,8 @@ impl SourceManager {
         // Before any runner: what an earlier run of this instance left behind.
         self.reconcile_refs(&feeds);
         for feed in feeds {
-            self.ensure_default_rule(&feed, None)?;
+            // Only a source this store has never seen gets the default rule.
+            self.give_default_rule(&feed, None, false)?;
             self.start(feed)?;
         }
         Ok(())
@@ -482,13 +488,9 @@ impl SourceManager {
         self.db.secret_release(id, self.secrets.owner(), keep)
     }
 
-    /// The default rule and the runner of a definition that was just published:
-    /// a failure here leaves the definition saved and the registrations kept.
-    fn start_published(
-        self: &Arc<Self>,
-        feed: &FeedConfig,
-        by: Option<&str>,
-    ) -> Result<(), ManagerError> {
+    /// The runner of a definition that was just published: a failure here
+    /// leaves the definition saved and the registrations kept.
+    fn start_published(self: &Arc<Self>, feed: &FeedConfig) -> Result<(), ManagerError> {
         #[cfg(all(test, feature = "secrets-native"))]
         if self
             .fail_next_start
@@ -498,14 +500,12 @@ impl SourceManager {
                 "the definition was saved, but the source could not be started: a test made the start fail; it starts with this definition at the next start of the engine".into(),
             ));
         }
-        self.ensure_default_rule(feed, by)
-            .and_then(|()| self.start(feed.clone()))
-            .map_err(|e| {
-                tracing::error!(feed = %feed.id, "the definition was saved, but the source did not start: {e:#}");
-                ManagerError::NotStarted(format!(
-                    "the definition was saved, but the source could not be started: {e:#}; it starts with this definition at the next start of the engine"
-                ))
-            })
+        self.start(feed.clone()).map_err(|e| {
+            tracing::error!(feed = %feed.id, "the definition was saved, but the source did not start: {e:#}");
+            ManagerError::NotStarted(format!(
+                "the definition was saved, but the source could not be started: {e:#}; it starts with this definition at the next start of the engine"
+            ))
+        })
     }
 
     /// Publishes the definition all at once: written to a temporary file of its
@@ -562,20 +562,43 @@ impl SourceManager {
             None => false,
         };
         pause_point!(await self, "manager:after-hold");
+        // A create is always a creation: the default rule comes before the
+        // definition is published, so a start that fails cannot lose it. A write
+        // that fails keeps it: another create, here or on another instance, may
+        // already count on it, and a create sent again uses it.
+        if let Err(e) = self.give_default_rule(&resolved, by, true) {
+            self.take_back(&submitted.id, secret.as_deref(), made);
+            return Err(if crate::db::is_busy(&e) {
+                ManagerError::StoreBusy
+            } else {
+                e.into()
+            });
+        }
         if let Err(e) = self.write(&submitted) {
             self.take_back(&submitted.id, secret.as_deref(), made);
             return Err(e.into());
         }
         pause_point!(await self, "manager:after-publish");
-        self.start_published(&resolved, by)?;
+        self.start_published(&resolved)?;
         Ok(resolved)
     }
 
-    /// Every source is born with one silence rule, so nobody has to remember to
-    /// watch it: `expect_every` when the definition says so, two hours otherwise.
-    fn ensure_default_rule(&self, feed: &FeedConfig, by: Option<&str>) -> Result<()> {
-        if self.db.has_rule(&feed.id, "silence")? {
-            return Ok(());
+    /// A source is born with one silence rule, so nobody has to remember to
+    /// watch it: `expect_every` when the definition says so, two hours
+    /// otherwise. Only at its birth (`Db::give_default_rule`): a replace, a
+    /// restart or a re-read never brings back a rule someone deleted.
+    fn give_default_rule(
+        &self,
+        feed: &FeedConfig,
+        by: Option<&str>,
+        force: bool,
+    ) -> Result<Option<i64>> {
+        #[cfg(all(test, feature = "secrets-native"))]
+        if self
+            .fail_next_birth
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("recording the birth of {}: a test made it fail", feed.id);
         }
         let rule = Rule {
             id: 0,
@@ -592,7 +615,7 @@ impl SourceManager {
             tz: None,
             created_at: None,
         };
-        self.db.insert_rule(&rule).map(drop)
+        self.db.give_default_rule(&rule, force)
     }
 
     pub async fn replace(
@@ -627,7 +650,7 @@ impl SourceManager {
         pause_point!(await self, "manager:after-publish");
         // The old credential's registration goes once the new runner has taken
         // over (`cleanup_refs`).
-        self.start_published(&resolved, None)?;
+        self.start_published(&resolved)?;
         Ok(resolved)
     }
 
@@ -859,6 +882,7 @@ impl SourceManager {
         let feed = FeedConfig {
             id: "test".into(),
             name: "test".into(),
+            contact: None,
             source,
             format: Default::default(),
             transform: PathBuf::new(),

@@ -819,3 +819,201 @@ async fn transform_tries_are_bounded_and_leave_nothing_behind() {
         assert_eq!(call.await.unwrap().status(), 200);
     }
 }
+
+/// A source's contact: read from a file at start and from the API, kept by a
+/// replace that sends back the definition it read, cleared by one without it,
+/// and refused when it is too long or more than one line.
+#[tokio::test]
+async fn a_source_contact_is_read_kept_and_cleared() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let urls: Urls = Arc::default();
+    let fhir = serve(Router::new().route("/", post(batch)).with_state(urls)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).unwrap();
+    std::fs::create_dir_all(root.join("sources")).unwrap();
+    std::fs::create_dir_all(root.join("inbox")).unwrap();
+    std::fs::copy(
+        repo().join("transforms/lab_results.py"),
+        root.join("transforms/lab_results.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {fhir}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    // One source defined by its file, one with none and a blank one.
+    std::fs::write(
+        root.join("sources/from-file.yaml"),
+        "id: from-file\nname: From a file\ncontact: \"5550100\"\nsource:\n  type: folder\n  path: inbox\n  poll_seconds: 3600\ntransform: transforms/lab_results.py\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("sources/blank.yaml"),
+        "id: blank\nname: Blank\ncontact: \"  \"\nsource:\n  type: folder\n  path: inbox\n  poll_seconds: 3600\ntransform: transforms/lab_results.py\n",
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (_manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let api = serve(hie::api::router(state)).await;
+    let http = reqwest::Client::new();
+    let get = |path: String| {
+        let (http, api) = (http.clone(), api.clone());
+        async move {
+            http.get(format!("{api}{path}"))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+
+    let from_file = get("/api/sources/from-file".into()).await;
+    assert_eq!(from_file["contact"], "5550100");
+    assert_eq!(from_file["definition"]["contact"], "5550100");
+    // A blank contact in a file is none; `definition` shows the file as it is.
+    let blank = get("/api/sources/blank".into()).await;
+    assert!(blank.get("contact").is_some_and(Value::is_null), "{blank}");
+    assert_eq!(blank["definition"]["contact"], "  ");
+
+    // Created with one: answered at the top and in `definition`, and written.
+    let contact = "Lab IT on-call, +1 555 0100, lab-it@example.org";
+    let definition = json!({
+        "id": "lab", "name": "Lab",
+        "contact": contact,
+        "source": {"type": "folder", "path": "inbox", "poll_seconds": 3600},
+        "transform": "transforms/lab_results.py",
+    });
+    let created = http
+        .post(format!("{api}/api/sources"))
+        .json(&definition)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let created: Value = created.json().await.unwrap();
+    assert_eq!(created["contact"], contact);
+    assert_eq!(created["definition"]["contact"], contact);
+    let file = || std::fs::read_to_string(root.join("sources/lab.yaml")).unwrap();
+    assert!(
+        file().contains(&format!("contact: {contact}")),
+        "{}",
+        file()
+    );
+    let listed = get("/api/sources".into()).await;
+    let in_list = |listed: &Value, id: &str| {
+        listed["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(in_list(&listed, "lab")["contact"], contact);
+    let status = get("/api/monitoring/status".into()).await;
+    assert_eq!(in_list(&status, "lab")["contact"], contact);
+    assert_eq!(in_list(&status, "from-file")["contact"], "5550100");
+    assert!(in_list(&status, "blank")["contact"].is_null());
+
+    // A replace that sends back the definition it read, with one change, keeps it.
+    let mut read = get("/api/sources/lab".into()).await["definition"].clone();
+    read["name"] = json!("Lab (renamed)");
+    let replace = |body: Value| {
+        let (http, api) = (http.clone(), api.clone());
+        async move {
+            http.put(format!("{api}/api/sources/lab"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let kept: Value = replace(read.clone()).await.json().await.unwrap();
+    assert_eq!(
+        (kept["name"].as_str(), kept["contact"].as_str()),
+        (Some("Lab (renamed)"), Some(contact))
+    );
+    let mut read_back = get("/api/sources/from-file".into()).await["definition"].clone();
+    read_back["name"] = json!("Renamed");
+    let kept: Value = http
+        .put(format!("{api}/api/sources/from-file"))
+        .json(&read_back)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(kept["contact"], "5550100");
+
+    // Paused, it needs someone: whom to call comes with it.
+    http.post(format!("{api}/api/sources/lab/pause"))
+        .send()
+        .await
+        .unwrap();
+    let status = get("/api/monitoring/status".into()).await;
+    let needs = status["needs_you"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "lab")
+        .cloned()
+        .unwrap();
+    assert_eq!(needs["contact"], contact);
+
+    // Refused: too long, or more than one line. Nothing changes.
+    let saved = file();
+    for bad in ["x".repeat(501), "Lab IT\n+1 555 0100".to_string()] {
+        let mut body = read.clone();
+        body["contact"] = json!(bad);
+        let refused = replace(body.clone()).await;
+        assert_eq!(refused.status(), 400);
+        let refused: Value = refused.json().await.unwrap();
+        assert_eq!(refused["code"], "invalid_definition", "{refused}");
+        assert!(refused["error"].as_str().unwrap().contains("contact"));
+        body["id"] = json!("lab-2");
+        let refused = http
+            .post(format!("{api}/api/sources"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 400);
+        assert!(!root.join("sources/lab-2.yaml").exists());
+    }
+    assert_eq!(file(), saved);
+    let unchanged = get("/api/sources/lab".into()).await;
+    assert_eq!(unchanged["contact"], contact);
+    assert_eq!(unchanged["definition"]["contact"], contact);
+
+    // A replace without it, with null or with a blank one clears it.
+    for cleared in [None, Some(Value::Null), Some(json!("")), Some(json!("  "))] {
+        let restored: Value = replace(read.clone()).await.json().await.unwrap();
+        assert_eq!(restored["contact"], contact);
+        let mut body = read.clone();
+        match &cleared {
+            None => {
+                body.as_object_mut().unwrap().remove("contact");
+            }
+            Some(value) => body["contact"] = value.clone(),
+        }
+        let replaced: Value = replace(body).await.json().await.unwrap();
+        assert!(
+            replaced.get("contact").is_some_and(Value::is_null),
+            "{cleared:?}: {replaced}"
+        );
+        assert!(
+            replaced["definition"].get("contact").is_none(),
+            "{cleared:?}"
+        );
+        assert!(!file().contains("contact"), "{cleared:?}: {}", file());
+    }
+}

@@ -370,3 +370,74 @@ fn a_start_with_the_wrong_key_or_an_ambiguous_one_is_refused_before_serving() {
     assert_eq!(refusal_markers(&stderr), (store_key, "ambiguous".into()));
     drop(db);
 }
+
+/// A source file with this tail in a configuration of its own.
+fn check_source(source: &str) -> Output {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("t.py"), "def transform(r, c): return r\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("sources")).unwrap();
+    std::fs::write(dir.path().join("sources").join("lab.yaml"), source).unwrap();
+    let config = dir.path().join("hie.yaml");
+    std::fs::write(&config, "fhir_base_url: http://127.0.0.1:1/fhir\n").unwrap();
+    Command::new(env!("CARGO_BIN_EXE_hie"))
+        .arg("--config")
+        .arg(&config)
+        .arg("check")
+        .env_remove("HIE_CONFIG")
+        .env_remove("HIE_RUNTIME_URL")
+        .output()
+        .unwrap()
+}
+
+const CONTACT_FOLDER: &str =
+    "id: lab\nname: Lab\nsource:\n  type: folder\n  path: inbox\ntransform: t.py\n";
+
+#[test]
+fn check_prints_a_source_contact() {
+    let out = check_source(&format!(
+        "{CONTACT_FOLDER}contact: \"Lab IT on-call, +1 555 0100\"\n"
+    ));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("    contact: Lab IT on-call, +1 555 0100"),
+        "{stdout}"
+    );
+    let out = check_source(CONTACT_FOLDER);
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("    contact: "));
+}
+
+#[test]
+fn check_refuses_an_invalid_contact_naming_the_file() {
+    let long = "x".repeat(501);
+    // An S3 source naming a credential too: a build without a secret store
+    // would skip that file, but not one whose contact is invalid.
+    let s3 = "id: lab\nname: Lab\nsource:\n  type: s3\n  bucket: b\n  credential: lab\nformat: ndjson\ntransform: t.py\n";
+    for (source, reason) in [
+        (
+            format!("{CONTACT_FOLDER}contact: {long}\n"),
+            "at most 500 characters",
+        ),
+        (
+            format!("{CONTACT_FOLDER}contact: 5550100\n"),
+            "contact: invalid type: integer",
+        ),
+        (
+            format!("{s3}contact: \"a\\u202Eb\"\n"),
+            "one line of plain text",
+        ),
+    ] {
+        let out = check_source(&source);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{source}");
+        assert!(
+            stderr.contains("lab.yaml") && stderr.contains(reason),
+            "{source}: {stderr}"
+        );
+    }
+}

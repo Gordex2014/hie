@@ -9,6 +9,7 @@ A source is one connection: where the data comes from, its format, the transform
 ```yaml
 id: lab-results
 name: Lab results
+contact: "Lab IT on-call, +1 555 0100"   # optional: who to call about this source
 source:
   type: folder               # or s3 (see sources/synthea-s3.yaml.example)
   path: inbox/lab-results
@@ -22,6 +23,8 @@ delivery:
   alert_after_attempts: 5
 expect_every: 24h            # the silence rule the source is born with
 ```
+
+`contact` says whom to call about the source: one line of free text (a team, a person, a phone number, an address), at most 500 characters, shown as it is and never interpreted. The engine sends nothing to it and does not read it as an address. The text, as decoded, may not hold control characters (Unicode category Cc: a tab, a line break, an escape), the line and paragraph separators U+2028 and U+2029, or the bidirectional marks U+061C, U+200E and U+200F and embedding, override and isolate controls U+202A to U+202E and U+2066 to U+2069. So a YAML block scalar that keeps a line break (`|`, `>`) is refused, while a plain value folded over several lines is one line. Leaving it out, `null`, or a blank value (only whitespace) means no contact, and a blank one is not written. In YAML, quote a contact that would read as a number or `true`/`false` (`contact: "5550100"`): a bare one is refused, because it is not text. It is returned as `contact` wherever the source is read, `GET /api/monitoring/status` included, and edited with the rest of the definition: `PUT /api/sources/{id}` replaces the whole definition, so a body without `contact` leaves the source with none, and a client that changes one member sends back the `definition` it read, contact included. A contact in a source file is read at start like any member; an invalid one stops `hie run` and `hie check`, naming the file, and `hie check` prints each source's contact.
 
 An S3 source names a `bucket`, an optional `prefix`, and an `archive_prefix` (default `processed`) that acknowledged objects are moved under. `endpoint` points at an S3-compatible store such as MinIO; `region` defaults to `us-east-1`. It says how it reaches the bucket with exactly one of:
 
@@ -73,7 +76,7 @@ The same document is what `POST /api/sources` takes. Before creating one, `POST 
 
 ### Alerts and rules
 
-Alerts are governed by **rules**: data, created and edited over the API, each naming a source (or every source), a condition with its threshold, who to notify, and the channels (`app`, `webhook`, `email`). Every source is born with one `silence` rule set to its `expect_every` (two hours when it has none), so nobody has to remember to watch it.
+Alerts are governed by **rules**: data, created and edited over the API, each naming a source (or every source), a condition with its threshold, who to notify, and the channels (`app`, `webhook`, `email`). A new source is born with one `silence` rule set to its `expect_every` (two hours when it has none), so nobody has to remember to watch it. It is given only when the source is created: the first time the store sees it at a start, or by `POST /api/sources`. A replace or a restart never adds it back, so a deleted default rule stays deleted. A source deleted through the API and created again with `POST` gets it again (unless its old `silence` rule is still there); one whose file is put back is the source the store knew and does not.
 
 | Condition | Threshold | Fires when | Clears when |
 |-----------|-----------|------------|-------------|
