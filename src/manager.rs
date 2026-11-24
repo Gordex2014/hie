@@ -131,6 +131,8 @@ pub struct SourceManager {
     bulk_dir: PathBuf,
     terminology_url: Option<String>,
     worker_limits: WorkerLimits,
+    /// `delivery.stamp_source`: every runner tags what it delivers.
+    stamp_source: bool,
     tries: tokio::sync::Semaphore,
     db: Arc<Db>,
     fhir: Arc<FhirClient>,
@@ -182,6 +184,7 @@ impl SourceManager {
             bulk_dir: config.bulk_dir(),
             terminology_url: config.terminology_url.clone(),
             worker_limits: config.worker.limits(),
+            stamp_source: config.delivery.stamp_source,
             tries: tokio::sync::Semaphore::new(TRY_CONCURRENCY),
             db,
             fhir,
@@ -209,6 +212,11 @@ impl SourceManager {
                     .as_millis() as u64,
             ),
         })
+    }
+
+    /// Whether this engine tags delivered resources with their source.
+    pub fn stamp_source(&self) -> bool {
+        self.stamp_source
     }
 
     /// Whether the FHIR server answers, as this engine sees it.
@@ -305,6 +313,7 @@ impl SourceManager {
         .with_bulk_dir(&self.bulk_dir)
         .with_terminology(self.terminology_url.as_deref())
         .with_worker_limits(self.worker_limits.clone())
+        .with_stamp_source(self.stamp_source)
         .with_secrets(self.secrets.clone());
         #[cfg(all(test, feature = "secrets-native"))]
         let runner = runner.with_pause(self.pause.lock().expect("pause mutex").clone());

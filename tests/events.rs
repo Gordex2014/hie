@@ -1062,7 +1062,14 @@ fn a_submission_whose_records_changed_meanwhile_is_not_opened() {
     assert!(db.reprocess(ids[1], None).unwrap());
     db.mark_passthrough(&[(ids[1], 1)]).unwrap();
     let opened = db
-        .create_submission("t1", "s", "hie-1", &json!({}), &[(ids[0], 0), (ids[1], 0)])
+        .create_submission(
+            "t1",
+            "s",
+            "hie-1",
+            &json!({}),
+            &[(ids[0], 0), (ids[1], 0)],
+            false,
+        )
         .unwrap();
     assert!(!opened);
     assert!(
@@ -1074,8 +1081,15 @@ fn a_submission_whose_records_changed_meanwhile_is_not_opened() {
     assert_eq!(kinds(&events(&db)[before..]), ["record.retried"]);
     // Built again from what is pending now, it opens over both.
     assert!(
-        db.create_submission("t2", "s", "hie-2", &json!({}), &[(ids[0], 0), (ids[1], 1)])
-            .unwrap()
+        db.create_submission(
+            "t2",
+            "s",
+            "hie-2",
+            &json!({}),
+            &[(ids[0], 0), (ids[1], 1)],
+            false
+        )
+        .unwrap()
     );
     assert_eq!(status(&db, ids[1]), "submitted");
 }

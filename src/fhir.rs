@@ -66,15 +66,37 @@ impl FhirClient {
     /// it reaches the record's error and the delivery alert. The log has the
     /// detail.
     pub async fn post_bundle(&self, bundle: &Value) -> Result<Value, SendError> {
+        let request = self.bundle_request(bundle).await?;
+        self.send_bundle(request).await
+    }
+
+    /// Posts a Bundle, running `before_send` once the request is authorized and
+    /// built, just before it leaves. When `before_send` fails nothing is sent,
+    /// and its error comes back as the outer one: not a `SendError`, since HFS
+    /// was not asked anything.
+    pub async fn post_bundle_with(
+        &self,
+        bundle: &Value,
+        before_send: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Result<Value, SendError>> {
+        let request = match self.bundle_request(bundle).await {
+            Ok(request) => request,
+            Err(e) => return Ok(Err(e)),
+        };
+        before_send()?;
+        Ok(self.send_bundle(request).await)
+    }
+
+    /// The Bundle's request, authorized and built. Built before it counts as a
+    /// request to the server: one that cannot be built never leaves the engine.
+    async fn bundle_request(&self, bundle: &Value) -> Result<reqwest::Request, SendError> {
         let request = self
             .http
             .post(&self.base)
             .header("Content-Type", "application/fhir+json")
             .header("Accept", "application/fhir+json")
             .json(bundle);
-        // Built before it counts as a request to the server: one that cannot
-        // be built never leaves the engine.
-        let request = authorize(request, &self.credentials)
+        authorize(request, &self.credentials)
             .await?
             .build()
             .map_err(|e| {
@@ -83,7 +105,10 @@ impl FhirClient {
                     crate::destination::send_detail(&e)
                 );
                 SendError::Transient("the request to the FHIR server could not be built".into())
-            })?;
+            })
+    }
+
+    async fn send_bundle(&self, request: reqwest::Request) -> Result<Value, SendError> {
         // Held until the answer has been read: the destination is not idle
         // while it downloads.
         let exchange = self.destination.start();
@@ -132,6 +157,36 @@ pub async fn refused_token(status: u16, credentials: &Credentials) -> SendError 
     SendError::Transient(format!(
         "HTTP {status}: HFS did not accept the engine's token; a new one will be requested"
     ))
+}
+
+/// The `meta.tag` system of the source tag; its code is the source id.
+pub const SOURCE_TAG_SYSTEM: &str = "urn:helios:hie:source";
+
+/// A copy of `resource` tagged with the source that delivers it: `meta.tag`
+/// gets `{system: SOURCE_TAG_SYSTEM, code: source_id}` once, after the
+/// resource's other tags, in place of any tag of that system it already had.
+/// Every other member of `meta` stays as it is. Applying it twice gives the
+/// same JSON as applying it once.
+pub fn stamp_source(resource: &Value, source_id: &str) -> Result<Value, String> {
+    let mut stamped = resource.clone();
+    let Some(object) = stamped.as_object_mut() else {
+        return Err("the resource is not a JSON object: the source tag cannot be added".into());
+    };
+    let meta = object
+        .entry("meta")
+        .or_insert_with(|| Value::Object(Default::default()));
+    let Some(meta) = meta.as_object_mut() else {
+        return Err("meta is not an object: the source tag cannot be added".into());
+    };
+    let tags = meta
+        .entry("tag")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(tags) = tags.as_array_mut() else {
+        return Err("meta.tag is not an array: the source tag cannot be added".into());
+    };
+    tags.retain(|t| t.get("system").and_then(Value::as_str) != Some(SOURCE_TAG_SYSTEM));
+    tags.push(json!({"system": SOURCE_TAG_SYSTEM, "code": source_id}));
+    Ok(stamped)
 }
 
 /// Encodes a search value for a conditional URL, keeping the `|` separator literal.
@@ -260,6 +315,68 @@ mod tests {
             ),
             "Observation?identifier=urn:helios:hie:lab-results|Patient/1%202345-7%26x"
         );
+    }
+
+    fn source_tags(r: &Value) -> Vec<&Value> {
+        r["meta"]["tag"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["system"] == SOURCE_TAG_SYSTEM)
+            .collect()
+    }
+
+    #[test]
+    fn the_source_tag_is_added_once_and_the_rest_of_meta_is_kept() {
+        let bare = json!({"resourceType": "Patient", "id": "p"});
+        assert_eq!(
+            stamp_source(&bare, "lab").unwrap()["meta"],
+            json!({"tag": [{"system": SOURCE_TAG_SYSTEM, "code": "lab"}]})
+        );
+
+        let with_meta = json!({"resourceType": "Observation", "meta": {
+            "source": "urn:lab:analyser-7",
+            "profile": ["http://example.org/p"],
+            "security": [{"system": "s", "code": "R"}],
+            "tag": [
+                {"system": "urn:a", "code": "1"},
+                {"system": SOURCE_TAG_SYSTEM, "code": "other-source", "display": "x"},
+                {"system": "urn:b", "code": "2"},
+                {"system": SOURCE_TAG_SYSTEM, "code": "lab"}
+            ]
+        }});
+        let stamped = stamp_source(&with_meta, "lab").unwrap();
+        assert_eq!(stamped["meta"]["source"], "urn:lab:analyser-7");
+        assert_eq!(stamped["meta"]["profile"], with_meta["meta"]["profile"]);
+        assert_eq!(stamped["meta"]["security"], with_meta["meta"]["security"]);
+        // Other systems keep their order; the engine's tag replaces any of its
+        // system, whatever its code, and comes last.
+        assert_eq!(
+            stamped["meta"]["tag"],
+            json!([
+                {"system": "urn:a", "code": "1"},
+                {"system": "urn:b", "code": "2"},
+                {"system": SOURCE_TAG_SYSTEM, "code": "lab"}
+            ])
+        );
+        assert_eq!(source_tags(&stamped).len(), 1);
+        // Stamping again (a re-delivery) changes nothing.
+        assert_eq!(stamp_source(&stamped, "lab").unwrap(), stamped);
+        // The input itself is never changed.
+        assert_eq!(source_tags(&with_meta).len(), 2);
+    }
+
+    #[test]
+    fn a_meta_that_cannot_carry_the_tag_is_refused() {
+        for resource in [
+            json!({"resourceType": "Patient", "meta": "x"}),
+            json!({"resourceType": "Patient", "meta": null}),
+            json!({"resourceType": "Patient", "meta": {"tag": {"system": "s"}}}),
+            json!({"resourceType": "Patient", "meta": {"tag": null}}),
+            json!(["not", "a", "resource"]),
+        ] {
+            assert!(stamp_source(&resource, "lab").is_err(), "{resource}");
+        }
     }
 
     #[test]

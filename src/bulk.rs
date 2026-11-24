@@ -186,6 +186,9 @@ pub struct BulkSubmitter {
 }
 
 /// The identifier system the engine submits under; the value is the source id.
+/// The same string as the source tag's system (`fhir::SOURCE_TAG_SYSTEM`): both
+/// name an engine source, but who submitted a manifest and which source a
+/// resource came from are separate facts, so they stay separate constants.
 pub const SUBMITTER_SYSTEM: &str = "urn:helios:hie:source";
 
 impl BulkSubmitter {
@@ -447,6 +450,24 @@ pub fn submission_id(source_id: &str, file_hashes: &[&str]) -> String {
     format!("hie-{}", &hex::encode(hasher.finalize())[..16])
 }
 
+/// The id of a submission over transformed records `first..=last`. One whose
+/// NDJSON carries the source tag also hashes its own `token`, so it never shares
+/// an id with an earlier submission of the same records: HFS would refuse it as
+/// a repeat, and its records would be settled by that earlier one's receipts,
+/// for resources sent without the tag (or with it, then without).
+pub fn transformed_submission_id(
+    source_id: &str,
+    first: i64,
+    last: i64,
+    stamped_token: Option<&str>,
+) -> String {
+    let span = format!("records {first}-{last}");
+    match stamped_token {
+        None => submission_id(source_id, &[span.as_str()]),
+        Some(token) => submission_id(source_id, &[span.as_str(), "stamped", token]),
+    }
+}
+
 /// An unguessable token for the manifest and file URLs the engine serves.
 pub fn token() -> String {
     hex::encode(rand::random::<[u8; 16]>())
@@ -468,6 +489,18 @@ mod tests {
         );
         assert_ne!(submission_id("lab", &["a"]), submission_id("other", &["a"]));
         assert!(submission_id("lab", &[]).starts_with("hie-"));
+    }
+
+    #[test]
+    fn a_stamped_submission_never_reuses_an_earlier_id() {
+        let unstamped = transformed_submission_id("lab", 1, 9, None);
+        // Unstamped ids are what they always were: the same records, the same id.
+        assert_eq!(unstamped, submission_id("lab", &["records 1-9"]));
+        assert_eq!(unstamped, transformed_submission_id("lab", 1, 9, None));
+        let a = transformed_submission_id("lab", 1, 9, Some("t1"));
+        let b = transformed_submission_id("lab", 1, 9, Some("t2"));
+        assert_ne!(a, unstamped);
+        assert_ne!(a, b);
     }
 
     #[test]

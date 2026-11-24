@@ -62,6 +62,8 @@ pub struct FeedRunner {
     bulk_dir: PathBuf,
     /// `$bulk-submit` over the engine's transformed NDJSON, not the source objects.
     bulk_transformed: bool,
+    /// Tag what this runner delivers with its source (`delivery.stamp_source`).
+    stamp_source: bool,
     /// How the manager drives this runner, once it runs: a halt is seen between records.
     control: std::sync::OnceLock<Arc<RunnerControl>>,
     /// The last record the transform could not finish now, as (id, revision,
@@ -156,6 +158,7 @@ impl FeedRunner {
             instance: instance_id().to_string(),
             bulk_dir: std::env::temp_dir().join("hie-bulk"),
             bulk_transformed: feed_bulk_transformed,
+            stamp_source: false,
             control: std::sync::OnceLock::new(),
             last_transient: std::sync::Mutex::new(None),
         }
@@ -219,6 +222,34 @@ impl FeedRunner {
     pub fn with_worker_limits(mut self, limits: WorkerLimits) -> Self {
         self.transformer.set_limits(limits);
         self
+    }
+
+    /// Tags every resource this runner delivers by REST or in a transformed
+    /// submission with its source (`delivery.stamp_source` in `hie.yaml`).
+    pub fn with_stamp_source(mut self, on: bool) -> Self {
+        self.stamp_source = on;
+        self
+    }
+
+    /// The resources of one record as they are sent: tagged copies when
+    /// stamping is on, the stored ones, borrowed, otherwise.
+    fn outgoing<'a>(
+        &self,
+        resources: Option<&'a Value>,
+    ) -> Result<Vec<std::borrow::Cow<'a, Value>>, String> {
+        use std::borrow::Cow;
+        resources
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|r| {
+                if self.stamp_source {
+                    fhir::stamp_source(r, &self.feed.id).map(Cow::Owned)
+                } else {
+                    Ok(Cow::Borrowed(r))
+                }
+            })
+            .collect()
     }
 
     fn halted(&self) -> bool {
@@ -1247,12 +1278,27 @@ impl FeedRunner {
             if records.is_empty() {
                 return Ok(());
             }
+            // Tagged here, just before they are written: a record whose
+            // resources cannot carry the tag is rejected and left out.
+            let mut records_out = Vec::with_capacity(records.len());
+            for (id, revision, resources) in &records {
+                match self.outgoing(Some(resources)) {
+                    Ok(resources) => records_out.push((*id, *revision, resources)),
+                    Err(msg) => {
+                        self.db
+                            .reject_before_submission(*id, *revision, "validation", &msg)?;
+                    }
+                }
+            }
+            if records_out.is_empty() {
+                continue;
+            }
             let token = bulk::token();
             let ttl = Duration::from_secs(self.feed.delivery.url_ttl_seconds);
             let mut by_type: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
             let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-            for (_, _, resources) in &records {
-                for resource in resources.as_array().into_iter().flatten() {
+            for (_, _, resources) in &records_out {
+                for resource in resources.iter().map(|r| &**r) {
                     let kind = resource["resourceType"]
                         .as_str()
                         .unwrap_or("Resource")
@@ -1297,9 +1343,14 @@ impl FeedRunner {
             // about them never carries it.
             let entries =
                 written.map_err(|e| anyhow::anyhow!(bulk::scrub(&format!("{e:#}"), &token)))?;
-            let claims: Vec<(i64, i64)> = records.iter().map(|(id, rev, _)| (*id, *rev)).collect();
-            let span = format!("records {}-{}", claims[0].0, claims[claims.len() - 1].0);
-            let submission_id = bulk::submission_id(&self.feed.id, &[span.as_str()]);
+            let claims: Vec<(i64, i64)> =
+                records_out.iter().map(|(id, rev, _)| (*id, *rev)).collect();
+            let submission_id = bulk::transformed_submission_id(
+                &self.feed.id,
+                claims[0].0,
+                claims[claims.len() - 1].0,
+                self.stamp_source.then_some(token.as_str()),
+            );
             let manifest = bulk.manifest(&entries);
             if !self.db.create_submission(
                 &token,
@@ -1307,10 +1358,12 @@ impl FeedRunner {
                 &submission_id,
                 &manifest,
                 &claims,
+                self.stamp_source,
             )? {
                 // A record changed while its file was written (a person put it
-                // back): nothing was opened; the files go, and the submission is
-                // built again from what is pending now.
+                // back), or another runner took one: nothing was opened; the
+                // files go, and the submission is built again from what is
+                // pending now.
                 tracing::info!(feed = %self.feed.id, "a record changed while its submission was written; building it again");
                 self.remove_submission_files(&token).await;
                 continue;
@@ -1374,26 +1427,80 @@ impl FeedRunner {
     /// Sends `items` in one batch Bundle. Returns false when HFS is unavailable,
     /// so the caller stops until the next pass instead of hammering it.
     async fn deliver(&self, items: &[WorkItem]) -> Result<bool> {
+        // A record whose resources cannot carry the source tag is rejected as a
+        // whole and goes no further: not in the Bundle, not in what is settled.
+        let mut kept: Vec<&WorkItem> = Vec::with_capacity(items.len());
+        let mut untaggable = Vec::new();
         let mut entries = Vec::new();
         let mut owner = Vec::new();
-        for (i, item) in items.iter().enumerate() {
-            for resource in item
-                .resources
-                .as_ref()
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let key = transform::check_resource(resource).map_err(anyhow::Error::msg)?;
-                entries.push((fhir::request_url(&key), resource.clone()));
-                owner.push(i);
+        for item in items {
+            match self.outgoing(item.resources.as_ref()) {
+                Ok(resources) => {
+                    for resource in resources {
+                        let key =
+                            transform::check_resource(&resource).map_err(anyhow::Error::msg)?;
+                        entries.push((fhir::request_url(&key), resource.into_owned()));
+                        owner.push(kept.len());
+                    }
+                    kept.push(item);
+                }
+                Err(msg) => untaggable.push((item, msg)),
             }
         }
-        match self.fhir.post_bundle(&fhir::batch_bundle(&entries)).await {
+        if !untaggable.is_empty() {
+            let rejected: Vec<(&WorkItem, Delivery)> = untaggable
+                .iter()
+                .map(|(item, msg)| {
+                    (
+                        *item,
+                        Delivery::Rejected {
+                            kind: "validation",
+                            error: msg,
+                            response: None,
+                        },
+                    )
+                })
+                .collect();
+            self.db.delivered(&rejected)?;
+        }
+        if kept.is_empty() {
+            return Ok(true);
+        }
+        let items = &kept[..];
+        // Untagged, HFS may hold what this request writes until well after it
+        // was sent: the bound is stored before it leaves, once the token is in
+        // hand, and never cleared, so neither a crash nor another instance's
+        // request can make it earlier. A store that cannot take it in time
+        // fails the pass, as any store failure does: nothing is sent.
+        let untagged = !self.stamp_source;
+        let sent = self
+            .fhir
+            .post_bundle_with(&fhir::batch_bundle(&entries), || {
+                if untagged {
+                    // A write slower than its slack (the store was held, by a
+                    // large file's rows, say) is taken again from a fresh instant:
+                    // the bound only grows, and the second write rarely waits.
+                    for _ in 0..2 {
+                        let start = now_ms();
+                        self.db
+                            .mark_untagged(&self.feed.id, start + crate::db::UNTAGGED_MARGIN_MS)
+                            .context("recording an untagged delivery before sending it")?;
+                        if now_ms() - start <= crate::db::UNTAGGED_WRITE_SLACK_MS {
+                            return Ok(());
+                        }
+                    }
+                    anyhow::bail!(
+                        "recording an untagged delivery took longer than its slack twice; not sent"
+                    );
+                }
+                Ok(())
+            })
+            .await?;
+        match sent {
             Err(SendError::Transient(reason)) => {
                 let deferred: Vec<_> = items
                     .iter()
-                    .map(|item| (item, self.defer(item, &reason)))
+                    .map(|item| (*item, self.defer(item, &reason)))
                     .collect();
                 self.db.delivered(&deferred)?;
                 let worst = items.iter().map(|i| i.attempts + 1).max().unwrap_or(0);
@@ -1416,7 +1523,7 @@ impl FeedRunner {
             Err(SendError::Refused(status, body)) => {
                 let reason = format!("HTTP {status}: {}", fhir::outcome_text(&body));
                 self.db.delivered(&[(
-                    &items[0],
+                    items[0],
                     Delivery::Rejected {
                         kind: "server",
                         error: &reason,
