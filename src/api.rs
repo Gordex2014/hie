@@ -18,6 +18,7 @@ use crate::config::FeedConfig;
 use crate::db::{Db, Rule, now_ms};
 use crate::manager::{ManagerError, SourceManager};
 use crate::pipeline::human;
+use crate::zone::{Days, Zone};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -176,6 +177,11 @@ async fn bulk_file(
 
 const DAY_MS: i64 = 86_400_000;
 
+/// A record that fails: rejected for any reason but `filtered`, which a
+/// transform asks for on purpose by returning no resources. `rejected` counts
+/// both; `failing` only these.
+const FAILING: &str = "status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'";
+
 /// An error answer: `{"error": <sentence>}`, plus a stable `code` and other
 /// members when set, and any headers it needs.
 struct ApiError {
@@ -292,6 +298,25 @@ fn count(db: &Db, sql: &str, p: impl Into<Vec<Param>>) -> anyhow::Result<i64> {
         .unwrap_or(0))
 }
 
+/// Rows rejected since `since`, and how many of them are failing, of one
+/// source or of all: one statement, so failing never exceeds rejected.
+fn rejected_and_failing(db: &Db, feed: Option<&str>, since: i64) -> anyhow::Result<(i64, i64)> {
+    let sql = "SELECT COUNT(*) AS rejected,
+                CAST(COALESCE(SUM(CASE WHEN COALESCE(error_kind, '') <> 'filtered' THEN 1 ELSE 0 END), 0) AS BIGINT) AS failing
+         FROM records WHERE status = 'rejected' AND updated_at >= $1";
+    let rows = match feed {
+        Some(feed) => db.query_json(&format!("{sql} AND feed_id = $2"), params![since, feed])?,
+        None => db.query_json(sql, params![since])?,
+    };
+    let n = |key: &str| {
+        rows.first()
+            .and_then(|r| r.get(key))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    };
+    Ok((n("rejected"), n("failing")))
+}
+
 /// A source's definition and its state, as one object.
 fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
     let db = &*s.db;
@@ -320,11 +345,7 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         params![feed.id],
     )?;
     let since = now_ms() - DAY_MS;
-    let rejected_24h = count(
-        db,
-        "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status = 'rejected' AND updated_at >= $2",
-        params![feed.id, since],
-    )?;
+    let (rejected_24h, failing_24h) = rejected_and_failing(db, Some(&feed.id), since)?;
     Ok(json!({
         "id": feed.id,
         "name": feed.name,
@@ -341,6 +362,7 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         "last_received_at": last.and_then(iso_ms),
         "records": db.feed_counts(&feed.id)?,
         "rejected_last_24h": rejected_24h,
+        "failing_last_24h": failing_24h,
         "last_alert": last_alert.into_iter().next(),
         "definition": s.manager.definition(&feed.id)?,
     }))
@@ -510,94 +532,113 @@ async fn test_source(State(s): State<AppState>, Json(body): Json<Value>) -> ApiR
 #[derive(Deserialize)]
 struct StatsQuery {
     days: Option<i64>,
+    /// The IANA time zone the days are counted in; UTC when absent.
+    tz: Option<String>,
 }
 
-/// What a source's page draws: today's numbers and one row per day for the last N days.
+/// What a source's page draws: today's numbers and one row per day for the last
+/// N days, days being local days in `tz` (UTC by default), which is echoed.
 async fn source_stats(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<StatsQuery>,
 ) -> ApiResult {
+    let zone = match q.tz.as_deref() {
+        None => Zone::utc(),
+        Some(name) => Zone::parse(name).map_err(|e| invalid_query("tz", e))?,
+    };
     s.manager
         .source(&id)
         .ok_or_else(|| not_found(&format!("source {id}")))?;
-    let days = q.days.unwrap_or(14).clamp(1, 366);
-    let today = chrono::Utc::now().date_naive();
-    let first = today - chrono::Days::new(days as u64 - 1);
-    let since = first
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
-        .timestamp_millis();
-
-    let mut by_day: Map<String, Value> = (0..days)
-        .map(|i| {
-            let day = (first + chrono::Days::new(i as u64)).to_string();
-            (day, json!({"files": 0, "sent": 0, "rejected": 0}))
-        })
-        .collect();
-    for row in s.db.query_json(
-        &format!(
-            "SELECT {} AS day, COUNT(*) AS n FROM files
-             WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2 GROUP BY 1",
-            s.db.day("received_at")
-        ),
-        params![id, since],
-    )? {
-        if let Some(entry) = row["day"].as_str().and_then(|d| by_day.get_mut(d)) {
-            entry["files"] = row["n"].clone();
-        }
-    }
-    for row in s.db.query_json(
-        &format!(
-            "SELECT {} AS day, status, COUNT(*) AS n FROM records
-             WHERE feed_id = $1 AND status IN ('sent', 'rejected') AND updated_at >= $2 GROUP BY 1, status",
-            s.db.day("updated_at")
-        ),
-        params![id, since],
-    )? {
-        if let (Some(entry), Some(status)) = (
-            row["day"].as_str().and_then(|d| by_day.get_mut(d)),
-            row["status"].as_str(),
-        ) {
-            entry[status] = row["n"].clone();
-        }
-    }
-    let rows: Vec<Value> = by_day
-        .into_iter()
-        .map(|(day, v)| json!({"day": day, "files": v["files"], "sent": v["sent"], "rejected": v["rejected"]}))
-        .collect();
-
-    let today_since = today
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
-        .timestamp_millis();
-    let today_json = json!({
-        "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2", params![id, today_since])?,
-        "records": count(&s.db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2", params![id, today_since])?,
-        "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status = 'sent' AND updated_at >= $2", params![id, today_since])?,
-        "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status = 'rejected' AND updated_at >= $2", params![id, today_since])?,
-        "pending": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status IN ('received', 'pending')", params![id])?,
-    });
-    Ok(Json(
-        json!({"source": id, "days": days, "today": today_json, "by_day": rows}),
-    ))
+    let days = q.days.unwrap_or(14).clamp(1, 366) as u32;
+    Ok(Json(daily_stats(
+        &s.db,
+        &id,
+        &zone,
+        days,
+        chrono::Utc::now(),
+    )?))
 }
 
-/// Day windows of a report: `days` UTC calendar days, oldest first, the last
-/// one today, each `(day, from, to)` in epoch milliseconds. The one place a
-/// report's days are drawn: a time zone would change only this.
-fn day_windows(now_ms: i64, days: usize) -> Vec<(String, i64, i64)> {
-    let today = now_ms.div_euclid(DAY_MS) * DAY_MS;
-    (0..days as i64)
-        .rev()
-        .map(|back| {
-            let from = today - back * DAY_MS;
-            let day = chrono::DateTime::from_timestamp_millis(from)
-                .map(|t| t.format("%Y-%m-%d").to_string())
-                .unwrap_or_default();
-            (day, from, from + DAY_MS)
+/// A source's figures by local day in `zone`, the last of the `days` being the
+/// one `now` falls in.
+fn daily_stats(
+    db: &Db,
+    id: &str,
+    zone: &Zone,
+    days: u32,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Value> {
+    let local = Days::ending_today(zone, now, days);
+    let (since, until) = local.span();
+    let mut by_day: Vec<Value> = (0..local.len())
+        .map(|i| {
+            let day = local.date(i as i64).expect("a day of the window");
+            json!({"day": day.to_string(), "files": 0, "sent": 0, "rejected": 0, "failing": 0})
+        })
+        .collect();
+    let by_index = |row: &Value| -> Option<usize> {
+        row["day"]
+            .as_i64()
+            .and_then(|i| usize::try_from(i).ok())
+            .filter(|i| *i < local.len())
+    };
+    for row in db.query_json(
+        &format!(
+            "SELECT {} AS day, COUNT(*) AS n FROM files
+             WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2 AND received_at < $3 GROUP BY 1",
+            local.sql_index("received_at")
+        ),
+        params![id, since, until],
+    )? {
+        if let Some(i) = by_index(&row) {
+            by_day[i]["files"] = row["n"].clone();
+        }
+    }
+    for row in db.query_json(
+        &format!(
+            "SELECT {} AS day, status, COUNT(*) AS n,
+                    CAST(COALESCE(SUM(CASE WHEN {FAILING} THEN 1 ELSE 0 END), 0) AS BIGINT) AS failing
+             FROM records
+             WHERE feed_id = $1 AND status IN ('sent', 'rejected') AND updated_at >= $2 AND updated_at < $3 GROUP BY 1, status",
+            local.sql_index("updated_at")
+        ),
+        params![id, since, until],
+    )? {
+        if let (Some(i), Some(status)) = (by_index(&row), row["status"].as_str()) {
+            by_day[i][status] = row["n"].clone();
+            if status == "rejected" {
+                by_day[i]["failing"] = row["failing"].clone();
+            }
+        }
+    }
+    let (today_since, today_until) = local.bounds(local.len() - 1);
+    let last = &by_day[local.len() - 1];
+    let today_json = json!({
+        "day": last["day"],
+        "files": last["files"],
+        "records": count(db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2 AND f.received_at < $3", params![id, today_since, today_until])?,
+        "sent": last["sent"],
+        "rejected": last["rejected"],
+        "failing": last["failing"],
+        "pending": count(db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status IN ('received', 'pending')", params![id])?,
+    });
+    Ok(
+        json!({"source": id, "days": days, "tz": zone.name(), "today": today_json, "by_day": by_day}),
+    )
+}
+
+/// Day windows of a report: `days` local days of `zone`, oldest first, the
+/// last one today, each `(day, from, to)` in epoch milliseconds: from local
+/// midnight to the next, as `/stats` counts them.
+fn day_windows(zone: &Zone, now_ms: i64, days: usize) -> Vec<(String, i64, i64)> {
+    let now = chrono::DateTime::from_timestamp_millis(now_ms).unwrap_or_default();
+    let local = Days::ending_today(zone, now, u32::try_from(days).unwrap_or(u32::MAX));
+    (0..local.len())
+        .map(|i| {
+            let day = local.date(i as i64).expect("a day of the window");
+            let (from, to) = local.bounds(i);
+            (day.format("%Y-%m-%d").to_string(), from, to)
         })
         .collect()
 }
@@ -609,27 +650,37 @@ fn instant(ms: i64) -> Option<String> {
 }
 
 /// Distinct records a source rejected over the last 24 hours and each of the
-/// last `days` UTC days, from the event log, with how far the log covers them.
+/// last `days` local days in `tz` (UTC by default, echoed), from the event log,
+/// with how far the log covers them.
 async fn source_failures(
     State(s): State<AppState>,
     Path(id): Path<String>,
     RawQuery(raw): RawQuery,
 ) -> ApiResult {
-    s.manager
-        .source(&id)
-        .ok_or_else(|| not_found(&format!("source {id}")))?;
     let mut days = 14usize;
-    let mut seen = false;
+    let mut zone = Zone::utc();
+    let (mut seen_days, mut seen_tz) = (false, false);
     for (key, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
-        if key != "days" {
-            let shown: String = key.chars().take(64).collect();
+        let seen = match key.as_ref() {
+            "days" => &mut seen_days,
+            "tz" => &mut seen_tz,
+            _ => {
+                let shown: String = key.chars().take(64).collect();
+                return Err(invalid_query(
+                    &shown,
+                    format!("unknown parameter {shown:?} (use days or tz)"),
+                ));
+            }
+        };
+        if std::mem::replace(seen, true) {
             return Err(invalid_query(
-                &shown,
-                format!("unknown parameter {shown:?} (use days)"),
+                &key,
+                format!("{key} is given more than once"),
             ));
         }
-        if std::mem::replace(&mut seen, true) {
-            return Err(invalid_query("days", "days is given more than once"));
+        if key == "tz" {
+            zone = Zone::parse(&value).map_err(|e| invalid_query("tz", e))?;
+            continue;
         }
         days = Some(value.as_ref())
             .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
@@ -637,6 +688,10 @@ async fn source_failures(
             .filter(|n| (1..=90).contains(n))
             .ok_or_else(|| invalid_query("days", "days must be a whole number from 1 to 90"))?;
     }
+    // As on `/stats`, the query is read before the source is looked up.
+    s.manager
+        .source(&id)
+        .ok_or_else(|| not_found(&format!("source {id}")))?;
     let now = now_ms();
     // The log covers what it has recorded since it began here, within the
     // retention.
@@ -653,7 +708,7 @@ async fn source_failures(
         }))
     };
     let mut by_day = Vec::with_capacity(days);
-    for (day, from, to) in day_windows(now, days) {
+    for (day, from, to) in day_windows(&zone, now, days) {
         let mut entry = Map::new();
         entry.insert("day".into(), json!(day));
         if let Value::Object(w) = window(from, to)? {
@@ -663,7 +718,7 @@ async fn source_failures(
     }
     Ok(Json(json!({
         "source_id": id,
-        "tz": "UTC",
+        "tz": zone.name(),
         "covered_from": instant(covered_from),
         "last_24h": window(now - DAY_MS, now)?,
         "days": by_day,
@@ -728,7 +783,8 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
     let mut needs_you = Vec::new();
     for feed in s.manager.sources() {
         let status = source_status(&s, &feed)?;
-        let rejected = status["rejected_last_24h"].as_i64().unwrap_or(0);
+        // Rows a transform filtered out on purpose are not a reason to look.
+        let failing = status["failing_last_24h"].as_i64().unwrap_or(0);
         let reason = match status["state"].as_str() {
             Some("late") => Some(format!(
                 "nothing received since {}, expected at least every {}",
@@ -743,7 +799,7 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
                     .unwrap_or_default(),
                 status["paused"]["since"].as_str().unwrap_or("?")
             )),
-            _ if rejected > 0 => Some(format!("{rejected} records rejected in the last 24 hours")),
+            _ if failing > 0 => Some(format!("{failing} records rejected in the last 24 hours")),
             _ => None,
         };
         if let Some(reason) = reason {
@@ -752,10 +808,12 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
         sources.push(status);
     }
     let since = now_ms() - DAY_MS;
+    let (rejected, failing) = rejected_and_failing(&s.db, None, since)?;
     let last_24h = json!({
         "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE status <> 'duplicate' AND received_at >= $1", params![since])?,
         "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'sent' AND updated_at >= $1", params![since])?,
-        "rejected": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'rejected' AND updated_at >= $1", params![since])?,
+        "rejected": rejected,
+        "failing": failing,
         "alerts": count(&s.db, "SELECT COUNT(*) AS n FROM alerts WHERE created_at >= $1", params![since])?,
     });
     let destination = s.manager.destination().snapshot();
@@ -1225,9 +1283,13 @@ async fn get_rule(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult {
 
 /// Parses a rule body, checks its shape and that the source it names exists.
 fn parse_rule(s: &AppState, body: Value) -> Result<Rule, ApiError> {
-    let rule: Rule = serde_json::from_value(body)
+    let mut rule: Rule = serde_json::from_value(body)
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
     crate::alerts::validate_rule(&rule).map_err(|m| ApiError::new(StatusCode::BAD_REQUEST, m))?;
+    // A zone is kept as the database spells it (`europe/madrid` is `Europe/Madrid`).
+    if let Some(zone) = rule.tz.as_deref().and_then(|tz| Zone::parse(tz).ok()) {
+        rule.tz = Some(zone.name().to_string());
+    }
     if let Some(source) = &rule.source_id
         && s.manager.source(source).is_none()
     {
@@ -1332,4 +1394,232 @@ async fn metrics(State(s): State<AppState>) -> Result<Response, ApiError> {
         ));
     }
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zone::{Zone, utc};
+
+    /// A store with one file and one record per instant: the file received and
+    /// the record `status` at that instant (`filtered` is rejected as filtered,
+    /// `rejected` as a data error).
+    fn store(rows: &[(&str, &str)]) -> Db {
+        let db = Db::in_memory().unwrap();
+        for (i, (at, status)) in rows.iter().enumerate() {
+            let ms = utc(at).timestamp_millis();
+            let file = db
+                .insert_file(
+                    "lab",
+                    "lab",
+                    at,
+                    &format!("sha-{i}"),
+                    1,
+                    "done",
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            db.insert_records(file, "lab", &[(1, json!({}), None)])
+                .unwrap();
+            db.execute_for_test(
+                "UPDATE files SET received_at = $2 WHERE id = $1",
+                &params![file, ms],
+            )
+            .unwrap();
+            let (status, kind) = match *status {
+                "filtered" => ("rejected", Some("filtered")),
+                "rejected" => ("rejected", Some("data")),
+                other => (other, None),
+            };
+            db.execute_for_test(
+                "UPDATE records SET status = $2, error_kind = $3, updated_at = $4 WHERE file_id = $1",
+                &params![file, status, kind, ms],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    fn day<'a>(stats: &'a Value, date: &str) -> &'a Value {
+        stats["by_day"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["day"] == date)
+            .unwrap_or_else(|| panic!("no {date} in {stats}"))
+    }
+
+    #[test]
+    fn failure_windows_are_the_same_local_days() {
+        let ms = |t: &str| utc(t).timestamp_millis();
+        let ny = Zone::parse("America/New_York").unwrap();
+        // Both changes of 2026, from a day after the second.
+        let days = day_windows(&ny, ms("2026-11-02T12:00:00Z"), 240);
+        assert_eq!(days.len(), 240);
+        let of = |date: &str| {
+            let (_, from, to) = days.iter().find(|(d, ..)| d == date).unwrap();
+            (*from, *to)
+        };
+        assert_eq!(
+            of("2026-03-08"),
+            (ms("2026-03-08T05:00:00Z"), ms("2026-03-09T04:00:00Z"))
+        );
+        assert_eq!(
+            of("2026-11-01"),
+            (ms("2026-11-01T04:00:00Z"), ms("2026-11-02T05:00:00Z"))
+        );
+        // Today last, still running; every day starts where the one before ends.
+        assert_eq!(days[239].0, "2026-11-02");
+        assert!(days.windows(2).all(|w| w[0].2 == w[1].1));
+        // The same windows `/stats` counts in.
+        let local = Days::ending_today(&ny, utc("2026-11-02T12:00:00Z"), 240);
+        assert_eq!((days[0].1, days[239].2), local.span());
+        // A zone without daylight saving time, and the default.
+        let kolkata = Zone::parse("Asia/Kolkata").unwrap();
+        assert_eq!(
+            day_windows(&kolkata, ms("2026-11-02T20:00:00Z"), 1),
+            [(
+                "2026-11-03".to_string(),
+                ms("2026-11-02T18:30:00Z"),
+                ms("2026-11-03T18:30:00Z")
+            )]
+        );
+        assert_eq!(
+            day_windows(&Zone::utc(), ms("2026-11-02T20:00:00Z"), 2),
+            [
+                (
+                    "2026-11-01".to_string(),
+                    ms("2026-11-01T00:00:00Z"),
+                    ms("2026-11-02T00:00:00Z")
+                ),
+                (
+                    "2026-11-02".to_string(),
+                    ms("2026-11-02T00:00:00Z"),
+                    ms("2026-11-03T00:00:00Z")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn days_are_local_days_across_both_dst_changes() {
+        let db = store(&[
+            // 2026-03-08 in New York (23 hours): 05:00Z to 04:00Z the next day.
+            ("2026-03-08T04:59:59.999Z", "sent"),     // the 7th
+            ("2026-03-08T05:00:00Z", "sent"),         // the 8th
+            ("2026-03-09T03:59:59.999Z", "rejected"), // the 8th
+            ("2026-03-09T04:00:00Z", "sent"),         // the 9th
+            // 2026-11-01 in New York (25 hours): 04:00Z to 05:00Z the next day.
+            ("2026-11-01T03:59:59.999Z", "sent"), // 10-31
+            ("2026-11-01T04:00:00Z", "sent"),     // 11-01
+            ("2026-11-02T04:30:00Z", "rejected"), // 11-01, its 25th hour
+            ("2026-11-02T05:00:00Z", "sent"),     // 11-02
+        ]);
+        let ny = Zone::parse("America/New_York").unwrap();
+        let now = utc("2026-11-02T12:00:00Z");
+        let stats = daily_stats(&db, "lab", &ny, 366, now).unwrap();
+        assert_eq!(stats["tz"], "America/New_York");
+        assert_eq!(stats["by_day"].as_array().unwrap().len(), 366);
+        assert_eq!(stats["by_day"][365]["day"], "2026-11-02");
+        for (date, files, sent, rejected) in [
+            ("2026-03-07", 1, 1, 0),
+            ("2026-03-08", 2, 1, 1),
+            ("2026-03-09", 1, 1, 0),
+            ("2026-10-31", 1, 1, 0),
+            ("2026-11-01", 2, 1, 1),
+            ("2026-11-02", 1, 1, 0),
+        ] {
+            let d = day(&stats, date);
+            assert_eq!(
+                (
+                    d["files"].as_i64(),
+                    d["sent"].as_i64(),
+                    d["rejected"].as_i64()
+                ),
+                (Some(files), Some(sent), Some(rejected)),
+                "{date}"
+            );
+        }
+        assert_eq!(stats["today"]["files"], 1);
+        assert_eq!(stats["today"]["records"], 1);
+
+        // The same rows by UTC day.
+        let stats = daily_stats(&db, "lab", &Zone::utc(), 366, now).unwrap();
+        assert_eq!(stats["tz"], "UTC");
+        for (date, files) in [
+            ("2026-03-08", 2),
+            ("2026-03-09", 2),
+            ("2026-11-01", 2),
+            ("2026-11-02", 2),
+        ] {
+            assert_eq!(day(&stats, date)["files"], files, "{date}");
+        }
+    }
+
+    #[test]
+    fn today_ends_at_the_next_local_midnight() {
+        let db = store(&[
+            ("2026-11-20T04:59:59.999Z", "sent"),     // the 19th in New York
+            ("2026-11-20T05:00:00Z", "sent"),         // the 20th
+            ("2026-11-21T04:59:59.999Z", "rejected"), // the 20th
+            ("2026-11-21T05:00:00Z", "rejected"),     // the 21st: tomorrow, not counted
+        ]);
+        let ny = Zone::parse("America/New_York").unwrap();
+        let stats = daily_stats(&db, "lab", &ny, 2, utc("2026-11-21T04:00:00Z")).unwrap();
+        assert_eq!(
+            stats["today"],
+            json!({"day": "2026-11-20", "files": 2, "records": 2, "sent": 1, "rejected": 1, "failing": 1, "pending": 0})
+        );
+        assert_eq!(
+            stats["by_day"][0],
+            json!({"day": "2026-11-19", "files": 1, "sent": 1, "rejected": 0, "failing": 0})
+        );
+        assert_eq!(
+            stats["by_day"][1],
+            json!({"day": "2026-11-20", "files": 2, "sent": 1, "rejected": 1, "failing": 1})
+        );
+        // Today's figures are the last day's.
+        assert_eq!(stats["today"]["files"], stats["by_day"][1]["files"]);
+    }
+
+    #[test]
+    fn rows_filtered_out_are_rejected_but_not_failing() {
+        let db = store(&[
+            ("2026-11-20T01:00:00Z", "filtered"),
+            ("2026-11-20T02:00:00Z", "filtered"),
+            ("2026-11-20T03:00:00Z", "rejected"),
+            ("2026-11-19T03:00:00Z", "filtered"),
+        ]);
+        let stats = daily_stats(&db, "lab", &Zone::utc(), 2, utc("2026-11-20T12:00:00Z")).unwrap();
+        assert_eq!(
+            (&stats["today"]["rejected"], &stats["today"]["failing"]),
+            (&json!(3), &json!(1))
+        );
+        assert_eq!(
+            (
+                &stats["by_day"][0]["rejected"],
+                &stats["by_day"][0]["failing"]
+            ),
+            (&json!(1), &json!(0))
+        );
+    }
+
+    #[test]
+    fn a_zone_without_dst_and_the_default() {
+        let db = store(&[
+            ("2026-11-19T18:29:59.999Z", "sent"),
+            ("2026-11-19T18:30:00Z", "sent"),
+        ]);
+        let kolkata = Zone::parse("Asia/Kolkata").unwrap();
+        let stats = daily_stats(&db, "lab", &kolkata, 2, utc("2026-11-20T06:00:00Z")).unwrap();
+        assert_eq!(stats["by_day"][0]["files"], 1);
+        assert_eq!(stats["by_day"][1]["files"], 1);
+        let stats =
+            daily_stats(&db, "lab", &Zone::default(), 2, utc("2026-11-20T06:00:00Z")).unwrap();
+        assert_eq!(stats["tz"], "UTC");
+        assert_eq!(stats["by_day"][0]["files"], 2);
+        assert_eq!(stats["today"]["files"], 0);
+    }
 }

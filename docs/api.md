@@ -20,20 +20,20 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /api/loads?status=&source=&limit=50&cursor=` | The loads of every source, newest first, a page at a time, with the same fields; `status=failed` keeps the loads failing now ([below](#loads)) |
 | `GET /api/loads/{id}` | One load, with the same fields, and its **failures grouped by reason**: kind, reason, count, first line, and up to three sample rows each |
 | `POST /api/loads/{id}/retry` | Puts the load's rejected rows back at the start, all of them or those with one reason (`{"reason": "..."}`); the source passes at once |
-| `GET /api/sources/{id}/stats?days=14` | What a source's page draws: today (files, records, sent, rejected, pending) and one row per day |
-| `GET /api/sources/{id}/failures?days=14` | Distinct records the source rejected over the last 24 hours and each of the last `days` UTC days (1 to 90), from the event log, with how far the log covers each (see [Rejected records over a period](#rejected-records-over-a-period)) |
+| `GET /api/sources/{id}/stats?days=14&tz=Europe/Madrid` | What a source's page draws: today (its `day`, files, records, sent, rejected, failing, pending) and one row per `day` (files, sent, rejected, failing), oldest first, today last. `rejected` counts every rejected row; `failing` leaves out the rows a transform filtered out on purpose (rejected as `filtered`, by returning no resources). Days are local days in `tz` (UTC without it), and the answer's `tz` names the zone they were counted in: see [Days and time zones](#days-and-time-zones) |
+| `GET /api/sources/{id}/failures?days=14&tz=Europe/Madrid` | Distinct records the source rejected over the last 24 hours and each of the last `days` local days in `tz` (1 to 90; UTC without it), from the event log, with how far the log covers each; each day names its `day`, and the answer's `tz` the zone (see [Rejected records over a period](#rejected-records-over-a-period) and [Days and time zones](#days-and-time-zones)) |
 | `GET /api/transforms` | Every transform file: name, path, size, modified, and the sources that use it |
 | `GET /api/transforms/{name}` | The transform's code |
 | `PUT /api/transforms/{name}` | Saves the code (`{"code": "..."}`); the sources using it restart their Python worker. `201` when new |
 | `POST /api/transforms/{name}/try` | Runs the transform on `{"records": [...]}` (up to 100) without loading: per record, the resources it became or the rejection reason. At most four tries run at once; `503` when one cannot start within 10 s |
-| `GET /api/monitoring/status` | What the monitoring page opens on: `needs_you` (late, paused, or rejecting sources with the reason), `last_24h` (files, sent, rejected, alerts), `destination` (whether the FHIR server answers, see [The destination](#the-destination)), every source with its `last_alert` (`kind`, `message`, `created_at`, `cleared_at`) |
+| `GET /api/monitoring/status` | What the monitoring page opens on: `needs_you` (late, paused, or failing sources with the reason), `last_24h` (files, sent, rejected, failing, alerts), `destination` (whether the FHIR server answers, see [The destination](#the-destination)), every source with its `rejected_last_24h`, `failing_last_24h` and `last_alert` (`kind`, `message`, `created_at`, `cleared_at`). A source is failing when it has failing rows (see `/stats`) in the last 24 hours; the reason still reads "N records rejected in the last 24 hours", N counting failing rows. Its figures cover the last 24 hours, not calendar days, so it takes no `tz` |
 | `GET /api/records?source=&status=&file_id=` | Records; `status` is `received`, `pending`, `sent` or `rejected` |
 | `GET /api/records/{id}` | One record: file, line, original and corrected row, resources sent, HFS response |
 | `POST /api/records/{id}/reprocess` | Runs a record again; body `{"raw": {...}}` replaces the row and keeps the original |
 | `GET /api/alerts?source=&open=true&since=&limit=100&cursor=` | Alerts, newest first, each with its rule, recipients, channels, when and why it cleared, and `webhook`: the delivery of its latest webhook event (`event`, `event_id`, `state`, `attempts`, `last_error`, `last_status`, `delivered_at`; null for alerts from before events were recorded); `open=true` lists only those not cleared. `since` and `cursor` read a period page by page (see [Reading alerts by period](#reading-alerts-by-period)). Kept for `retention.history` (see [Alerts and retention](#alerts-and-retention)). Also `webhook: {configured, signed}`, this instance's webhook settings (see [the alert webhook](sources.md#the-alert-webhook)) |
 | `GET /api/events?source=&kind=&since=&cursor=&limit=` | The event log, oldest first: each record's attempts and outcomes, each load's steps, each submission's steps (see [Events](#events)) |
-| `GET /api/alert-rules?source=` | Every rule, each with its `created_at`; `POST` creates one (`400` names what is wrong with it). `created_at` is set by the engine, never by the body. A rule id is never given again, like alert and event ids |
-| `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove. A `PUT` that turns the rule off (`enabled: false`) or changes its `condition`, `threshold` or `source_id`, and a `DELETE`, clear the rule's open alerts in the same transaction, each with its webhook `cleared` event; a change of `notify` or `channels` alone does not |
+| `GET /api/alert-rules?source=` | Every rule, each with its `created_at`; `POST` creates one (`400` names what is wrong with it). `created_at` is set by the engine, never by the body. A rule id is never given again, like alert and event ids. A `missing_by` rule may name a `tz` (see [sources](sources.md#alerts-and-rules)) |
+| `GET` / `PUT` / `DELETE /api/alert-rules/{id}` | One rule: read, replace, remove. A `PUT` that turns the rule off (`enabled: false`) or changes its `condition`, `threshold`, `tz` or `source_id`, and a `DELETE`, clear the rule's open alerts in the same transaction, each with its webhook `cleared` event; a change of `notify` or `channels` alone does not |
 | `GET /api/secrets` | Every stored credential, by name, without its value |
 | `POST /api/secrets` | Stores a credential: `{"name", "kind": "aws", "value": {"access_key_id", "secret_access_key"}}`. `201` |
 | `GET /api/secrets/{id}` | One credential, without its value |
@@ -42,7 +42,15 @@ The HTTP API clients and UIs use, and how it and the engine's own calls to HFS a
 | `GET /metrics` | Prometheus text: records by status, last received time, paused flag, alerts by kind (`hie_alerts_total`, which counts purged alerts too and never goes down) |
 | `GET /health` | `{"status": "ok", "service": "hie", "version", "uptime_seconds", "started_at", "timestamp", "secrets"}`; `secrets` is `{"backend": "native"\|"none", "available", "key_id"}`, the key id being a one-way 16-hex fingerprint of the key in use, or `null` |
 
-Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), `invalid_query` (`400`: a query parameter of `/api/events`, `/api/alerts`, `/api/checks/{id}` or `/api/loads` that cannot be read, with `field` as their sections say), and the codes of the credential routes below.
+Errors answer `{"error": "<sentence>"}`. Where a client needs to tell cases apart they also carry a stable `code`, and sometimes more members: `invalid_definition` (a source definition that cannot run), `source_not_started` (`500`: the definition was saved, but its source could not be started; it starts with that definition at the next start of the engine), `store_busy` (`503` with `Retry-After: 1`: the store's lock was not free; try again), `invalid_query` (`400`: a query parameter of `/api/events`, `/api/alerts`, `/api/checks/{id}`, `/api/loads`, `/stats` or `/failures` that cannot be read or used, such as an unknown `tz`, with `field` as their sections say; the sentence never repeats what was sent), and the codes of the credential routes below.
+
+### Days and time zones
+
+Daily figures (`/stats` and `/failures`) are counted in UTC unless the request names a zone with `tz`, an IANA name such as `Europe/Madrid` or `America/New_York` (matched without regard to case; a `+` is sent as `%2B`, as in `Etc/GMT%2B5`). The answer's `tz` names the zone used, as the database spells it, and is `UTC` when none was asked for; a client that wants its own zone's days checks it before labelling them. A name that is not a zone answers `400` `{"error": "tz must be an IANA time zone name, such as Europe/Madrid or UTC", "code": "invalid_query", "field": "tz"}`; on `/stats`, a `tz` given twice is refused before that, with a plain-text `400`; on `/failures`, with `invalid_query`.
+
+- A day runs from local midnight to the next local midnight. When a change of offset (such as the start of daylight saving time) skips midnight, the day starts at the change, the first valid moment after it; when one repeats midnight, the day starts at the first one.
+- So a day with a change lasts as long as it did on the clock (23 or 25 hours in most zones, 23½ on Lord Howe Island), and a date the zone skipped altogether is a day with nothing in it.
+- Zone rules come from the IANA database built into the engine, the same on every instance and never the host's; a release brings newer rules.
 
 ### Events
 
@@ -117,19 +125,19 @@ A poller pages with `cursor`: the first request may give `since`, and each next 
 
 ### Rejected records over a period
 
-`GET /api/sources/{id}/failures?days=14` counts, from the event log, the distinct records a source rejected in each window: a record rejected more than once in a window counts once.
+`GET /api/sources/{id}/failures?days=14&tz=Europe/Madrid` counts, from the event log, the distinct records a source rejected in each window: a record rejected more than once in a window counts once.
 
 ```json
-{"source_id": "lab-results", "tz": "UTC", "covered_from": "2026-11-12T09:30:00.000Z",
+{"source_id": "lab-results", "tz": "Europe/Madrid", "covered_from": "2026-11-12T09:30:00.000Z",
  "last_24h": {"from": "...", "to": "...", "records": 3, "filtered": 1, "complete": true},
- "days": [{"day": "2026-11-07", "from": "2026-11-07T00:00:00.000Z", "to": "2026-11-08T00:00:00.000Z",
+ "days": [{"day": "2026-11-07", "from": "2026-11-06T23:00:00.000Z", "to": "2026-11-07T23:00:00.000Z",
            "records": 0, "filtered": 0, "complete": false}, ...]}
 ```
 
-- `last_24h` is the 24 hours before the request; `days` are UTC calendar days, oldest first, the last one today (still running). A window holds what was stored from its `from`, included, to its `to`, left out: an event at midnight belongs to the day that starts then.
+- `last_24h` is the 24 hours before the request, whatever the zone; `days` are local days in `tz` (UTC without it; see [Days and time zones](#days-and-time-zones)), oldest first, the last one today (still running), each named by its `day`, and the answer's `tz` names the zone they were counted in. A window holds what was stored from its `from`, included, to its `to`, left out: an event at midnight belongs to the day that starts then.
 - `records` counts records rejected as `parse`, `data`, `validation`, `transform` or `server`. Records a transform filtered out on purpose (`filtered`) are not failures and are counted apart, in `filtered`.
 - `covered_from` is where the log's history starts: when this store began recording events (its first start with a version that keeps them), or the retention's limit, whichever is later. A window is `complete` when `covered_from` is at or before its `from`. A window that is not complete is still counted over what is kept, and says `complete: false`.
-- `days` is a whole number from 1 to 90 (14 by default). A value that cannot be read, a second `days` or any other parameter answers `400 invalid_query` with `field`. An unknown source answers `404` with `{"error": "source <id> not found"}`, as `/stats` does.
+- `days` is a whole number from 1 to 90 (14 by default). A value that cannot be read, an unknown `tz`, a second `days` or `tz`, or any other parameter answers `400 invalid_query` with `field`. An unknown source answers `404` with `{"error": "source <id> not found"}`, as `/stats` does, once the query has been read.
 
 ### Alerts and retention
 

@@ -589,6 +589,7 @@ impl SourceManager {
             channels: vec!["app".into(), "webhook".into()],
             enabled: true,
             created_by: by.map(str::to_string),
+            tz: None,
             created_at: None,
         };
         self.db.insert_rule(&rule).map(drop)

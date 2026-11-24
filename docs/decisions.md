@@ -251,7 +251,7 @@ A reprocess with corrected data keeps the original (`original_raw`).
 
 ## 22. Alert rules are data, and an alert clears itself
 
-**Chosen:** A rule names a source (or all of them), one of four conditions with its threshold — `silence` (duration), `missing_by` (time of day, UTC), `rejected_share` (percentage of a load), `unreachable` (failed delivery attempts) — who to notify, and the channels (`app`, `webhook`, `email`). Rules are rows in the engine's database with a CRUD under `/api/alert-rules`. A condition raises **one** alert per rule and source, and the engine closes it when the condition goes away: data arrives, the file arrives, a later load is within the limit, delivery succeeds. The alert keeps its rule, the recipients, the channels, and when and why it cleared. Every source gets a `silence` rule at birth, set to its `expect_every` or two hours. Without a `rejected_share` or `unreachable` rule the fixed behaviour of decision 12 stays.
+**Chosen:** A rule names a source (or all of them), one of four conditions with its threshold — `silence` (duration), `missing_by` (time of day, in the rule's time zone; UTC without one), `rejected_share` (percentage of a load), `unreachable` (failed delivery attempts) — who to notify, and the channels (`app`, `webhook`, `email`). Rules are rows in the engine's database with a CRUD under `/api/alert-rules`. A condition raises **one** alert per rule and source, and the engine closes it when the condition goes away: data arrives, the file arrives, a later load is within the limit, delivery succeeds. The alert keeps its rule, the recipients, the channels, and when and why it cleared. Every source gets a `silence` rule at birth, set to its `expect_every` or two hours. Without a `rejected_share` or `unreachable` rule the fixed behaviour of decision 12 stays.
 
 **Why:**
 - The four conditions are the ones the monitoring brief asks the UI to offer, with the thresholds in the units a person would type.
@@ -260,6 +260,8 @@ A reprocess with corrected data keeps the original (`original_raw`).
 - The default rule keeps the promise of decision 12 that a quiet source is noticed without anyone configuring it.
 
 **Cost / not yet:** `email` is recorded but not sent; the webhook is still the one outward channel. Recipients are free text; nothing resolves them against the identity provider. Rules are evaluated once per pass of the source, so a `silence` or `missing_by` alert is late by up to one poll interval.
+
+*Amended 2026-11-20 (decision 44):* a `missing_by` time of day was UTC only; a rule may now name an IANA time zone (`tz`), and a rule without one stays in UTC.
 
 ## 23. The engine calls HFS with its own client-credentials token
 
@@ -565,6 +567,27 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 - The first start of this version clears every open alert whose rule an earlier version turned off, deleted or moved, however old, and each one fired with the webhook gets its `cleared` event then.
 - An index check per table per start is a short lock per index rather than one long one; a start on a store in use waits for each. Every start also runs `ALTER TABLE … ADD COLUMN IF NOT EXISTS` for each added column, which takes an exclusive lock on its table even when the column exists: it cannot deadlock, one table at a time, but it waits behind a running instance's longest transaction on that table and holds that instance's next statements on it meanwhile.
 - Delivery failure reasons that are not about reaching the server (a token endpoint's answer, HFS's own OperationOutcome text) reach records and alerts as before.
+
+*Amended 2026-11-23 (decision 44):* a `missing_by` rule's `tz` is part of what it watches, like its threshold: changing it ends the rule's open alerts, and an alert is written only while the rule has the zone the pass read.
+
+## 44. Days and deadlines in an explicit time zone
+
+**Chosen:** Daily figures and `missing_by` deadlines take an IANA time zone, with UTC as the default. `GET /api/sources/{id}/stats` and `GET /api/sources/{id}/failures` (decision 38) take `tz`, count their days in that zone, echo the zone they used once (`UTC` without one) and name each day they report, today included. A `missing_by` rule takes an optional `tz` (amending decision 22); a rule without one stays in UTC, and changing it ends the rule's open alert as a change of its threshold does (decision 43). A day is `[local midnight, next local midnight)`. A local time a change of offset (such as daylight saving time) skips stands for the first valid instant after it (the change itself); a time that happens twice stands for its first occurrence. A day with a change keeps its length on the clock (23 or 25 hours in most zones), and a skipped date is an empty day. When a deadline is pushed onto the next midnight, it is checked as that day begins, against the day it belongs to, once; a rule made after that midnight does not judge the day before it, and an alert that a change of the rule ended does not count as that day's. Zone rules come from the IANA database built into the engine (`jiff-tzdb`), never from the host. An unknown zone answers `400` with a fixed sentence (`invalid_query`, `field: tz`, on a query).
+
+**Why:**
+- A consumer works in its own zone. Days cut at UTC midnight make "today" start in the middle of its afternoon or night, and a `missing_by` time in UTC moves by an hour twice a year for anyone with daylight saving time.
+- The caller supplies the zone rather than the engine holding one: one engine can serve consumers in several zones, and nothing in the engine's configuration has to agree with the consumer's.
+- Echoing the zone lets a client tell an engine that counted in its zone from an older one that ignored the parameter and counted in UTC.
+- The rule for skipped and repeated times is the one people expect from a clock and the one scheduling tools use: a time that never happened is taken at the change, a repeated one at its first occurrence. Keeping 23- and 25-hour days as they are means every row belongs to exactly one day, and the days add up to the period.
+- The built-in database makes every instance, and every test, count the same days, whatever zone files the host or image has. Days are computed in the store's SQL from boundaries the engine works out, so the numbers are exact to the millisecond without reading the rows.
+
+**Cost / not yet:**
+- Zone rules change only with an engine release (`cargo update -p jiff-tzdb`, in [RELEASING.md](../RELEASING.md)); until then an instance counts a zone whose rules a government changed by its old rules.
+- Only `stats` and `failures` have days; the monitoring status and the rolling 24 hours of `failures` count the last 24 hours, which no zone changes. Other conditions (`silence`, `rejected_share`, `unreachable`) have no calendar in them and take no zone.
+- An older engine reading a store with zoned rules evaluates them in UTC without a warning, and one that edits such a rule leaves its zone in place, so the zone comes back after the next upgrade.
+- A stored zone that a later database no longer knows is skipped (logged at debug); the IANA database keeps old names as links, so this should not happen.
+
+*Also counted with these figures (2026-11-20):* rows a transform filtered out on purpose (rejected as `filtered`) are not failures. `rejected` keeps its meaning, every rejected row; `failing` beside it, on `stats` (per local day and today) and the monitoring status (`last_24h`, each source's `failing_last_24h`), leaves them out, and a source is listed under `needs_you` for its failing rows only, so a transform that drops rows by design raises nothing. The reason's sentence is unchanged; its number counts failing rows.
 
 ## Not in the prototype
 

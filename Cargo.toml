@@ -38,6 +38,8 @@ hkdf = { version = "0.13", optional = true }
 # wipes the HMAC state the secret store derives keys with.
 hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
 http = "1"
+# Time zones, from the IANA database built into the engine (jiff-tzdb), never the host's.
+jiff = { version = "1.0.1", default-features = false, features = ["std", "tzdb-bundle-always"] }
 object_store = { version = "0.11", features = ["aws"] }
 percent-encoding = "2"
 postgres = "0.19"

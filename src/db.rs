@@ -110,7 +110,8 @@ CREATE TABLE IF NOT EXISTS alert_rules (
   channels TEXT NOT NULL DEFAULT '[\"app\"]',
   enabled INTEGER NOT NULL DEFAULT 1,
   created_by TEXT,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  tz TEXT
 );
 CREATE TABLE IF NOT EXISTS store_meta (
   key TEXT PRIMARY KEY,
@@ -189,6 +190,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("alerts", "cleared_reason", "TEXT"),
     ("alerts", "notify", "TEXT"),
     ("alerts", "channels", "TEXT"),
+    ("alert_rules", "tz", "TEXT"),
 ];
 
 /// Indexes made after the added columns, since they may name one.
@@ -264,7 +266,7 @@ fn never_reuse_rule_ids(conn: &rusqlite::Connection) -> Result<()> {
             "CREATE TABLE IF NOT EXISTS alert_rules (",
             "CREATE TABLE alert_rules_rebuilt (",
         );
-        let columns = "id, source_id, condition, threshold, notify, channels, enabled, created_by, created_at";
+        let columns = "id, source_id, condition, threshold, notify, channels, enabled, created_by, created_at, tz";
         conn.execute_batch(&format!(
             "{ddl}
              INSERT INTO alert_rules_rebuilt ({columns}) SELECT {columns} FROM alert_rules;
@@ -305,6 +307,9 @@ pub struct Rule {
     pub enabled: bool,
     #[serde(default)]
     pub created_by: Option<String>,
+    /// The IANA time zone a `missing_by` time of day is in; `None` is UTC.
+    #[serde(default)]
+    pub tz: Option<String>,
     /// When the rule was made, as an instant; never taken from a request.
     #[serde(default, skip_deserializing)]
     pub created_at: Option<String>,
@@ -393,7 +398,7 @@ pub struct UnwatchedAlert {
 pub enum RuleGone {
     Deleted,
     TurnedOff,
-    /// Changed in what it watches: its condition, threshold or source.
+    /// Changed in what it watches: its condition, threshold, time zone or source.
     Changed,
 }
 
@@ -1505,15 +1510,6 @@ impl Db {
             )
         } else {
             format!("strftime('%Y-%m-%dT%H:%M:%fZ', {col} / 1000.0, 'unixepoch')")
-        }
-    }
-
-    /// The SQL that formats an epoch-milliseconds column as a UTC calendar day.
-    pub fn day(&self, col: &str) -> String {
-        if self.postgres {
-            format!("to_char(to_timestamp({col} / 1000.0) AT TIME ZONE 'UTC', 'YYYY-MM-DD')")
-        } else {
-            format!("date({col} / 1000, 'unixepoch')")
         }
     }
 
@@ -2900,6 +2896,51 @@ impl Db {
             .and_then(|r| r.opt_i64(0)))
     }
 
+    /// Whether a file (not a duplicate) was received in `[from, to)`, epoch ms.
+    pub fn received_between(&self, feed: &str, from: i64, to: i64) -> Result<bool> {
+        Ok(self
+            .query_one(
+                "SELECT 1 FROM files WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2 AND received_at < $3 LIMIT 1",
+                &params![feed, from, to],
+            )?
+            .is_some())
+    }
+
+    /// Whether an alert of a rule was open at `at` (epoch ms) or raised since.
+    /// One the rule's own change, turning off or deletion cleared does not
+    /// count: it watched the rule as it was.
+    pub fn rule_alert_alive_since(
+        &self,
+        feed: &str,
+        kind: &str,
+        rule_id: i64,
+        at: i64,
+    ) -> Result<bool> {
+        Ok(self
+            .query_one(
+                "SELECT 1 FROM alerts WHERE feed_id = $1 AND kind = $2 AND rule_id = $3
+                   AND (cleared_at IS NULL
+                        OR (cleared_at >= $4 AND COALESCE(cleared_reason, '') NOT IN ($5, $6, $7)))
+                 LIMIT 1",
+                &params![
+                    feed,
+                    kind,
+                    rule_id,
+                    at,
+                    RuleGone::Changed.reason(),
+                    RuleGone::TurnedOff.reason(),
+                    RuleGone::Deleted.reason()
+                ],
+            )?
+            .is_some())
+    }
+
+    /// Any statement, for tests that set up rows by hand.
+    #[cfg(test)]
+    pub(crate) fn execute_for_test(&self, sql: &str, params: &[Param]) -> Result<u64> {
+        self.execute(sql, params)
+    }
+
     pub fn last_alert_at(&self, feed: &str, kind: &str) -> Result<Option<i64>> {
         Ok(self
             .query_one(
@@ -2984,7 +3025,8 @@ impl Db {
     /// Records an alert and, in the same transaction, the webhook event `webhook`
     /// builds from the stored row. An alert of a rule is recorded only while
     /// the rule is still on and watches what it did when it was read (its
-    /// condition, threshold and source): `None` when it does not any more. On
+    /// condition, threshold, time zone and source): `None` when it does not
+    /// any more. On
     /// PostgreSQL the rule's row stays locked to the commit, so a change of the
     /// rule waits for the alert and then clears it.
     pub fn insert_alert_with_webhook(
@@ -3008,9 +3050,10 @@ impl Db {
                         &format!(
                             "SELECT 1 FROM alert_rules
                              WHERE id = $1 AND enabled = 1 AND condition = $2 AND threshold = $3
-                               AND source_id IS NOT DISTINCT FROM $4{lock}"
+                               AND source_id IS NOT DISTINCT FROM $4
+                               AND tz IS NOT DISTINCT FROM $5{lock}"
                         ),
-                        &params![rule.id, rule.condition, rule.threshold, rule.source_id],
+                        &params![rule.id, rule.condition, rule.threshold, rule.source_id, rule.tz],
                     )?;
                     if current.is_empty() {
                         return Ok(None);
@@ -3723,7 +3766,7 @@ impl Db {
 
     // ---- alert rules -------------------------------------------------------
 
-    const RULE_SELECT: &'static str = "SELECT id, source_id, condition, threshold, notify, channels, enabled, created_by, created_at FROM alert_rules";
+    const RULE_SELECT: &'static str = "SELECT id, source_id, condition, threshold, notify, channels, enabled, created_by, created_at, tz FROM alert_rules";
 
     fn rule_from(r: &Row) -> Rule {
         Rule {
@@ -3742,6 +3785,7 @@ impl Db {
             enabled: r.i64(6) != 0,
             created_by: r.opt_string(7),
             created_at: r.opt_i64(8).and_then(iso_ms),
+            tz: r.opt_string(9),
         }
     }
 
@@ -3776,7 +3820,7 @@ impl Db {
                 return Ok(None);
             };
             tx.execute(
-                "UPDATE alert_rules SET source_id = $2, condition = $3, threshold = $4, notify = $5, channels = $6, enabled = $7
+                "UPDATE alert_rules SET source_id = $2, condition = $3, threshold = $4, notify = $5, channels = $6, enabled = $7, tz = $8
                  WHERE id = $1",
                 &params![
                     id,
@@ -3785,7 +3829,8 @@ impl Db {
                     rule.threshold,
                     serde_json::to_string(&rule.notify).unwrap_or_default(),
                     serde_json::to_string(&rule.channels).unwrap_or_default(),
-                    rule.enabled
+                    rule.enabled,
+                    rule.tz
                 ],
             )?;
             match ends(&before) {
@@ -3875,8 +3920,8 @@ impl Db {
 
     pub fn insert_rule(&self, rule: &Rule) -> Result<i64> {
         self.insert_returning_id(
-            "INSERT INTO alert_rules (source_id, condition, threshold, notify, channels, enabled, created_by, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO alert_rules (source_id, condition, threshold, notify, channels, enabled, created_by, created_at, tz)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             &params![
                 rule.source_id,
                 rule.condition,
@@ -3885,14 +3930,15 @@ impl Db {
                 serde_json::to_string(&rule.channels).unwrap_or_default(),
                 rule.enabled,
                 rule.created_by,
-                now_ms()
+                now_ms(),
+                rule.tz
             ],
         )
     }
 
     pub fn update_rule(&self, id: i64, rule: &Rule) -> Result<bool> {
         let n = self.execute(
-            "UPDATE alert_rules SET source_id = $2, condition = $3, threshold = $4, notify = $5, channels = $6, enabled = $7
+            "UPDATE alert_rules SET source_id = $2, condition = $3, threshold = $4, notify = $5, channels = $6, enabled = $7, tz = $8
              WHERE id = $1",
             &params![
                 id,
@@ -3901,7 +3947,8 @@ impl Db {
                 rule.threshold,
                 serde_json::to_string(&rule.notify).unwrap_or_default(),
                 serde_json::to_string(&rule.channels).unwrap_or_default(),
-                rule.enabled
+                rule.enabled,
+                rule.tz
             ],
         )?;
         Ok(n > 0)
@@ -4318,6 +4365,69 @@ mod tests {
         assert!(matches!(p[4], Param::Null));
         assert!(matches!(p[5], Param::Int(1)));
         assert!(matches!(p[6], Param::Int(3)));
+    }
+
+    #[test]
+    fn a_receipt_counts_in_its_half_open_interval() {
+        let db = Db::in_memory().unwrap();
+        let at = |id: i64, ms: i64| {
+            db.execute(
+                "UPDATE files SET received_at = $2 WHERE id = $1",
+                &params![id, ms],
+            )
+            .unwrap();
+        };
+        let file = db
+            .insert_file("lab", "lab", "a.csv", "sha-a", 1, "done", None, None, None)
+            .unwrap();
+        at(file, 1_000);
+        assert!(db.received_between("lab", 1_000, 2_000).unwrap());
+        assert!(!db.received_between("lab", 0, 1_000).unwrap());
+        assert!(!db.received_between("lab", 1_001, 2_000).unwrap());
+        assert!(!db.received_between("other", 0, 2_000).unwrap());
+        let duplicate = db
+            .insert_file(
+                "lab",
+                "lab",
+                "b.csv",
+                "sha-a",
+                1,
+                "duplicate",
+                Some(file),
+                None,
+                None,
+            )
+            .unwrap();
+        at(duplicate, 5_000);
+        assert!(!db.received_between("lab", 5_000, 6_000).unwrap());
+    }
+
+    #[test]
+    fn rules_of_an_older_store_read_back_without_a_zone() {
+        // A store made before rules had a zone: its rule is read as UTC.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE alert_rules (id INTEGER PRIMARY KEY, source_id TEXT, condition TEXT NOT NULL,
+               threshold TEXT NOT NULL, notify TEXT NOT NULL DEFAULT '[]', channels TEXT NOT NULL DEFAULT '[\"app\"]',
+               enabled INTEGER NOT NULL DEFAULT 1, created_by TEXT, created_at INTEGER NOT NULL);
+             INSERT INTO alert_rules (source_id, condition, threshold, created_at) VALUES ('lab', 'missing_by', '06:00', 0);",
+        )
+        .unwrap();
+        let db = Db::init_sqlite(conn).unwrap();
+        let rules = db.rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tz, None);
+        // And a zone written now reads back.
+        let mut rule = rules[0].clone();
+        rule.tz = Some("Europe/Madrid".into());
+        assert!(db.update_rule(rule.id, &rule).unwrap());
+        assert_eq!(
+            db.rule(rule.id).unwrap().unwrap().tz.as_deref(),
+            Some("Europe/Madrid")
+        );
+        rule.tz = None;
+        assert!(db.update_rule(rule.id, &rule).unwrap());
+        assert_eq!(db.rule(rule.id).unwrap().unwrap().tz, None);
     }
 
     #[test]

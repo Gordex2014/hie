@@ -6,9 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use chrono::Timelike;
-
-use crate::alerts::{Alerter, parse_clock};
+use crate::alerts::Alerter;
 use crate::bulk::{self, BulkSubmitter, Poll};
 use crate::config::{DeliveryMethod, FeedConfig, Format, parse_duration};
 use crate::db::{Admission, CheckFailure, Db, Delivery, NewFile, Rule, WorkItem, now_ms};
@@ -1632,7 +1630,8 @@ impl FeedRunner {
     }
 
     /// The rules that watch time rather than loads: silence, and a file expected by
-    /// a time of day. Each fires once and clears itself when data arrives.
+    /// a time of day (in the rule's zone). Each fires once and clears itself when
+    /// data arrives.
     fn check_silence(&self) -> Result<()> {
         let last = self.db.last_received_at(&self.feed.id)?;
         let since = last.unwrap_or(self.started_at);
@@ -1666,36 +1665,12 @@ impl FeedRunner {
                     }
                 }
                 "missing_by" => {
-                    let Some(due_minute) = parse_clock(&rule.threshold) else {
-                        continue;
-                    };
-                    let now_utc = chrono::Utc::now();
-                    let today = now_utc
-                        .date_naive()
-                        .and_hms_opt(0, 0, 0)
-                        .expect("midnight")
-                        .and_utc()
-                        .timestamp_millis();
-                    let received_today = last.is_some_and(|t| t >= today);
-                    let due = now_utc.hour() * 60 + now_utc.minute() >= due_minute;
-                    if received_today {
-                        self.alerts.clear_open(
-                            &self.feed.id,
-                            "missing",
-                            Some(rule.id),
-                            &format!("{}: the file arrived", self.feed.name),
-                        )?;
-                    } else if due {
-                        self.alerts.fire_once(
-                            &self.feed.id,
-                            "missing",
-                            &rule,
-                            &format!(
-                                "{}: nothing has arrived today and the file was expected by {} UTC",
-                                self.feed.name, rule.threshold
-                            ),
-                        )?;
-                    }
+                    self.alerts.check_missing_by(
+                        &self.feed.id,
+                        &self.feed.name,
+                        &rule,
+                        chrono::Utc::now(),
+                    )?;
                 }
                 _ => {}
             }

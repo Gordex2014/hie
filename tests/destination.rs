@@ -641,6 +641,7 @@ async fn delivery_alerts_left_open_by_earlier_versions_are_closed_or_cleared() {
         enabled: true,
         created_by: None,
         created_at: None,
+        tz: None,
     };
     e.state
         .db

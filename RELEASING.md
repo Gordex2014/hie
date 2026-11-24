@@ -30,6 +30,7 @@ HIE is a single Rust crate (`helios-hie`, binary `hie`). It is not published to 
 
 ### 1. Prepare for Release
 
+- Bring the built-in time zone data up to date: `cargo update -p jiff-tzdb` takes the newest IANA database that `jiff-tzdb` ships. The engine never reads the host's zone files, so a zone rule changed by a government reaches it only through a release.
 - Run the same checks CI runs:
 ```bash
 cargo fmt --all -- --check

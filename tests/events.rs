@@ -2396,6 +2396,119 @@ async fn rejected_records_are_counted_once_per_day_with_their_coverage() {
     }
 }
 
+#[tokio::test]
+async fn rejected_records_are_counted_in_local_days_of_the_zone_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_manager, state) = engine(
+        dir.path(),
+        "fhir_base_url: http://127.0.0.1:9\n",
+        &[("one", ndjson_source("one", ""))],
+    );
+    let db = state.db.clone();
+    let api = serve(hie::api::router(state.clone())).await;
+    // Fourteen hours ahead of UTC, so its days are not UTC's.
+    let zone = hie::zone::Zone::parse("Pacific/Kiritimati").unwrap();
+    // The test reads the clock apart from the handler: kept clear of a
+    // midnight, in the zone (10:00Z) or in UTC, that could fall between them.
+    // Neither zone changes its offset, so their days are 24 hours.
+    loop {
+        let now = chrono::Utc::now();
+        let near = |start: i64| {
+            let ms = now.timestamp_millis();
+            (start - ms).abs() < 30_000 || (start + 86_400_000 - ms).abs() < 30_000
+        };
+        let (_, from, _) = zone.today_bounds(now);
+        let (_, utc_from, _) = hie::zone::Zone::utc().today_bounds(now);
+        if !near(from) && !near(utc_from) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    let (today, from, to) = zone.today_bounds(chrono::Utc::now());
+    load(&db, "one", "a", 0, 3);
+    let [a, b, c] = [1, 2, 3].map(|line| record_id(&db, "one", line));
+    // One at local midnight, one the millisecond before, one filtered out today.
+    rejected_at(&db, a, "data", from);
+    rejected_at(&db, b, "validation", from - 1);
+    rejected_at(&db, c, "filtered", to - 1);
+
+    let url = format!("{api}/api/sources/one/failures");
+    // Matched without regard to case, echoed as the database spells it.
+    let (code, answer) = get_json(&format!("{url}?tz=pacific/kiritimati&days=2")).await;
+    assert_eq!(code, 200, "{answer}");
+    assert_eq!(answer["tz"], "Pacific/Kiritimati");
+    let days = answer["days"].as_array().unwrap();
+    assert_eq!(days.len(), 2);
+    let iso = |ms: i64| {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    };
+    let yesterday = today.pred_opt().unwrap().to_string();
+    assert_eq!(
+        (&days[1]["day"], &days[1]["from"], &days[1]["to"]),
+        (
+            &json!(today.to_string()),
+            &json!(iso(from)),
+            &json!(iso(to))
+        ),
+        "{answer}"
+    );
+    assert_eq!(days[0]["day"], yesterday.as_str());
+    assert_eq!(days[0]["to"], days[1]["from"]);
+    assert_eq!(
+        (&days[1]["records"], &days[1]["filtered"]),
+        (&json!(1), &json!(1)),
+        "{answer}"
+    );
+    assert_eq!(
+        (&days[0]["records"], &days[0]["filtered"]),
+        (&json!(1), &json!(0)),
+        "{answer}"
+    );
+
+    // Without a zone the days are UTC's, and say so.
+    let (_, answer) = get_json(&format!("{url}?days=1")).await;
+    assert_eq!(answer["tz"], "UTC");
+    let utc_today = chrono::Utc::now().date_naive().to_string();
+    assert_eq!(answer["days"][0]["day"], utc_today.as_str());
+    assert!(
+        answer["days"][0]["from"]
+            .as_str()
+            .unwrap()
+            .ends_with("T00:00:00.000Z")
+    );
+
+    // An unknown zone is refused with the same answer as on `/stats`, before
+    // the source is looked up; so is a second `tz`.
+    for path in [
+        "one/failures",
+        "nobody/failures",
+        "one/stats",
+        "nobody/stats",
+    ] {
+        for tz in ["Mars/Olympus", "Factory", "%20UTC", ""] {
+            let (code, body) = get_json(&format!("{api}/api/sources/{path}?tz={tz}")).await;
+            assert_eq!(code, 400, "{path} {tz}: {body}");
+            assert_eq!(
+                body,
+                json!({
+                    "error": "tz must be an IANA time zone name, such as Europe/Madrid or UTC",
+                    "code": "invalid_query",
+                    "field": "tz"
+                }),
+                "{path} {tz}"
+            );
+        }
+    }
+    let (code, body) = get_json(&format!("{url}?tz=UTC&tz=UTC")).await;
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(
+        (&body["code"], &body["field"]),
+        (&json!("invalid_query"), &json!("tz"))
+    );
+}
+
 #[test]
 fn the_event_log_start_is_set_once_and_kept() {
     let dir = tempfile::tempdir().unwrap();

@@ -1,5 +1,5 @@
 //! An open alert ends with its rule: when the rule is turned off, deleted, or
-//! changed in its condition, threshold or source. Not when only its
+//! changed in its condition, threshold, time zone or source. Not when only its
 //! recipients or channels change. No transform runs: the source's folder stays
 //! empty.
 
@@ -376,6 +376,58 @@ async fn an_alert_from_a_rule_read_before_its_change_is_not_raised() {
             .unwrap()
     );
     assert!(e.open_of(&rule).is_empty());
+}
+
+/// A `missing_by` rule's zone is part of what it watches: changing it, setting
+/// it or removing it ends the rule's open alert, and a pass that read the rule
+/// in its earlier zone raises nothing. Spelling the same zone differently
+/// changes nothing, since the stored name is the database's.
+#[tokio::test]
+async fn a_missing_by_alert_ends_when_its_zone_changes() {
+    let e = engine().await;
+    let alerts = &e.state.alerts;
+    let missing = |tz: Value| json!({"source_id": "lab-results", "condition": "missing_by", "threshold": "06:00", "tz": tz, "channels": ["app"]});
+    let rule = e.rule(missing(json!("Europe/Madrid"))).await;
+    assert_eq!(rule.tz.as_deref(), Some("Europe/Madrid"));
+
+    // The same zone in other letters: stored as before, the alert stays.
+    let first = e.raise("lab-results", "missing", Some(&rule));
+    e.change(&rule, json!({"tz": "europe/madrid"})).await;
+    let same = e.state.db.rule(rule.id).unwrap().unwrap();
+    assert_eq!(same.tz.as_deref(), Some("Europe/Madrid"));
+    assert_eq!(e.state_of(first), (false, None));
+
+    // Another zone, then none, then one again: each ends the open alert.
+    let mut read = same;
+    for tz in [
+        json!("America/New_York"),
+        Value::Null,
+        json!("Asia/Kolkata"),
+    ] {
+        let open = e.open_of(&read);
+        assert_eq!(open.len(), 1, "{tz}");
+        e.change(&read, json!({ "tz": tz })).await;
+        assert_eq!(e.state_of(open[0]), (true, Some(CHANGED.into())), "{tz}");
+        let before = read;
+        read = e.state.db.rule(rule.id).unwrap().unwrap();
+        assert_eq!(read.tz.as_deref(), tz.as_str(), "{tz}");
+        // A pass that read the rule before the change writes nothing.
+        assert!(
+            !alerts
+                .fire_once("lab-results", "missing", &before, "stale")
+                .unwrap(),
+            "{tz}"
+        );
+        assert!(e.open_of(&read).is_empty(), "{tz}");
+        // One that read it after raises as usual.
+        assert!(
+            alerts
+                .fire_once("lab-results", "missing", &read, "current")
+                .unwrap(),
+            "{tz}"
+        );
+    }
+    assert_eq!(e.open_of(&read).len(), 1);
 }
 
 /// Alerts of rules an earlier version turned off, deleted or changed, which
