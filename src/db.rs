@@ -3873,22 +3873,23 @@ impl Db {
             });
         };
         let forward = |next: i64| Some(q.cursor.map_or(next, |c| c.max(next)));
-        // From the cursor, or from where `since` starts when that is later
-        // (no event at or after `since` has a lower id), or from the start of
-        // the log.
-        let start = match q.since {
-            Some(since) => match self.since_start(since)? {
-                Some(start) => q.cursor.map_or(start, |c| c.max(start)),
+        // From the cursor; without one, from where `since` starts, or from
+        // the start of the log. A cursor is never moved by `since`: an event
+        // stored after it is listed, whatever the clock of its instance.
+        let start = match (q.cursor, q.since) {
+            (Some(cursor), _) => cursor,
+            (None, Some(since)) => match self.since_start(since)? {
+                Some(start) => start,
                 // Nothing stored at or after `since`.
                 None => {
                     return Ok(EventPage {
                         events: vec![],
-                        next: forward(mark),
+                        next: Some(mark),
                         has_more: false,
                     });
                 }
             },
-            None => q.cursor.unwrap_or(0),
+            (None, None) => 0,
         };
         // Filters that no index serves in id order (`since`, a source and a
         // kind together, or several kinds) read at most `span` events past
@@ -3981,42 +3982,65 @@ impl Db {
     /// The statement of a page of events in `(start, end]` with `q`'s filters,
     /// and its parameters.
     fn event_page_sql(&self, q: &EventQuery, start: i64, end: i64) -> (String, Vec<Param>) {
-        // A source alone, or one kind, is read through its index in id order,
-        // whatever SQLite's statistics say of an average source or kind: a
-        // rare one would otherwise be looked for along the whole log.
-        // PostgreSQL's statistics know the rare values.
-        // Ordered by the index's own columns (the first one is fixed by the
-        // filter, so the order is still by id), which PostgreSQL then reads
-        // rather than walking the primary key for a source or kind whose
-        // events lie far from where it starts.
         let kinds = exact_kinds(&q.kinds);
-        let (index, order) = match (q.source.is_some(), kinds.len()) {
-            (true, 0) => (" INDEXED BY events_source", "source_id, id"),
-            (false, 1) => (" INDEXED BY events_kind", "kind, id"),
-            _ => ("", "id"),
+        let mut values = params![start, end].to_vec();
+        // A source alone, or one kind, is read through its index in id order,
+        // however its events lie in the log: SQLite is told the index (its
+        // statistics weigh an average source or kind), and PostgreSQL gets
+        // the range as a row value over the index's columns, which the
+        // primary key cannot serve (with an equality on the first column it
+        // would walk the primary key towards events far from the start).
+        let served = match (q.source.as_deref(), kinds.as_slice()) {
+            (Some(source), []) => Some(("source_id", "events_source", source)),
+            (None, [kind]) => Some(("kind", "events_kind", *kind)),
+            _ => None,
         };
-        let index = if self.is_postgres() { "" } else { index };
+        let (index, range, order) = match served {
+            Some((column, index, value)) => {
+                values.push(Param::Text(value.to_string()));
+                let v = values.len();
+                if self.is_postgres() {
+                    (
+                        String::new(),
+                        format!("({column}, id) > (${v}, $1) AND ({column}, id) <= (${v}, $2)"),
+                        format!("{column}, id"),
+                    )
+                } else {
+                    (
+                        format!(" INDEXED BY {index}"),
+                        format!("id > $1 AND id <= $2 AND {column} = ${v}"),
+                        "id".to_string(),
+                    )
+                }
+            }
+            None => (
+                String::new(),
+                "id > $1 AND id <= $2".to_string(),
+                "id".to_string(),
+            ),
+        };
         let mut sql = format!(
             "SELECT id, {} AS at, source_id, kind, load_id, record_id, attempt, error_kind, reason, detail
-             FROM events{index} WHERE id > $1 AND id <= $2",
+             FROM events{index} WHERE {range}",
             self.iso("at"),
         );
-        let mut values = params![start, end].to_vec();
-        if let Some(source) = &q.source {
-            values.push(Param::Text(source.clone()));
-            sql.push_str(&format!(" AND source_id = ${}", values.len()));
+        if served.is_none() {
+            if let Some(source) = &q.source {
+                values.push(Param::Text(source.clone()));
+                sql.push_str(&format!(" AND source_id = ${}", values.len()));
+            }
+            if !kinds.is_empty() {
+                let mut marks = Vec::with_capacity(kinds.len());
+                for kind in &kinds {
+                    values.push(Param::Text(kind.to_string()));
+                    marks.push(format!("${}", values.len()));
+                }
+                sql.push_str(&format!(" AND kind IN ({})", marks.join(", ")));
+            }
         }
         if let Some(since) = q.since {
             values.push(Param::Int(since));
             sql.push_str(&format!(" AND at >= ${}", values.len()));
-        }
-        if !kinds.is_empty() {
-            let mut marks = Vec::with_capacity(kinds.len());
-            for kind in kinds {
-                values.push(Param::Text(kind.to_string()));
-                marks.push(format!("${}", values.len()));
-            }
-            sql.push_str(&format!(" AND kind IN ({})", marks.join(", ")));
         }
         values.push(Param::Int(q.limit as i64 + 1));
         sql.push_str(&format!(" ORDER BY {order} LIMIT ${}", values.len()));
@@ -5296,16 +5320,27 @@ mod tests {
         let first = page(&db, &[], Some(1_000_000), None, 100);
         assert_eq!(listed(&first), [ids[25]]);
         assert_eq!((first.next, first.has_more), (Some(ids[25]), false));
-        // An old cursor with it starts where `since` does, not at the cursor.
-        let resumed = page(&db, &[], Some(1_000_000), Some(ids[0]), 100);
-        assert_eq!(listed(&resumed), [ids[25]]);
-        // A cursor past where `since` starts is kept.
-        let later = page(&db, &[], Some(1), Some(ids[20]), 100);
-        assert_eq!(listed(&later), ids[21..=25]);
+        // A poll from its cursor lists every event stored since at or after
+        // `since`, an earlier `at` stored after a later one included.
+        let more = log(
+            &db,
+            &[
+                (1_000_000 + 2 * EVENT_CLOCK_MARGIN_MS, "load.received"),
+                (1_000_001, "load.received"),
+            ],
+        );
+        let next = page(&db, &[], Some(1_000_000), first.next, 100);
+        assert_eq!(listed(&next), more);
         // Nothing at or after it: an empty page at the newest id.
-        let none = page(&db, &[], Some(2_000_000), None, 100);
+        let none = page(
+            &db,
+            &[],
+            Some(1_000_000 + 3 * EVENT_CLOCK_MARGIN_MS),
+            None,
+            100,
+        );
         assert!(none.events.is_empty() && !none.has_more);
-        assert_eq!(none.next, Some(ids[25]));
+        assert_eq!(none.next, Some(more[1]));
     }
 
     /// An event stored before the first one at or after `since`, whose clock
@@ -5390,14 +5425,17 @@ mod tests {
     #[test]
     fn unspanned_reads_use_an_index() {
         let db = Db::in_memory().unwrap();
-        let mut events: Vec<(i64, &str)> = (0..3000).map(|i| (i, "load.received")).collect();
-        events.push((3000, "submission.opened"));
+        // The source and the kind looked for first appear late in the log,
+        // and are not rare from there on.
+        let events: Vec<(i64, &str)> = (0..3000).map(|i| (i, "load.received")).collect();
         log(&db, &events);
-        db.execute_for_test(
-            "INSERT INTO events (at, source_id, kind) VALUES (3001, 'other', 'load.received')",
-            &[],
-        )
-        .unwrap();
+        for at in 3000..4000 {
+            db.execute_for_test(
+                "INSERT INTO events (at, source_id, kind) VALUES ($1, 'other', 'submission.opened')",
+                &params![at],
+            )
+            .unwrap();
+        }
         // As the engine leaves the store (it never analyzes it), then with
         // statistics.
         for analyzed in [false, true] {

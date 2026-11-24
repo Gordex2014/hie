@@ -175,20 +175,24 @@ pub enum Poll {
     },
 }
 
-/// Reads an answer's body to its end, keeping it only when `keep`: the
-/// engine reads nothing from a success but its status and headers.
+/// The most of a refusal's body kept: an OperationOutcome is far smaller,
+/// and a longer body (a proxy's page) is drained but not kept.
+const KEPT_BODY: usize = 1 << 20;
+
+/// Reads an answer's body to its end, keeping up to `KEPT_BODY` of it only
+/// when `keep`: the engine reads nothing from a success, a `429` or a `5xx`
+/// but its status and headers.
 async fn read_whole(mut response: reqwest::Response, keep: bool) -> reqwest::Result<Vec<u8>> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        if keep {
+        if keep && body.len() + chunk.len() <= KEPT_BODY {
             body.extend_from_slice(&chunk);
         }
     }
     Ok(body)
 }
 
-/// An answer of HFS to a post, read whole (its body kept only when it is not
-/// a success).
+/// An answer of HFS to a post, read whole (its body kept only for a refusal).
 struct Answer {
     status: u16,
     headers: reqwest::header::HeaderMap,
@@ -312,7 +316,9 @@ impl BulkSubmitter {
         })?;
         let status = response.status().as_u16();
         let headers = response.headers().clone();
-        match read_whole(response, !(200..=299).contains(&status)).await {
+        // Only a refusal's body is read by the engine (`classify`).
+        let used = !matches!(status, 200..=299 | 429 | 500..=599);
+        match read_whole(response, used).await {
             Ok(body) => {
                 if let Some(exchange) = &exchange {
                     exchange.observe(

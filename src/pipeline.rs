@@ -1113,6 +1113,11 @@ impl FeedRunner {
                     Some(l) if l.owner != self.instance => {
                         tracing::info!(feed = %self.feed.id, submission = %sub.submission_id, "not claimed: another instance holds the source");
                     }
+                    // Renewed just before, yet run out by the claim (a long
+                    // wait for the store).
+                    None if leased => {
+                        tracing::info!(feed = %self.feed.id, submission = %sub.submission_id, "not claimed: this instance's lease on the source ran out");
+                    }
                     _ => {
                         tracing::debug!(feed = %self.feed.id, submission = %sub.submission_id, "not claimed: another runner moved it");
                     }
