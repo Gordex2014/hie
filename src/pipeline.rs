@@ -799,7 +799,8 @@ impl FeedRunner {
             Format::Ndjson => &["ndjson", "jsonl"][..],
             Format::FhirBundle => &["json"][..],
             Format::Hl7v2 => &["hl7", "txt"][..],
-            Format::Fhir => &["ndjson", "jsonl", "json"][..],
+            // By its reader, below.
+            Format::Fhir => &[][..],
         };
         let entries =
             match tokio::task::spawn_blocking(move || -> Result<Vec<(String, Vec<u8>)>> {
@@ -842,13 +843,18 @@ impl FeedRunner {
         let mut stage_count = 0usize;
         for (path, data) in entries {
             let extension = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-            if !wanted.contains(&extension.as_str()) {
+            let reader = self.feed.format.reader_for(&path);
+            let fits = match self.feed.format {
+                Format::Fhir => reader.is_some(),
+                _ => wanted.contains(&extension.as_str()),
+            };
+            if !fits {
                 tracing::debug!(feed, file = %name, entry = %path, "entry skipped: not a {} file", self.feed.format.as_str());
                 continue;
             }
             // A `.json` entry is read first: a manifest is not a load at all.
             let mut read = None;
-            if self.feed.format == Format::Fhir && extension == "json" {
+            if self.feed.format == Format::Fhir && reader == Some(Format::FhirBundle) {
                 let early = self.read(&path, &data);
                 if matches!(early, Ok(None)) {
                     tracing::debug!(feed, file = %name, entry = %path, "entry skipped: a bulk export manifest");

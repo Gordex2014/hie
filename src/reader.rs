@@ -70,8 +70,8 @@ pub fn read(format: Format, bytes: &[u8]) -> Result<Vec<SourceRecord>> {
 }
 
 /// Reads a `.json` file of a `fhir` source as a Bundle, or as nothing (`None`)
-/// when it is a bulk export manifest: an object with no `resourceType`, a
-/// `transactionTime` and an `output` list.
+/// when it is a bulk export manifest: an object with no string `resourceType`,
+/// a string `transactionTime` and an array `output`.
 pub fn read_fhir_json(bytes: &[u8]) -> Result<Option<Vec<SourceRecord>>> {
     let doc: Value = serde_json::from_str(&decode_text(bytes)?).context("invalid JSON")?;
     let manifest = doc.get("resourceType").and_then(Value::as_str).is_none()

@@ -1681,6 +1681,14 @@ mod tests {
     }
 
     #[test]
+    fn a_format_is_named_as_a_source_file_writes_it() {
+        use Format::*;
+        for format in [Csv, Ndjson, FhirBundle, Hl7v2, Fhir] {
+            assert_eq!(serde_json::to_value(format).unwrap(), format.as_str());
+        }
+    }
+
+    #[test]
     fn a_fhir_file_source_takes_only_the_passthrough_and_transformed_bulk() {
         let dir = tempfile::tempdir().unwrap();
         for t in ["lab_results.py", "fhir_passthrough.py"] {

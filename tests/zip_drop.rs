@@ -374,6 +374,11 @@ async fn a_fhir_zip_reads_ndjson_and_bundle_entries_by_their_extension() {
             ("bundle.json", bundle.as_bytes()),
             ("manifest.json", MANIFEST),
             ("README.txt", b"An export.\n"),
+            // No extension: skipped, though its name is one.
+            (
+                "ndjson",
+                b"{\"resourceType\":\"Patient\",\"id\":\"p9\"}\n",
+            ),
         ]),
     )
     .unwrap();
@@ -517,6 +522,39 @@ async fn a_fhir_file_sent_again_under_a_name_read_another_way_is_read_again() {
             ("x.txt".to_string(), "unreadable".to_string()),
             ("x.ndjson".to_string(), "done".to_string()),
             ("y.jsonl".to_string(), "duplicate".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_fhir_zip_entry_is_read_again_only_under_a_name_read_another_way() {
+    let dir = tempfile::tempdir().unwrap();
+    let inbox = dir.path().join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let lines: &[u8] = b"{\"resourceType\":\"Patient\",\"id\":\"p1\"}\n";
+    std::fs::write(inbox.join("x.txt"), lines).unwrap();
+    let Some((runner, db, urls)) = fhir_drops(&inbox).await else {
+        return;
+    };
+    runner.tick().await.unwrap();
+    assert!(sent_urls(&urls).is_empty());
+
+    std::fs::write(inbox.join("first.zip"), zip_of(&[("x.ndjson", lines)])).unwrap();
+    runner.tick().await.unwrap();
+    assert_eq!(sent_urls(&urls), ["Patient/p1"]);
+
+    std::fs::write(inbox.join("second.zip"), zip_of(&[("y.jsonl", lines)])).unwrap();
+    runner.tick().await.unwrap();
+    assert_eq!(sent_urls(&urls), ["Patient/p1"]);
+    let entries: Vec<_> = loads(&db)
+        .into_iter()
+        .filter(|(name, _)| name.contains('!'))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("first.zip!/x.ndjson".to_string(), "done".to_string()),
+            ("second.zip!/y.jsonl".to_string(), "duplicate".to_string()),
         ]
     );
 }
