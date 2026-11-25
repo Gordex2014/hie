@@ -264,6 +264,16 @@ async fn scopes_decide_what_a_token_may_do() {
         .unwrap();
     assert_eq!(r.status(), 403);
     assert_eq!(r.json::<Value>().await.unwrap()["required"], "hie/manage");
+    // Nor send a manifest to a manifest source.
+    let r = http
+        .post(format!("{api}/api/sources/exports/manifests"))
+        .bearer_auth(&reader)
+        .json(&json!({"manifest_url": "https://provider.example/m.json"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    assert_eq!(r.json::<Value>().await.unwrap()["required"], "hie/manage");
 
     // Credentials are not for readers, not even to list them.
     for path in ["/api/secrets", "/api/secrets/sec_0123456789abcdef"] {
@@ -301,6 +311,19 @@ async fn scopes_decide_what_a_token_may_do() {
             .unwrap()
             .status(),
         201
+    );
+    // A manager may send a manifest: past the scope check, to the source's answer.
+    let r = http
+        .post(format!("{api}/api/sources/exports/manifests"))
+        .bearer_auth(&manager)
+        .json(&json!({"manifest_url": "https://provider.example/m.json"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(
+        r.json::<Value>().await.unwrap()["code"],
+        "not_a_manifest_source"
     );
     assert_eq!(
         http.get(format!("{api}/api/transforms"))
