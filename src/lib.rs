@@ -36,6 +36,7 @@ pub mod events;
 pub mod fhir;
 pub mod hl7;
 pub mod manager;
+pub mod manifest;
 pub mod pipeline;
 pub mod reader;
 pub mod retention;

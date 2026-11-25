@@ -133,14 +133,14 @@ impl Ask {
         let sql = match &self.keep {
             Keep::All => format!(
                 "WITH RECURSIVE candidates(id) AS (
-                   SELECT id FROM files WHERE id <= CAST({below} AS BIGINT){of_source}
+                   SELECT id FROM files WHERE id <= CAST({below} AS BIGINT){of_source} AND listed = 1
                    ORDER BY id DESC LIMIT CAST({take} AS BIGINT))"
             ),
             Keep::Status(status) => {
                 let status = bind(status);
                 format!(
                     "WITH RECURSIVE candidates(id) AS (
-                       SELECT id FROM files WHERE id <= CAST({below} AS BIGINT){of_source} AND status = CAST({status} AS TEXT)
+                       SELECT id FROM files WHERE id <= CAST({below} AS BIGINT){of_source} AND status = CAST({status} AS TEXT) AND listed = 1
                        ORDER BY id DESC LIMIT CAST({take} AS BIGINT))"
                 )
             }
@@ -160,8 +160,11 @@ impl Ask {
                    SELECT id FROM (
                      SELECT id FROM rejected WHERE id IS NOT NULL
                      UNION
-                     SELECT id FROM (SELECT id FROM files WHERE status = 'unreadable'{of_source} AND id <= CAST({below} AS BIGINT)
+                     SELECT id FROM (SELECT id FROM files WHERE status = 'unreadable'{of_source} AND listed = 1 AND id <= CAST({below} AS BIGINT)
                                      ORDER BY id DESC LIMIT CAST({take} AS BIGINT)) unreadable
+                     UNION
+                     SELECT id FROM (SELECT id FROM files WHERE receipts_rejected > 0{of_source} AND id <= CAST({below} AS BIGINT)
+                                     ORDER BY id DESC LIMIT CAST({take} AS BIGINT)) receipts
                    ) failed ORDER BY id DESC LIMIT CAST({take} AS BIGINT))"
             ),
         };

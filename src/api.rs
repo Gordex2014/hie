@@ -1,4 +1,5 @@
 mod loads;
+mod manifests;
 mod paging;
 mod secrets;
 
@@ -65,6 +66,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sources/{id}/pause", post(pause_source))
         .route("/api/sources/{id}/resume", post(resume_source))
         .route("/api/sources/{id}/check-now", post(check_now))
+        .route(
+            "/api/sources/{id}/manifests",
+            post(manifests::submit_manifest),
+        )
         .route("/api/checks/{id}", get(get_check))
         .route("/api/sources/{id}/files", get(list_files))
         .route("/api/sources/{id}/loads", get(list_files))
@@ -128,11 +133,20 @@ async fn health(State(s): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn bulk_manifest(State(s): State<AppState>, Path(token): Path<String>) -> ApiResult {
+async fn bulk_manifest(
+    State(s): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Response, ApiError> {
+    // An uploaded manifest of a `manifest` source: served as stored while its
+    // load is open, gone once its receipts are in.
+    if let Some(upload) = s.db.manifest_upload(&token)? {
+        let text = upload.ok_or_else(|| not_found("submission"))?;
+        return Ok(([(header::CONTENT_TYPE, "application/json")], text).into_response());
+    }
     let submission =
         s.db.submission(&token)?
             .ok_or_else(|| not_found("submission"))?;
-    Ok(Json(submission.manifest))
+    Ok(Json(submission.manifest).into_response())
 }
 
 async fn bulk_file(
@@ -268,6 +282,9 @@ impl From<ManagerError> for ApiError {
             }
             ManagerError::NotFound(m) => ApiError::new(StatusCode::NOT_FOUND, m),
             ManagerError::Conflict(m) => ApiError::new(StatusCode::CONFLICT, m),
+            ManagerError::NotSupported(m) => {
+                ApiError::new(StatusCode::BAD_REQUEST, m).code("not_supported")
+            }
             ManagerError::Busy(m) => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, m).code("busy"),
             ManagerError::StoreBusy => ApiError::store_busy(),
             ManagerError::SecretsUnavailable(m) => ApiError::secrets_unavailable(m),
@@ -314,7 +331,9 @@ fn rejected_and_failing(db: &Db, feed: Option<&str>, since: i64) -> anyhow::Resu
             .and_then(Value::as_i64)
             .unwrap_or(0)
     };
-    Ok((n("rejected"), n("failing")))
+    // A manifest load's failing receipts, by when the load finished.
+    let (_, receipts) = db.receipts_between(feed, since, i64::MAX)?;
+    Ok((n("rejected") + receipts, n("failing") + receipts))
 }
 
 /// A source's definition and its state, as one object.
@@ -352,7 +371,7 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         "contact": feed.contact,
         "source": feed.source.describe(),
         "format": feed.format,
-        "transform": feed.transform.display().to_string(),
+        "transform": (!feed.is_manifest()).then(|| feed.transform.display().to_string()),
         "poll_seconds": feed.source.poll_interval().as_secs(),
         "expect_every": feed.expect_every.map(human),
         "state": if state != "paused" && lease.as_ref().is_some_and(|l| l.owner != crate::pipeline::instance_id()) { "standby" } else { state },
@@ -613,7 +632,7 @@ fn daily_stats(
     for row in db.query_json(
         &format!(
             "SELECT {} AS day, COUNT(*) AS n FROM files
-             WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2 AND received_at < $3 GROUP BY 1",
+             WHERE feed_id = $1 AND status <> 'duplicate' AND listed = 1 AND received_at >= $2 AND received_at < $3 GROUP BY 1",
             local.sql_index("received_at")
         ),
         params![id, since, until],
@@ -639,12 +658,35 @@ fn daily_stats(
             }
         }
     }
+    // A manifest load's receipts, on the day the load finished.
+    for row in db.query_json(
+        &format!(
+            "SELECT {} AS day, CAST(COALESCE(SUM(receipts_sent), 0) AS BIGINT) AS sent,
+                    CAST(COALESCE(SUM(receipts_rejected), 0) AS BIGINT) AS rejected
+             FROM files
+             WHERE feed_id = $1 AND manifest IS NOT NULL AND listed = 1 AND finished_at >= $2 AND finished_at < $3 GROUP BY 1",
+            local.sql_index("finished_at")
+        ),
+        params![id, since, until],
+    )? {
+        if let Some(i) = by_index(&row) {
+            let rejected = row["rejected"].as_i64().unwrap_or(0);
+            for (key, n) in [
+                ("sent", row["sent"].as_i64().unwrap_or(0)),
+                ("rejected", rejected),
+                ("failing", rejected),
+            ] {
+                by_day[i][key] = json!(by_day[i][key].as_i64().unwrap_or(0) + n);
+            }
+        }
+    }
     let (today_since, today_until) = local.bounds(local.len() - 1);
     let last = &by_day[local.len() - 1];
     let today_json = json!({
         "day": last["day"],
         "files": last["files"],
-        "records": count(db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2 AND f.received_at < $3", params![id, today_since, today_until])?,
+        "records": count(db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2 AND f.received_at < $3", params![id, today_since, today_until])?
+            + count(db, "SELECT CAST(COALESCE(SUM(receipts_sent + receipts_rejected), 0) AS BIGINT) AS n FROM files WHERE feed_id = $1 AND manifest IS NOT NULL AND listed = 1 AND received_at >= $2 AND received_at < $3", params![id, today_since, today_until])?,
         "sent": last["sent"],
         "rejected": last["rejected"],
         "failing": last["failing"],
@@ -852,9 +894,10 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
     }
     let since = now_ms() - DAY_MS;
     let (rejected, failing) = rejected_and_failing(&s.db, None, since)?;
+    let (receipts_sent, _) = s.db.receipts_between(None, since, i64::MAX)?;
     let last_24h = json!({
-        "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE status <> 'duplicate' AND received_at >= $1", params![since])?,
-        "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'sent' AND updated_at >= $1", params![since])?,
+        "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE status <> 'duplicate' AND listed = 1 AND received_at >= $1", params![since])?,
+        "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'sent' AND updated_at >= $1", params![since])? + receipts_sent,
         "rejected": rejected,
         "failing": failing,
         "alerts": count(&s.db, "SELECT COUNT(*) AS n FROM alerts WHERE created_at >= $1", params![since])?,
@@ -886,10 +929,13 @@ const LOAD_COLUMNS: &str = "f.id, f.feed_id AS source_id, f.source_name, f.name,
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT) AS rejected,
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' AND COALESCE(r.error_kind, '') <> 'filtered' THEN 1 ELSE 0 END), 0) AS BIGINT) AS failing,
                     CAST(COALESCE(SUM(CASE WHEN r.status IN ('received', 'pending', 'submitted') THEN 1 ELSE 0 END), 0) AS BIGINT) AS in_progress,
-                    CASE WHEN f.finished_at IS NULL THEN NULL ELSE f.finished_at - f.received_at END AS took_ms";
+                    CASE WHEN f.finished_at IS NULL THEN NULL ELSE f.finished_at - f.received_at END AS took_ms,
+                    f.manifest AS manifest_meta, f.request_id AS manifest_request_id,
+                    f.receipts_sent AS manifest_sent, f.receipts_rejected AS manifest_rejected";
 
 /// Every `files` column a load row selects, for its `GROUP BY`.
-const LOAD_GROUP: &str = "GROUP BY f.id, f.feed_id, f.source_name, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived, f.finished_at, f.received_at";
+const LOAD_GROUP: &str = "GROUP BY f.id, f.feed_id, f.source_name, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived, f.finished_at, f.received_at,
+                          f.manifest, f.request_id, f.receipts_sent, f.receipts_rejected";
 
 /// The load rows of `ids`, in that order, each with what became of its
 /// records. Each load is read in a statement of its own (its file and its
@@ -902,7 +948,7 @@ fn load_rows(s: &AppState, ids: &[i64]) -> Result<Vec<Value>, ApiError> {
         &format!(
             "SELECT {LOAD_COLUMNS}, {} AS received_at, {} AS finished_at
              FROM files f LEFT JOIN records r ON r.file_id = f.id
-             WHERE f.id = CAST($1 AS BIGINT) {LOAD_GROUP}",
+             WHERE f.id = CAST($1 AS BIGINT) AND f.listed = 1 {LOAD_GROUP}",
             s.db.iso("f.received_at"),
             s.db.iso("f.finished_at")
         ),
@@ -910,6 +956,9 @@ fn load_rows(s: &AppState, ids: &[i64]) -> Result<Vec<Value>, ApiError> {
     )?;
     let mut methods: std::collections::HashMap<String, Value> = Default::default();
     for row in &mut rows {
+        if manifest_load(row) {
+            continue;
+        }
         let source = row["source_id"].as_str().unwrap_or_default().to_string();
         row["method"] = methods
             .entry(source)
@@ -926,6 +975,77 @@ fn load_rows(s: &AppState, ids: &[i64]) -> Result<Vec<Value>, ApiError> {
         row["failed"] = Value::Bool(row["status"] == "unreadable" || failing > 0);
     }
     Ok(rows)
+}
+
+/// Projects a load row of a `manifest` source from what its receipts gave:
+/// no per-line rows, `records` is `sent + rejected`, `failing` is `rejected`.
+/// Every load gets its `manifest` member, `null` but on these. Whether it was
+/// one.
+fn manifest_load(row: &mut Value) -> bool {
+    let Some(object) = row.as_object_mut() else {
+        return false;
+    };
+    let meta = object.remove("manifest_meta").and_then(|m| {
+        m.as_str()
+            .and_then(|t| serde_json::from_str::<Value>(t).ok())
+    });
+    let request_id = object.remove("manifest_request_id").unwrap_or(Value::Null);
+    let sent = object
+        .remove("manifest_sent")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let rejected = object
+        .remove("manifest_rejected")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let Some(meta) = meta.filter(Value::is_object) else {
+        object.insert("manifest".into(), Value::Null);
+        return false;
+    };
+    let size = object.get("size").and_then(Value::as_i64).unwrap_or(0);
+    object.insert("size".into(), crate::db::manifest::shown_size(&meta, size));
+    for (key, value) in [
+        ("records", sent + rejected),
+        ("sent", sent),
+        ("rejected", rejected),
+        ("failing", rejected),
+        ("in_progress", 0),
+    ] {
+        object.insert(key.into(), json!(value));
+    }
+    for key in ["duplicate_of", "source_key", "archived"] {
+        object.insert(key.into(), Value::Null);
+    }
+    object.insert("method".into(), json!("bulk_submit"));
+    object.insert(
+        "failed".into(),
+        json!(object.get("status").and_then(Value::as_str) == Some("unreadable") || rejected > 0),
+    );
+    object.insert(
+        "manifest".into(),
+        json!({
+            "by": meta["by"],
+            "request_id": request_id,
+            "submission_id": meta["submission_id"],
+            "kickoff": meta["kickoff"],
+            "sent_by_type": meta.get("sent_by_type").cloned().unwrap_or_else(|| json!({})),
+            "deleted": meta["deleted"].as_i64().unwrap_or(0),
+        }),
+    );
+    true
+}
+
+/// One load as `GET /api/loads/{id}` answers it, its failures included;
+/// `None` when there is no such load.
+fn load_detail(s: &AppState, file_id: i64) -> Result<Option<Value>, ApiError> {
+    let Some(mut load) = load_rows(s, &[file_id])?.into_iter().next() else {
+        return Ok(None);
+    };
+    load["failures"] = Value::Array(match s.db.manifest_failures(file_id)? {
+        Some(groups) => groups,
+        None => s.db.failure_groups(file_id)?,
+    });
+    Ok(Some(load))
 }
 
 /// The most loads `/api/sources/{id}/loads` lists at once.
@@ -949,7 +1069,7 @@ async fn list_files(
     tokio::task::spawn_blocking(move || {
         let ids: Vec<i64> =
             s.db.query_json(
-                "SELECT id FROM files WHERE feed_id = $1 ORDER BY id DESC LIMIT $2",
+                "SELECT id FROM files WHERE feed_id = $1 AND listed = 1 ORDER BY id DESC LIMIT $2",
                 params![id, limit],
             )?
             .iter()
@@ -966,11 +1086,7 @@ async fn list_files(
 /// purpose included, as kind `filtered`), each with sample rows, so a
 /// person can see what went wrong and retry the rows after a fix.
 async fn get_load(State(s): State<AppState>, Path(file_id): Path<i64>) -> ApiResult {
-    let mut load = load_rows(&s, &[file_id])?
-        .into_iter()
-        .next()
-        .ok_or_else(|| not_found(&format!("load {file_id}")))?;
-    load["failures"] = Value::Array(s.db.failure_groups(file_id)?);
+    let load = load_detail(&s, file_id)?.ok_or_else(|| not_found(&format!("load {file_id}")))?;
     Ok(Json(load))
 }
 
@@ -987,12 +1103,26 @@ async fn retry_load(
     body: Option<Json<RetryBody>>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let reason = body.and_then(|Json(b)| b.reason);
-    let source_id =
-        s.db.query_json("SELECT feed_id FROM files WHERE id = $1", params![file_id])?
-            .into_iter()
-            .next()
-            .and_then(|r| r["feed_id"].as_str().map(str::to_string))
-            .ok_or_else(|| not_found(&format!("load {file_id}")))?;
+    let found =
+        s.db.query_json(
+            "SELECT feed_id, CASE WHEN manifest IS NULL THEN 0 ELSE 1 END AS manifest FROM files WHERE id = $1 AND listed = 1",
+            params![file_id],
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| not_found(&format!("load {file_id}")))?;
+    // A manifest load keeps no rows to put back: it is sent again instead.
+    if found["manifest"] == 1 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "a manifest load cannot be retried; send the manifest again (the same URL or file) to load it again",
+        )
+        .code("not_retryable"));
+    }
+    let source_id = found["feed_id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| not_found(&format!("load {file_id}")))?;
     let retried = s.db.reprocess_rejected(file_id, reason.as_deref())?;
     if retried > 0 {
         let _ = s.manager.check_now(&source_id);
