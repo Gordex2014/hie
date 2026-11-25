@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 use crate::bulk::{SUBMITTER_SYSTEM, safe_reason, shown};
 use crate::credentials::Credentials;
-use crate::destination::Destination;
+use crate::destination::{Destination, Failure};
 
 /// The largest body `POST /api/sources/{id}/manifests` takes, counted as received.
 pub const BODY_MAX: usize = 4 << 20;
@@ -39,7 +39,8 @@ pub const GROUPS_KEPT: usize = 100;
 /// them count in `other`.
 pub const GROUPS_TRACKED: usize = 1000;
 
-/// Failed reads of one receipt file before the load is given up as unreadable.
+/// Failed reads in a row of one receipt file (per receipt file, whatever the
+/// others do) before the load is given up as unreadable.
 pub const RECEIPT_ATTEMPTS: u32 = 5;
 
 /// Redirects followed when a status page or a receipt file is read.
@@ -555,27 +556,37 @@ impl Client {
         if let Some(bearer) = bearer {
             request = request.bearer_auth(bearer);
         }
+        // Observed as the outbound path's requests are: a request that gets
+        // no status line in time or loses its connection is a failure; a
+        // status line counts once its body has been read, or its deadline
+        // ended.
         let exchange = self.destination.as_ref().map(|d| d.start());
+        let observe = |outcome: Result<(), Failure>, detail: &str| {
+            if let Some(exchange) = &exchange {
+                exchange.observe(outcome, detail);
+            }
+        };
         let Ok(sent) = tokio::time::timeout_at(deadline, request.send()).await else {
+            observe(Err(Failure::Timeout), "no answer in time");
             return Kickoff::Lost(format!(
                 "no answer from {} within {}",
                 shown(&self.fhir_base),
                 crate::pipeline::human(kickoff_timeout())
             ));
         };
-        if let Some(exchange) = &exchange {
-            exchange.observe_send(&sent);
-        }
         let response = match sent {
             Ok(response) => response,
-            Err(e) if e.is_connect() => {
-                return Kickoff::Unreachable(format!(
-                    "cannot reach {}: {}",
-                    shown(&self.fhir_base),
-                    e.without_url()
-                ));
-            }
             Err(e) => {
+                if let Some(failure) = crate::destination::send_failure(&e) {
+                    observe(Err(failure), &crate::destination::send_detail(&e));
+                }
+                if e.is_connect() {
+                    return Kickoff::Unreachable(format!(
+                        "cannot reach {}: {}",
+                        shown(&self.fhir_base),
+                        e.without_url()
+                    ));
+                }
                 return Kickoff::Lost(format!(
                     "the answer of {} was lost: {}",
                     shown(&self.fhir_base),
@@ -584,23 +595,46 @@ impl Client {
             }
         };
         let status = response.status().as_u16();
+        // A refusal's body, read before the deadline, then observed.
+        let read_body = |response: reqwest::Response| async move {
+            let read = tokio::time::timeout_at(deadline, read_capped(response, REFUSAL_MAX)).await;
+            match &read {
+                Ok(Ok(_)) => observe(
+                    crate::destination::status_outcome(status),
+                    &format!("HTTP {status}"),
+                ),
+                Ok(Err(e)) => observe(
+                    Err(crate::destination::send_failure(e).unwrap_or(Failure::Lost)),
+                    &crate::destination::send_detail(e),
+                ),
+                Err(_) => observe(
+                    Err(Failure::Timeout),
+                    "the answer's body did not arrive in time",
+                ),
+            }
+            match read {
+                Ok(Ok(body)) => Ok(body),
+                _ => Err(()),
+            }
+        };
         match status {
-            200..=299 => Kickoff::Accepted,
+            200..=299 => {
+                observe(Ok(()), &format!("HTTP {status}"));
+                Kickoff::Accepted
+            }
             401 | 403 => {
-                self.forget_token().await;
+                // Forgetting the token waits for no other caller's refresh
+                // past the deadline.
+                let _ = tokio::time::timeout_at(deadline, self.forget_token()).await;
                 let secrets = self.secrets(bearer);
-                let detail =
-                    match tokio::time::timeout_at(deadline, read_capped(response, REFUSAL_MAX))
-                        .await
-                    {
-                        Ok(Ok(Some(body))) => refusal_issues(status, &body, &secrets),
-                        Ok(Ok(None)) => format!("HTTP {status}, a body over {REFUSAL_MAX} bytes"),
-                        _ => format!("HTTP {status}, a body that could not be read in time"),
-                    };
+                let detail = match read_body(response).await {
+                    Ok(Some(body)) => refusal_issues(status, &body, &secrets),
+                    Ok(None) => format!("HTTP {status}, a body over {REFUSAL_MAX} bytes"),
+                    Err(()) => format!("HTTP {status}, a body that could not be read in time"),
+                };
                 Kickoff::Auth(redact(&detail, &secrets))
             }
-            408 => Kickoff::Lost(format!("HTTP 408 from {}", shown(&self.fhir_base))),
-            400..=499 | 501 => {
+            400..=499 | 501 if status != 408 => {
                 let content_type = response
                     .headers()
                     .get(reqwest::header::CONTENT_TYPE)
@@ -611,8 +645,8 @@ impl Client {
                     .cloned();
                 // The status says the server refused it; a body that does not
                 // arrive whole, in time and small enough cannot be passed on.
-                match tokio::time::timeout_at(deadline, read_capped(response, REFUSAL_MAX)).await {
-                    Ok(Ok(Some(body))) => Kickoff::Refused {
+                match read_body(response).await {
+                    Ok(Some(body)) => Kickoff::Refused {
                         status,
                         body,
                         content_type,
@@ -621,7 +655,13 @@ impl Client {
                     _ => Kickoff::TooLarge { status },
                 }
             }
-            _ => Kickoff::Lost(format!("HTTP {status} from {}", shown(&self.fhir_base))),
+            _ => {
+                observe(
+                    crate::destination::status_outcome(status),
+                    &format!("HTTP {status}"),
+                );
+                Kickoff::Lost(format!("HTTP {status} from {}", shown(&self.fhir_base)))
+            }
         }
     }
 
@@ -1057,9 +1097,12 @@ pub struct Tally {
     pub other: i64,
     /// Whether a page listed any file (`output`, `outcome` or `deleted`).
     pub files: bool,
-    /// Failed reads of a receipt file of the page `next` names, since that
-    /// page was last read whole.
-    pub receipt_failures: u32,
+    /// The number of the status page `next` names, from 0.
+    pub page: u32,
+    /// Failed reads in a row of each receipt file of that page, by its
+    /// member and index on the page (which survive a re-read of the page for
+    /// fresh URLs); a receipt read whole is taken out.
+    pub receipt_failures: BTreeMap<String, u32>,
 }
 
 impl Tally {

@@ -150,8 +150,11 @@ struct World {
     token_delay: Option<Duration>,
     /// The identity provider refuses with this body.
     token_refusal: Option<String>,
-    /// Receipt files answered `500` from now on, one each.
-    receipt_500: u32,
+    /// Receipt files answered `500`, in this order: the first is failed
+    /// when it is the one asked for, and taken off.
+    receipt_fail: VecDeque<String>,
+    /// Output entries carry no `count`, so their files are read.
+    output_without_count: bool,
     /// Holds the next status page that has receipts until notified, and says
     /// it holds it.
     page_gate: Option<Arc<tokio::sync::Notify>>,
@@ -491,6 +494,7 @@ fn poll_page(w: &W, id: &str, q: &HashMap<String, String>, headers: &HeaderMap) 
         w.poll_500 -= 1;
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    let without_count = w.output_without_count;
     let (pages, store, in_progress, two_pages, page2_429, no_url) = (
         w.pages.clone(),
         if w.receipts_on_pages {
@@ -515,6 +519,13 @@ fn poll_page(w: &W, id: &str, q: &HashMap<String, String>, headers: &HeaderMap) 
     let mut outcome_entries = Vec::new();
     if sub.manifest {
         for (t, refs) in &sub.output {
+            if without_count {
+                output.push(
+                    json!({"type": t, "url": format!("{store}/bulk-submit-file/{id}/output-{t}"),
+                                   "manifestUrl": manifest_url}),
+                );
+                continue;
+            }
             output.push(
                 json!({"type": t, "url": format!("{store}/bulk-submit-file/{id}/output-{t}"),
                                "count": refs.len(), "manifestUrl": manifest_url}),
@@ -556,8 +567,8 @@ async fn artifact(
     let mut w = w.lock().unwrap();
     w.receipt_requests
         .push((format!("/bulk-submit-file/{id}/{part}"), bearer(&headers)));
-    if w.receipt_500 > 0 {
-        w.receipt_500 -= 1;
+    if w.receipt_fail.front() == Some(&part) {
+        w.receipt_fail.pop_front();
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let malformed = w.malformed;
@@ -2397,10 +2408,18 @@ async fn a_completed_probe_reads_the_status_again_before_it_settles() {
 }
 
 #[tokio::test]
-async fn receipt_reads_are_counted_apart_from_failed_polls() {
+async fn receipt_reads_are_counted_per_receipt_file() {
     let w = fake().await;
-    w.lock().unwrap().poll_500 = 4;
-    w.lock().unwrap().receipt_500 = 1;
+    {
+        // Receipt A fails four times, then receipt B once: no file fails five
+        // times in a row, so the load is still retried.
+        let mut world = w.lock().unwrap();
+        world.output_without_count = true;
+        for _ in 0..4 {
+            world.receipt_fail.push_back("output-Patient".into());
+        }
+        world.receipt_fail.push_back("error".into());
+    }
     let e = engine(&w).await;
     e.source("export", json!({})).await;
     let url = url_manifest(&w, "m", &[("Patient", "patients.ndjson")]);
@@ -2429,7 +2448,7 @@ async fn receipt_reads_are_counted_apart_from_failed_polls() {
         .into_iter()
         .filter(|ev| ev["kind"] == "submission.attempt_failed")
         .count();
-    assert_eq!(failed, 5, "four polls and one receipt read");
+    assert_eq!(failed, 5, "four reads of one receipt and one of another");
 }
 
 #[tokio::test]
@@ -2506,6 +2525,17 @@ async fn a_check_answered_during_a_kickoff_never_gains_its_load() {
     assert_eq!(answered["status"], "nothing_new", "{answered}");
     assert_eq!(answered["file_count"], 0);
     assert_eq!(answered["files"], json!([]));
+    // A load listed in the very millisecond of the cutoff is not the
+    // check's either: the count and the page use the same strict bound.
+    e.sql(&format!(
+        "UPDATE files SET listed_at = (SELECT cutoff_at FROM checks WHERE id = {check}) WHERE feed_id = 'export' RETURNING id"
+    ));
+    let (_, answered) = e.get(&format!("/api/checks/{check}")).await;
+    assert_eq!(
+        (answered["file_count"].as_i64(), answered["files"].clone()),
+        (Some(0), json!([])),
+        "{answered}"
+    );
 }
 
 #[tokio::test]
@@ -2631,6 +2661,11 @@ async fn monitoring_splits_the_last_day_by_source_type() {
             == 2
     })
     .await;
+    until("the deleted source's rows decided", || {
+        let c = db.feed_counts("gone").unwrap();
+        c["sent"].as_i64().unwrap_or(0) + c["rejected"].as_i64().unwrap_or(0) > 0
+    })
+    .await;
     let (status, _) = (
         e.http
             .delete(format!("{}/api/sources/gone", e.api))
@@ -2659,6 +2694,24 @@ async fn monitoring_splits_the_last_day_by_source_type() {
     for (member, total) in [("loads", "files"), ("sent", "sent"), ("failing", "failing")] {
         let sum: i64 = by.values().map(|v| v[member].as_i64().unwrap()).sum();
         assert_eq!(sum, last[total].as_i64().unwrap(), "{member}: {last}");
+    }
+
+    // A manifest source created again on the deleted folder source's id has
+    // figures of its own: none of the earlier source's rows or loads.
+    e.source("gone", json!({})).await;
+    let (_, gone) = e.get("/api/sources/gone").await;
+    assert_eq!(
+        (
+            gone["rejected_last_24h"].as_i64(),
+            gone["failing_last_24h"].as_i64()
+        ),
+        (Some(0), Some(0)),
+        "{gone}"
+    );
+    assert_eq!(gone["last_received_at"], Value::Null, "{gone}");
+    let (_, stats) = e.get("/api/sources/gone/stats").await;
+    for key in ["sent", "rejected", "failing", "pending", "records"] {
+        assert_eq!(stats["today"][key], 0, "{key}: {stats}");
     }
 }
 

@@ -235,21 +235,23 @@ impl FeedRunner {
             // The page counts whole or not at all: a receipt that cannot be
             // read leaves the tally as the previous page left it, and the
             // page is read again, for fresh URLs, at the next attempt. Five
-            // failed reads of the page's receipts in a row give it up.
+            // failed reads in a row of one receipt file give it up.
             let mut page = tally.clone();
+            let mut failures = std::mem::take(&mut tally.receipt_failures);
             match self
-                .tally_page(client, due, claim, leased, status_url, &manifest, &mut page)
+                .tally_page(
+                    client,
+                    (due, claim, leased),
+                    status_url,
+                    &manifest,
+                    &mut page,
+                    &mut failures,
+                )
                 .await
             {
                 Ok(true) => {}
                 Ok(false) => return Ok(Step::Abandoned),
                 Err(StepError::Transient(reason)) => {
-                    let failures = tally.receipt_failures + 1;
-                    if failures >= crate::manifest::RECEIPT_ATTEMPTS {
-                        return Ok(Step::Unreadable(format!(
-                            "the FHIR server's receipts could not be read: {reason}"
-                        )));
-                    }
                     tally.receipt_failures = failures;
                     if !self.db.manifest_checkpoint(&due.token, claim, &tally)? {
                         return Ok(Step::Abandoned);
@@ -258,7 +260,7 @@ impl FeedRunner {
                 }
                 Err(StepError::Unreadable(reason)) => return Ok(Step::Unreadable(reason)),
             }
-            page.receipt_failures = 0;
+            page.receipt_failures.clear();
             let next = manifest["link"]
                 .as_array()
                 .into_iter()
@@ -268,6 +270,7 @@ impl FeedRunner {
                 .map(str::to_string);
             if let Some(next) = next {
                 page.next = Some(next);
+                page.page += 1;
                 if !self.db.manifest_checkpoint(&due.token, claim, &page)? {
                     return Ok(Step::Abandoned);
                 }
@@ -313,23 +316,52 @@ impl FeedRunner {
     /// Adds one status page to `tally`: the resources written (`output`, by
     /// its counts), the deletions, and the failing outcomes, read line by
     /// line. `false` when the runner stopped holding the submission between
-    /// two receipt files.
-    #[allow(clippy::too_many_arguments)]
+    /// two receipt files. `failures` counts each receipt file's failed reads
+    /// in a row: one read whole is taken out, and one that fails for the
+    /// `RECEIPT_ATTEMPTS`th time makes the load unreadable.
     async fn tally_page(
         &self,
         client: &crate::manifest::Client,
-        due: &Due,
-        claim: Claim,
-        leased: bool,
+        (due, claim, leased): (&Due, Claim, bool),
         status_url: &str,
         manifest: &Value,
         tally: &mut Tally,
+        failures: &mut std::collections::BTreeMap<String, u32>,
     ) -> Result<bool, StepError> {
+        let page = tally.page;
+        let counted = |failures: &mut std::collections::BTreeMap<String, u32>,
+                       key: String,
+                       read: Result<(), StepError>|
+         -> Result<(), StepError> {
+            match read {
+                Ok(()) => {
+                    failures.remove(&key);
+                    Ok(())
+                }
+                Err(StepError::Transient(reason)) => {
+                    let n = failures.entry(key).or_default();
+                    *n += 1;
+                    if *n >= crate::manifest::RECEIPT_ATTEMPTS {
+                        Err(StepError::Unreadable(format!(
+                            "the FHIR server's receipts could not be read: {reason}"
+                        )))
+                    } else {
+                        Err(StepError::Transient(reason))
+                    }
+                }
+                Err(other) => Err(other),
+            }
+        };
         let keeps = || {
             self.keeps(due, claim, leased)
                 .map_err(|e| StepError::Transient(crate::bulk::safe_reason(&format!("{e:#}"))))
         };
-        for entry in manifest["output"].as_array().into_iter().flatten() {
+        for (i, entry) in manifest["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
             tally.files = true;
             let kind = entry["type"].as_str().unwrap_or("unknown").to_string();
             let count = match entry["count"].as_i64() {
@@ -340,7 +372,7 @@ impl FeedRunner {
                             return Ok(false);
                         }
                         let mut n = 0;
-                        client
+                        let read = client
                             .lines(url, status_url, |line| {
                                 if serde_json::from_slice::<Value>(line)
                                     .is_ok_and(|v| v["reference"].is_string())
@@ -349,7 +381,8 @@ impl FeedRunner {
                                 }
                                 Ok(())
                             })
-                            .await?;
+                            .await;
+                        counted(failures, format!("{page}:output:{i}"), read)?;
                         n
                     }
                     None => 0,
@@ -362,15 +395,21 @@ impl FeedRunner {
             tally.files = true;
             tally.deleted += entry["count"].as_i64().unwrap_or(0);
         }
-        for entry in manifest["outcome"].as_array().into_iter().flatten() {
+        for (i, entry) in manifest["outcome"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
             tally.files = true;
             if let Some(url) = entry["url"].as_str() {
                 if !keeps()? {
                     return Ok(false);
                 }
-                client
+                let read = client
                     .lines(url, status_url, |line| tally.outcome(line, url))
-                    .await?;
+                    .await;
+                counted(failures, format!("{page}:outcome:{i}"), read)?;
             }
         }
         Ok(true)

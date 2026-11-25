@@ -370,7 +370,14 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         params![feed.id],
     )?;
     let since = now_ms() - DAY_MS;
-    let (rejected_24h, failing_24h) = rejected_and_failing(db, Some(&feed.id), since)?;
+    // A manifest source's are its receipts': rows an earlier source with the
+    // id rejected are not its own.
+    let (rejected_24h, failing_24h) = if feed.is_manifest() {
+        let (_, failing) = db.receipts_between(Some(&feed.id), since, i64::MAX)?;
+        (failing, failing)
+    } else {
+        rejected_and_failing(db, Some(&feed.id), since)?
+    };
     Ok(json!({
         "id": feed.id,
         "name": feed.name,
@@ -605,7 +612,8 @@ async fn source_stats(
         None => Zone::utc(),
         Some(name) => Zone::parse(name).map_err(|e| invalid_query("tz", e))?,
     };
-    s.manager
+    let feed = s
+        .manager
         .source(&id)
         .ok_or_else(|| not_found(&format!("source {id}")))?;
     let days = q.days.unwrap_or(14).clamp(1, 366) as u32;
@@ -615,17 +623,20 @@ async fn source_stats(
         &zone,
         days,
         chrono::Utc::now(),
+        feed.is_manifest(),
     )?))
 }
 
 /// A source's figures by local day in `zone`, the last of the `days` being the
-/// one `now` falls in.
+/// one `now` falls in. A `manifest` source's come from its loads' receipts
+/// only: rows an earlier source with the id kept are not its own.
 fn daily_stats(
     db: &Db,
     id: &str,
     zone: &Zone,
     days: u32,
     now: chrono::DateTime<chrono::Utc>,
+    manifest: bool,
 ) -> anyhow::Result<Value> {
     let local = Days::ending_today(zone, now, days);
     let (since, until) = local.span();
@@ -653,7 +664,10 @@ fn daily_stats(
             by_day[i]["files"] = row["n"].clone();
         }
     }
-    for row in db.query_json(
+    for row in if manifest {
+        Vec::new()
+    } else {
+        db.query_json(
         &format!(
             "SELECT {} AS day, status, COUNT(*) AS n,
                     CAST(COALESCE(SUM(CASE WHEN {FAILING} THEN 1 ELSE 0 END), 0) AS BIGINT) AS failing
@@ -662,7 +676,8 @@ fn daily_stats(
             local.sql_index("updated_at")
         ),
         params![id, since, until],
-    )? {
+    )?
+    } {
         if let (Some(i), Some(status)) = (by_index(&row), row["status"].as_str()) {
             by_day[i][status] = row["n"].clone();
             if status == "rejected" {
@@ -697,12 +712,12 @@ fn daily_stats(
     let today_json = json!({
         "day": last["day"],
         "files": last["files"],
-        "records": count(db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2 AND f.received_at < $3", params![id, today_since, today_until])?
+        "records": if manifest { 0 } else { count(db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2 AND f.received_at < $3", params![id, today_since, today_until])? }
             + count(db, "SELECT CAST(COALESCE(SUM(receipts_sent + receipts_rejected), 0) AS BIGINT) AS n FROM files WHERE feed_id = $1 AND manifest IS NOT NULL AND listed = 1 AND received_at >= $2 AND received_at < $3", params![id, today_since, today_until])?,
         "sent": last["sent"],
         "rejected": last["rejected"],
         "failing": last["failing"],
-        "pending": count(db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status IN ('received', 'pending')", params![id])?,
+        "pending": if manifest { 0 } else { count(db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status IN ('received', 'pending')", params![id])? },
     });
     Ok(
         json!({"source": id, "days": days, "tz": zone.name(), "today": today_json, "by_day": by_day}),
@@ -905,13 +920,17 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
         sources.push(status);
     }
     let since = now_ms() - DAY_MS;
-    let (rejected, failing) = rejected_and_failing(&s.db, None, since)?;
-    let (receipts_sent, _) = s.db.receipts_between(None, since, i64::MAX)?;
-    // The same figures by source type: a manifest load under `manifest`, any
+    let (rejected, _) = rejected_and_failing(&s.db, None, since)?;
+    // `files`, `sent` and `failing`, and the same figures by source type,
+    // from one read, so the types always add up to the totals: a manifest load under `manifest`, any
     // other under the type of the source registered under its id now, or
     // `unregistered`.
     let mut by_type: std::collections::BTreeMap<&'static str, (i64, i64, i64)> = Default::default();
+    let (mut files, mut sent, mut failing) = (0, 0, 0);
     for share in s.db.shares_since(since)? {
+        files += share.loads;
+        sent += share.sent;
+        failing += share.failing;
         let kind = if share.manifest {
             "manifest"
         } else {
@@ -935,8 +954,8 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
         })
         .collect();
     let last_24h = json!({
-        "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE status <> 'duplicate' AND listed = 1 AND received_at >= $1", params![since])?,
-        "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'sent' AND updated_at >= $1", params![since])? + receipts_sent,
+        "files": files,
+        "sent": sent,
         "rejected": rejected,
         "failing": failing,
         "alerts": count(&s.db, "SELECT COUNT(*) AS n FROM alerts WHERE created_at >= $1", params![since])?,
@@ -1791,7 +1810,7 @@ mod tests {
         ]);
         let ny = Zone::parse("America/New_York").unwrap();
         let now = utc("2026-11-02T12:00:00Z");
-        let stats = daily_stats(&db, "lab", &ny, 366, now).unwrap();
+        let stats = daily_stats(&db, "lab", &ny, 366, now, false).unwrap();
         assert_eq!(stats["tz"], "America/New_York");
         assert_eq!(stats["by_day"].as_array().unwrap().len(), 366);
         assert_eq!(stats["by_day"][365]["day"], "2026-11-02");
@@ -1818,7 +1837,7 @@ mod tests {
         assert_eq!(stats["today"]["records"], 1);
 
         // The same rows by UTC day.
-        let stats = daily_stats(&db, "lab", &Zone::utc(), 366, now).unwrap();
+        let stats = daily_stats(&db, "lab", &Zone::utc(), 366, now, false).unwrap();
         assert_eq!(stats["tz"], "UTC");
         for (date, files) in [
             ("2026-03-08", 2),
@@ -1839,7 +1858,7 @@ mod tests {
             ("2026-11-21T05:00:00Z", "rejected"),     // the 21st: tomorrow, not counted
         ]);
         let ny = Zone::parse("America/New_York").unwrap();
-        let stats = daily_stats(&db, "lab", &ny, 2, utc("2026-11-21T04:00:00Z")).unwrap();
+        let stats = daily_stats(&db, "lab", &ny, 2, utc("2026-11-21T04:00:00Z"), false).unwrap();
         assert_eq!(
             stats["today"],
             json!({"day": "2026-11-20", "files": 2, "records": 2, "sent": 1, "rejected": 1, "failing": 1, "pending": 0})
@@ -1864,7 +1883,15 @@ mod tests {
             ("2026-11-20T03:00:00Z", "rejected"),
             ("2026-11-19T03:00:00Z", "filtered"),
         ]);
-        let stats = daily_stats(&db, "lab", &Zone::utc(), 2, utc("2026-11-20T12:00:00Z")).unwrap();
+        let stats = daily_stats(
+            &db,
+            "lab",
+            &Zone::utc(),
+            2,
+            utc("2026-11-20T12:00:00Z"),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             (&stats["today"]["rejected"], &stats["today"]["failing"]),
             (&json!(3), &json!(1))
@@ -1885,11 +1912,19 @@ mod tests {
             ("2026-11-19T18:30:00Z", "sent"),
         ]);
         let kolkata = Zone::parse("Asia/Kolkata").unwrap();
-        let stats = daily_stats(&db, "lab", &kolkata, 2, utc("2026-11-20T06:00:00Z")).unwrap();
+        let stats =
+            daily_stats(&db, "lab", &kolkata, 2, utc("2026-11-20T06:00:00Z"), false).unwrap();
         assert_eq!(stats["by_day"][0]["files"], 1);
         assert_eq!(stats["by_day"][1]["files"], 1);
-        let stats =
-            daily_stats(&db, "lab", &Zone::default(), 2, utc("2026-11-20T06:00:00Z")).unwrap();
+        let stats = daily_stats(
+            &db,
+            "lab",
+            &Zone::default(),
+            2,
+            utc("2026-11-20T06:00:00Z"),
+            false,
+        )
+        .unwrap();
         assert_eq!(stats["tz"], "UTC");
         assert_eq!(stats["by_day"][0]["files"], 2);
         assert_eq!(stats["today"]["files"], 0);

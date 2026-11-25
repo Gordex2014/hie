@@ -153,11 +153,13 @@ pub(super) async fn submit_manifest(
         }
     };
 
-    // The kick-off's deadline runs from the admission: the token, the
-    // dispatch and the answer all fit in it, and a load still unlisted twice
-    // that long after it was recorded is its source's to confirm.
-    let deadline = tokio::time::Instant::now() + crate::manifest::kickoff_timeout();
+    // The kick-off's deadline runs from when the load was recorded: the
+    // token, the dispatch and the answer all end by then, and a load still
+    // unlisted twice that long after it was recorded is its source's to
+    // confirm.
     let deadline_ms = crate::manifest::kickoff_timeout().as_millis() as i64;
+    let left = (admitted.received_at + deadline_ms - crate::db::now_ms()).max(0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(left as u64);
     let load = admitted.load_id;
     // The load as this request knows it, should the store not answer.
     let known = json!({
@@ -178,7 +180,7 @@ pub(super) async fn submit_manifest(
     match s.db.manifest_dispatch(&token, deadline_ms) {
         Ok(true) => {}
         Ok(false) => {
-            if let Some(detail) = load_detail(&s, load)? {
+            if let Some(detail) = load_detail(&s, load).ok().flatten() {
                 return Ok(
                     (StatusCode::ACCEPTED, located(load), axum::Json(detail)).into_response()
                 );

@@ -4181,16 +4181,6 @@ impl Db {
         )
     }
 
-    fn max_file_id(&self, feed: &str) -> Result<i64> {
-        Ok(self
-            .query_one(
-                "SELECT MAX(id) FROM files WHERE feed_id = $1",
-                &params![feed],
-            )?
-            .and_then(|r| r.opt_i64(0))
-            .unwrap_or(0))
-    }
-
     /// The source's checks waiting for an answer, as they are now: what the scan
     /// about to start answers. Checks recorded after this wait for the next one.
     pub fn pending_checks(&self, feed: &str) -> Result<Vec<i64>> {
@@ -4217,14 +4207,15 @@ impl Db {
         if snapshot.is_empty() {
             return Ok(());
         }
-        // The loads listed by `now`, the answer's cutoff: one listed later
-        // (a manifest whose kick-off was still being sent) is never the
-        // check's, here or in its pages (`check`).
+        // The loads up to `upto`, a manifest load only when listed before
+        // `now`, the answer's cutoff: one listed later (its kick-off was still
+        // being sent) is never the check's, here or in its pages (`check`), which use the same strict
+        // predicate. The cutoff is taken under the source's manifest lock,
+        // which a listing takes too, so a listing commits wholly before or
+        // after it.
         const COUNT: &str = "(SELECT COUNT(*) FROM files WHERE files.feed_id = checks.feed_id
                                AND files.id > checks.after_file AND files.id <= $3 AND files.listed = 1
-                               AND COALESCE(files.listed_at, files.received_at) <= $4)";
-        let upto = self.max_file_id(feed)?;
-        let now = now_ms();
+                               AND (files.listed_at IS NULL OR files.listed_at < $4))";
         let status = match failure {
             Some(_) => "'failed'".to_string(),
             None => format!("CASE WHEN {COUNT} > 0 THEN 'found' ELSE 'nothing_new' END"),
@@ -4235,13 +4226,24 @@ impl Db {
                reason = $5
              WHERE id = $1 AND feed_id = $2 AND status = 'pending'"
         );
-        for &id in snapshot {
-            self.execute(
-                &sql,
-                &params![id, feed, upto, now, failure.map(CheckFailure::reason)],
-            )?;
-        }
-        Ok(())
+        self.transaction(|tx| {
+            manifest::admission_lock(tx, feed)?;
+            let upto = tx
+                .query_one(
+                    "SELECT MAX(id) FROM files WHERE feed_id = $1",
+                    &params![feed],
+                )?
+                .and_then(|r| r.opt_i64(0))
+                .unwrap_or(0);
+            let now = now_ms();
+            for &id in snapshot {
+                tx.execute(
+                    &sql,
+                    &params![id, feed, upto, now, failure.map(CheckFailure::reason)],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Fails every pending check of the source with the failure's fixed reason,
@@ -4258,7 +4260,7 @@ impl Db {
             "UPDATE checks SET status = 'failed',
                file_count = (SELECT COUNT(*) FROM files
                              WHERE files.feed_id = checks.feed_id AND files.id > checks.after_file AND files.listed = 1
-                               AND COALESCE(files.listed_at, files.received_at) <= $4),
+                               AND (files.listed_at IS NULL OR files.listed_at < $4)),
                upto_file = (SELECT COALESCE(MAX(id), 0) FROM files WHERE feed_id = $1), cutoff_at = $4,
                finished_at = CASE WHEN requested_at > $4 THEN requested_at ELSE $4 END,
                reason = $2
@@ -4293,7 +4295,7 @@ impl Db {
             Some(upto) => self.query_json(
                 "SELECT id, name, status, duplicate_of FROM files
                  WHERE feed_id = $1 AND id > $2 AND id <= $3 AND listed = 1
-                   AND (CAST($5 AS BIGINT) IS NULL OR COALESCE(listed_at, received_at) <= CAST($5 AS BIGINT))
+                   AND (CAST($5 AS BIGINT) IS NULL OR listed_at IS NULL OR listed_at < CAST($5 AS BIGINT))
                  ORDER BY id LIMIT $4",
                 params![
                     check["source"].as_str().unwrap_or(""),

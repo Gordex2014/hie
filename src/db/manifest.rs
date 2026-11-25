@@ -156,10 +156,36 @@ impl Db {
                     }
                     // Left by a request that stopped while it sent: listed as
                     // unconfirmed, for its source to confirm.
-                    if let Some(token) = found.opt_string(3) {
-                        list(tx, &token, None, false)?;
+                    let token = found.opt_string(3).unwrap_or_default();
+                    if list(tx, &token, None, false)? {
+                        return Ok(Admission::Existing(id));
                     }
-                    return Ok(Admission::Existing(id));
+                    // Its request moved it meanwhile: answered from the row as
+                    // it is now. A refusal frees the key, and this request is
+                    // sent.
+                    let now_row = tx.query_one(
+                        "SELECT f.listed, s.status FROM files f LEFT JOIN submissions s ON s.load_id = f.id
+                         WHERE f.id = $1",
+                        &params![id],
+                    )?;
+                    match now_row {
+                        Some(r) if r.i64(0) == 1 => return Ok(Admission::Existing(id)),
+                        Some(r) if r.opt_string(1).is_none_or(|s| s == "m_refused") => {
+                            tx.execute(
+                                "DELETE FROM submissions WHERE load_id = $1 AND status = 'm_refused'",
+                                &params![id],
+                            )?;
+                            tx.execute(
+                                "DELETE FROM files WHERE id = $1 AND listed = 0",
+                                &params![id],
+                            )?;
+                        }
+                        None => {}
+                        Some(_) => {
+                            tx.rollback = true;
+                            return Ok(Admission::InProgress);
+                        }
+                    }
                 }
             }
             if tx
@@ -653,6 +679,9 @@ fn list(tx: &mut Tx, token: &str, epoch: Option<i64>, accepted: bool) -> Result<
         return Ok(false);
     };
     let (feed, submission_id, load_id) = (r.string(0), r.string(1), r.i64(2));
+    // A check's answer takes the same lock: the load is listed wholly
+    // before or after its cutoff.
+    admission_lock(tx, &feed)?;
     let Some(f) = tx.query_one(
         "SELECT name, size, manifest FROM files WHERE id = $1",
         &params![load_id],
