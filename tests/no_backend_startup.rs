@@ -285,8 +285,8 @@ async fn a_skipped_file_alert_stays_while_a_file_of_the_source_is_skipped() {
 
 /// Another instance on the store, which does not skip the file, leaves the
 /// alert open: it is the instance that skips it that clears it. An alert an
-/// earlier version raised names no instance: it stays until an instance that
-/// skips the file has taken it as its own, then clears as that one's.
+/// earlier version raised names no instance, and no start clears it: an
+/// instance that skips the file raises its own, and clears only that one.
 #[tokio::test]
 async fn only_the_instance_that_skips_a_file_clears_its_alert() {
     let a = tempfile::tempdir().unwrap();
@@ -331,14 +331,17 @@ listen: 127.0.0.1:{b_port}
             "b cleared an alert of an earlier version"
         );
     }
-    // a still skips it: it takes the alert, and clears it once fixed.
-    drop(serve(a.path(), a_port, "a-adopts.log").await);
+    // a still skips it: it raises its own, and once fixed clears that one.
+    drop(serve(a.path(), a_port, "a-own.log").await);
     std::fs::write(a.path().join("sources/private.yaml"), PRIVATE_FOLDER).unwrap();
     let _a = serve(a.path(), a_port, "a-fixed.log").await;
     let alerts = definition_alerts(a_port).await;
-    assert_eq!(alerts.len(), 1, "{alerts:?}");
-    assert!(!alerts[0]["cleared_at"].is_null(), "{alerts:?}");
+    assert_eq!(alerts.len(), 2, "{alerts:?}");
+    // Newest first: a's own, cleared once; the earlier version's, open.
+    let open: Vec<bool> = alerts.iter().map(|a| a["cleared_at"].is_null()).collect();
+    assert_eq!(open, [false, true], "{alerts:?}");
     assert_eq!(clears(&alerts[0]), 1, "{alerts:?}");
+    assert_eq!(clears(&alerts[1]), 0, "{alerts:?}");
 }
 
 /// Two instances on one store that both skip a file of a source each keep an
@@ -370,4 +373,30 @@ async fn two_instances_that_skip_a_file_each_keep_their_own_alert() {
     // Newest first: b's is still open, a's cleared.
     assert_eq!(open, [true, false], "{alerts:?}");
     assert_eq!(clears(&alerts[1]), 1, "{alerts:?}");
+}
+
+/// An instance without a stable id (no `HIE_INSTANCE_ID`, a sources directory
+/// it cannot write) is a new one at each start: it raises one alert naming no
+/// instance for a skipped file, and no second one at the next start.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_instance_without_a_stable_id_raises_one_alert_for_a_skipped_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    root(dir.path(), port);
+    let sources = dir.path().join("sources");
+    std::fs::set_permissions(&sources, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(sources.join("probe"), "").is_ok() {
+        // Root writes anyway: the case cannot be made here.
+        let _ = std::fs::remove_file(sources.join("probe"));
+        eprintln!("skipping: the sources directory stays writable");
+        return;
+    }
+    drop(serve(dir.path(), port, "first.log").await);
+    let _engine = serve(dir.path(), port, "second.log").await;
+    let alerts = definition_alerts(port).await;
+    std::fs::set_permissions(&sources, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert!(alerts[0]["cleared_at"].is_null(), "{alerts:?}");
 }

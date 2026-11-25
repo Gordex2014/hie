@@ -204,8 +204,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("alerts", "cleared_reason", "TEXT"),
     ("alerts", "notify", "TEXT"),
     ("alerts", "channels", "TEXT"),
-    // The instance that raised an alert of a source file it skipped; null on
-    // every other alert, and on those an earlier version raised.
+    // The instance that raised an alert of a source file it skipped, which only
+    // that instance clears; null on every other alert, and on those an earlier
+    // version raised.
     ("alerts", "raised_by", "TEXT"),
     ("alert_rules", "tz", "TEXT"),
     ("submissions", "stamped", "INTEGER NOT NULL DEFAULT 0"),
@@ -3493,16 +3494,6 @@ impl Db {
             .collect())
     }
 
-    /// Records `owner` as the instance that raised open alert `id`, when none
-    /// is recorded: one an earlier version raised, taken over by an instance
-    /// whose own state it describes. Whether it was taken.
-    pub fn adopt_alert(&self, id: i64, owner: &str) -> Result<bool> {
-        Ok(self.execute(
-            "UPDATE alerts SET raised_by = $1 WHERE id = $2 AND raised_by IS NULL AND cleared_at IS NULL",
-            &params![owner, id],
-        )? > 0)
-    }
-
     /// Whether source `feed` has an open alert of `kind` without a rule
     /// (its outage, its credential) raised since its current definition was
     /// born (a create through the API sets the birth again): one an earlier
@@ -4156,9 +4147,10 @@ impl Db {
     /// since they were raised while open) in one transaction, and adds what went
     /// to the purged tallies `/metrics` counts. Kept at any age: open alerts of a
     /// rule that exists, is enabled and is older than the alert (a SQLite rule id
-    /// may be given again after a rule is deleted), open `credential` and `definition`
-    /// alerts, and the alert with the highest id, so no alert id is ever given
-    /// again. Returns how many went.
+    /// may be given again after a rule is deleted), open `credential` alerts, open
+    /// `definition` alerts an instance raised (one an earlier version raised
+    /// names none, and no start clears it), and the alert with the highest id,
+    /// so no alert id is ever given again. Returns how many went.
     pub fn purge_alerts(&self, cutoff_ms: i64, limit: usize) -> Result<usize> {
         self.transaction(|tx| {
             // The predicate is checked again on the row deleted: on PostgreSQL an
@@ -4168,7 +4160,8 @@ impl Db {
                     "COALESCE({a}.cleared_at, {a}.created_at) < $1
                      AND {a}.id < (SELECT MAX(id) FROM alerts)
                      AND NOT ({a}.cleared_at IS NULL AND (
-                           {a}.kind IN ('credential', 'definition')
+                           {a}.kind = 'credential'
+                           OR ({a}.kind = 'definition' AND {a}.raised_by IS NOT NULL)
                            OR ({a}.kind = 'delivery' AND {a}.rule_id IS NULL)
                            OR EXISTS (SELECT 1 FROM alert_rules r
                                       WHERE r.id = {a}.rule_id AND r.enabled = 1

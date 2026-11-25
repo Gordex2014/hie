@@ -728,9 +728,17 @@ impl SourceManager {
     /// finds it (any `*.yaml` or `*.yml` whose body has that id): what the source
     /// runs once a start succeeds, which may differ from the running one after
     /// a start that failed. `None` once the file is gone.
-    fn published(&self, id: &str) -> Result<Option<FeedConfig>> {
-        crate::config::find_source(&self.sources_dir, &self.base_dir, id, &self.source_ids)
-            .with_context(|| format!("reading the definition of {id}"))
+    /// A file no start could load, which may be any source's, fails the lookup
+    /// when `strict`, and is passed over otherwise.
+    fn published(&self, id: &str, strict: bool) -> Result<Option<FeedConfig>> {
+        crate::config::find_source(
+            &self.sources_dir,
+            &self.base_dir,
+            id,
+            &self.source_ids,
+            strict,
+        )
+        .with_context(|| format!("reading the definition of {id}"))
     }
 
     /// Stops the source and removes its definition. Its records and alerts stay.
@@ -808,7 +816,7 @@ impl SourceManager {
             let _changing = lock.lock().await;
             pause_point!(await self, "manager:cleanup:before");
             let running = self.source(id);
-            let published = match self.published(id) {
+            let published = match self.published(id, false) {
                 Ok(published) => published,
                 Err(e) => {
                     tracing::warn!(feed = %id, "credential registrations kept: {e:#}");
@@ -1097,7 +1105,7 @@ impl SourceManager {
         // Fails before restarting any source when a definition it would
         // restart cannot be read now (the code is already written).
         for running in &using {
-            self.published(&running.id)?;
+            self.published(&running.id, true)?;
         }
         for running in using {
             let lock = self.source_lock(&running.id);
@@ -1105,7 +1113,7 @@ impl SourceManager {
             if self.source(&running.id).is_none() {
                 continue; // deleted meanwhile
             }
-            let feed = match self.published(&running.id)? {
+            let feed = match self.published(&running.id, true)? {
                 Some(feed) => feed,
                 None => continue,
             };

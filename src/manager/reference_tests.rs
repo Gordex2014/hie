@@ -940,3 +940,38 @@ async fn overlapping_changes_of_a_source_leave_no_lock_behind() {
     }
     assert!(a.manager.locks.lock().unwrap().is_empty());
 }
+
+/// A transform save fails, restarting no source, while the own file of a
+/// source that uses the transform cannot be read: the sources keep running
+/// one version of it, as before the save.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transform_save_restarts_nothing_while_a_definition_cannot_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (database, _keeper) = store(dir.path());
+    let bucket = refusing_bucket().await;
+    let a = Instance::start(&dir.path().join("a"), &database, &key());
+    a.secret("x").await;
+    for id in ["s1", "s2"] {
+        a.manager
+            .create(&a.definition(id, "x", &bucket), None)
+            .await
+            .unwrap();
+        a.settled(id).await;
+    }
+    let before = [
+        a.manager.runner("s1").unwrap(),
+        a.manager.runner("s2").unwrap(),
+    ];
+    // A hand edit that broke the YAML of s2's own file.
+    std::fs::write(a.root.join("sources/s2.yaml"), "id: [s2\n").unwrap();
+    a.manager
+        .save_transform("t", "def transform(r, c):\n    return []\n")
+        .await
+        .unwrap_err();
+    let after = [
+        a.manager.runner("s1").unwrap(),
+        a.manager.runner("s2").unwrap(),
+    ];
+    assert!(Arc::ptr_eq(&before[0], &after[0]), "s1 restarted");
+    assert!(Arc::ptr_eq(&before[1], &after[1]), "s2 restarted");
+}

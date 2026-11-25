@@ -1285,16 +1285,17 @@ pub fn source_files(dir: &Path) -> Result<Vec<PathBuf>> {
 /// The definition of source `id` as `load` would find it in `dir`, resolved
 /// against `base`: the one file whose body has that id, whatever the file is
 /// called. `None` when no file has it; an error, as at load, when that file
-/// does not parse or when two files have it. A file with another id, or none
-/// a definition could have (not YAML at all, say), is passed over: no start
-/// could run it as this source. Only the files with that id are parsed as a
-/// definition; the id of each other file is read once per content, kept in
-/// `ids`.
+/// does not parse or when two files have it. A file with another id is passed
+/// over. So is a file with no id a definition could have (not UTF-8, not YAML,
+/// no text `id`), as no start could run it, unless `strict`: then it fails the
+/// lookup, as at load. Only the files with that id are parsed as a definition;
+/// the id of each other file is read once per content, kept in `ids`.
 pub fn find_source(
     dir: &Path,
     base: &Path,
     id: &str,
     ids: &SourceIds,
+    strict: bool,
 ) -> Result<Option<FeedConfig>> {
     let files = source_files(dir)?;
     let mut known = ids.known.lock().expect("source ids lock");
@@ -1302,25 +1303,28 @@ pub fn find_source(
     known.retain(|path, _| present.contains(path));
     let mut found = None;
     for path in files {
-        let text = std::fs::read_to_string(&path)?;
+        let bytes = std::fs::read(&path)?;
         let hash = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            text.hash(&mut h);
+            bytes.hash(&mut h);
             h.finish()
         };
         let file_id = match known.get(&path) {
             Some((seen, file_id)) if *seen == hash => file_id.clone(),
             _ => {
-                let file_id = ids.read(&path, &text);
+                let file_id = ids.read(&path, &bytes);
                 known.insert(path.clone(), (hash, file_id.clone()));
                 file_id
             }
         };
         match file_id {
             FileId::Source(of) if of == id => {}
-            FileId::Source(_) | FileId::NotASource => continue,
+            FileId::Source(_) => continue,
+            FileId::NotASource(why) if strict => bail!("parsing {}: {why}", path.display()),
+            FileId::NotASource(_) => continue,
         }
+        let text = String::from_utf8(bytes).expect("an id was read from it as text");
         let mut feed: FeedConfig =
             serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         if found.is_some() {
@@ -1348,13 +1352,13 @@ pub struct SourceIds {
 enum FileId {
     /// Its `id`, decoded as a definition's is (`id: 123` is `"123"`).
     Source(String),
-    /// No id a definition could have (not YAML, or YAML without a text
-    /// `id`): no source's file, as no start could load it.
-    NotASource,
+    /// No id a definition could have (not UTF-8, not YAML, or no text `id`),
+    /// and why: no start could load it.
+    NotASource(String),
 }
 
 impl SourceIds {
-    fn read(&self, path: &Path, text: &str) -> FileId {
+    fn read(&self, path: &Path, bytes: &[u8]) -> FileId {
         #[cfg(test)]
         self.reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1362,14 +1366,17 @@ impl SourceIds {
         struct IdOnly {
             id: String,
         }
-        match serde_yaml::from_str::<IdOnly>(text) {
+        let read = std::str::from_utf8(bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|text| serde_yaml::from_str::<IdOnly>(text).map_err(|e| e.to_string()));
+        match read {
             Ok(file) => FileId::Source(file.id),
-            Err(e) => {
+            Err(why) => {
                 tracing::warn!(
-                    "{}: no source id read ({e}); the file is passed over until it changes",
+                    "{}: no source id read ({why}); the file is passed over until it changes",
                     path.display()
                 );
-                FileId::NotASource
+                FileId::NotASource(why)
             }
         }
     }
@@ -2018,22 +2025,22 @@ mod tests {
         let (sources, base) = (dir.path().join("sources"), dir.path().to_path_buf());
         let ids = SourceIds::default();
         let reads = || ids.reads.load(std::sync::atomic::Ordering::Relaxed);
-        let found = find_source(&sources, &base, "inbox", &ids).unwrap();
+        let found = find_source(&sources, &base, "inbox", &ids, false).unwrap();
         assert_eq!(found.unwrap().id, "inbox");
         assert_eq!(reads(), 3);
         assert!(
-            find_source(&sources, &base, "inbox", &ids)
+            find_source(&sources, &base, "inbox", &ids, false)
                 .unwrap()
                 .is_some()
         );
         assert_eq!(reads(), 3, "unchanged files are not read again");
         // `id: 123` is source "123", as `load` reads it.
-        let found = find_source(&sources, &base, "123", &ids).unwrap();
+        let found = find_source(&sources, &base, "123", &ids, false).unwrap();
         assert_eq!(found.unwrap().id, "123");
         assert_eq!(reads(), 3);
         // A hand edit is seen.
         std::fs::write(sources.join("notes.yaml"), FOLDER).unwrap();
-        let err = find_source(&sources, &base, "inbox", &ids).unwrap_err();
+        let err = find_source(&sources, &base, "inbox", &ids, false).unwrap_err();
         assert!(
             format!("{err:#}").contains("duplicate source id inbox"),
             "{err:#}"
@@ -2042,11 +2049,22 @@ mod tests {
         // Not YAML: no start could load it, so it is no source's file.
         std::fs::write(sources.join("notes.yaml"), "id: [inbox\n").unwrap();
         assert!(
-            find_source(&sources, &base, "inbox", &ids)
+            find_source(&sources, &base, "inbox", &ids, false)
                 .unwrap()
                 .is_some()
         );
         assert_eq!(reads(), 5);
+        // Nor is a file that is not UTF-8. A strict lookup (a transform save)
+        // still fails on either, as a start would.
+        std::fs::write(sources.join("notes.yaml"), [0xff, 0xfe, b'i', 0, b'd', 0]).unwrap();
+        assert!(
+            find_source(&sources, &base, "inbox", &ids, false)
+                .unwrap()
+                .is_some()
+        );
+        let err = find_source(&sources, &base, "inbox", &ids, true).unwrap_err();
+        assert!(format!("{err:#}").contains("notes.yaml"), "{err:#}");
+        assert_eq!(reads(), 6);
     }
 
     #[test]

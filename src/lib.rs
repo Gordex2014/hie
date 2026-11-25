@@ -102,9 +102,11 @@ pub fn build(
 /// this instance, one per source id and instance, until a start of this
 /// instance no longer skips a file of that source (fixed, removed, or loaded
 /// by a build with a secret backend), which clears it. Another instance's
-/// alerts are left to it. One an earlier version raised names no instance: an
-/// instance that skips a file of that source and has no alert of its own for
-/// it takes it as its own, and any other leaves it.
+/// alerts are left to it. One an earlier version raised names no instance, so
+/// no start clears it: the instance it describes may still skip the file.
+/// Retention purges it by age instead. An instance without a stable id is a
+/// new one at each start: it raises an alert naming no instance, and only for
+/// a source with none open, as earlier versions did.
 fn skipped_file_alerts(
     config: &config::Config,
     db: &db::Db,
@@ -115,38 +117,41 @@ fn skipped_file_alerts(
         // Nothing to raise, and nothing raised by an instance to clear.
         return Ok(());
     }
-    let owner =
-        secrets::owner::owner_id(std::env::var("HIE_INSTANCE_ID").ok(), &config.sources_dir);
+    let Some(owner) =
+        secrets::owner::stable_owner_id(std::env::var("HIE_INSTANCE_ID").ok(), &config.sources_dir)
+    else {
+        for skipped in &config.skipped {
+            alerts.know_source(&skipped.source_id, &skipped.source_name);
+            if db
+                .open_rule_less_alerts_of(&skipped.source_id, "definition")?
+                .is_empty()
+            {
+                alerts.raise(
+                    Some(&skipped.source_id),
+                    "definition",
+                    &skipped_message(skipped),
+                )?;
+            }
+        }
+        return Ok(());
+    };
     for skipped in &config.skipped {
         alerts.know_source(&skipped.source_id, &skipped.source_name);
         // Read again for each file: an earlier file of the same id may have
-        // raised or taken one.
-        let mine = db.open_rule_less_alerts_of(&skipped.source_id, "definition")?;
-        if mine
+        // raised one.
+        let open_of = db.open_rule_less_alerts_of(&skipped.source_id, "definition")?;
+        if open_of
             .iter()
             .any(|(_, by)| by.as_deref() == Some(owner.as_str()))
         {
             continue;
         }
-        let mut taken = false;
-        for (id, _) in mine.iter().filter(|(_, by)| by.is_none()) {
-            if db.adopt_alert(*id, &owner)? {
-                taken = true;
-                break;
-            }
-        }
-        if !taken {
-            alerts.raise_as(
-                &skipped.source_id,
-                "definition",
-                &format!(
-                    "{}: {}; the file is skipped",
-                    skipped.file.display(),
-                    skipped.reason
-                ),
-                &owner,
-            )?;
-        }
+        alerts.raise_as(
+            &skipped.source_id,
+            "definition",
+            &skipped_message(skipped),
+            &owner,
+        )?;
     }
     let skipped: std::collections::HashSet<&str> = config
         .skipped
@@ -164,6 +169,14 @@ fn skipped_file_alerts(
         }
     }
     Ok(())
+}
+
+fn skipped_message(skipped: &config::SkippedSource) -> String {
+    format!(
+        "{}: {}; the file is skipped",
+        skipped.file.display(),
+        skipped.reason
+    )
 }
 
 /// `build`, with the secret key inputs of the process (`KeySettings::load()`

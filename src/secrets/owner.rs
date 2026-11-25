@@ -24,18 +24,26 @@ impl Drop for OwnTemp {
 /// kept in the sources directory, made once. Unlike the per-process lease
 /// name, it stays the same across restarts, so a restart finds and cleans what
 /// an earlier run of this instance left.
+#[cfg(feature = "secrets-native")]
 pub(crate) fn owner_id(env: Option<String>, sources_dir: &Path) -> String {
+    stable_owner_id(env, sources_dir).unwrap_or_else(|| crate::pipeline::instance_id().to_string())
+}
+
+/// `owner_id` when it is stable; `None` (with a warning) when there is no
+/// `HIE_INSTANCE_ID` and the id cannot be kept in the sources directory, so
+/// each start would be another instance.
+pub(crate) fn stable_owner_id(env: Option<String>, sources_dir: &Path) -> Option<String> {
     if let Some(id) = env.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
-        return id;
+        return Some(id);
     }
     match stable_id(sources_dir) {
-        Ok(id) => id,
+        Ok(id) => Some(id),
         Err(e) => {
             tracing::warn!(
                 "this instance's id: set HIE_INSTANCE_ID, or make {} writable; without a stable id, what an earlier run left (credential registrations, alerts of skipped source files) is not cleaned ({e:#})",
                 sources_dir.display()
             );
-            crate::pipeline::instance_id().to_string()
+            None
         }
     }
 }
