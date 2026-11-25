@@ -93,6 +93,42 @@ impl RunnerTask {
     }
 }
 
+/// The per-source locks of a manager, by source id.
+type LockMap = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// A handle to the lock of one source's changes. The last handle to go takes
+/// the lock out of the map; the next change of the source makes a new one.
+struct SourceLock<'a> {
+    map: &'a LockMap,
+    id: String,
+    /// `None` only while the handle is dropped.
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl std::ops::Deref for SourceLock<'_> {
+    type Target = tokio::sync::Mutex<()>;
+
+    fn deref(&self) -> &Self::Target {
+        self.lock.as_deref().expect("a live handle holds its lock")
+    }
+}
+
+impl Drop for SourceLock<'_> {
+    fn drop(&mut self) {
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Let go of this handle's reference under the map's lock: handles are
+        // made and dropped only under it, so the count read next is exact, and
+        // the map's own reference alone means no change holds or waits for it.
+        drop(self.lock.take());
+        if map.get(&self.id).is_some_and(|l| Arc::strong_count(l) == 1) {
+            map.remove(&self.id);
+        }
+    }
+}
+
 /// Waits until every runner in `predecessors` has ended. After each `grace`, the
 /// ones still running are aborted and waited for again: an aborted task ends at
 /// its next await, so only one blocked inside a synchronous call stays, and the
@@ -149,7 +185,10 @@ pub struct SourceManager {
     /// Per source id, held across a change of the source: checking its
     /// credential, registering it, publishing the definition, starting it, and
     /// cleaning up the registrations it no longer needs.
-    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// A source's entry stays only while a change holds or waits for it.
+    locks: LockMap,
+    /// The id each file in the sources directory holds, read once per content.
+    source_ids: crate::config::SourceIds,
     /// What a test runs at the manager's and its runners' pause points.
     #[cfg(all(test, feature = "secrets-native"))]
     pause: Mutex<Option<crate::AsyncPause>>,
@@ -193,6 +232,7 @@ impl SourceManager {
             sources: Mutex::new(BTreeMap::new()),
             runners: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
+            source_ids: Default::default(),
             webhook_sender: Mutex::new(None),
             #[cfg(all(test, feature = "secrets-native"))]
             pause: Mutex::new(None),
@@ -259,14 +299,21 @@ impl SourceManager {
         });
     }
 
-    /// The lock a change of source `id` holds.
-    fn source_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.locks
+    /// The lock a change of source `id` holds. The map keeps it while a handle
+    /// to it exists, so a deleted source's lock goes with its last change.
+    fn source_lock(&self, id: &str) -> SourceLock<'_> {
+        let lock = self
+            .locks
             .lock()
             .expect("manager mutex")
             .entry(id.to_string())
             .or_default()
-            .clone()
+            .clone();
+        SourceLock {
+            map: &self.locks,
+            id: id.to_string(),
+            lock: Some(lock),
+        }
     }
 
     #[cfg(all(test, feature = "secrets-native"))]
@@ -682,7 +729,7 @@ impl SourceManager {
     /// runs once a start succeeds, which may differ from the running one after
     /// a start that failed. `None` once the file is gone.
     fn published(&self, id: &str) -> Result<Option<FeedConfig>> {
-        crate::config::find_source(&self.sources_dir, &self.base_dir, id)
+        crate::config::find_source(&self.sources_dir, &self.base_dir, id, &self.source_ids)
             .with_context(|| format!("reading the definition of {id}"))
     }
 
@@ -1042,10 +1089,17 @@ impl SourceManager {
         let existed = path.exists();
         std::fs::write(&path, code).with_context(|| format!("writing {}", path.display()))?;
         let canonical = path.canonicalize().unwrap_or(path);
-        for running in self.sources() {
-            if running.transform.canonicalize().ok().as_ref() != Some(&canonical) {
-                continue;
-            }
+        let using: Vec<FeedConfig> = self
+            .sources()
+            .into_iter()
+            .filter(|running| running.transform.canonicalize().ok().as_ref() == Some(&canonical))
+            .collect();
+        // A definition that cannot be read fails the save before any source
+        // restarts, so they keep running one version of the transform.
+        for running in &using {
+            self.published(&running.id)?;
+        }
+        for running in using {
             let lock = self.source_lock(&running.id);
             let _changing = lock.lock().await;
             if self.source(&running.id).is_none() {

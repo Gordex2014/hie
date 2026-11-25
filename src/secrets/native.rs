@@ -88,17 +88,25 @@ impl NativeStore {
     }
 
     fn meta(&self, row: SecretRow) -> Result<SecretMeta, SecretError> {
-        let kind = SecretKind::parse(&row.kind).ok_or_else(|| {
-            SecretError::Integrity(format!(
-                "credential {} revision {} has an unknown kind",
-                row.id, row.revision
-            ))
-        })?;
+        let kind = Self::kind_of(&row)?;
         let used_by = self
             .db
             .secret_used_by(&row.id)
             .map_err(SecretError::Store)?;
-        Ok(SecretMeta {
+        Ok(Self::meta_with(row, kind, used_by))
+    }
+
+    fn kind_of(row: &SecretRow) -> Result<SecretKind, SecretError> {
+        SecretKind::parse(&row.kind).ok_or_else(|| {
+            SecretError::Integrity(format!(
+                "credential {} revision {} has an unknown kind",
+                row.id, row.revision
+            ))
+        })
+    }
+
+    fn meta_with(row: SecretRow, kind: SecretKind, used_by: Vec<String>) -> SecretMeta {
+        SecretMeta {
             id: row.id,
             name: row.name,
             kind,
@@ -107,7 +115,7 @@ impl NativeStore {
             created_at: row.created_at,
             updated_at: row.updated_at,
             used_by,
-        })
+        }
     }
 
     /// Opens and decodes a row's sealed value: exactly the kind's fields, in
@@ -241,10 +249,13 @@ impl SecretStore for NativeStore {
 
     async fn list(&self) -> Result<Vec<SecretMeta>, SecretError> {
         self.db
-            .secret_rows()
+            .secret_rows_with_users()
             .map_err(SecretError::Store)?
             .into_iter()
-            .map(|row| self.meta(row))
+            .map(|(row, used_by)| {
+                let kind = Self::kind_of(&row)?;
+                Ok(Self::meta_with(row, kind, used_by))
+            })
             .collect()
     }
 

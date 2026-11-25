@@ -1284,17 +1284,44 @@ pub fn source_files(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// The definition of source `id` as `load` would find it in `dir`, resolved
 /// against `base`: the one file whose body has that id, whatever the file is
-/// called. `None` when no file has it; an error, as at load, when a file does
-/// not parse or two files have it.
-pub fn find_source(dir: &Path, base: &Path, id: &str) -> Result<Option<FeedConfig>> {
+/// called. `None` when no file has it; an error, as at load, when that file
+/// does not parse, when two files have it, or when a file is not YAML at all
+/// (its id is unknown). A YAML file with another id, or none, is passed over.
+/// Only the files with that id are parsed as a definition; the id of each
+/// other file is read once per content, kept in `ids`.
+pub fn find_source(
+    dir: &Path,
+    base: &Path,
+    id: &str,
+    ids: &SourceIds,
+) -> Result<Option<FeedConfig>> {
+    let files = source_files(dir)?;
+    let mut known = ids.known.lock().expect("source ids lock");
+    known.retain(|path, _| files.contains(path));
     let mut found = None;
-    for path in source_files(dir)? {
+    for path in files {
         let text = std::fs::read_to_string(&path)?;
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut h);
+            h.finish()
+        };
+        let file_id = match known.get(&path) {
+            Some((seen, file_id)) if *seen == hash => file_id.clone(),
+            _ => {
+                let file_id = ids.read(&text);
+                known.insert(path.clone(), (hash, file_id.clone()));
+                file_id
+            }
+        };
+        match file_id {
+            FileId::Source(of) if of == id => {}
+            FileId::Source(_) | FileId::NotASource => continue,
+            FileId::NotYaml(e) => bail!("parsing {}: {e}", path.display()),
+        }
         let mut feed: FeedConfig =
             serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        if feed.id != id {
-            continue;
-        }
         if found.is_some() {
             bail!("duplicate source id {id}");
         }
@@ -1303,6 +1330,46 @@ pub fn find_source(dir: &Path, base: &Path, id: &str) -> Result<Option<FeedConfi
         found = Some(feed);
     }
     Ok(found)
+}
+
+/// The id each source file held when `find_source` last read it, by path and
+/// a hash of its content: a file is read again only once its content changes.
+#[derive(Default)]
+pub struct SourceIds {
+    known: std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, FileId)>>,
+    /// Files whose id was read, for tests.
+    #[cfg(test)]
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+/// What a source file says about its id.
+#[derive(Clone)]
+enum FileId {
+    /// Its `id`, decoded as a definition's is (`id: 123` is `"123"`).
+    Source(String),
+    /// YAML without an id a definition could have: no source's file.
+    NotASource,
+    /// Not YAML: it could be any source's file.
+    NotYaml(String),
+}
+
+impl SourceIds {
+    fn read(&self, text: &str) -> FileId {
+        #[cfg(test)]
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[derive(Deserialize)]
+        struct IdOnly {
+            id: String,
+        }
+        match serde_yaml::from_str::<IdOnly>(text) {
+            Ok(file) => FileId::Source(file.id),
+            Err(e) => match serde_yaml::from_str::<serde_yaml::Value>(text) {
+                Ok(_) => FileId::NotASource,
+                Err(_) => FileId::NotYaml(e.to_string()),
+            },
+        }
+    }
 }
 
 /// Parses `90s`, `30m`, `24h` or `7d`.
@@ -1936,6 +2003,59 @@ mod tests {
     const CREDENTIAL_S3: &str = "id: private\nname: P\nsource:\n  type: s3\n  bucket: b\n  credential: lab\nformat: ndjson\ntransform: t.py\n";
     const FOLDER: &str =
         "id: inbox\nname: I\nsource:\n  type: folder\n  path: inbox\ntransform: t.py\n";
+
+    #[test]
+    fn a_source_is_found_reading_each_unchanged_file_once() {
+        let numbered = FOLDER.replace("id: inbox", "id: 123");
+        let dir = root_with(&[
+            ("inbox.yaml", FOLDER),
+            (
+                "notes.yaml",
+                "id: other
+name: N
+",
+            ),
+            ("numbered.yml", &numbered),
+        ]);
+        let (sources, base) = (dir.path().join("sources"), dir.path().to_path_buf());
+        let ids = SourceIds::default();
+        let reads = || ids.reads.load(std::sync::atomic::Ordering::Relaxed);
+        let found = find_source(&sources, &base, "inbox", &ids).unwrap();
+        assert_eq!(found.unwrap().id, "inbox");
+        assert_eq!(reads(), 3);
+        assert!(
+            find_source(&sources, &base, "inbox", &ids)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(reads(), 3, "unchanged files are not read again");
+        // `id: 123` is source "123", as `load` reads it.
+        let found = find_source(&sources, &base, "123", &ids).unwrap();
+        assert_eq!(found.unwrap().id, "123");
+        assert_eq!(reads(), 3);
+        // A hand edit is seen.
+        std::fs::write(sources.join("notes.yaml"), FOLDER).unwrap();
+        let err = find_source(&sources, &base, "inbox", &ids).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("duplicate source id inbox"),
+            "{err:#}"
+        );
+        assert_eq!(reads(), 4);
+        // Not YAML: its id is unknown, so no lookup can say a source is absent.
+        std::fs::write(
+            sources.join("notes.yaml"),
+            "id: [inbox
+",
+        )
+        .unwrap();
+        assert!(find_source(&sources, &base, "other", &ids).is_err());
+        std::fs::remove_file(sources.join("notes.yaml")).unwrap();
+        assert!(
+            find_source(&sources, &base, "other", &ids)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn a_legacy_s3_file_refuses_the_load_naming_the_file() {

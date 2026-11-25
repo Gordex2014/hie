@@ -145,7 +145,7 @@ A poller pages with `cursor`: the first request may give `since`, and each next 
 
 Stored alerts follow `retention.history` too. An alert is purged that long after it cleared, or after it was raised if it is still open, except:
 - open alerts of a rule that exists, is enabled and was created before the alert (on SQLite a deleted rule's id may be given to a new rule);
-- open `credential` and `definition` alerts, which the engine clears itself;
+- open `credential` and `definition` alerts, which the engine clears itself (a `definition` alert at the first start of the instance that raised it which no longer skips its source; see [Credentials and the secret key](running.md#credentials-and-the-secret-key));
 - open `delivery` alerts without a rule: an outage still going on, which its recovery clears;
 - the alert with the highest id.
 

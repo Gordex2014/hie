@@ -98,6 +98,60 @@ pub fn build(
     )
 }
 
+/// Source files this build could not load: each stays visible as an alert of
+/// this instance, one per source id, until a start of this instance no longer
+/// skips a file of that source (fixed, removed, or loaded by a build with a
+/// secret backend), which clears it. An alert another instance raised is left
+/// to it. One an earlier version raised names no instance: an instance that
+/// skips a file of that source takes it as its own, and any other leaves it.
+fn skipped_file_alerts(
+    config: &config::Config,
+    db: &db::Db,
+    alerts: &alerts::Alerter,
+) -> Result<()> {
+    let open = db.open_rule_less_alerts("definition")?;
+    if config.skipped.is_empty() && open.iter().all(|(_, _, by)| by.is_none()) {
+        // Nothing to raise, and nothing raised by an instance to clear.
+        return Ok(());
+    }
+    let owner =
+        secrets::owner::owner_id(std::env::var("HIE_INSTANCE_ID").ok(), &config.sources_dir);
+    for skipped in &config.skipped {
+        alerts.know_source(&skipped.source_id, &skipped.source_name);
+        match db.open_alert(&skipped.source_id, "definition", None)? {
+            Some((id, _)) => {
+                db.adopt_alert(id, &owner)?;
+            }
+            None => alerts.raise_as(
+                &skipped.source_id,
+                "definition",
+                &format!(
+                    "{}: {}; the file is skipped",
+                    skipped.file.display(),
+                    skipped.reason
+                ),
+                &owner,
+            )?,
+        }
+    }
+    let skipped: std::collections::HashSet<&str> = config
+        .skipped
+        .iter()
+        .map(|s| s.source_id.as_str())
+        .collect();
+    for (id, source, raised_by) in open {
+        if raised_by.as_deref() == Some(owner.as_str()) && !skipped.contains(source.as_str()) {
+            alerts.clear(
+                id,
+                &source,
+                "definition",
+                &format!("{source}: its definition is no longer skipped"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// `build`, with the secret key inputs of the process (`KeySettings::load()`
 /// in production). Refuses to start when the store is sealed and the key is
 /// missing, wrong or malformed, or when the key settings are ambiguous.
@@ -117,24 +171,7 @@ pub fn build_with(
         credentials,
     ));
     let alerts = Arc::new(alerts::Alerter::from_config(db.clone(), &config.alerts));
-    // Source files this build could not load: each stays visible as an alert.
-    for skipped in &config.skipped {
-        alerts.know_source(&skipped.source_id, &skipped.source_name);
-        if db
-            .open_alert(&skipped.source_id, "definition", None)?
-            .is_none()
-        {
-            alerts.raise(
-                Some(&skipped.source_id),
-                "definition",
-                &format!(
-                    "{}: {}; the file is skipped",
-                    skipped.file.display(),
-                    skipped.reason
-                ),
-            )?;
-        }
-    }
+    skipped_file_alerts(config, &db, &alerts)?;
     // Alerts older versions left open after a recovery: closed before any
     // source runs, so none of them stands in for a new outage.
     let closed = db.close_legacy_recoveries()?;

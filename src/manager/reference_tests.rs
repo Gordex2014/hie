@@ -811,3 +811,139 @@ async fn a_create_keeps_its_rule_through_a_failed_write_or_start() {
     assert!(a.manager.source("s").is_some());
     assert_eq!(a.silence_rules("s").len(), 1);
 }
+
+/// A file in the sources directory that is not the source's definition does
+/// not keep its registrations after a delete: one with another id is passed
+/// over. One that cannot be read as YAML could be its definition, so they stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stray_file_keeps_registrations_only_when_it_could_be_the_definition() {
+    for (stray, kept) in [
+        (
+            "id: other
+name: Other
+",
+            false,
+        ),
+        (
+            "id: [s
+", true,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (database, _keeper) = store(dir.path());
+        let bucket = refusing_bucket().await;
+        let a = Instance::start(&dir.path().join("a"), &database, &key());
+        let x = a.secret("x").await;
+        a.manager
+            .create(&a.definition("s", "x", &bucket), None)
+            .await
+            .unwrap();
+        a.settled("s").await;
+        assert_eq!(a.refs("s"), set(&[&x]));
+        std::fs::write(a.root.join("sources/notes.yaml"), stray).unwrap();
+        a.delete_source("s").await;
+        eprintln!(
+            "stray {stray:?}: registrations of s after the delete: {:?}",
+            a.refs("s")
+        );
+        if kept {
+            assert_eq!(a.refs("s"), set(&[&x]), "{stray:?}");
+            assert_eq!(in_use(a.delete_secret(&x).await), ["s"]);
+        } else {
+            assert!(a.refs("s").is_empty(), "{stray:?}");
+            a.delete_secret(&x).await.unwrap();
+        }
+    }
+}
+
+/// Listing the credentials reads the store once, whatever their number, and
+/// still names once each source any instance registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listing_credentials_reads_the_store_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (database, _keeper) = store(dir.path());
+    let a = Instance::start(&dir.path().join("a"), &database, &key());
+    // Named so a byte order and a PostgreSQL collation would differ.
+    let (x, y) = (a.secret("x").await, a.secret("Y").await);
+    a.secret("a").await;
+    a.db.secret_hold(&x, "s1", a.owner()).unwrap();
+    a.db.secret_hold(&x, "s2", a.owner()).unwrap();
+    a.db.secret_hold(&x, "s1", "another-instance").unwrap();
+    a.db.secret_hold(&y, "s3", "another-instance").unwrap();
+    let store = a.secrets.store().unwrap();
+    // Counted on this thread, where the store's calls run.
+    let before = crate::db::statements_on_this_thread();
+    let listed = store.list().await.unwrap();
+    let statements = crate::db::statements_on_this_thread() - before;
+    eprintln!("listing 3 credentials ran {statements} statement(s)");
+    let used: Vec<(String, Vec<String>)> =
+        listed.into_iter().map(|m| (m.name, m.used_by)).collect();
+    let expected: Vec<(String, Vec<String>)> = vec![
+        ("Y".into(), vec!["s3".into()]),
+        ("a".into(), vec![]),
+        ("x".into(), vec!["s1".into(), "s2".into()]),
+    ];
+    assert_eq!(used, expected);
+    assert_eq!(statements, 1);
+}
+
+/// A deleted source leaves no entry in the manager's lock map once its
+/// cleanup has run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deleted_source_leaves_no_lock_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let (database, _keeper) = store(dir.path());
+    let bucket = refusing_bucket().await;
+    let a = Instance::start(&dir.path().join("a"), &database, &key());
+    a.secret("x").await;
+    a.manager
+        .create(&a.definition("s", "x", &bucket), None)
+        .await
+        .unwrap();
+    a.settled("s").await;
+    a.delete_source("s").await;
+    let started = std::time::Instant::now();
+    while a.manager.locks.lock().unwrap().contains_key("s") {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the lock of deleted source s is still in the map"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    eprintln!(
+        "the lock map has no entry for s {:?} after the cleanup",
+        started.elapsed()
+    );
+}
+
+/// Changes of one source that overlap, their handles going in any order, run
+/// one at a time and leave no lock behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_changes_of_a_source_leave_no_lock_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let (database, _keeper) = store(dir.path());
+    let a = Instance::start(&dir.path().join("a"), &database, &key());
+    let inside = Arc::new(AtomicUsize::new(0));
+    let tasks: Vec<_> = (0..16)
+        .map(|_| {
+            let (manager, inside) = (a.manager.clone(), inside.clone());
+            tokio::spawn(async move {
+                for _ in 0..50 {
+                    let lock = manager.source_lock("s");
+                    let _changing = lock.lock().await;
+                    assert_eq!(
+                        inside.fetch_add(1, Ordering::SeqCst),
+                        0,
+                        "two changes at once"
+                    );
+                    tokio::task::yield_now().await;
+                    inside.fetch_sub(1, Ordering::SeqCst);
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap();
+    }
+    assert!(a.manager.locks.lock().unwrap().is_empty());
+}

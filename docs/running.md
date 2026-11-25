@@ -78,7 +78,7 @@ To build the image yourself: `docker build -t hie .`
 | `HIE_RUNTIME_DIR` | `hie_runtime` next to the config | Location of the Python worker |
 | `HIE_LOG` | `info` | Log filter (`debug`, `hie=debug`, ...). Whatever it says, `tokio_postgres` never logs below `info`: at `debug` and `trace` it would log the values bound to every statement (record data, status URLs, tokens) |
 | `HIE_DATABASE_URL` | | The store, overriding `database:` in `hie.yaml`: a `postgres://user:password@host/db` URL. Set it here so the password is not in the file |
-| `HIE_INSTANCE_ID` | host, pid and a random tail | This instance's name in the leases, when several share one store; also the owner of its credential registrations (otherwise an id kept in `sources/.hie-instance-id`) |
+| `HIE_INSTANCE_ID` | host, pid and a random tail | This instance's name in the leases, when several share one store; also the owner of its credential registrations and of the alerts of the source files it skips (otherwise an id kept in `sources/.hie-instance-id`) |
 | `HIE_ALERT_WEBHOOK_URL` | `alerts.webhook_url` in `hie.yaml` | Where [alert events](sources.md#the-alert-webhook) are posted, `http` or `https`. A chat webhook's URL is itself a credential: set it here rather than in the file |
 | `HIE_ALERT_WEBHOOK_SECRET` | `alerts.webhook_secret` in `hie.yaml` | The secret that signs alert events (`X-HIE-Signature`, over `X-HIE-Timestamp` and the body); unsigned without one. Leading and trailing whitespace is ignored |
 | `HIE_TERMINOLOGY_SERVER` | `terminology_url` in `hie.yaml` | The HTS transforms may ask through `lookup` and `translate` |
@@ -191,7 +191,7 @@ If two instances make their first start at the same time and one seals the store
 
 If the engine stops while it creates the automatic key file, a `data/.hie-secrets.key.*.tmp` copy of the key may remain; delete it while no engine is starting.
 
-A build without the `secrets-native` feature has no secret store: it skips source files that name a credential, with an error and a `definition` alert naming each file, and starts with the rest (`hie check` prints what it skipped). `secrets-aws`, a store on AWS Secrets Manager, is reserved but not built.
+A build without the `secrets-native` feature has no secret store: it skips source files that name a credential, with an error and a `definition` alert naming each file, and starts with the rest (`hie check` prints what it skipped). The alert is the instance's that skipped the file (its `HIE_INSTANCE_ID`, or the id in `sources/.hie-instance-id`, which such a build then makes too), one per source id: the first start of that instance that skips no file of the source (the file fixed, removed, or loaded by a build with a store) clears it with the reason `<id>: its definition is no longer skipped`. Another instance on the store leaves it open. An alert an earlier version raised names no instance: it stays open until a start of an instance that still skips a file of that source takes it as its own, and clears at that instance's next start without it. `secrets-aws`, a store on AWS Secrets Manager, is reserved but not built.
 
 ### The store, and more than one instance
 

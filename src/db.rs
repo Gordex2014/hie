@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS alerts (
   cleared_at INTEGER,
   cleared_reason TEXT,
   notify TEXT,
-  channels TEXT
+  channels TEXT,
+  raised_by TEXT
 );
 CREATE INDEX IF NOT EXISTS alerts_feed_kind ON alerts(feed_id, kind, created_at);
 CREATE TABLE IF NOT EXISTS source_state (
@@ -203,6 +204,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("alerts", "cleared_reason", "TEXT"),
     ("alerts", "notify", "TEXT"),
     ("alerts", "channels", "TEXT"),
+    // The instance that raised an alert of a source file it skipped; null on
+    // every other alert, and on those an earlier version raised.
+    ("alerts", "raised_by", "TEXT"),
     ("alert_rules", "tz", "TEXT"),
     ("submissions", "stamped", "INTEGER NOT NULL DEFAULT 0"),
     // Bumped by every change of a submission's state, and by the claim before
@@ -999,8 +1003,21 @@ fn pg_query(client: &mut postgres::Client, sql: &str, params: &[Param]) -> Resul
         .collect())
 }
 
+#[cfg(test)]
+thread_local! {
+    static STATEMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The statements this thread has sent to a store, for tests that count them.
+#[cfg(all(test, feature = "secrets-native"))]
+pub(crate) fn statements_on_this_thread() -> u64 {
+    STATEMENTS.with(std::cell::Cell::get)
+}
+
 impl Conn {
     fn execute(&mut self, sql: &str, params: &[Param]) -> Result<u64> {
+        #[cfg(test)]
+        STATEMENTS.with(|n| n.set(n.get() + 1));
         match self {
             Conn::Sqlite(c) => {
                 let sql = sql.replace('$', "?");
@@ -1013,6 +1030,8 @@ impl Conn {
     }
 
     fn query(&mut self, sql: &str, params: &[Param]) -> Result<Vec<Row>> {
+        #[cfg(test)]
+        STATEMENTS.with(|n| n.set(n.get() + 1));
         match self {
             Conn::Sqlite(c) => {
                 let sql = sql.replace('$', "?");
@@ -3369,12 +3388,14 @@ impl Db {
     /// any more. On
     /// PostgreSQL the rule's row stays locked to the commit, so a change of the
     /// rule waits for the alert and then clears it.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_alert_with_webhook(
         &self,
         feed: Option<&str>,
         kind: &str,
         message: &str,
         rule: Option<&Rule>,
+        raised_by: Option<&str>,
         now: i64,
         webhook: impl FnOnce(&AlertRow) -> NewWebhook,
     ) -> Result<Option<AlertRow>> {
@@ -3402,8 +3423,8 @@ impl Db {
                 let row = c
                     .query(
                         &format!(
-                            "INSERT INTO alerts (feed_id, kind, message, created_at, rule_id, notify, channels)
-                             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {columns}"
+                            "INSERT INTO alerts (feed_id, kind, message, created_at, rule_id, notify, channels, raised_by)
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {columns}"
                         ),
                         &params![
                             feed,
@@ -3413,6 +3434,7 @@ impl Db {
                             rule.map(|r| r.id),
                             rule.map(|r| serde_json::to_string(&r.notify).unwrap_or_default()),
                             rule.map(|r| serde_json::to_string(&r.channels).unwrap_or_default()),
+                            raised_by,
                         ],
                     )?
                     .first()
@@ -3435,6 +3457,31 @@ impl Db {
                 }
             }
         })
+    }
+
+    /// The open alerts of `kind` without a rule, oldest first, as (id, source
+    /// id, the instance that raised it when one is recorded).
+    pub fn open_rule_less_alerts(&self, kind: &str) -> Result<Vec<(i64, String, Option<String>)>> {
+        Ok(self
+            .query(
+                "SELECT id, feed_id, raised_by FROM alerts
+                 WHERE kind = $1 AND rule_id IS NULL AND cleared_at IS NULL AND feed_id IS NOT NULL
+                 ORDER BY id",
+                &params![kind],
+            )?
+            .iter()
+            .map(|r| (r.i64(0), r.string(1), r.opt_string(2)))
+            .collect())
+    }
+
+    /// Records `owner` as the instance that raised open alert `id`, when none
+    /// is recorded: one an earlier version raised, taken over by an instance
+    /// whose own state it describes. Whether it was taken.
+    pub fn adopt_alert(&self, id: i64, owner: &str) -> Result<bool> {
+        Ok(self.execute(
+            "UPDATE alerts SET raised_by = $1 WHERE id = $2 AND raised_by IS NULL AND cleared_at IS NULL",
+            &params![owner, id],
+        )? > 0)
     }
 
     /// Whether source `feed` has an open alert of `kind` without a rule
@@ -4708,7 +4755,7 @@ mod tests {
     }
 
     fn fire(db: &Db, event_id: &str, destination: &str) -> i64 {
-        db.insert_alert_with_webhook(Some("src"), "silence", "quiet", None, 1_000, |_| {
+        db.insert_alert_with_webhook(Some("src"), "silence", "quiet", None, None, 1_000, |_| {
             hook(event_id, "fired", destination)
         })
         .unwrap()
@@ -4988,9 +5035,9 @@ mod tests {
         // An event that cannot be written (its id is taken) leaves no alert behind.
         let before = a.query("SELECT id FROM alerts", &[]).unwrap().len();
         assert!(
-            a.insert_alert_with_webhook(Some("src"), "silence", "quiet", None, 4_000, |_| hook(
-                "f", "fired", ""
-            ))
+            a.insert_alert_with_webhook(Some("src"), "silence", "quiet", None, None, 4_000, |_| {
+                hook("f", "fired", "")
+            })
             .is_err()
         );
         assert_eq!(a.query("SELECT id FROM alerts", &[]).unwrap().len(), before);
