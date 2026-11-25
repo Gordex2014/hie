@@ -1094,8 +1094,8 @@ impl SourceManager {
             .into_iter()
             .filter(|running| running.transform.canonicalize().ok().as_ref() == Some(&canonical))
             .collect();
-        // A definition that cannot be read fails the save before any source
-        // restarts, so they keep running one version of the transform.
+        // Fails before restarting any source when a definition it would
+        // restart cannot be read now (the code is already written).
         for running in &using {
             self.published(&running.id)?;
         }

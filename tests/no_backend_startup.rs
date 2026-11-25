@@ -61,6 +61,7 @@ fn engine(dir: &Path, command: &str) -> Command {
         .env_remove("HIE_DATABASE_URL")
         .env_remove("HIE_SECRET_KEY")
         .env_remove("HIE_SECRET_KEY_FILE")
+        .env_remove("HIE_INSTANCE_ID")
         .env("HIE_LOG", "info");
     c
 }
@@ -162,8 +163,11 @@ async fn a_credential_file_is_skipped_and_the_engine_starts() {
 async fn serve(dir: &Path, port: u16, log: &str) -> Running {
     let log = dir.join(log);
     let output = std::fs::File::create(&log).unwrap();
+    // Restarts need a store that outlives the process: SQLite, also when
+    // the other tests run on PostgreSQL.
     let mut child = Running(
         engine(dir, "run")
+            .env_remove("HIE_TEST_DATABASE_URL")
             .stdout(output.try_clone().unwrap())
             .stderr(output)
             .spawn()
@@ -255,13 +259,8 @@ async fn a_skipped_file_alert_clears_once_the_file_is_not_skipped() {
     }
 }
 
-const PRIVATE_FOLDER: &str = "id: private
-name: Private
-source:
-  type: folder
-  path: private-inbox
-transform: t.py
-";
+const PRIVATE_FOLDER: &str =
+    "id: private\nname: Private\nsource:\n  type: folder\n  path: private-inbox\ntransform: t.py\n";
 
 /// A start that still skips a file of the source keeps its alert open, also
 /// when another file of the same id loads.
@@ -340,4 +339,35 @@ listen: 127.0.0.1:{b_port}
     assert_eq!(alerts.len(), 1, "{alerts:?}");
     assert!(!alerts[0]["cleared_at"].is_null(), "{alerts:?}");
     assert_eq!(clears(&alerts[0]), 1, "{alerts:?}");
+}
+
+/// Two instances on one store that both skip a file of a source each keep an
+/// alert of their own: the one that no longer skips it clears only its own.
+#[tokio::test]
+async fn two_instances_that_skip_a_file_each_keep_their_own_alert() {
+    let a = tempfile::tempdir().unwrap();
+    let a_port = free_port();
+    root(a.path(), a_port);
+    let b = tempfile::tempdir().unwrap();
+    let b_port = free_port();
+    root(b.path(), b_port);
+    let database = a.path().join("data/hie.db");
+    std::fs::write(
+        b.path().join("hie.yaml"),
+        format!(
+            "fhir_base_url: http://127.0.0.1:9/fhir\ndatabase: {}\nlisten: 127.0.0.1:{b_port}\n",
+            database.display()
+        ),
+    )
+    .unwrap();
+    drop(serve(a.path(), a_port, "a.log").await);
+    drop(serve(b.path(), b_port, "b.log").await);
+    std::fs::write(a.path().join("sources/private.yaml"), PRIVATE_FOLDER).unwrap();
+    let _a = serve(a.path(), a_port, "a-fixed.log").await;
+    let alerts = definition_alerts(a_port).await;
+    assert_eq!(alerts.len(), 2, "{alerts:?}");
+    let open: Vec<bool> = alerts.iter().map(|a| a["cleared_at"].is_null()).collect();
+    // Newest first: b's is still open, a's cleared.
+    assert_eq!(open, [true, false], "{alerts:?}");
+    assert_eq!(clears(&alerts[1]), 1, "{alerts:?}");
 }

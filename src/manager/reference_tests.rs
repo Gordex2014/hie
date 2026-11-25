@@ -812,22 +812,15 @@ async fn a_create_keeps_its_rule_through_a_failed_write_or_start() {
     assert_eq!(a.silence_rules("s").len(), 1);
 }
 
-/// A file in the sources directory that is not the source's definition does
-/// not keep its registrations after a delete: one with another id is passed
-/// over. One that cannot be read as YAML could be its definition, so they stay.
+/// A file in the sources directory that no start could run as the source
+/// does not keep its registrations after a delete: one with another id, one
+/// that is not YAML. One that still has the source's id keeps them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stray_file_keeps_registrations_only_when_it_could_be_the_definition() {
     for (stray, kept) in [
-        (
-            "id: other
-name: Other
-",
-            false,
-        ),
-        (
-            "id: [s
-", true,
-        ),
+        ("id: other\nname: Other\n", false),
+        ("id: [s\n", false),
+        ("id: s\nname: S\n", true),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let (database, _keeper) = store(dir.path());

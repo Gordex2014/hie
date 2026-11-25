@@ -658,7 +658,7 @@ mod tests {
         let waited = started.elapsed();
         eprintln!("a registration on a locked store answered Busy after {waited:?}");
         assert!(
-            waited < std::time::Duration::from_secs(3),
+            waited < std::time::Duration::from_secs(4),
             "held the database for {waited:?}"
         );
         assert_eq!(

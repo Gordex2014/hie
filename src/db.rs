@@ -3474,6 +3474,25 @@ impl Db {
             .collect())
     }
 
+    /// The open alerts of `kind` without a rule of source `feed`, oldest
+    /// first, as (id, the instance that raised it when one is recorded).
+    pub fn open_rule_less_alerts_of(
+        &self,
+        feed: &str,
+        kind: &str,
+    ) -> Result<Vec<(i64, Option<String>)>> {
+        Ok(self
+            .query(
+                "SELECT id, raised_by FROM alerts
+                 WHERE feed_id = $1 AND kind = $2 AND rule_id IS NULL AND cleared_at IS NULL
+                 ORDER BY id",
+                &params![feed, kind],
+            )?
+            .iter()
+            .map(|r| (r.i64(0), r.opt_string(1)))
+            .collect())
+    }
+
     /// Records `owner` as the instance that raised open alert `id`, when none
     /// is recorded: one an earlier version raised, taken over by an instance
     /// whose own state it describes. Whether it was taken.

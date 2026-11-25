@@ -99,11 +99,12 @@ pub fn build(
 }
 
 /// Source files this build could not load: each stays visible as an alert of
-/// this instance, one per source id, until a start of this instance no longer
-/// skips a file of that source (fixed, removed, or loaded by a build with a
-/// secret backend), which clears it. An alert another instance raised is left
-/// to it. One an earlier version raised names no instance: an instance that
-/// skips a file of that source takes it as its own, and any other leaves it.
+/// this instance, one per source id and instance, until a start of this
+/// instance no longer skips a file of that source (fixed, removed, or loaded
+/// by a build with a secret backend), which clears it. Another instance's
+/// alerts are left to it. One an earlier version raised names no instance: an
+/// instance that skips a file of that source and has no alert of its own for
+/// it takes it as its own, and any other leaves it.
 fn skipped_file_alerts(
     config: &config::Config,
     db: &db::Db,
@@ -118,11 +119,24 @@ fn skipped_file_alerts(
         secrets::owner::owner_id(std::env::var("HIE_INSTANCE_ID").ok(), &config.sources_dir);
     for skipped in &config.skipped {
         alerts.know_source(&skipped.source_id, &skipped.source_name);
-        match db.open_alert(&skipped.source_id, "definition", None)? {
-            Some((id, _)) => {
-                db.adopt_alert(id, &owner)?;
+        // Read again for each file: an earlier file of the same id may have
+        // raised or taken one.
+        let mine = db.open_rule_less_alerts_of(&skipped.source_id, "definition")?;
+        if mine
+            .iter()
+            .any(|(_, by)| by.as_deref() == Some(owner.as_str()))
+        {
+            continue;
+        }
+        let mut taken = false;
+        for (id, _) in mine.iter().filter(|(_, by)| by.is_none()) {
+            if db.adopt_alert(*id, &owner)? {
+                taken = true;
+                break;
             }
-            None => alerts.raise_as(
+        }
+        if !taken {
+            alerts.raise_as(
                 &skipped.source_id,
                 "definition",
                 &format!(
@@ -131,7 +145,7 @@ fn skipped_file_alerts(
                     skipped.reason
                 ),
                 &owner,
-            )?,
+            )?;
         }
     }
     let skipped: std::collections::HashSet<&str> = config
