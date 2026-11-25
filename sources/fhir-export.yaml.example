@@ -1,0 +1,15 @@
+# Rename to .yaml to enable. A FHIR bulk export dropped as a zip: NDJSON per
+# resource type and Bundle files side by side, each entry read by its
+# extension; the export manifest is skipped. Only the passthrough transform.
+id: fhir-export
+name: FHIR export drops
+source:
+  type: folder
+  path: inbox/fhir-export
+  pattern: "*.zip"
+  poll_seconds: 30
+format: fhir
+transform: transforms/fhir_passthrough.py
+delivery:
+  batch_size: 200
+expect_every: 7d
