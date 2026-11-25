@@ -14,6 +14,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde_json::{Value, json};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
@@ -76,6 +77,8 @@ enum Answer {
         content_type: &'static str,
         retry_after: Option<&'static str>,
     },
+    /// A refusal whose body never arrives whole.
+    RefuseStalled { status: u16 },
     /// Registers the submission (with its manifest when `manifest`, and
     /// completed when `completed`), then answers `status` after `after`.
     Late {
@@ -100,6 +103,9 @@ struct Sub {
     outcomes: Vec<Value>,
     deleted: i64,
     page2_tripped: bool,
+    /// The kick-off was cut before the manifest: a status-only kick-off
+    /// finds it completed, with its manifest added meanwhile.
+    attach_on_probe: bool,
 }
 
 #[derive(Default)]
@@ -140,6 +146,25 @@ struct World {
     malformed: bool,
     /// The manifest is fetched with a provider token, as a server may do.
     provider_token: bool,
+    /// The identity provider answers after this long.
+    token_delay: Option<Duration>,
+    /// The identity provider refuses with this body.
+    token_refusal: Option<String>,
+    /// Receipt files answered `500` from now on, one each.
+    receipt_500: u32,
+    /// Holds the next status page that has receipts until notified, and says
+    /// it holds it.
+    page_gate: Option<Arc<tokio::sync::Notify>>,
+    page_held: bool,
+    /// The status request and status pages answer `501`.
+    bulk_off: bool,
+    /// The status page's outcome entry has no `url`.
+    outcome_without_url: bool,
+    /// Receipt files are on the status pages' own host, as HFS serves them.
+    receipts_on_pages: bool,
+    /// The next submission registered is one whose manifest a status-only
+    /// kick-off finds added (`Sub::attach_on_probe`).
+    attach_next: bool,
 }
 
 type W = Arc<Mutex<World>>;
@@ -225,16 +250,20 @@ async fn fetch(w: W, id: String, manifest_url: String) {
 }
 
 fn register(w: &W, id: &str, manifest_url: &str, manifest: bool, completed: bool) {
-    w.lock().unwrap().subs.insert(
+    let mut world = w.lock().unwrap();
+    let attach_on_probe = std::mem::take(&mut world.attach_next);
+    world.subs.insert(
         id.to_string(),
         Sub {
             manifest_url: manifest_url.to_string(),
             manifest,
             completed,
             fetched: !manifest,
+            attach_on_probe,
             ..Sub::default()
         },
     );
+    drop(world);
     if manifest {
         tokio::spawn(fetch(w.clone(), id.to_string(), manifest_url.to_string()));
     }
@@ -258,6 +287,7 @@ async fn kickoff(State(w): State<W>, headers: HeaderMap, body: String) -> Respon
     // A status-only kick-off, as HFS answers one: a completed submission
     // refuses it, an open one takes it and nothing changes.
     let Some(manifest_url) = param(&body, "manifestUrl") else {
+        let w_arc = w.clone();
         let mut w = w.lock().unwrap();
         w.probes.push(id.clone());
         assert!(
@@ -265,6 +295,16 @@ async fn kickoff(State(w): State<W>, headers: HeaderMap, body: String) -> Respon
                 && param(&body, "submissionStatus").unwrap()["valueCoding"]["code"]
                     == "in-progress"
         );
+        let attach = w.subs.get(&id).is_some_and(|sub| sub.attach_on_probe);
+        if attach {
+            let sub = w.subs.get_mut(&id).unwrap();
+            sub.attach_on_probe = false;
+            sub.manifest = true;
+            sub.completed = true;
+            sub.fetched = false;
+            let url = sub.manifest_url.clone();
+            tokio::spawn(fetch(w_arc.clone(), id.clone(), url));
+        }
         return match w.subs.get(&id) {
             Some(sub) if sub.completed => (
                 StatusCode::CONFLICT,
@@ -322,6 +362,20 @@ async fn kickoff(State(w): State<W>, headers: HeaderMap, body: String) -> Respon
             }
             response
         }
+        Answer::RefuseStalled { status } => {
+            let stalled = futures::stream::once(async {
+                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                    b"{\"resourceType\": \"Operation",
+                ))
+            })
+            .chain(futures::stream::pending());
+            (
+                StatusCode::from_u16(status).unwrap(),
+                [(header::CONTENT_TYPE, "application/fhir+json")],
+                axum::body::Body::from_stream(stalled),
+            )
+                .into_response()
+        }
         Answer::Late {
             after,
             status,
@@ -352,10 +406,17 @@ async fn status_request(State(w): State<W>, body: String) -> Response {
         .as_str()
         .unwrap()
         .to_string();
-    let (known, pages) = {
+    let (known, pages, off) = {
         let w = w.lock().unwrap();
-        (w.subs.contains_key(&id), w.pages.clone())
+        (w.subs.contains_key(&id), w.pages.clone(), w.bulk_off)
     };
+    if off {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(outcome("error", "not-supported", "bulk submit is disabled")),
+        )
+            .into_response();
+    }
     if !known {
         return (
             StatusCode::NOT_FOUND,
@@ -385,12 +446,44 @@ async fn poll(
     Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
+    let (response, gate) = poll_answer(&w, &id, &q, &headers);
+    if let Some(gate) = gate {
+        gate.notified().await;
+    }
+    response
+}
+
+/// What a poll answers, and the gate to hold it at when one is set.
+fn poll_answer(
+    w: &W,
+    id: &str,
+    q: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> (Response, Option<Arc<tokio::sync::Notify>>) {
+    let response = poll_page(w, id, q, headers);
+    let mut w = w.lock().unwrap();
+    let gate = if response.status() == StatusCode::OK {
+        w.page_gate.take()
+    } else {
+        None
+    };
+    if gate.is_some() {
+        w.page_held = true;
+    }
+    (response, gate)
+}
+
+fn poll_page(w: &W, id: &str, q: &HashMap<String, String>, headers: &HeaderMap) -> Response {
+    let id = id.to_string();
     let mut w = w.lock().unwrap();
     let page = q.get("page").cloned().unwrap_or_else(|| "1".into());
     w.page_requests.push((
         format!("/bulk-submit-status/{id}?page={page}"),
-        bearer(&headers),
+        bearer(headers),
     ));
+    if w.bulk_off {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
     if w.hold {
         return StatusCode::ACCEPTED.into_response();
     }
@@ -398,12 +491,17 @@ async fn poll(
         w.poll_500 -= 1;
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    let (pages, store, in_progress, two_pages, page2_429) = (
+    let (pages, store, in_progress, two_pages, page2_429, no_url) = (
         w.pages.clone(),
-        w.store.clone(),
+        if w.receipts_on_pages {
+            w.pages.clone()
+        } else {
+            w.store.clone()
+        },
         w.in_progress,
         w.two_pages,
         w.page2_429,
+        w.outcome_without_url,
     );
     let Some(sub) = w.subs.get_mut(&id) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -426,6 +524,9 @@ async fn poll(
             json!({"url": format!("{store}/bulk-submit-file/{id}/error"),
                                     "count": sub.outcomes.len(), "manifestUrl": manifest_url}),
         );
+        if no_url {
+            outcome_entries.push(json!({"count": 1, "manifestUrl": manifest_url}));
+        }
     }
     let deleted = if sub.deleted > 0 {
         vec![json!({"url": format!("{store}/bulk-submit-file/{id}/deleted"), "count": sub.deleted})]
@@ -455,6 +556,10 @@ async fn artifact(
     let mut w = w.lock().unwrap();
     w.receipt_requests
         .push((format!("/bulk-submit-file/{id}/{part}"), bearer(&headers)));
+    if w.receipt_500 > 0 {
+        w.receipt_500 -= 1;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     let malformed = w.malformed;
     let sub = w.subs.get(&id).unwrap();
     let mut body = String::new();
@@ -493,9 +598,21 @@ async fn provider_manifest(State(w): State<W>, Path(name): Path<String>) -> Resp
     }
 }
 
-/// The engine's identity provider: one fixed token.
-async fn idp_token() -> Json<Value> {
+/// The engine's identity provider: one fixed token, after `token_delay`, or
+/// the refusal `token_refusal`.
+async fn idp_token(State(w): State<W>) -> Response {
+    let (delay, refusal) = {
+        let w = w.lock().unwrap();
+        (w.token_delay, w.token_refusal.clone())
+    };
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
+    if let Some(refusal) = refusal {
+        return (StatusCode::BAD_REQUEST, refusal).into_response();
+    }
     Json(json!({"access_token": "ENGINE-CANARY-TOKEN", "token_type": "Bearer", "expires_in": 3600}))
+        .into_response()
 }
 
 async fn bind() -> (tokio::net::TcpListener, String) {
@@ -771,6 +888,15 @@ async fn a_manifest_source_is_defined_in_one_canonical_form() {
             json!({"delivery": {"batch_size": 100}}),
             "delivery.batch_size",
         ),
+        (json!({"delivery": {}}), "delivery"),
+        (
+            json!({"source": {"type": "manifest", "poll_seconds": null}}),
+            "poll_seconds",
+        ),
+        (
+            json!({"source": {"type": "manifest", "oauth_metadata_url": null}}),
+            "oauth_metadata_url",
+        ),
         (
             json!({"source": {"type": "manifest", "path": "inbox"}}),
             "source.path",
@@ -919,6 +1045,14 @@ async fn a_manifest_source_is_defined_in_one_canonical_form() {
         text.contains("bad.yaml") && text.contains("transform"),
         "{text}"
     );
+    // A file that JSON cannot hold is refused, not read leniently.
+    std::fs::write(
+        again.root.path().join("sources/bad.yaml"),
+        "id: bad\nname: Bad\nsource:\n  type: manifest\ntransform: t.py\nnotes:\n  ? [a, b]\n  : c\n",
+    )
+    .unwrap();
+    let e3 = hie::config::load(&again.root.path().join("hie.yaml")).unwrap_err();
+    assert!(format!("{e3:#}").contains("bad.yaml"), "{e3:#}");
 }
 
 // ---- by URL -------------------------------------------------------------------
@@ -1045,7 +1179,15 @@ async fn a_manifest_url_is_forwarded_unchanged_and_loads_from_its_receipts() {
     assert_eq!(source["failing_last_24h"], 2);
     assert_eq!(source["rejected_last_24h"], 2);
     assert!(source["last_received_at"].is_string());
-    for key in ["received", "pending", "submitted", "sent", "rejected"] {
+    for key in [
+        "received",
+        "pending",
+        "submitted",
+        "sent",
+        "rejected",
+        "files",
+        "duplicate_files",
+    ] {
         assert_eq!(source["records"][key], 0, "{key}: {source}");
     }
     let (_, failed) = e.get("/api/loads?status=failed").await;
@@ -1519,12 +1661,9 @@ async fn nothing_sent_and_no_token_are_engine_errors() {
     let w = fake().await;
     let e = engine_with(&w, true, &[]).await;
     e.source("export", json!({})).await;
-    let hfs = w.lock().unwrap().hfs.clone();
     let (dead, dead_url) = bind().await;
     drop(dead);
-    // The token endpoint is the server's `/token`: move the server's base away
-    // from it by making a new engine against a dead identity provider.
-    let _ = (hfs, dead_url.clone());
+    // A new engine against an identity provider that is not there.
     let root = tempfile::tempdir().unwrap();
     std::fs::write(
         root.path().join("hie.yaml"),
@@ -1648,6 +1787,7 @@ async fn a_lost_answer_is_confirmed_with_the_status_request() {
         gone["error"],
         "the FHIR server did not receive this manifest; send it again"
     );
+    assert_eq!(gone["manifest"]["kickoff"], "not_received");
 
     assert!(
         w.lock().unwrap().probes.is_empty(),
@@ -1703,6 +1843,7 @@ async fn a_lost_answer_is_confirmed_with_the_status_request() {
         gone["error"],
         "the FHIR server did not receive this manifest; send it again"
     );
+    assert_eq!(gone["manifest"]["kickoff"], "not_received", "{gone}");
 }
 
 #[tokio::test]
@@ -1819,7 +1960,7 @@ async fn a_load_left_while_it_was_sent_is_listed_and_confirmed() {
     e.sql(&format!("UPDATE submissions SET created_at = created_at - 600000 WHERE load_id = {id} RETURNING token"));
     let gone = e.settled(id).await;
     assert_eq!(gone["status"], "unreadable", "{gone}");
-    assert_eq!(gone["manifest"]["kickoff"], "unconfirmed");
+    assert_eq!(gone["manifest"]["kickoff"], "not_received");
     assert_eq!(
         gone["error"],
         "the FHIR server did not receive this manifest; send it again"
@@ -1936,6 +2077,8 @@ async fn a_malformed_receipt_makes_the_load_unreadable() {
             .contains("not an OperationOutcome"),
         "{gone}"
     );
+    // Another cause of an unreadable load keeps the kick-off as it was.
+    assert_eq!(gone["manifest"]["kickoff"], "accepted");
     assert_eq!(
         kinds(&e.events("export")).last().unwrap(),
         "load.unreadable"
@@ -2103,4 +2246,452 @@ fn a_store_from_before_manifest_loads_reopens() {
     assert_eq!(rows[0]["manifest"], Value::Null);
     assert_eq!(rows[0]["receipts_sent"], 0);
     assert_eq!(db.feed_counts("old").unwrap()["files"], 1);
+}
+
+// ---- after review: refusals, deadlines, recovery, ownership ---------------
+
+/// Waits for `done`, up to 30 s.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(started.elapsed() < Duration::from_secs(30), "never: {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn new_load<'a>(
+    token: &'a str,
+    request_id: Option<&'a str>,
+    served: Option<&'a str>,
+) -> hie::db::manifest::NewLoad<'a> {
+    hie::db::manifest::NewLoad {
+        feed: "export",
+        source_name: "Source export",
+        name: "manifest.json",
+        sha: "00",
+        size: served.map_or(0, str::len),
+        by: if served.is_some() { "upload" } else { "url" },
+        request_id,
+        request_hash: "h",
+        token,
+        served,
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_whose_removal_failed_is_never_a_load_and_its_source_removes_it() {
+    let w = fake().await;
+    let e = engine(&w).await;
+    e.source("export", json!({"poll_seconds": 3600})).await;
+    let db = e.state.db.clone();
+    // What a request leaves when the store refuses the removal after the
+    // mark: two refused loads, one with a key, one uploaded.
+    let keyed = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let upload = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    for (token, key, served) in [
+        (keyed, Some("k"), None),
+        (upload, None, Some("{\"output\":[]}")),
+    ] {
+        let hie::db::manifest::Admission::New(_) =
+            db.admit_manifest(&new_load(token, key, served)).unwrap()
+        else {
+            panic!("not admitted");
+        };
+        assert!(db.manifest_dispatch(token, 60_000).unwrap());
+        assert!(
+            db.manifest_refuse(token, hie::db::manifest::DISPATCHED)
+                .unwrap()
+        );
+    }
+    // Never served, never listed, never answered as a load.
+    let served = reqwest::get(format!("{}/bulk/{upload}/manifest.json", e.api))
+        .await
+        .unwrap();
+    assert_eq!(served.status(), StatusCode::NOT_FOUND);
+    let (_, loads) = e.get("/api/loads").await;
+    assert_eq!(loads["loads"], json!([]));
+    // A replay of the refused key is sent again.
+    let again = db
+        .admit_manifest(&new_load(
+            "cccccccccccccccccccccccccccccccc",
+            Some("k"),
+            None,
+        ))
+        .unwrap();
+    assert!(
+        matches!(again, hie::db::manifest::Admission::New(_)),
+        "{again:?}"
+    );
+    // The source's next pass removes what is left.
+    e.manager.runner("export").unwrap().tick().await.unwrap();
+    let left = e.sql(&format!(
+        "SELECT COUNT(*) AS n FROM submissions WHERE token IN ('{keyed}', '{upload}')"
+    ));
+    assert_eq!(left[0]["n"], 0);
+    // A kick-off whose deadline passed before it could be sent is not sent.
+    let late = "dddddddddddddddddddddddddddddddd";
+    let hie::db::manifest::Admission::New(_) =
+        db.admit_manifest(&new_load(late, None, None)).unwrap()
+    else {
+        panic!("not admitted");
+    };
+    assert!(!db.manifest_dispatch(late, 0).unwrap());
+}
+
+#[tokio::test]
+async fn a_slow_token_or_a_refusal_that_stalls_leaves_no_load() {
+    let w = fake().await;
+    w.lock().unwrap().token_delay = Some(KICKOFF_TIMEOUT * 2);
+    let e = engine_with(&w, true, &[]).await;
+    e.source("export", json!({})).await;
+    let url = url_manifest(&w, "m", &[("Patient", "patients.ndjson")]);
+    let (status, _, answer) = e.send("export", json!({"manifest_url": url})).await;
+    assert_eq!(
+        (status, answer["code"].as_str()),
+        (StatusCode::BAD_GATEWAY, Some("destination_auth")),
+        "{answer}"
+    );
+    assert!(w.lock().unwrap().kickoffs.is_empty(), "nothing was sent");
+    assert_eq!(e.sql("SELECT COUNT(*) AS n FROM files")[0]["n"], 0);
+
+    // A refusal whose body never arrives whole.
+    w.lock().unwrap().token_delay = None;
+    w.lock()
+        .unwrap()
+        .script
+        .push_back(Answer::RefuseStalled { status: 429 });
+    let (status, headers, answer) = e.send("export", json!({"manifest_url": url})).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{answer}");
+    assert_eq!(answer["code"], "destination_answer_too_large");
+    assert_eq!(answer["destination_status"], 429);
+    assert!(headers.get("x-hie-refused-by").is_none());
+    assert_eq!(e.sql("SELECT COUNT(*) AS n FROM files")[0]["n"], 0);
+    assert_eq!(e.sql("SELECT COUNT(*) AS n FROM submissions")[0]["n"], 0);
+}
+
+#[tokio::test]
+async fn a_completed_probe_reads_the_status_again_before_it_settles() {
+    let w = fake().await;
+    let e = engine(&w).await;
+    e.source("export", json!({})).await;
+    let url = url_manifest(&w, "m", &[("Patient", "patients.ndjson")]);
+    // Cut before its manifest; the manifest is added by the time the
+    // status-only kick-off asks.
+    w.lock().unwrap().attach_next = true;
+    w.lock().unwrap().script.push_back(Answer::Late {
+        after: Duration::ZERO,
+        status: 503,
+        register: true,
+        manifest: false,
+        completed: false,
+    });
+    let (status, _, load) = e.send("export", json!({"manifest_url": url})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let done = e.settled(load["id"].as_i64().unwrap()).await;
+    assert_eq!(
+        (done["status"].as_str(), done["sent"].as_i64()),
+        (Some("done"), Some(2)),
+        "{done}"
+    );
+    assert_eq!(w.lock().unwrap().probes.len(), 1);
+}
+
+#[tokio::test]
+async fn receipt_reads_are_counted_apart_from_failed_polls() {
+    let w = fake().await;
+    w.lock().unwrap().poll_500 = 4;
+    w.lock().unwrap().receipt_500 = 1;
+    let e = engine(&w).await;
+    e.source("export", json!({})).await;
+    let url = url_manifest(&w, "m", &[("Patient", "patients.ndjson")]);
+    let (_, _, load) = e.send("export", json!({"manifest_url": url})).await;
+    let id = load["id"].as_i64().unwrap();
+    // The backoff runs out at once, as time would.
+    let started = Instant::now();
+    let done = loop {
+        e.sql(&format!(
+            "UPDATE submissions SET next_attempt_at = 0 WHERE load_id = {id} RETURNING token"
+        ));
+        let (_, now) = e.get(&format!("/api/loads/{id}")).await;
+        if now["status"] != "processing" {
+            break now;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "{now}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        (done["status"].as_str(), done["sent"].as_i64()),
+        (Some("done"), Some(2)),
+        "{done}"
+    );
+    let failed = e
+        .events("export")
+        .into_iter()
+        .filter(|ev| ev["kind"] == "submission.attempt_failed")
+        .count();
+    assert_eq!(failed, 5, "four polls and one receipt read");
+}
+
+#[tokio::test]
+async fn a_pause_during_a_page_stops_the_step() {
+    let w = fake().await;
+    w.lock().unwrap().two_pages = true;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    w.lock().unwrap().page_gate = Some(gate.clone());
+    let e = engine(&w).await;
+    e.source("export", json!({})).await;
+    let url = url_manifest(&w, "m", &[("Patient", "patients.ndjson")]);
+    let (_, _, load) = e.send("export", json!({"manifest_url": url})).await;
+    let id = load["id"].as_i64().unwrap();
+    until("page 1 held", || w.lock().unwrap().page_held).await;
+    e.manager.pause("export", None).unwrap();
+    gate.notify_one();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    {
+        let world = w.lock().unwrap();
+        assert!(
+            world.receipt_requests.is_empty(),
+            "{:?}",
+            world.receipt_requests
+        );
+        assert!(
+            !world
+                .page_requests
+                .iter()
+                .any(|(p, _)| p.ends_with("page=2")),
+            "{:?}",
+            world.page_requests
+        );
+    }
+    let (_, paused) = e.get(&format!("/api/loads/{id}")).await;
+    assert_eq!(paused["status"], "processing");
+    e.manager.resume("export").unwrap();
+    let done = e.settled(id).await;
+    assert_eq!(done["status"], "done", "{done}");
+}
+
+#[tokio::test]
+async fn a_check_answered_during_a_kickoff_never_gains_its_load() {
+    let w = fake().await;
+    let e = engine(&w).await;
+    e.source("export", json!({"poll_seconds": 3600})).await;
+    let url = url_manifest(&w, "m", &[("Patient", "patients.ndjson")]);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    w.lock().unwrap().gate = Some(gate.clone());
+    let check = e.state.db.insert_check("export").unwrap();
+    let sending = {
+        let (http, api, url) = (e.http.clone(), e.api.clone(), url.clone());
+        tokio::spawn(async move {
+            http.post(format!("{api}/api/sources/export/manifests"))
+                .json(&json!({"manifest_url": url}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+    until("the kick-off held", || {
+        !w.lock().unwrap().kickoffs.is_empty()
+    })
+    .await;
+    e.manager
+        .runner("export")
+        .unwrap()
+        .tick_with(&[check])
+        .await
+        .unwrap();
+    gate.notify_one();
+    assert_eq!(sending.await.unwrap(), StatusCode::CREATED);
+    let (_, answered) = e.get(&format!("/api/checks/{check}")).await;
+    assert_eq!(answered["status"], "nothing_new", "{answered}");
+    assert_eq!(answered["file_count"], 0);
+    assert_eq!(answered["files"], json!([]));
+}
+
+#[tokio::test]
+async fn secrets_echoed_by_the_identity_provider_or_the_server_are_not_logged() {
+    // A token endpoint that echoes the client secret.
+    let w = fake().await;
+    w.lock().unwrap().token_refusal = Some(
+        "{\"error\": \"invalid_client\", \"detail\": \"secret ENGINE-CANARY-SECRET is wrong\"}"
+            .into(),
+    );
+    let e = engine_with(&w, true, &[]).await;
+    e.source("export", json!({})).await;
+    let url = url_manifest(&w, "m", &[("Patient", "patients.ndjson")]);
+    let (status, _, answer) = e.send("export", json!({"manifest_url": url})).await;
+    assert_eq!(
+        (status, answer["code"].as_str()),
+        (StatusCode::BAD_GATEWAY, Some("destination_auth"))
+    );
+    assert!(logged().contains("could not get its own token"));
+
+    // A 401 whose text echoes the bearer where the 500 characters end.
+    w.lock().unwrap().token_refusal = None;
+    let text = format!("{}ENGINE-CANARY-TOKEN rejected", "x".repeat(490));
+    w.lock().unwrap().script.push_back(Answer::Refuse {
+        status: 401,
+        body: json!({"resourceType": "OperationOutcome", "issue": [{"severity": "error", "code": "security",
+                     "details": {"text": text}}]})
+        .to_string(),
+        content_type: "application/fhir+json",
+        retry_after: None,
+    });
+    let (status, _, _) = e.send("export", json!({"manifest_url": url})).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let log = logged();
+    for leak in ["ENGINE-CANARY-SECRET", "ENGINE-CAN"] {
+        assert!(!log.contains(leak), "{leak} logged");
+    }
+}
+
+#[tokio::test]
+async fn a_disabled_bulk_submit_or_a_malformed_status_makes_the_load_unreadable() {
+    let w = fake().await;
+    let e = engine(&w).await;
+    e.source("export", json!({})).await;
+    let url = url_manifest(&w, "m", &[("Patient", "patients.ndjson")]);
+    w.lock().unwrap().bulk_off = true;
+    let (_, _, load) = e.send("export", json!({"manifest_url": url})).await;
+    let gone = e.settled(load["id"].as_i64().unwrap()).await;
+    assert_eq!(gone["status"], "unreadable", "{gone}");
+    assert_eq!(
+        gone["error"],
+        "the FHIR server's $bulk-submit is off (HTTP 501)"
+    );
+    assert_eq!(gone["manifest"]["kickoff"], "accepted");
+
+    w.lock().unwrap().bulk_off = false;
+    w.lock().unwrap().outcome_without_url = true;
+    let (_, _, load) = e.send("export", json!({"manifest_url": url})).await;
+    let gone = e.settled(load["id"].as_i64().unwrap()).await;
+    assert_eq!(gone["status"], "unreadable", "{gone}");
+    assert!(
+        gone["error"].as_str().unwrap().contains("without a url"),
+        "{gone}"
+    );
+}
+
+#[tokio::test]
+async fn manifest_traffic_counts_for_the_destination_and_for_stamping() {
+    let w = fake().await;
+    let e = engine_config(&w, false, &[], "destination:\n  probe_seconds: 0\n").await;
+    let (_, before) = e.get("/api/monitoring/status").await;
+    assert_ne!(before["destination"]["reachable"], true, "{before}");
+    e.source("export", json!({})).await;
+    w.lock().unwrap().hold = true;
+    let url = url_manifest(&w, "m", &[("Patient", "patients.ndjson")]);
+    let (_, _, load) = e.send("export", json!({"manifest_url": url})).await;
+    let (_, after) = e.get("/api/monitoring/status").await;
+    assert_eq!(after["destination"]["reachable"], true, "{after}");
+    let (_, open) = e.get("/api/sources/export").await;
+    assert_eq!(open["stamping"]["untagged"], "open", "{open}");
+    w.lock().unwrap().hold = false;
+    e.settled(load["id"].as_i64().unwrap()).await;
+    let (_, done) = e.get("/api/sources/export").await;
+    assert_eq!(done["stamping"]["untagged"], "until", "{done}");
+}
+
+#[tokio::test]
+async fn monitoring_splits_the_last_day_by_source_type() {
+    let w = fake().await;
+    let e = engine(&w).await;
+    e.source("export", json!({})).await;
+    for id in ["kept", "gone"] {
+        let (status, _, _) = e
+            .post(
+                "/api/sources",
+                json!({"id": id, "name": id, "source": {"type": "folder", "path": format!("in-{id}"), "poll_seconds": 1, "min_file_age_ms": 0},
+                       "format": "ndjson", "transform": "transforms/fhir_passthrough.py"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let inbox = e.root.path().join(format!("in-{id}"));
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(
+            inbox.join("a.ndjson"),
+            "{\"resourceType\":\"Patient\",\"id\":\"p1\"}\n",
+        )
+        .unwrap();
+    }
+    let url = url_manifest(
+        &w,
+        "m",
+        &[
+            ("Patient", "patients.ndjson"),
+            ("Patient", "missing.ndjson"),
+        ],
+    );
+    let (_, _, load) = e.send("export", json!({"manifest_url": url})).await;
+    e.settled(load["id"].as_i64().unwrap()).await;
+    let db = e.state.db.clone();
+    until("both folder loads", || {
+        db.query_json("SELECT COUNT(*) AS n FROM files WHERE manifest IS NULL", [])
+            .unwrap()[0]["n"]
+            == 2
+    })
+    .await;
+    let (status, _) = (
+        e.http
+            .delete(format!("{}/api/sources/gone", e.api))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        (),
+    );
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, monitoring) = e.get("/api/monitoring/status").await;
+    let last = &monitoring["last_24h"];
+    let by = last["by_source_type"].as_object().unwrap();
+    assert_eq!(
+        by.keys().collect::<Vec<_>>(),
+        ["folder", "manifest", "unregistered"],
+        "{last}"
+    );
+    assert_eq!(
+        by["manifest"],
+        json!({"loads": 1, "sent": 2, "failing": 1}),
+        "{last}"
+    );
+    assert_eq!(by["folder"]["loads"], 1);
+    assert_eq!(by["unregistered"]["loads"], 1);
+    for (member, total) in [("loads", "files"), ("sent", "sent"), ("failing", "failing")] {
+        let sum: i64 = by.values().map(|v| v[member].as_i64().unwrap()).sum();
+        assert_eq!(sum, last[total].as_i64().unwrap(), "{member}: {last}");
+    }
+}
+
+#[tokio::test]
+async fn receipts_on_the_status_host_get_the_engine_token() {
+    let w = fake().await;
+    w.lock().unwrap().receipts_on_pages = true;
+    let e = engine_with(&w, true, &[]).await;
+    e.source("export", json!({})).await;
+    let url = url_manifest(&w, "m", &[("Patient", "patients.ndjson")]);
+    let (_, _, load) = e.send("export", json!({"manifest_url": url})).await;
+    let done = e.settled(load["id"].as_i64().unwrap()).await;
+    assert_eq!(done["status"], "done", "{done}");
+    let world = w.lock().unwrap();
+    assert!(
+        !world.receipt_requests.is_empty() && world.receipt_requests.iter().all(|(_, auth)| *auth),
+        "{:?}",
+        world.receipt_requests
+    );
+}
+
+#[tokio::test]
+async fn an_uploaded_manifest_may_name_urls_longer_than_a_manifest_url() {
+    let w = fake().await;
+    let e = engine(&w).await;
+    e.source("upload", json!({})).await;
+    let provider = w.lock().unwrap().provider.clone();
+    let long = format!("{provider}/files/patients.ndjson?sig={}", "s".repeat(3000));
+    let (status, _, load) = e
+        .send(
+            "upload",
+            json!({"manifest": {"output": [{"type": "Patient", "url": long}]}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{load}");
 }
