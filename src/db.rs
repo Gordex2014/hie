@@ -222,6 +222,11 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // The load a manifest submission is for, and how far its receipts were read.
     ("submissions", "load_id", "INTEGER"),
     ("submissions", "progress", "TEXT"),
+    // When a manifest load was listed; a load recorded otherwise is listed
+    // from its `received_at`.
+    ("files", "listed_at", "INTEGER"),
+    // The instant a check's answer counted the loads listed up to.
+    ("checks", "cutoff_at", "INTEGER"),
 ];
 
 /// How long the store write before an untagged REST request may take: a
@@ -2703,7 +2708,9 @@ impl Db {
     }
 
     /// What the store knows about `feed`'s deliveries without the tag, read in
-    /// one statement. Untagged submissions count whatever the source's path
+    /// one statement. A manifest load is one: the FHIR server stores the
+    /// provider's resources as they are (`m_*` statuses, never stamped); a
+    /// kick-off it refused is not. Untagged submissions count whatever the source's path
     /// is now: one nobody polls any more stays open. One that is done is a
     /// bound at its last update; one still to send or running is open, from
     /// whichever version wrote it. A failed one may have left HFS importing (a
@@ -2719,11 +2726,11 @@ impl Db {
                    (SELECT untagged_until FROM source_stamping WHERE feed_id = $1) AS rest,
                    (SELECT MAX(updated_at) FROM submissions
                      WHERE feed_id = $1 AND stamped = 0
-                       AND status = 'done') AS bulk,
+                       AND status IN ('done', 'm_done')) AS bulk,
                    (SELECT COUNT(*) FROM submissions
                      WHERE feed_id = $1 AND stamped = 0
-                       AND (status IN ('kickoff', 'running')
-                            OR (status = 'failed'
+                       AND (status IN ('kickoff', 'running', 'm_sending', 'm_status', 'm_polling')
+                            OR (status IN ('failed', 'm_failed')
                                 AND updated_at >= COALESCE((SELECT CAST(value AS BIGINT) FROM store_meta WHERE key = $2), 0)))) AS open",
                 &params![feed, STAMPING_TRACKED],
             )?
@@ -4210,8 +4217,12 @@ impl Db {
         if snapshot.is_empty() {
             return Ok(());
         }
+        // The loads listed by `now`, the answer's cutoff: one listed later
+        // (a manifest whose kick-off was still being sent) is never the
+        // check's, here or in its pages (`check`).
         const COUNT: &str = "(SELECT COUNT(*) FROM files WHERE files.feed_id = checks.feed_id
-                               AND files.id > checks.after_file AND files.id <= $3 AND files.listed = 1)";
+                               AND files.id > checks.after_file AND files.id <= $3 AND files.listed = 1
+                               AND COALESCE(files.listed_at, files.received_at) <= $4)";
         let upto = self.max_file_id(feed)?;
         let now = now_ms();
         let status = match failure {
@@ -4219,7 +4230,7 @@ impl Db {
             None => format!("CASE WHEN {COUNT} > 0 THEN 'found' ELSE 'nothing_new' END"),
         };
         let sql = format!(
-            "UPDATE checks SET status = {status}, file_count = {COUNT}, upto_file = $3,
+            "UPDATE checks SET status = {status}, file_count = {COUNT}, upto_file = $3, cutoff_at = $4,
                finished_at = CASE WHEN requested_at > $4 THEN requested_at ELSE $4 END,
                reason = $5
              WHERE id = $1 AND feed_id = $2 AND status = 'pending'"
@@ -4246,8 +4257,9 @@ impl Db {
         self.execute(
             "UPDATE checks SET status = 'failed',
                file_count = (SELECT COUNT(*) FROM files
-                             WHERE files.feed_id = checks.feed_id AND files.id > checks.after_file AND files.listed = 1),
-               upto_file = (SELECT COALESCE(MAX(id), 0) FROM files WHERE feed_id = $1),
+                             WHERE files.feed_id = checks.feed_id AND files.id > checks.after_file AND files.listed = 1
+                               AND COALESCE(files.listed_at, files.received_at) <= $4),
+               upto_file = (SELECT COALESCE(MAX(id), 0) FROM files WHERE feed_id = $1), cutoff_at = $4,
                finished_at = CASE WHEN requested_at > $4 THEN requested_at ELSE $4 END,
                reason = $2
              WHERE feed_id = $1 AND status = 'pending'
@@ -4264,7 +4276,7 @@ impl Db {
             .query_json(
                 &format!(
                     "SELECT id AS check_id, feed_id AS source, status, {} AS requested_at, {} AS finished_at,
-                            file_count, reason, after_file, upto_file
+                            file_count, reason, after_file, upto_file, cutoff_at
                      FROM checks WHERE id = $1",
                     self.iso("requested_at"),
                     self.iso("finished_at")
@@ -4280,12 +4292,15 @@ impl Db {
         let files = match check["upto_file"].as_i64() {
             Some(upto) => self.query_json(
                 "SELECT id, name, status, duplicate_of FROM files
-                 WHERE feed_id = $1 AND id > $2 AND id <= $3 AND listed = 1 ORDER BY id LIMIT $4",
+                 WHERE feed_id = $1 AND id > $2 AND id <= $3 AND listed = 1
+                   AND (CAST($5 AS BIGINT) IS NULL OR COALESCE(listed_at, received_at) <= CAST($5 AS BIGINT))
+                 ORDER BY id LIMIT $4",
                 params![
                     check["source"].as_str().unwrap_or(""),
                     from,
                     upto,
-                    limit + 1
+                    limit + 1,
+                    check["cutoff_at"].as_i64()
                 ],
             )?,
             None => Vec::new(),
@@ -4300,6 +4315,7 @@ impl Db {
         let object = check.as_object_mut().expect("a row is an object");
         object.remove("after_file");
         object.remove("upto_file");
+        object.remove("cutoff_at");
         if object["file_count"].is_null() {
             object.insert("file_count".into(), json!(0));
         }

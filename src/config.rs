@@ -656,10 +656,14 @@ pub const MANIFEST_URL_MAX_CHARS: usize = 2048;
 /// Whether `text` is an absolute `http` or `https` URL with a host, of at most
 /// `MANIFEST_URL_MAX_CHARS` characters.
 pub fn absolute_http_url(text: &str) -> bool {
-    text.chars().count() <= MANIFEST_URL_MAX_CHARS
-        && url::Url::parse(text).is_ok_and(|u| {
-            matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
-        })
+    text.chars().count() <= MANIFEST_URL_MAX_CHARS && absolute_http_url_any_length(text)
+}
+
+/// Whether `text` is an absolute `http` or `https` URL with a host, however long.
+pub fn absolute_http_url_any_length(text: &str) -> bool {
+    url::Url::parse(text).is_ok_and(|u| {
+        matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
+    })
 }
 
 /// Credentials for a remote FHIR server. Secrets are named by environment
@@ -871,6 +875,18 @@ impl SourceConfig {
             | SourceConfig::Database { poll_seconds, .. }
             | SourceConfig::Mllp { poll_seconds, .. }
             | SourceConfig::Manifest { poll_seconds, .. } => Duration::from_secs(*poll_seconds),
+        }
+    }
+
+    /// The source's `type`, as its definition names it.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            SourceConfig::Folder { .. } => "folder",
+            SourceConfig::S3 { .. } => "s3",
+            SourceConfig::FhirServer { .. } => "fhir_server",
+            SourceConfig::Database { .. } => "database",
+            SourceConfig::Mllp { .. } => "mllp",
+            SourceConfig::Manifest { .. } => "manifest",
         }
     }
 
@@ -1237,10 +1253,18 @@ pub fn definition_from_json(body: &serde_json::Value) -> Result<FeedConfig> {
 /// Reads a source file: a `manifest` source by its own rules
 /// (`manifest_definition`), any other as it always was.
 pub fn definition_from_yaml(text: &str) -> Result<FeedConfig> {
+    // A manifest source is told by its YAML, before anything is converted:
+    // a file that cannot be read as JSON is refused, never read leniently.
     if let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(text)
-        && let Ok(json) = serde_json::to_value(&raw)
-        && is_manifest_definition(&json)
+        && raw
+            .get("source")
+            .and_then(|s| s.get("type"))
+            .and_then(serde_yaml::Value::as_str)
+            == Some("manifest")
     {
+        let json = serde_json::to_value(&raw).context(
+            "a manifest source's definition must hold only what JSON can (string keys, no tags)",
+        )?;
         return manifest_definition(&json);
     }
     Ok(serde_yaml::from_str(text)?)
@@ -1280,6 +1304,11 @@ fn manifest_definition(body: &serde_json::Value) -> Result<FeedConfig> {
     match top.get("delivery") {
         None => {}
         Some(Value::Object(d)) => {
+            if d.is_empty() {
+                bail!(
+                    "source {id}: delivery must be absent or exactly {{method: bulk_submit}}, not empty"
+                );
+            }
             for (key, value) in d {
                 if key != "method" {
                     bail!(
@@ -1306,14 +1335,14 @@ fn manifest_definition(body: &serde_json::Value) -> Result<FeedConfig> {
         }
     }
     let oauth_metadata_url = match source.get("oauth_metadata_url") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(url)) => Some(url.clone()),
         Some(_) => {
             bail!("source {id}: source.oauth_metadata_url must be an absolute http or https URL")
         }
     };
     let poll_seconds = match source.get("poll_seconds") {
-        None | Some(Value::Null) => MANIFEST_POLL_SECONDS,
+        None => MANIFEST_POLL_SECONDS,
         Some(v) => v.as_u64().with_context(|| {
             format!("source {id}: source.poll_seconds must be a whole number from 1 to 3600")
         })?,

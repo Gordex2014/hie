@@ -10,14 +10,18 @@
 //! (Manifest).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::bulk::{SUBMITTER_SYSTEM, safe_reason, shown};
 use crate::credentials::Credentials;
+use crate::destination::Destination;
 
 /// The largest body `POST /api/sources/{id}/manifests` takes, counted as received.
 pub const BODY_MAX: usize = 4 << 20;
@@ -295,7 +299,7 @@ fn check_manifest(manifest: &Value) -> Result<(), BodyError> {
         if !entry
             .get("url")
             .and_then(Value::as_str)
-            .is_some_and(crate::config::absolute_http_url)
+            .is_some_and(crate::config::absolute_http_url_any_length)
         {
             return Err(BodyError::Manifest(format!(
                 "manifest.output[{i}].url must be an absolute http or https URL"
@@ -344,6 +348,9 @@ pub enum Kickoff {
     Auth(String),
     /// No connection could be made: nothing reached the server.
     Unreachable(String),
+    /// Nothing was sent: the store could not claim the kick-off before its
+    /// deadline. Answered `503 store_busy`.
+    NotSent,
     /// The request went out and its answer did not come back as one the
     /// engine can rely on (a timeout, a broken connection, a `5xx` but `501`,
     /// a `408`, a redirect, any status not listed): the server may have
@@ -396,28 +403,65 @@ pub enum Page {
 /// only to the FHIR server's origin and to the origin of the status URL that
 /// server gave; any other host (a pre-signed receipt URL) is read without it.
 pub struct Client {
+    /// Kick-offs, status requests and status pages: each whole within
+    /// `fhir::HTTP_TIMEOUT`.
     http: reqwest::Client,
+    /// Receipt files, which may be large: no bound on the whole, only on
+    /// each wait for more of it.
+    receipts: reqwest::Client,
     fhir_base: String,
     public_url: String,
     credentials: Credentials,
+    /// Told how each request under `fhir_base` went, as the outbound path's.
+    destination: Option<Arc<Destination>>,
 }
+
+/// What is logged and stored when the engine cannot get its own token: a
+/// fixed sentence, since what the identity provider answered may echo the
+/// engine's secret.
+pub const NO_TOKEN: &str = "the engine could not get its own token from its identity provider";
+
+/// The most of a status page the engine reads.
+pub const STATUS_MAX: usize = 4 << 20;
+
+/// How long a receipt file may send nothing before its read is given up.
+const RECEIPT_IDLE: Duration = Duration::from_secs(60);
 
 impl Client {
     pub fn new(fhir_base: &str, public_url: &str, credentials: Credentials) -> Self {
+        // A connection that cannot be made is known well before the
+        // kick-off's deadline: nothing was sent.
+        let connect = Duration::from_secs(10).min(kickoff_timeout() / 3);
         // Redirects are never followed by the client: a kick-off's `3xx` is an
         // answer, and a status page's is followed by hand, hop by hop, so
         // that each hop decides on its own whether it gets the token.
         let http = reqwest::Client::builder()
             .timeout(crate::fhir::HTTP_TIMEOUT)
+            .connect_timeout(connect)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("HTTP client");
+        let receipts = reqwest::Client::builder()
+            .connect_timeout(connect)
+            .read_timeout(RECEIPT_IDLE)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("HTTP client");
         Self {
             http,
+            receipts,
             fhir_base: fhir_base.trim_end_matches('/').to_string(),
             public_url: public_url.trim_end_matches('/').to_string(),
             credentials,
+            destination: None,
         }
+    }
+
+    /// The same client, telling `destination` how its requests to the FHIR
+    /// server went.
+    pub fn with_destination(mut self, destination: Arc<Destination>) -> Self {
+        self.destination = Some(destination);
+        self
     }
 
     /// The URL the engine serves an uploaded manifest at.
@@ -455,14 +499,12 @@ impl Client {
         Self::parameters(source_id, submission_id, more)
     }
 
-    /// The bearer token, when the engine has credentials.
+    /// The bearer token, when the engine has credentials; `NO_TOKEN` when it
+    /// cannot get one.
     async fn bearer(&self) -> Result<Option<String>, String> {
         match &self.credentials {
             None => Ok(None),
-            Some(source) => source.bearer().await.map(Some).map_err(|e| match e {
-                crate::fhir::SendError::Transient(m) => m,
-                crate::fhir::SendError::Refused(status, _) => format!("HTTP {status}"),
-            }),
+            Some(source) => source.bearer().await.map(Some).map_err(|_| NO_TOKEN.into()),
         }
     }
 
@@ -472,36 +514,59 @@ impl Client {
         }
     }
 
-    /// Hands one manifest to the FHIR server and reads its answer, all within
-    /// `kickoff_timeout`, the engine's token included.
-    pub async fn kickoff(&self, body: &Value) -> Kickoff {
-        match tokio::time::timeout(kickoff_timeout(), self.kickoff_within(body)).await {
-            Ok(answer) => answer,
-            Err(_) => Kickoff::Lost(format!(
-                "no answer from {} within {}",
-                shown(&self.fhir_base),
-                crate::pipeline::human(kickoff_timeout())
-            )),
+    /// The values a server's text must never carry into a log: the engine's
+    /// client secret and the bearer it sent.
+    fn secrets(&self, bearer: Option<&str>) -> Vec<String> {
+        let mut secrets: Vec<String> = bearer.map(str::to_string).into_iter().collect();
+        if let Some(source) = &self.credentials {
+            secrets.push(source.settings().client_secret.clone());
+        }
+        secrets.retain(|s| !s.is_empty());
+        secrets
+    }
+
+    /// The first phase of a kick-off: the engine's token, within its share
+    /// of the kick-off's `deadline` (a third of the kick-off timeout at
+    /// most). Nothing is sent yet; a token the engine cannot get is a
+    /// `Kickoff::Auth`, with `NO_TOKEN`.
+    pub async fn kickoff_token(&self, deadline: Instant) -> Result<Option<String>, Kickoff> {
+        let Some(source) = &self.credentials else {
+            return Ok(None);
+        };
+        let share = deadline.min(Instant::now() + kickoff_timeout() / 3);
+        match tokio::time::timeout_at(share, source.bearer()).await {
+            Ok(Ok(token)) => Ok(Some(token)),
+            Ok(Err(_)) => Err(Kickoff::Auth(NO_TOKEN.into())),
+            Err(_) => Err(Kickoff::Auth(format!("{NO_TOKEN} in time"))),
         }
     }
 
-    async fn kickoff_within(&self, body: &Value) -> Kickoff {
-        let bearer = match self.bearer().await {
-            Ok(bearer) => bearer,
-            Err(e) => {
-                return Kickoff::Auth(format!("getting the engine's token: {}", safe_reason(&e)));
-            }
-        };
+    /// The second phase: hands one manifest to the FHIR server and reads its
+    /// answer, all before `deadline`. Only a request that went out and got
+    /// no status line in time, or a status that says nothing for sure, is
+    /// `Lost`.
+    pub async fn kickoff(&self, body: &Value, bearer: Option<&str>, deadline: Instant) -> Kickoff {
         let mut request = self
             .http
             .post(format!("{}/$bulk-submit", self.fhir_base))
             .header("Content-Type", "application/fhir+json")
             .header("Accept", "application/fhir+json")
             .json(body);
-        if let Some(bearer) = &bearer {
+        if let Some(bearer) = bearer {
             request = request.bearer_auth(bearer);
         }
-        let response = match request.send().await {
+        let exchange = self.destination.as_ref().map(|d| d.start());
+        let Ok(sent) = tokio::time::timeout_at(deadline, request.send()).await else {
+            return Kickoff::Lost(format!(
+                "no answer from {} within {}",
+                shown(&self.fhir_base),
+                crate::pipeline::human(kickoff_timeout())
+            ));
+        };
+        if let Some(exchange) = &exchange {
+            exchange.observe_send(&sent);
+        }
+        let response = match sent {
             Ok(response) => response,
             Err(e) if e.is_connect() => {
                 return Kickoff::Unreachable(format!(
@@ -523,12 +588,16 @@ impl Client {
             200..=299 => Kickoff::Accepted,
             401 | 403 => {
                 self.forget_token().await;
-                let detail = match read_capped(response, REFUSAL_MAX).await {
-                    Ok(Some(body)) => refusal_issues(status, &body),
-                    Ok(None) => format!("HTTP {status}, a body over {REFUSAL_MAX} bytes"),
-                    Err(_) => format!("HTTP {status}, a body that could not be read"),
-                };
-                Kickoff::Auth(redact(&detail, bearer.as_deref()))
+                let secrets = self.secrets(bearer);
+                let detail =
+                    match tokio::time::timeout_at(deadline, read_capped(response, REFUSAL_MAX))
+                        .await
+                    {
+                        Ok(Ok(Some(body))) => refusal_issues(status, &body, &secrets),
+                        Ok(Ok(None)) => format!("HTTP {status}, a body over {REFUSAL_MAX} bytes"),
+                        _ => format!("HTTP {status}, a body that could not be read in time"),
+                    };
+                Kickoff::Auth(redact(&detail, &secrets))
             }
             408 => Kickoff::Lost(format!("HTTP 408 from {}", shown(&self.fhir_base))),
             400..=499 | 501 => {
@@ -540,23 +609,47 @@ impl Client {
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .cloned();
-                match read_capped(response, REFUSAL_MAX).await {
-                    Ok(Some(body)) => Kickoff::Refused {
+                // The status says the server refused it; a body that does not
+                // arrive whole, in time and small enough cannot be passed on.
+                match tokio::time::timeout_at(deadline, read_capped(response, REFUSAL_MAX)).await {
+                    Ok(Ok(Some(body))) => Kickoff::Refused {
                         status,
                         body,
                         content_type,
                         retry_after,
                     },
-                    Ok(None) => Kickoff::TooLarge { status },
-                    Err(e) => Kickoff::Lost(format!(
-                        "reading the HTTP {status} answer of {}: {}",
-                        shown(&self.fhir_base),
-                        e.without_url()
-                    )),
+                    _ => Kickoff::TooLarge { status },
                 }
             }
             _ => Kickoff::Lost(format!("HTTP {status} from {}", shown(&self.fhir_base))),
         }
+    }
+
+    /// A POST under the FHIR server's base, with the engine's token, told to
+    /// the destination observer.
+    async fn post_fhir(&self, path: &str, body: &Value) -> Result<reqwest::Response, StepError> {
+        let bearer = self.bearer().await.map_err(StepError::Transient)?;
+        let mut request = self
+            .http
+            .post(format!("{}/{path}", self.fhir_base))
+            .header("Content-Type", "application/fhir+json")
+            .header("Accept", "application/fhir+json")
+            .json(body);
+        if let Some(bearer) = &bearer {
+            request = request.bearer_auth(bearer);
+        }
+        let exchange = self.destination.as_ref().map(|d| d.start());
+        let sent = request.send().await;
+        if let Some(exchange) = &exchange {
+            exchange.observe_send(&sent);
+        }
+        sent.map_err(|e| {
+            StepError::Transient(format!(
+                "cannot reach {}: {}",
+                shown(&self.fhir_base),
+                e.without_url()
+            ))
+        })
     }
 
     /// A status-only kick-off (`submissionStatus: in-progress`, no manifest),
@@ -571,28 +664,11 @@ impl Client {
                 json!({"name": "submissionStatus", "valueCoding": {"system": "http://hl7.org/fhir/event-status", "code": "in-progress"}}),
             ],
         );
-        let bearer = self.bearer().await.map_err(|e| {
-            StepError::Transient(format!("getting the engine's token: {}", safe_reason(&e)))
-        })?;
-        let mut request = self
-            .http
-            .post(format!("{}/$bulk-submit", self.fhir_base))
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .json(&body);
-        if let Some(bearer) = &bearer {
-            request = request.bearer_auth(bearer);
-        }
-        let response = request.send().await.map_err(|e| {
-            StepError::Transient(format!(
-                "cannot reach {}: {}",
-                shown(&self.fhir_base),
-                e.without_url()
-            ))
-        })?;
+        let response = self.post_fhir("$bulk-submit", &body).await?;
         match response.status().as_u16() {
             409 => Ok(Probe::Completed),
             200..=299 => Ok(Probe::Open),
+            501 => Err(StepError::Unreadable(BULK_OFF.into())),
             status => {
                 if matches!(status, 401 | 403) {
                     self.forget_token().await;
@@ -612,25 +688,7 @@ impl Client {
         submission_id: &str,
     ) -> Result<Status, StepError> {
         let body = Self::parameters(source_id, submission_id, vec![]);
-        let bearer = self.bearer().await.map_err(|e| {
-            StepError::Transient(format!("getting the engine's token: {}", safe_reason(&e)))
-        })?;
-        let mut request = self
-            .http
-            .post(format!("{}/$bulk-submit-status", self.fhir_base))
-            .header("Content-Type", "application/fhir+json")
-            .header("Accept", "application/fhir+json")
-            .json(&body);
-        if let Some(bearer) = &bearer {
-            request = request.bearer_auth(bearer);
-        }
-        let response = request.send().await.map_err(|e| {
-            StepError::Transient(format!(
-                "cannot reach {}: {}",
-                shown(&self.fhir_base),
-                e.without_url()
-            ))
-        })?;
+        let response = self.post_fhir("$bulk-submit-status", &body).await?;
         let status = response.status().as_u16();
         match status {
             200..=299 => response
@@ -648,6 +706,7 @@ impl Client {
                     StepError::Transient("no Content-Location on the status request".into())
                 }),
             404 => Ok(Status::Unknown),
+            501 => Ok(Status::Refused(BULK_OFF.into())),
             401 | 403 if self.credentials.is_some() => {
                 self.forget_token().await;
                 Err(StepError::Transient(format!(
@@ -676,21 +735,20 @@ impl Client {
             || origin(status_url).as_deref() == Some(target.as_str())
     }
 
-    /// GET `url`, following redirects by hand: each hop gets the engine's
-    /// token only when it is on a trusted origin (`trusted`).
+    /// GET `url` with `http`, following redirects by hand: each hop gets the
+    /// engine's token only when it is on a trusted origin (`trusted`).
     async fn get(
         &self,
+        http: &reqwest::Client,
         url: &str,
         status_url: &str,
         accept: &str,
     ) -> Result<reqwest::Response, StepError> {
         let mut target = url.to_string();
         for _ in 0..=REDIRECTS {
-            let mut request = self.http.get(&target).header("Accept", accept);
+            let mut request = http.get(&target).header("Accept", accept);
             if self.trusted(&target, status_url)
-                && let Some(bearer) = self.bearer().await.map_err(|e| {
-                    StepError::Transient(format!("getting the engine's token: {}", safe_reason(&e)))
-                })?
+                && let Some(bearer) = self.bearer().await.map_err(StepError::Transient)?
             {
                 request = request.bearer_auth(bearer);
             }
@@ -724,9 +782,18 @@ impl Client {
         )))
     }
 
-    /// One page of the status manifest.
-    pub async fn page(&self, url: &str, status_url: &str) -> Result<Page, StepError> {
-        let response = self.get(url, status_url, "application/json").await?;
+    /// One page of the status manifest of `submission_id`, checked: a JSON
+    /// object of at most `STATUS_MAX` bytes, its `output`, `outcome` and
+    /// `deleted` arrays of entries with a `url`, for this submission.
+    pub async fn page(
+        &self,
+        url: &str,
+        status_url: &str,
+        submission_id: &str,
+    ) -> Result<Page, StepError> {
+        let response = self
+            .get(&self.http, url, status_url, "application/json")
+            .await?;
         let status = response.status().as_u16();
         let retry_after = response
             .headers()
@@ -738,6 +805,7 @@ impl Client {
             200 => {}
             202 | 429 => return Ok(Page::InProgress(retry_after)),
             404 => return Ok(Page::Unknown),
+            501 => return Err(StepError::Unreadable(BULK_OFF.into())),
             401 | 403 if self.credentials.is_some() => {
                 self.forget_token().await;
                 return Err(StepError::Transient(format!(
@@ -757,16 +825,30 @@ impl Client {
                 )));
             }
         }
-        let bytes = response.bytes().await.map_err(|e| {
-            StepError::Transient(format!("reading {}: {}", shown(url), e.without_url()))
-        })?;
-        match serde_json::from_slice::<Value>(&bytes) {
-            Ok(manifest) if manifest.is_object() => Ok(Page::Done(manifest)),
-            _ => Err(StepError::Unreadable(format!(
-                "the FHIR server's status manifest at {} is not a JSON object",
+        let body = match read_capped(response, STATUS_MAX).await {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                return Err(StepError::Unreadable(format!(
+                    "the FHIR server's status manifest at {} is over {STATUS_MAX} bytes",
+                    shown(url)
+                )));
+            }
+            Err(e) => {
+                return Err(StepError::Transient(format!(
+                    "reading {}: {}",
+                    shown(url),
+                    e.without_url()
+                )));
+            }
+        };
+        let manifest = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+        check_status_manifest(&manifest, submission_id).map_err(|why| {
+            StepError::Unreadable(format!(
+                "the FHIR server's status manifest at {} {why}",
                 shown(url)
-            ))),
-        }
+            ))
+        })?;
+        Ok(Page::Done(manifest))
     }
 
     /// Reads a receipt file line by line, giving each non-blank line to
@@ -779,6 +861,7 @@ impl Client {
     ) -> Result<(), StepError> {
         let mut response = self
             .get(
+                &self.receipts,
                 url,
                 status_url,
                 "application/fhir+ndjson, application/x-ndjson, */*",
@@ -833,12 +916,45 @@ impl Client {
     }
 }
 
+/// Why a load is unreadable when the FHIR server's `$bulk-submit` is off.
+pub const BULK_OFF: &str = "the FHIR server's $bulk-submit is off (HTTP 501)";
+
+/// A status page's shape: a JSON object; `output`, `outcome` and `deleted`,
+/// when present, arrays of objects each with a string `url`; `submissionId`,
+/// when present, the one asked about. Why not, otherwise.
+fn check_status_manifest(manifest: &Value, submission_id: &str) -> Result<(), String> {
+    let Some(object) = manifest.as_object() else {
+        return Err("is not a JSON object".into());
+    };
+    for member in ["output", "outcome", "deleted"] {
+        let Some(entries) = object.get(member) else {
+            continue;
+        };
+        let Some(entries) = entries.as_array() else {
+            return Err(format!("has a {member} that is not an array"));
+        };
+        if entries
+            .iter()
+            .any(|e| !e.get("url").is_some_and(Value::is_string))
+        {
+            return Err(format!("has an {member} entry without a url"));
+        }
+    }
+    if let Some(id) = object.get("submissionId")
+        && id.as_str() != Some(submission_id)
+    {
+        return Err("is for another submission".into());
+    }
+    Ok(())
+}
+
 /// The issues logged when the FHIR server refuses the engine's token, never
 /// the body itself: the status and, for an `OperationOutcome`, each issue's
 /// severity, code and text (`diagnostics`, or `details.text` without one),
-/// every URL cut to its origin, each text to 500 characters, at most 10
-/// issues; for any other body, its length only.
-fn refusal_issues(status: u16, body: &[u8]) -> String {
+/// with `secrets` taken out and every URL cut to its origin, then each text
+/// cut to 500 characters, at most 10 issues; for any other body, its length
+/// only.
+fn refusal_issues(status: u16, body: &[u8], secrets: &[String]) -> String {
     let outcome = serde_json::from_slice::<Value>(body)
         .ok()
         .filter(|v| v["resourceType"] == "OperationOutcome");
@@ -854,14 +970,17 @@ fn refusal_issues(status: u16, body: &[u8]) -> String {
             let word = |key: &str| -> String {
                 issue[key]
                     .as_str()
-                    .map(|v| safe_reason(v).chars().take(40).collect())
+                    .map(|v| safe_reason(&redact(v, secrets)).chars().take(40).collect())
                     .unwrap_or_else(|| "-".into())
             };
             let text = issue["diagnostics"]
                 .as_str()
                 .or_else(|| issue.pointer("/details/text").and_then(Value::as_str))
                 .unwrap_or("");
-            let text: String = safe_reason(text).chars().take(500).collect();
+            let text: String = safe_reason(&redact(text, secrets))
+                .chars()
+                .take(500)
+                .collect();
             format!("{} {}: {text}", word("severity"), word("code"))
         })
         .collect();
@@ -872,12 +991,14 @@ fn refusal_issues(status: u16, body: &[u8]) -> String {
     }
 }
 
-/// `text` with the bearer value replaced, should a server echo it.
-fn redact(text: &str, bearer: Option<&str>) -> String {
-    match bearer {
-        Some(b) if !b.is_empty() => text.replace(b, "<token>"),
-        _ => text.to_string(),
-    }
+/// `text` with every one of `secrets` replaced, should a server echo one.
+fn redact(text: &str, secrets: &[String]) -> String {
+    secrets
+        .iter()
+        .filter(|s| !s.is_empty())
+        .fold(text.to_string(), |text, secret| {
+            text.replace(secret.as_str(), "<redacted>")
+        })
 }
 
 /// Reads a body up to `max` bytes: `None` when it is longer.
@@ -921,6 +1042,7 @@ pub struct Group {
 /// What a submission's receipts said so far: kept with the submission after
 /// every status page, so a poll that stops halfway resumes where it was.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Tally {
     /// The status page to read next; `None` before the first.
     pub next: Option<String>,
@@ -935,6 +1057,9 @@ pub struct Tally {
     pub other: i64,
     /// Whether a page listed any file (`output`, `outcome` or `deleted`).
     pub files: bool,
+    /// Failed reads of a receipt file of the page `next` names, since that
+    /// page was last read whole.
+    pub receipt_failures: u32,
 }
 
 impl Tally {

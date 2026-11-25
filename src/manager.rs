@@ -177,11 +177,14 @@ impl SourceManager {
         alerts: Arc<Alerter>,
         secrets: Secrets,
     ) -> Arc<Self> {
-        let manifest_client = Arc::new(crate::manifest::Client::new(
-            &config.fhir_base_url,
-            &config.public_url,
-            fhir.credentials().clone(),
-        ));
+        let manifest_client = Arc::new(
+            crate::manifest::Client::new(
+                &config.fhir_base_url,
+                &config.public_url,
+                fhir.credentials().clone(),
+            )
+            .with_destination(fhir.destination().clone()),
+        );
         Arc::new(Self {
             python: config.python.clone(),
             runtime_dir: runtime_dir.to_path_buf(),

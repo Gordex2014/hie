@@ -21,6 +21,11 @@ enum Step {
     Transient(String),
     /// The load is unreadable, for this reason.
     Unreadable(String),
+    /// The load is unreadable: the FHIR server never received the manifest.
+    NotReceived,
+    /// The runner no longer holds the submission (stopped, paused, or its
+    /// lease or claim lost): it writes nothing.
+    Abandoned,
 }
 
 impl FeedRunner {
@@ -40,6 +45,11 @@ impl FeedRunner {
         let Some(client) = &self.manifest else {
             return Ok(());
         };
+        // Kick-offs the FHIR server refused whose request could not remove
+        // them: never listed, removed here.
+        for token in self.db.manifest_refused_left(&self.feed.id)? {
+            self.db.manifest_remove_refused(&token)?;
+        }
         let leased = self.leased.load(std::sync::atomic::Ordering::Acquire);
         for due in self.db.manifest_due(&self.feed.id)? {
             if self.halted() {
@@ -71,18 +81,34 @@ impl FeedRunner {
                     self.db.manifest_list_stale(&due.token, claim)?;
                     Step::Done
                 }
-                "m_status" => self.ask_status(client, &due, claim).await?,
-                "m_polling" => self.read_receipts(client, &due, claim).await?,
+                "m_status" => self.ask_status(client, &due, claim, leased).await?,
+                "m_polling" => self.read_receipts(client, &due, claim, leased).await?,
                 _ => Step::Done,
             };
             match step {
                 Step::Done => {}
+                Step::Abandoned => {
+                    tracing::info!(feed = %self.feed.id, load = due.load_id, "the source was paused, stopped or taken over during a step; the load is left as it was");
+                    return Ok(());
+                }
                 Step::Later(at) => {
                     self.db.manifest_later(&due.token, claim, at)?;
                 }
                 Step::Unreadable(reason) => {
                     let reason = crate::bulk::scrub(&reason, &due.token);
-                    if self.db.manifest_unreadable(&due.token, claim, &reason)? {
+                    if self
+                        .db
+                        .manifest_unreadable(&due.token, claim, &reason, false)?
+                    {
+                        tracing::warn!(feed = %self.feed.id, load = due.load_id, "manifest load unreadable: {reason}");
+                    }
+                }
+                Step::NotReceived => {
+                    let reason = crate::manifest::NOT_RECEIVED;
+                    if self
+                        .db
+                        .manifest_unreadable(&due.token, claim, reason, true)?
+                    {
                         tracing::warn!(feed = %self.feed.id, load = due.load_id, "manifest load unreadable: {reason}");
                     }
                 }
@@ -108,6 +134,24 @@ impl FeedRunner {
         Ok(())
     }
 
+    /// Whether this runner may send the next request of a step: it is not
+    /// stopped, it still holds the source's lease (renewed here, between
+    /// requests, so a long step keeps it), and the submission is still under
+    /// its claim, its source not paused.
+    fn keeps(&self, due: &Due, claim: Claim, leased: bool) -> Result<bool> {
+        if self.halted() {
+            return Ok(false);
+        }
+        if leased
+            && !self
+                .db
+                .acquire_lease(&self.feed.id, &self.instance, self.lease_ttl_ms())?
+        {
+            return Ok(false);
+        }
+        self.db.manifest_claim_holds(&due.token, claim)
+    }
+
     /// The next poll of an open load, at the source's interval or later when
     /// the server asked for more.
     fn next_poll(&self, at_least: Option<std::time::Duration>) -> i64 {
@@ -123,8 +167,12 @@ impl FeedRunner {
         client: &crate::manifest::Client,
         due: &Due,
         claim: Claim,
+        leased: bool,
     ) -> Result<Step> {
         use crate::manifest::Status;
+        if !self.keeps(due, claim, leased)? {
+            return Ok(Step::Abandoned);
+        }
         Ok(
             match client.status_url(&self.feed.id, &due.submission_id).await {
                 Ok(Status::Found(url)) => {
@@ -139,7 +187,7 @@ impl FeedRunner {
                 Ok(Status::Unknown) => {
                     let believed = due.created_at + crate::manifest::unknown_after_ms();
                     if now_ms() >= believed {
-                        Step::Unreadable(crate::manifest::NOT_RECEIVED.into())
+                        Step::NotReceived
                     } else {
                         Step::Later(believed.max(now_ms() + 1000))
                     }
@@ -158,6 +206,7 @@ impl FeedRunner {
         client: &crate::manifest::Client,
         due: &Due,
         claim: Claim,
+        leased: bool,
     ) -> Result<Step> {
         let Some(status_url) = due.status_url.as_deref() else {
             return Ok(Step::Unreadable(
@@ -165,9 +214,14 @@ impl FeedRunner {
             ));
         };
         let mut tally = due.progress.clone();
+        // Set once a status-only kick-off said the submission was completed.
+        let mut completed = false;
         loop {
+            if !self.keeps(due, claim, leased)? {
+                return Ok(Step::Abandoned);
+            }
             let page_url = tally.next.clone().unwrap_or_else(|| status_url.to_string());
-            let manifest = match client.page(&page_url, status_url).await {
+            let manifest = match client.page(&page_url, status_url, &due.submission_id).await {
                 Ok(Page::InProgress(wait)) => return Ok(Step::Later(self.next_poll(wait))),
                 Ok(Page::Unknown) => {
                     return Ok(Step::Unreadable(
@@ -180,24 +234,31 @@ impl FeedRunner {
             };
             // The page counts whole or not at all: a receipt that cannot be
             // read leaves the tally as the previous page left it, and the
-            // page is read again, for fresh URLs, at the next attempt.
+            // page is read again, for fresh URLs, at the next attempt. Five
+            // failed reads of the page's receipts in a row give it up.
             let mut page = tally.clone();
             match self
-                .tally_page(client, status_url, &manifest, &mut page)
+                .tally_page(client, due, claim, leased, status_url, &manifest, &mut page)
                 .await
             {
-                Ok(()) => {}
+                Ok(true) => {}
+                Ok(false) => return Ok(Step::Abandoned),
                 Err(StepError::Transient(reason)) => {
-                    return Ok(if claim.attempts + 1 >= crate::manifest::RECEIPT_ATTEMPTS {
-                        Step::Unreadable(format!(
+                    let failures = tally.receipt_failures + 1;
+                    if failures >= crate::manifest::RECEIPT_ATTEMPTS {
+                        return Ok(Step::Unreadable(format!(
                             "the FHIR server's receipts could not be read: {reason}"
-                        ))
-                    } else {
-                        Step::Transient(reason)
-                    });
+                        )));
+                    }
+                    tally.receipt_failures = failures;
+                    if !self.db.manifest_checkpoint(&due.token, claim, &tally)? {
+                        return Ok(Step::Abandoned);
+                    }
+                    return Ok(Step::Transient(reason));
                 }
                 Err(StepError::Unreadable(reason)) => return Ok(Step::Unreadable(reason)),
             }
+            page.receipt_failures = 0;
             let next = manifest["link"]
                 .as_array()
                 .into_iter()
@@ -205,58 +266,69 @@ impl FeedRunner {
                 .find(|l| l["relation"] == "next")
                 .and_then(|l| l["url"].as_str())
                 .map(str::to_string);
-            match next {
-                Some(next) => {
-                    page.next = Some(next);
-                    if !self.db.manifest_checkpoint(&due.token, claim, &page)? {
-                        return Ok(Step::Done);
-                    }
-                    tally = page;
+            if let Some(next) = next {
+                page.next = Some(next);
+                if !self.db.manifest_checkpoint(&due.token, claim, &page)? {
+                    return Ok(Step::Abandoned);
                 }
-                None => {
-                    page.next = None;
-                    // A load whose kick-off went unanswered and whose status
-                    // lists no file: a manifest with no files, or a kick-off
-                    // cut after the submission was registered and before its
-                    // manifest. Only a completed submission tells.
-                    if !due.answered && !page.files {
-                        use crate::manifest::Probe;
-                        match client.probe(&self.feed.id, &due.submission_id).await {
-                            Ok(Probe::Completed) => {}
-                            Ok(Probe::Open) => {
-                                let believed = due.created_at + crate::manifest::unknown_after_ms();
-                                return Ok(if now_ms() >= believed {
-                                    Step::Unreadable(crate::manifest::NOT_RECEIVED.into())
-                                } else {
-                                    Step::Later(believed.max(self.next_poll(None)))
-                                });
-                            }
-                            Err(StepError::Transient(reason)) => {
-                                return Ok(Step::Transient(reason));
-                            }
-                            Err(StepError::Unreadable(reason)) => {
-                                return Ok(Step::Unreadable(reason));
-                            }
-                        }
+                tally = page;
+                continue;
+            }
+            page.next = None;
+            // A load whose kick-off went unanswered and whose status lists no
+            // file: a manifest with no files, or a kick-off cut after the
+            // submission was registered and before its manifest. Only a
+            // completed submission tells; then the status is read once more,
+            // since the kick-off may have added the manifest meanwhile.
+            if !due.answered && !page.files && !completed {
+                use crate::manifest::Probe;
+                if !self.keeps(due, claim, leased)? {
+                    return Ok(Step::Abandoned);
+                }
+                match client.probe(&self.feed.id, &due.submission_id).await {
+                    Ok(Probe::Completed) => {
+                        completed = true;
+                        tally = Tally::default();
+                        continue;
                     }
-                    if self.db.manifest_settle(&due.token, claim, &page)? {
-                        self.recovered()?;
+                    Ok(Probe::Open) => {
+                        let believed = due.created_at + crate::manifest::unknown_after_ms();
+                        return Ok(if now_ms() >= believed {
+                            Step::NotReceived
+                        } else {
+                            Step::Later(believed.max(self.next_poll(None)))
+                        });
                     }
-                    return Ok(Step::Done);
+                    Err(StepError::Transient(reason)) => return Ok(Step::Transient(reason)),
+                    Err(StepError::Unreadable(reason)) => return Ok(Step::Unreadable(reason)),
                 }
             }
+            if self.db.manifest_settle(&due.token, claim, &page)? {
+                self.recovered()?;
+            }
+            return Ok(Step::Done);
         }
     }
 
     /// Adds one status page to `tally`: the resources written (`output`, by
-    /// its counts), the deletions, and the failing outcomes, read line by line.
+    /// its counts), the deletions, and the failing outcomes, read line by
+    /// line. `false` when the runner stopped holding the submission between
+    /// two receipt files.
+    #[allow(clippy::too_many_arguments)]
     async fn tally_page(
         &self,
         client: &crate::manifest::Client,
+        due: &Due,
+        claim: Claim,
+        leased: bool,
         status_url: &str,
         manifest: &Value,
         tally: &mut Tally,
-    ) -> Result<(), StepError> {
+    ) -> Result<bool, StepError> {
+        let keeps = || {
+            self.keeps(due, claim, leased)
+                .map_err(|e| StepError::Transient(crate::bulk::safe_reason(&format!("{e:#}"))))
+        };
         for entry in manifest["output"].as_array().into_iter().flatten() {
             tally.files = true;
             let kind = entry["type"].as_str().unwrap_or("unknown").to_string();
@@ -264,6 +336,9 @@ impl FeedRunner {
                 Some(n) => n,
                 None => match entry["url"].as_str() {
                     Some(url) => {
+                        if !keeps()? {
+                            return Ok(false);
+                        }
                         let mut n = 0;
                         client
                             .lines(url, status_url, |line| {
@@ -290,11 +365,14 @@ impl FeedRunner {
         for entry in manifest["outcome"].as_array().into_iter().flatten() {
             tally.files = true;
             if let Some(url) = entry["url"].as_str() {
+                if !keeps()? {
+                    return Ok(false);
+                }
                 client
                     .lines(url, status_url, |line| tally.outcome(line, url))
                     .await?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 }

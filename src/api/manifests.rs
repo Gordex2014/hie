@@ -10,7 +10,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use super::{ApiError, AppState, iso_ms, load_detail};
-use crate::db::manifest::{Admission, NewLoad};
+use crate::db::manifest::{Admission, DISPATCHED, NewLoad};
 use crate::manager::ManagerError;
 use crate::manifest::{BODY_MAX, BodyError, Given, Kickoff};
 
@@ -104,14 +104,15 @@ pub(super) async fn submit_manifest(
                 token: &token,
                 served: served.as_deref(),
             };
-            s.db.admit_manifest(&load).map(|a| Some((a, oauth)))
+            s.db.admit_manifest(&load)
+                .map(|a| Some((a, oauth, feed.name.clone())))
         })
         .await
         .map_err(|e| match e {
             ManagerError::NotFound(_) => super::not_found(&format!("source {id}")),
             other => other.into(),
         })?;
-    let (admission, oauth) = match admitted {
+    let (admission, oauth, source_name) = match admitted {
         Ok(Some(found)) => found,
         Ok(None) => {
             return Err(ApiError::new(
@@ -152,18 +153,15 @@ pub(super) async fn submit_manifest(
         }
     };
 
-    let kickoff = crate::manifest::Client::kickoff_body(
-        &id,
-        &admitted.submission_id,
-        &forwarded,
-        &fhir_base_url,
-        oauth.as_deref(),
-    );
-    let answer = client.kickoff(&kickoff).await;
+    // The kick-off's deadline runs from the admission: the token, the
+    // dispatch and the answer all fit in it, and a load still unlisted twice
+    // that long after it was recorded is its source's to confirm.
+    let deadline = tokio::time::Instant::now() + crate::manifest::kickoff_timeout();
+    let deadline_ms = crate::manifest::kickoff_timeout().as_millis() as i64;
     let load = admitted.load_id;
     // The load as this request knows it, should the store not answer.
     let known = json!({
-        "id": load, "source_id": id, "source_name": null, "name": name, "status": "processing",
+        "id": load, "source_id": id, "source_name": source_name, "name": name, "status": "processing",
         "duplicate_of": null, "size": served.as_ref().map(String::len),
         "error": null, "source_key": null, "archived": null, "records": 0, "sent": 0, "rejected": 0,
         "failing": 0, "in_progress": 0, "took_ms": null, "received_at": iso_ms(admitted.received_at),
@@ -171,59 +169,42 @@ pub(super) async fn submit_manifest(
         "manifest": {"by": by, "request_id": request.request_id, "submission_id": admitted.submission_id,
                      "kickoff": "unconfirmed", "sent_by_type": {}, "deleted": 0},
     });
-    match answer {
+    let bearer = match client.kickoff_token(deadline).await {
+        Ok(bearer) => bearer,
+        Err(nothing_sent) => return Ok(refused(&s, &id, &token, 0, nothing_sent, known).await),
+    };
+    // Claimed right before it is sent: a load its source already listed as
+    // left behind, or past its deadline, is not sent.
+    match s.db.manifest_dispatch(&token, deadline_ms) {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Some(detail) = load_detail(&s, load)? {
+                return Ok(
+                    (StatusCode::ACCEPTED, located(load), axum::Json(detail)).into_response()
+                );
+            }
+            tracing::warn!(feed = %id, load, "the manifest was not sent: its deadline passed before it could be");
+            return Ok(refused(&s, &id, &token, 0, Kickoff::NotSent, known).await);
+        }
+        Err(e) => {
+            tracing::warn!(feed = %id, load, "the manifest was not sent: {e:#}");
+            return Ok(refused(&s, &id, &token, 0, Kickoff::NotSent, known).await);
+        }
+    }
+    let kickoff = crate::manifest::Client::kickoff_body(
+        &id,
+        &admitted.submission_id,
+        &forwarded,
+        &fhir_base_url,
+        oauth.as_deref(),
+    );
+    match client.kickoff(&kickoff, bearer.as_deref(), deadline).await {
         Kickoff::Accepted => Ok(listed(&s, &token, load, true, known).await),
         Kickoff::Lost(reason) => {
             tracing::warn!(feed = %id, load, "the kick-off's answer was lost, the source will confirm it: {}", crate::bulk::scrub(&reason, &token));
             Ok(listed(&s, &token, load, false, known).await)
         }
-        Kickoff::Refused {
-            status,
-            body,
-            content_type,
-            retry_after,
-        } => {
-            remove(&s, &token).await;
-            tracing::info!(feed = %id, status, "the FHIR server refused the manifest; its answer is passed through");
-            let mut response = Response::new(Body::from(body));
-            *response.status_mut() =
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-            let h = response.headers_mut();
-            if let Some(v) = content_type {
-                h.insert(header::CONTENT_TYPE, v);
-            }
-            if let Some(v) = retry_after {
-                h.insert(header::RETRY_AFTER, v);
-            }
-            h.insert(REFUSED_BY, HeaderValue::from_static("destination"));
-            Ok(response)
-        }
-        Kickoff::TooLarge { status } => {
-            remove(&s, &token).await;
-            Err(ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                format!("the FHIR server refused the manifest with HTTP {status} and an answer over 64 KiB"),
-            )
-            .code("destination_answer_too_large")
-            .with("destination_status", status))
-        }
-        Kickoff::Auth(detail) => {
-            remove(&s, &token).await;
-            tracing::warn!(feed = %id, "the FHIR server refused the engine's token on a manifest kick-off: {}", crate::bulk::scrub(&detail, &token));
-            Err(ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                "the FHIR server did not accept the engine's own credentials; the engine log says why",
-            )
-            .code("destination_auth"))
-        }
-        Kickoff::Unreachable(reason) => {
-            remove(&s, &token).await;
-            tracing::warn!(feed = %id, "the manifest was not sent: {}", crate::bulk::scrub(&reason, &token));
-            Err(
-                ApiError::new(StatusCode::BAD_GATEWAY, "the FHIR server cannot be reached")
-                    .code("destination_unreachable"),
-            )
-        }
+        refusal => Ok(refused(&s, &id, &token, DISPATCHED, refusal, known).await),
     }
 }
 
@@ -288,17 +269,103 @@ async fn listed(s: &AppState, token: &str, load: i64, accepted: bool, known: Val
     }
 }
 
-/// Removes a load the FHIR server refused, trying again briefly when the
-/// store is busy. One left behind is listed by its source as unconfirmed and
-/// found unknown there.
-async fn remove(s: &AppState, token: &str) {
+/// A kick-off the FHIR server refused, or one never sent: its load is marked
+/// refused first (so it is never served, listed or answered as a load, even
+/// should its removal fail), then removed, then the refusal is answered. One
+/// whose mark cannot be written is answered `202` with the load as the
+/// request knows it: it follows the recovery of a lost answer. `epoch` is
+/// the submission's as the request left it.
+async fn refused(
+    s: &AppState,
+    id: &str,
+    token: &str,
+    epoch: i64,
+    answer: Kickoff,
+    known: Value,
+) -> Response {
+    let load = known["id"].as_i64().unwrap_or_default();
+    let mut marked = None;
     for attempt in 0..WRITE_TRIES {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(attempt))).await;
         }
-        match s.db.manifest_refused(token) {
-            Ok(_) => return,
-            Err(e) => tracing::warn!("removing a refused manifest load: {e:#}"),
+        match s.db.manifest_refuse(token, epoch) {
+            Ok(done) => {
+                marked = Some(done);
+                break;
+            }
+            Err(e) => tracing::warn!(feed = %id, load, "marking a refused manifest load: {e:#}"),
+        }
+    }
+    match marked {
+        Some(true) => {}
+        // Its source moved it meanwhile: answered as it is now.
+        Some(false) => {
+            let detail = load_detail(s, load).ok().flatten().unwrap_or(known);
+            return (StatusCode::ACCEPTED, located(load), axum::Json(detail)).into_response();
+        }
+        None => return (StatusCode::ACCEPTED, located(load), axum::Json(known)).into_response(),
+    }
+    for attempt in 0..WRITE_TRIES {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(attempt))).await;
+        }
+        match s.db.manifest_remove_refused(token) {
+            Ok(()) => break,
+            Err(e) => {
+                tracing::warn!(feed = %id, load, "removing a refused manifest load; its source removes it: {e:#}")
+            }
+        }
+    }
+    match answer {
+        Kickoff::Refused {
+            status,
+            body,
+            content_type,
+            retry_after,
+        } => {
+            tracing::info!(feed = %id, status, "the FHIR server refused the manifest; its answer is passed through");
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() =
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let h = response.headers_mut();
+            if let Some(v) = content_type {
+                h.insert(header::CONTENT_TYPE, v);
+            }
+            if let Some(v) = retry_after {
+                h.insert(header::RETRY_AFTER, v);
+            }
+            h.insert(REFUSED_BY, HeaderValue::from_static("destination"));
+            response
+        }
+        Kickoff::TooLarge { status } => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "the FHIR server refused the manifest with HTTP {status}, and its answer could not be passed on (over 64 KiB, or not read whole in time)"
+            ),
+        )
+        .code("destination_answer_too_large")
+        .with("destination_status", status)
+        .into_response(),
+        Kickoff::Auth(detail) => {
+            tracing::warn!(feed = %id, "the FHIR server refused the engine's token on a manifest kick-off: {}", crate::bulk::scrub(&detail, token));
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "the FHIR server did not accept the engine's own credentials; the engine log says why",
+            )
+            .code("destination_auth")
+            .into_response()
+        }
+        Kickoff::Unreachable(reason) => {
+            tracing::warn!(feed = %id, "the manifest was not sent: {}", crate::bulk::scrub(&reason, token));
+            ApiError::new(StatusCode::BAD_GATEWAY, "the FHIR server cannot be reached")
+                .code("destination_unreachable")
+                .into_response()
+        }
+        Kickoff::NotSent => ApiError::store_busy().into_response(),
+        // Never handed here: they list the load.
+        Kickoff::Accepted | Kickoff::Lost(_) => {
+            (StatusCode::ACCEPTED, located(load), axum::Json(known)).into_response()
         }
     }
 }

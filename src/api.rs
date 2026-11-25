@@ -339,7 +339,13 @@ fn rejected_and_failing(db: &Db, feed: Option<&str>, since: i64) -> anyhow::Resu
 /// A source's definition and its state, as one object.
 fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
     let db = &*s.db;
-    let last = db.last_received_at(&feed.id)?;
+    // A manifest source is read from its own loads: an earlier source with
+    // the id does not make it look received.
+    let last = if feed.is_manifest() {
+        db.last_manifest_received_at(&feed.id)?
+    } else {
+        db.last_received_at(&feed.id)?
+    };
     let paused = db.paused_state(&feed.id)?;
     let lease = db.lease(&feed.id)?;
     let started = s
@@ -380,13 +386,19 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         "lease": lease.map(|l| json!({"owner": l.owner, "until": iso_ms(l.until), "mine": l.owner == crate::pipeline::instance_id()})),
         "instance": crate::pipeline::instance_id(),
         "last_received_at": last.and_then(iso_ms),
-        "records": db.feed_counts(&feed.id)?,
+        "records": if feed.is_manifest() { manifest_records() } else { db.feed_counts(&feed.id)? },
         "rejected_last_24h": rejected_24h,
         "failing_last_24h": failing_24h,
         "last_alert": last_alert.into_iter().next(),
         "stamping": stamping(s, feed)?,
         "definition": s.manager.definition(&feed.id)?,
     }))
+}
+
+/// A manifest source's `records`: all zeros, as it keeps no per-line rows.
+fn manifest_records() -> Value {
+    json!({"received": 0, "pending": 0, "submitted": 0, "sent": 0, "rejected": 0,
+           "files": 0, "duplicate_files": 0})
 }
 
 /// Whether what this instance delivers for `feed` carries the source tag, and
@@ -895,12 +907,40 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
     let since = now_ms() - DAY_MS;
     let (rejected, failing) = rejected_and_failing(&s.db, None, since)?;
     let (receipts_sent, _) = s.db.receipts_between(None, since, i64::MAX)?;
+    // The same figures by source type: a manifest load under `manifest`, any
+    // other under the type of the source registered under its id now, or
+    // `unregistered`.
+    let mut by_type: std::collections::BTreeMap<&'static str, (i64, i64, i64)> = Default::default();
+    for share in s.db.shares_since(since)? {
+        let kind = if share.manifest {
+            "manifest"
+        } else {
+            s.manager
+                .source(&share.feed_id)
+                .map_or("unregistered", |f| f.source.type_name())
+        };
+        let entry = by_type.entry(kind).or_default();
+        entry.0 += share.loads;
+        entry.1 += share.sent;
+        entry.2 += share.failing;
+    }
+    let by_source_type: Map<String, Value> = by_type
+        .into_iter()
+        .filter(|(_, (loads, sent, failing))| *loads != 0 || *sent != 0 || *failing != 0)
+        .map(|(kind, (loads, sent, failing))| {
+            (
+                kind.to_string(),
+                json!({"loads": loads, "sent": sent, "failing": failing}),
+            )
+        })
+        .collect();
     let last_24h = json!({
         "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE status <> 'duplicate' AND listed = 1 AND received_at >= $1", params![since])?,
         "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'sent' AND updated_at >= $1", params![since])? + receipts_sent,
         "rejected": rejected,
         "failing": failing,
         "alerts": count(&s.db, "SELECT COUNT(*) AS n FROM alerts WHERE created_at >= $1", params![since])?,
+        "by_source_type": by_source_type,
     });
     let destination = s.manager.destination().snapshot();
     Ok(Json(json!({

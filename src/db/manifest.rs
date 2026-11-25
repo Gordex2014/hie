@@ -102,6 +102,14 @@ pub struct Due {
 /// The live statuses of a manifest submission.
 const OPEN: &str = "('m_sending', 'm_status', 'm_polling')";
 
+/// The epoch of a submission whose request is about to send its kick-off,
+/// or sent it (`manifest_dispatch`); 0 before.
+pub const DISPATCHED: i64 = 1;
+
+/// What every write of the runner also needs: the source is not paused, so
+/// a step under way when it was paused writes nothing.
+const NOT_PAUSED: &str = "NOT EXISTS (SELECT 1 FROM source_state p WHERE p.feed_id = submissions.feed_id AND p.paused = 1)";
+
 impl Db {
     /// Records a manifest load, unlisted, and its submission, in one
     /// transaction under the source's admission lock: a `request_id` the
@@ -121,25 +129,38 @@ impl Db {
                 )?
             {
                 let meta = found.json(2).unwrap_or(Value::Null);
-                if meta["request_hash"].as_str() != Some(load.request_hash) {
+                let refused = found.opt_string(4).is_none_or(|s| s == "m_refused");
+                if refused && found.i64(1) == 0 {
+                    // A kick-off the FHIR server refused left no load: the key
+                    // is free, and this request is sent.
+                    tx.execute(
+                        "DELETE FROM submissions WHERE load_id = $1 AND status = 'm_refused'",
+                        &params![found.i64(0)],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM files WHERE id = $1 AND listed = 0",
+                        &params![found.i64(0)],
+                    )?;
+                } else if meta["request_hash"].as_str() != Some(load.request_hash) {
                     tx.rollback = true;
                     return Ok(Admission::Conflict);
-                }
-                let id = found.i64(0);
-                if found.i64(1) == 1 {
+                } else {
+                    let id = found.i64(0);
+                    if found.i64(1) == 1 {
+                        return Ok(Admission::Existing(id));
+                    }
+                    let stale = found.opt_i64(5).unwrap_or(0) + crate::manifest::sending_until_ms();
+                    if found.string(4) == "m_sending" && stale > now {
+                        tx.rollback = true;
+                        return Ok(Admission::InProgress);
+                    }
+                    // Left by a request that stopped while it sent: listed as
+                    // unconfirmed, for its source to confirm.
+                    if let Some(token) = found.opt_string(3) {
+                        list(tx, &token, None, false)?;
+                    }
                     return Ok(Admission::Existing(id));
                 }
-                let stale = found.opt_i64(5).unwrap_or(0) + crate::manifest::sending_until_ms();
-                if found.string(4) == "m_sending" && stale > now {
-                    tx.rollback = true;
-                    return Ok(Admission::InProgress);
-                }
-                // Left by a request that stopped while it sent: listed as
-                // unconfirmed, for its source to confirm.
-                if let Some(token) = found.opt_string(3) {
-                    list(tx, &token, None, false)?;
-                }
-                return Ok(Admission::Existing(id));
             }
             if tx
                 .query_one(
@@ -201,32 +222,79 @@ impl Db {
         })
     }
 
-    /// The request that sent a kick-off lists its load: accepted (`2xx`) or
-    /// unconfirmed (its answer was lost). Only while the submission is still
-    /// as the request left it (`m_sending`, epoch 0): `false` when its source
-    /// moved it meanwhile.
-    pub fn manifest_kicked(&self, token: &str, accepted: bool) -> Result<bool> {
-        self.transaction(|tx| list(tx, token, Some(0), accepted))
+    /// The request about to send a kick-off claims it, right before it
+    /// sends: only while the submission is still as admitted (`m_sending`,
+    /// epoch 0) and the kick-off's deadline, `deadline_ms` after the load
+    /// was recorded, has not passed. `false`: nothing may be sent.
+    pub fn manifest_dispatch(&self, token: &str, deadline_ms: i64) -> Result<bool> {
+        Ok(self.execute(
+            "UPDATE submissions SET epoch = $2, updated_at = $3
+             WHERE token = $1 AND status = 'm_sending' AND epoch = 0 AND created_at + $4 > $3",
+            &params![token, DISPATCHED, now_ms(), deadline_ms],
+        )? > 0)
     }
 
-    /// The FHIR server refused the kick-off: the load and its submission go,
-    /// as though never recorded. Only while the request still holds them
-    /// (`m_sending`, epoch 0).
-    pub fn manifest_refused(&self, token: &str) -> Result<bool> {
+    /// The request that sent a kick-off lists its load: accepted (`2xx`) or
+    /// unconfirmed (its answer was lost). Only while the submission is still
+    /// as the request left it (`m_sending`, dispatched): `false` when its
+    /// source moved it meanwhile.
+    pub fn manifest_kicked(&self, token: &str, accepted: bool) -> Result<bool> {
+        self.transaction(|tx| list(tx, token, Some(DISPATCHED), accepted))
+    }
+
+    /// The FHIR server refused the kick-off, or it was never sent: the
+    /// submission is marked refused (only while the request still holds it,
+    /// `m_sending` at `epoch`), and from then on is never served, listed or
+    /// answered as a load. `false` when the request no longer holds it.
+    pub fn manifest_refuse(&self, token: &str, epoch: i64) -> Result<bool> {
+        Ok(self.execute(
+            "UPDATE submissions SET status = 'm_refused', manifest = 'null', updated_at = $3, epoch = epoch + 1
+             WHERE token = $1 AND status = 'm_sending' AND epoch = $2",
+            &params![token, epoch, now_ms()],
+        )? > 0)
+    }
+
+    /// Removes a refused submission and its load, as though never recorded.
+    /// The request that marked it tries first; the source's runner removes
+    /// what is left.
+    pub fn manifest_remove_refused(&self, token: &str) -> Result<()> {
         self.transaction(|tx| {
-            let Some(r) = tx.query_one(
-                "DELETE FROM submissions WHERE token = $1 AND status = 'm_sending' AND epoch = 0 RETURNING load_id",
+            if let Some(r) = tx.query_one(
+                "DELETE FROM submissions WHERE token = $1 AND status = 'm_refused' RETURNING load_id",
                 &params![token],
-            )?
-            else {
-                return Ok(false);
-            };
-            tx.execute(
-                "DELETE FROM files WHERE id = $1 AND listed = 0",
-                &params![r.i64(0)],
-            )?;
-            Ok(true)
+            )? {
+                tx.execute(
+                    "DELETE FROM files WHERE id = $1 AND listed = 0",
+                    &params![r.i64(0)],
+                )?;
+            }
+            Ok(())
         })
+    }
+
+    /// The tokens of the source's refused submissions still stored.
+    pub fn manifest_refused_left(&self, feed: &str) -> Result<Vec<String>> {
+        Ok(self
+            .query(
+                "SELECT token FROM submissions WHERE feed_id = $1 AND status = 'm_refused' AND load_id IS NOT NULL",
+                &params![feed],
+            )?
+            .iter()
+            .map(|r| r.string(0))
+            .collect())
+    }
+
+    /// Whether the runner's claim on a submission still holds: it is at the
+    /// claim's epoch and attempts, and its source is not paused.
+    pub fn manifest_claim_holds(&self, token: &str, claim: Claim) -> Result<bool> {
+        Ok(self
+            .query_one(
+                &format!(
+                    "SELECT 1 FROM submissions WHERE token = $1 AND epoch = $2 AND attempts = $3 AND {NOT_PAUSED}"
+                ),
+                &params![token, claim.epoch, claim.attempts],
+            )?
+            .is_some())
     }
 
     /// The manifest an engine URL serves: `None` when `token` is no manifest
@@ -340,10 +408,12 @@ impl Db {
     ) -> Result<bool> {
         self.transaction(|tx| {
             let Some(r) = tx.query_one(
-                "UPDATE submissions SET status = 'm_polling', status_url = $2, attempts = 0, next_attempt_at = 0,
-                        error = NULL, updated_at = $3, epoch = epoch + 1
-                 WHERE token = $1 AND status = 'm_status' AND epoch = $4 AND attempts = $5
-                 RETURNING feed_id, submission_id, load_id",
+                &format!(
+                    "UPDATE submissions SET status = 'm_polling', status_url = $2, attempts = 0, next_attempt_at = 0,
+                            error = NULL, updated_at = $3, epoch = epoch + 1
+                     WHERE token = $1 AND status = 'm_status' AND epoch = $4 AND attempts = $5 AND {NOT_PAUSED}
+                     RETURNING feed_id, submission_id, load_id"
+                ),
                 &params![token, status_url, now_ms(), claim.epoch, claim.attempts],
             )?
             else {
@@ -369,7 +439,7 @@ impl Db {
         Ok(self.execute(
             &format!(
                 "UPDATE submissions SET next_attempt_at = $2, updated_at = $3, epoch = epoch + 1
-                 WHERE token = $1 AND status IN {OPEN} AND epoch = $4 AND attempts = $5"
+                 WHERE token = $1 AND status IN {OPEN} AND epoch = $4 AND attempts = $5 AND {NOT_PAUSED}"
             ),
             &params![
                 token,
@@ -397,7 +467,7 @@ impl Db {
                 &format!(
                     "UPDATE submissions SET attempts = $2, next_attempt_at = $3, error = $4, failures = failures + 1,
                             updated_at = $5, epoch = epoch + 1
-                     WHERE token = $1 AND status IN {OPEN} AND epoch = $6 AND attempts = $7
+                     WHERE token = $1 AND status IN {OPEN} AND epoch = $6 AND attempts = $7 AND {NOT_PAUSED}
                      RETURNING feed_id, submission_id, load_id"
                 ),
                 &params![token, attempts, next_attempt_at, reason, now_ms(), claim.epoch, claim.attempts],
@@ -419,8 +489,10 @@ impl Db {
     /// stops resumes from here.
     pub fn manifest_checkpoint(&self, token: &str, claim: Claim, tally: &Tally) -> Result<bool> {
         Ok(self.execute(
-            "UPDATE submissions SET progress = $2, updated_at = $3
-             WHERE token = $1 AND status = 'm_polling' AND epoch = $4 AND attempts = $5",
+            &format!(
+                "UPDATE submissions SET progress = $2, updated_at = $3
+                 WHERE token = $1 AND status = 'm_polling' AND epoch = $4 AND attempts = $5 AND {NOT_PAUSED}"
+            ),
             &params![
                 token,
                 serde_json::to_string(tally)?,
@@ -438,10 +510,12 @@ impl Db {
         self.transaction(|tx| {
             let now = now_ms();
             let Some(r) = tx.query_one(
-                "UPDATE submissions SET status = 'm_done', manifest = 'null', progress = NULL, attempts = 0,
-                        next_attempt_at = 0, error = NULL, sent = $2, rejected = $3, updated_at = $4, epoch = epoch + 1
-                 WHERE token = $1 AND status = 'm_polling' AND epoch = $5 AND attempts = $6
-                 RETURNING feed_id, submission_id, load_id, failures",
+                &format!(
+                    "UPDATE submissions SET status = 'm_done', manifest = 'null', progress = NULL, attempts = 0,
+                            next_attempt_at = 0, error = NULL, sent = $2, rejected = $3, updated_at = $4, epoch = epoch + 1
+                     WHERE token = $1 AND status = 'm_polling' AND epoch = $5 AND attempts = $6 AND {NOT_PAUSED}
+                     RETURNING feed_id, submission_id, load_id, failures"
+                ),
                 &params![token, tally.sent, tally.rejected, now, claim.epoch, claim.attempts],
             )?
             else {
@@ -452,7 +526,7 @@ impl Db {
             meta["sent_by_type"] = json!(tally.sent_by_type);
             meta["deleted"] = json!(tally.deleted);
             tx.execute(
-                "UPDATE files SET status = 'done', finished_at = $2, listed = 1, receipts_sent = $3,
+                "UPDATE files SET status = 'done', finished_at = $2, listed = 1, listed_at = COALESCE(listed_at, $2), receipts_sent = $3,
                         receipts_rejected = $4, receipt_failures = $5, manifest = $6, error = NULL
                  WHERE id = $1",
                 &params![
@@ -485,15 +559,23 @@ impl Db {
 
     /// Gives a load up as unreadable, with `error` (already safe to store)
     /// and `load.unreadable`: the stored manifest goes. Under the runner's
-    /// claim.
-    pub fn manifest_unreadable(&self, token: &str, claim: Claim, error: &str) -> Result<bool> {
+    /// claim. `not_received` when recovery found the FHIR server never had
+    /// the manifest: its `kickoff` becomes `not_received` in the same
+    /// transaction; any other cause leaves `kickoff` as it was.
+    pub fn manifest_unreadable(
+        &self,
+        token: &str,
+        claim: Claim,
+        error: &str,
+        not_received: bool,
+    ) -> Result<bool> {
         self.transaction(|tx| {
             let now = now_ms();
             let Some(r) = tx.query_one(
                 &format!(
                     "UPDATE submissions SET status = 'm_failed', manifest = 'null', progress = NULL,
                             next_attempt_at = 0, error = $2, updated_at = $3, epoch = epoch + 1
-                     WHERE token = $1 AND status IN {OPEN} AND epoch = $4 AND attempts = $5
+                     WHERE token = $1 AND status IN {OPEN} AND epoch = $4 AND attempts = $5 AND {NOT_PAUSED}
                      RETURNING feed_id, load_id"
                 ),
                 &params![token, error, now, claim.epoch, claim.attempts],
@@ -502,8 +584,17 @@ impl Db {
                 return Ok(false);
             };
             let (feed, load_id) = (r.string(0), r.i64(1));
+            if not_received {
+                let mut meta = load_meta(tx, load_id)?;
+                meta["kickoff"] = json!("not_received");
+                tx.execute(
+                    "UPDATE files SET manifest = $2 WHERE id = $1",
+                    &params![load_id, meta.to_string()],
+                )?;
+            }
             let Some(f) = tx.query_one(
-                "UPDATE files SET status = 'unreadable', error = $2, finished_at = $3, listed = 1
+                "UPDATE files SET status = 'unreadable', error = $2, finished_at = $3, listed = 1,
+                        listed_at = COALESCE(listed_at, $3)
                  WHERE id = $1 RETURNING name, size, manifest",
                 &params![load_id, error, now],
             )?
@@ -573,8 +664,8 @@ fn list(tx: &mut Tx, token: &str, epoch: Option<i64>, accepted: bool) -> Result<
     meta["kickoff"] = json!(if accepted { "accepted" } else { "unconfirmed" });
     meta["answered"] = json!(accepted);
     tx.execute(
-        "UPDATE files SET listed = 1, manifest = $2 WHERE id = $1",
-        &params![load_id, meta.to_string()],
+        "UPDATE files SET listed = 1, listed_at = $3, manifest = $2 WHERE id = $1",
+        &params![load_id, meta.to_string(), now_ms()],
     )?;
     let mut events = vec![
         Event::new("load.received", &feed)
@@ -631,5 +722,74 @@ impl Db {
             )?
             .context("the receipts read returned no row")?;
         Ok((r.i64(0), r.i64(1)))
+    }
+}
+
+/// One source id's share of a window's figures: its loads, sent and failing,
+/// for its manifest loads (`manifest`) or for the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Share {
+    pub feed_id: String,
+    pub manifest: bool,
+    pub loads: i64,
+    pub sent: i64,
+    pub failing: i64,
+}
+
+impl Db {
+    /// The `received_at` of the source's newest listed manifest load.
+    pub fn last_manifest_received_at(&self, feed: &str) -> Result<Option<i64>> {
+        Ok(self
+            .query_one(
+                "SELECT MAX(received_at) FROM files WHERE feed_id = $1 AND manifest IS NOT NULL AND listed = 1",
+                &params![feed],
+            )?
+            .and_then(|r| r.opt_i64(0)))
+    }
+
+    /// The figures of `GET /api/monitoring/status`'s `last_24h` since `since`,
+    /// per source id and kind of load, with its definitions: loads received
+    /// (listed, duplicates left out), rows sent and failing, and a manifest
+    /// load's receipts by when it finished.
+    pub fn shares_since(&self, since: i64) -> Result<Vec<Share>> {
+        use std::collections::BTreeMap;
+        let mut shares: BTreeMap<(String, bool), Share> = BTreeMap::new();
+        let mut add = |feed: String, manifest: bool, loads: i64, sent: i64, failing: i64| {
+            let share = shares.entry((feed.clone(), manifest)).or_insert(Share {
+                feed_id: feed,
+                manifest,
+                ..Share::default()
+            });
+            share.loads += loads;
+            share.sent += sent;
+            share.failing += failing;
+        };
+        for r in self.query(
+            "SELECT feed_id, CASE WHEN manifest IS NULL THEN 0 ELSE 1 END, COUNT(*) FROM files
+             WHERE status <> 'duplicate' AND listed = 1 AND received_at >= $1 GROUP BY 1, 2",
+            &params![since],
+        )? {
+            add(r.string(0), r.i64(1) == 1, r.i64(2), 0, 0);
+        }
+        for r in self.query(
+            &format!(
+                "SELECT feed_id,
+                        CAST(COALESCE(SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END), 0) AS BIGINT),
+                        CAST(COALESCE(SUM(CASE WHEN {} THEN 1 ELSE 0 END), 0) AS BIGINT)
+                 FROM records WHERE status IN ('sent', 'rejected') AND updated_at >= $1 GROUP BY feed_id",
+                super::FAILING
+            ),
+            &params![since],
+        )? {
+            add(r.string(0), false, 0, r.i64(1), r.i64(2));
+        }
+        for r in self.query(
+            "SELECT feed_id, CAST(COALESCE(SUM(receipts_sent), 0) AS BIGINT), CAST(COALESCE(SUM(receipts_rejected), 0) AS BIGINT)
+             FROM files WHERE manifest IS NOT NULL AND listed = 1 AND finished_at >= $1 GROUP BY feed_id",
+            &params![since],
+        )? {
+            add(r.string(0), true, 0, r.i64(1), r.i64(2));
+        }
+        Ok(shares.into_values().collect())
     }
 }

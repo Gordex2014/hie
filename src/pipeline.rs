@@ -151,6 +151,7 @@ impl FeedRunner {
             });
         let manifest = feed.is_manifest().then(|| {
             crate::manifest::Client::new(fhir_base_url, public_url, fhir.credentials().clone())
+                .with_destination(fhir.destination().clone())
         });
         Self {
             feed,
