@@ -664,6 +664,38 @@ pub enum Format {
     FhirBundle,
     /// HL7 v2 messages, one or more per file, each starting with `MSH`.
     Hl7v2,
+    /// FHIR JSON files read by their extension: `.ndjson` and `.jsonl` as
+    /// NDJSON, `.json` as a Bundle (or a single resource). Passthrough only.
+    Fhir,
+}
+
+impl Format {
+    /// The reader a file or zip entry of this name is read with: in a `fhir`
+    /// source the one its extension picks, `None` for any other extension;
+    /// otherwise the source's format, whatever the name.
+    pub fn reader_for(self, name: &str) -> Option<Format> {
+        if self != Format::Fhir {
+            return Some(self);
+        }
+        let base = name.rsplit('/').next().unwrap_or(name);
+        let (_, extension) = base.rsplit_once('.')?;
+        match extension.to_ascii_lowercase().as_str() {
+            "ndjson" | "jsonl" => Some(Format::Ndjson),
+            "json" => Some(Format::FhirBundle),
+            _ => None,
+        }
+    }
+
+    /// The format as a source file writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Format::Csv => "csv",
+            Format::Ndjson => "ndjson",
+            Format::FhirBundle => "fhir_bundle",
+            Format::Hl7v2 => "hl7v2",
+            Format::Fhir => "fhir",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -692,7 +724,8 @@ pub struct DeliveryConfig {
     /// resources as NDJSON per resource type and hands those over; a resource
     /// without an `id` gets one derived from its identifier. `auto` (default) is
     /// `source_objects` for NDJSON or Bundle files with the passthrough transform
-    /// and `transformed` for everything else.
+    /// and `transformed` for everything else, `fhir` included (which refuses
+    /// `source_objects`).
     #[serde(default)]
     pub bulk_from: BulkFrom,
     /// Records per submission on the `transformed` path.
@@ -1026,6 +1059,30 @@ impl FeedConfig {
                 );
             }
         }
+        // Also before the early return without a secret backend. A source that
+        // is not read from files has its format fixed below, whatever it says.
+        if self.format == Format::Fhir
+            && matches!(
+                self.source,
+                SourceConfig::Folder { .. } | SourceConfig::S3 { .. }
+            )
+        {
+            if !self.passthrough() {
+                bail!(
+                    "source {}: format fhir reads FHIR resources as they are and needs the passthrough transform (fhir_passthrough.py), not {}",
+                    self.id,
+                    self.transform.display()
+                );
+            }
+            if self.delivery.method == DeliveryMethod::BulkSubmit
+                && self.delivery.bulk_from == BulkFrom::SourceObjects
+            {
+                bail!(
+                    "source {}: format fhir hands HFS the transformed resources; bulk_from source_objects cannot take its Bundle files, use transformed or auto",
+                    self.id
+                );
+            }
+        }
         self.source.resolve(base);
         self.source
             .check()
@@ -1109,14 +1166,18 @@ impl FeedConfig {
             BulkFrom::Transformed => true,
             BulkFrom::SourceObjects => false,
             BulkFrom::Auto => {
-                let passthrough = self
-                    .transform
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n == "fhir_passthrough.py");
-                !(matches!(self.format, Format::Ndjson | Format::FhirBundle) && passthrough)
+                !(matches!(self.format, Format::Ndjson | Format::FhirBundle) && self.passthrough())
             }
         }
+    }
+
+    /// Whether the transform is the passthrough, which hands FHIR resources on
+    /// as they are.
+    pub fn passthrough(&self) -> bool {
+        self.transform
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "fhir_passthrough.py")
     }
 
     /// The source's YAML file, as submitted (paths as given, not resolved).
@@ -1601,6 +1662,66 @@ mod tests {
         assert!(!feed("ndjson", passthrough, bulk(Some("transformed"))).direct_bulk());
         assert!(!feed("csv", passthrough, bulk(None)).direct_bulk());
         assert!(!feed("ndjson", passthrough, json!({"method": "rest"})).direct_bulk());
+        // Its Bundle files are not NDJSON: the engine writes the resources out.
+        assert!(feed("fhir", passthrough, bulk(None)).bulk_transformed());
+    }
+
+    #[test]
+    fn a_fhir_source_reads_each_file_by_its_extension() {
+        for (name, reader) in [
+            ("Patient.ndjson", Some(Format::Ndjson)),
+            ("drop.zip!/out/Observation.JSONL", Some(Format::Ndjson)),
+            ("bundle.json", Some(Format::FhirBundle)),
+            ("export.v2/notes.txt", None),
+            ("json", None),
+        ] {
+            assert_eq!(Format::Fhir.reader_for(name), reader, "{name}");
+        }
+        assert_eq!(Format::Csv.reader_for("x.json"), Some(Format::Csv));
+    }
+
+    #[test]
+    fn a_fhir_file_source_takes_only_the_passthrough_and_transformed_bulk() {
+        let dir = tempfile::tempdir().unwrap();
+        for t in ["lab_results.py", "fhir_passthrough.py"] {
+            std::fs::write(dir.path().join(t), "def transform(r, c): return r\n").unwrap();
+        }
+        let resolve = |source: Value, transform: &str, delivery: Value| {
+            let mut feed: FeedConfig = serde_json::from_value(json!({
+                "id": "drops", "name": "Drops", "source": source, "format": "fhir",
+                "transform": transform, "delivery": delivery,
+            }))
+            .unwrap();
+            feed.resolve(dir.path()).map(|()| feed)
+        };
+        let folder = json!({"type": "folder", "path": "inbox"});
+        let s3 = json!({"type": "s3", "bucket": "b", "anonymous": true});
+        for source in [&folder, &s3] {
+            let err = resolve(source.clone(), "lab_results.py", json!({})).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "source drops: format fhir reads FHIR resources as they are and needs the passthrough transform (fhir_passthrough.py), not lab_results.py"
+            );
+        }
+        let err = resolve(
+            folder.clone(),
+            "fhir_passthrough.py",
+            json!({"method": "bulk_submit", "bulk_from": "source_objects"}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("bulk_from source_objects"),
+            "{err}"
+        );
+        let feed = resolve(folder, "fhir_passthrough.py", json!({})).unwrap();
+        assert_eq!(feed.format, Format::Fhir);
+        // A database has its own shape, whatever the file says.
+        let database = json!({
+            "type": "database", "url_env": "DB_URL", "cursor_column": "id",
+            "query": "SELECT * FROM labs WHERE id > {cursor} ORDER BY id",
+        });
+        let feed = resolve(database, "lab_results.py", json!({})).unwrap();
+        assert_eq!(feed.format, Format::Ndjson);
     }
 
     fn contact_json(contact: Value) -> Result<FeedConfig, serde_json::Error> {

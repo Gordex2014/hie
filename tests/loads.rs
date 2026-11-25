@@ -704,6 +704,7 @@ async fn a_name_that_cannot_be_stored_is_not_kept() {
                 origin: None,
             },
             Ok(&rows),
+            None,
         )
         .unwrap()
     {

@@ -1037,7 +1037,10 @@ fn load(db: &Db, feed: &str, name: &str, bad: usize, good: usize) -> i64 {
             )
         })
         .collect();
-    match db.admit_file(&new_file(feed, name), Ok(&rows)).unwrap() {
+    match db
+        .admit_file(&new_file(feed, name), Ok(&rows), None)
+        .unwrap()
+    {
         Admission::Admitted(id) => id,
         other => panic!("{other:?}"),
     }
@@ -1921,6 +1924,7 @@ fn content_taken_meanwhile_is_not_admitted_twice() {
                 ..new_file("s", "copy-of-a")
             },
             Ok(&rows),
+            None,
         )
         .unwrap();
     assert_eq!(again, Admission::AlreadyTaken(first));

@@ -510,6 +510,22 @@ fn storable_name(name: &str) -> Option<&str> {
     Some(name).filter(|n| !n.contains('\0'))
 }
 
+/// The files of a source (`$1`) that took this content (`$2`), oldest first:
+/// only the first, unless a predicate on their names is to pick one.
+fn taken_sql(same: Option<&dyn Fn(&str) -> bool>) -> String {
+    let sql = "SELECT id, name FROM files WHERE feed_id = $1 AND sha256 = $2 AND status <> 'duplicate' ORDER BY id";
+    match same {
+        Some(_) => sql.to_string(),
+        None => format!("{sql} LIMIT 1"),
+    }
+}
+
+fn first_taken(rows: Vec<Row>, same: Option<&dyn Fn(&str) -> bool>) -> Option<i64> {
+    rows.into_iter()
+        .find(|r| same.is_none_or(|same| same(&r.string(1))))
+        .map(|r| r.i64(0))
+}
+
 /// A file as it is recorded on arrival: see `Db::insert_file` for `source_key`
 /// and `origin`.
 #[derive(Debug, Clone, Copy)]
@@ -1659,13 +1675,16 @@ impl Db {
             .is_some())
     }
 
-    pub fn find_file_by_hash(&self, feed: &str, sha: &str) -> Result<Option<i64>> {
-        Ok(self
-            .query_one(
-                "SELECT id FROM files WHERE feed_id = $1 AND sha256 = $2 AND status <> 'duplicate' ORDER BY id LIMIT 1",
-                &params![feed, sha],
-            )?
-            .map(|r| r.i64(0)))
+    /// The first file of the source that took this content (not as a
+    /// duplicate); with `same`, the first whose name it accepts.
+    pub fn find_file_by_hash(
+        &self,
+        feed: &str,
+        sha: &str,
+        same: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<Option<i64>> {
+        let rows = self.query(&taken_sql(same), &params![feed, sha])?;
+        Ok(first_taken(rows, same))
     }
 
     /// Records a file. `source_key` is kept when the object must stay at its source
@@ -1819,10 +1838,13 @@ impl Db {
     /// source over after a lease lapsed may be reading the same object. When the
     /// content was taken meanwhile nothing is written and the file it went into
     /// comes back, to be handled as a duplicate.
+    ///
+    /// `same` narrows what counts as the same content, as in `find_file_by_hash`.
     pub fn admit_file(
         &self,
         file: &NewFile,
         read: std::result::Result<&[ReadRow], &str>,
+        same: Option<&dyn Fn(&str) -> bool>,
     ) -> Result<Admission> {
         self.transaction(|tx| {
             if tx.postgres {
@@ -1831,13 +1853,8 @@ impl Db {
                     &params![file.feed],
                 )?;
             }
-            if let Some(original) = tx
-                .query_one(
-                    "SELECT id FROM files WHERE feed_id = $1 AND sha256 = $2 AND status <> 'duplicate' ORDER BY id LIMIT 1",
-                    &params![file.feed, file.sha],
-                )?
-                .map(|r| r.i64(0))
-            {
+            let rows = tx.query(&taken_sql(same), &params![file.feed, file.sha])?;
+            if let Some(original) = first_taken(rows, same) {
                 tx.rollback = true;
                 return Ok(Admission::AlreadyTaken(original));
             }
