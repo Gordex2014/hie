@@ -700,6 +700,38 @@ pub enum Format {
     FhirBundle,
     /// HL7 v2 messages, one or more per file, each starting with `MSH`.
     Hl7v2,
+    /// FHIR JSON files read by their extension: `.ndjson` and `.jsonl` as
+    /// NDJSON, `.json` as a Bundle (or a single resource). Passthrough only.
+    Fhir,
+}
+
+impl Format {
+    /// The reader a file or zip entry of this name is read with: in a `fhir`
+    /// source the one its extension picks, `None` for any other extension;
+    /// otherwise the source's format, whatever the name.
+    pub fn reader_for(self, name: &str) -> Option<Format> {
+        if self != Format::Fhir {
+            return Some(self);
+        }
+        let base = name.rsplit('/').next().unwrap_or(name);
+        let (_, extension) = base.rsplit_once('.')?;
+        match extension.to_ascii_lowercase().as_str() {
+            "ndjson" | "jsonl" => Some(Format::Ndjson),
+            "json" => Some(Format::FhirBundle),
+            _ => None,
+        }
+    }
+
+    /// The format as a source file writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Format::Csv => "csv",
+            Format::Ndjson => "ndjson",
+            Format::FhirBundle => "fhir_bundle",
+            Format::Hl7v2 => "hl7v2",
+            Format::Fhir => "fhir",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -728,7 +760,8 @@ pub struct DeliveryConfig {
     /// resources as NDJSON per resource type and hands those over; a resource
     /// without an `id` gets one derived from its identifier. `auto` (default) is
     /// `source_objects` for NDJSON or Bundle files with the passthrough transform
-    /// and `transformed` for everything else.
+    /// and `transformed` for everything else, `fhir` included (which refuses
+    /// `source_objects`).
     #[serde(default)]
     pub bulk_from: BulkFrom,
     /// Records per submission on the `transformed` path.
@@ -1097,6 +1130,30 @@ impl FeedConfig {
                 );
             }
         }
+        // Also before the early return without a secret backend. A source that
+        // is not read from files has its format fixed below, whatever it says.
+        if self.format == Format::Fhir
+            && matches!(
+                self.source,
+                SourceConfig::Folder { .. } | SourceConfig::S3 { .. }
+            )
+        {
+            if !self.passthrough() {
+                bail!(
+                    "source {}: format fhir reads FHIR resources as they are and needs the passthrough transform (fhir_passthrough.py), not {}",
+                    self.id,
+                    self.transform.display()
+                );
+            }
+            if self.delivery.method == DeliveryMethod::BulkSubmit
+                && self.delivery.bulk_from == BulkFrom::SourceObjects
+            {
+                bail!(
+                    "source {}: format fhir hands HFS the transformed resources; bulk_from source_objects cannot take its Bundle files, use transformed or auto",
+                    self.id
+                );
+            }
+        }
         self.source.resolve(base);
         self.source
             .check()
@@ -1197,14 +1254,18 @@ impl FeedConfig {
             BulkFrom::Transformed => true,
             BulkFrom::SourceObjects => false,
             BulkFrom::Auto => {
-                let passthrough = self
-                    .transform
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n == "fhir_passthrough.py");
-                !(matches!(self.format, Format::Ndjson | Format::FhirBundle) && passthrough)
+                !(matches!(self.format, Format::Ndjson | Format::FhirBundle) && self.passthrough())
             }
         }
+    }
+
+    /// Whether the transform is the passthrough, which hands FHIR resources on
+    /// as they are.
+    pub fn passthrough(&self) -> bool {
+        self.transform
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "fhir_passthrough.py")
     }
 
     /// The source's YAML file, as submitted (paths as given, not resolved). A
@@ -1532,17 +1593,50 @@ pub fn source_files(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// The definition of source `id` as `load` would find it in `dir`, resolved
 /// against `base`: the one file whose body has that id, whatever the file is
-/// called. `None` when no file has it; an error, as at load, when a file does
-/// not parse or two files have it.
-pub fn find_source(dir: &Path, base: &Path, id: &str) -> Result<Option<FeedConfig>> {
+/// called. `None` when no file has it; an error, as at load, when that file
+/// does not parse or when two files have it. A file with another id is passed
+/// over. So is a file with no id a definition could have (not UTF-8, not YAML,
+/// no text `id`), as no start could run it, unless `strict`: then it fails the
+/// lookup, as at load. Only the files with that id are parsed as a definition;
+/// the id of each other file is read once per content, kept in `ids`.
+pub fn find_source(
+    dir: &Path,
+    base: &Path,
+    id: &str,
+    ids: &SourceIds,
+    strict: bool,
+) -> Result<Option<FeedConfig>> {
+    let files = source_files(dir)?;
+    let mut known = ids.known.lock().expect("source ids lock");
+    let present: HashSet<&PathBuf> = files.iter().collect();
+    known.retain(|path, _| present.contains(path));
     let mut found = None;
-    for path in source_files(dir)? {
-        let text = std::fs::read_to_string(&path)?;
+    for path in files {
+        let bytes = std::fs::read(&path)?;
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut h);
+            h.finish()
+        };
+        let file_id = match known.get(&path) {
+            Some((seen, file_id)) if *seen == hash => file_id.clone(),
+            _ => {
+                let file_id = ids.read(&path, &bytes);
+                known.insert(path.clone(), (hash, file_id.clone()));
+                file_id
+            }
+        };
+        match file_id {
+            FileId::Source(of) if of == id => {}
+            FileId::Source(_) => continue,
+            FileId::NotASource(why) if strict => bail!("parsing {}: {why}", path.display()),
+            FileId::NotASource(_) => continue,
+        }
+        let text = String::from_utf8(bytes).expect("an id was read from it as text");
+        // Parsed as `load` parses it: a manifest source by its own rules.
         let mut feed =
             definition_from_yaml(&text).with_context(|| format!("parsing {}", path.display()))?;
-        if feed.id != id {
-            continue;
-        }
         if found.is_some() {
             bail!("duplicate source id {id}");
         }
@@ -1551,6 +1645,51 @@ pub fn find_source(dir: &Path, base: &Path, id: &str) -> Result<Option<FeedConfi
         found = Some(feed);
     }
     Ok(found)
+}
+
+/// The id each source file held when `find_source` last read it, by path and
+/// a hash of its content: a file is read again only once its content changes.
+#[derive(Default)]
+pub struct SourceIds {
+    known: std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, FileId)>>,
+    /// Files whose id was read, for tests.
+    #[cfg(test)]
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+/// What a source file says about its id.
+#[derive(Clone)]
+enum FileId {
+    /// Its `id`, decoded as a definition's is (`id: 123` is `"123"`).
+    Source(String),
+    /// No id a definition could have (not UTF-8, not YAML, or no text `id`),
+    /// and why: no start could load it.
+    NotASource(String),
+}
+
+impl SourceIds {
+    fn read(&self, path: &Path, bytes: &[u8]) -> FileId {
+        #[cfg(test)]
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[derive(Deserialize)]
+        struct IdOnly {
+            id: String,
+        }
+        let read = std::str::from_utf8(bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|text| serde_yaml::from_str::<IdOnly>(text).map_err(|e| e.to_string()));
+        match read {
+            Ok(file) => FileId::Source(file.id),
+            Err(why) => {
+                tracing::warn!(
+                    "{}: no source id read ({why}); the file is passed over until it changes",
+                    path.display()
+                );
+                FileId::NotASource(why)
+            }
+        }
+    }
 }
 
 /// Parses `90s`, `30m`, `24h` or `7d`.
@@ -1849,6 +1988,74 @@ mod tests {
         assert!(!feed("ndjson", passthrough, bulk(Some("transformed"))).direct_bulk());
         assert!(!feed("csv", passthrough, bulk(None)).direct_bulk());
         assert!(!feed("ndjson", passthrough, json!({"method": "rest"})).direct_bulk());
+        // Its Bundle files are not NDJSON: the engine writes the resources out.
+        assert!(feed("fhir", passthrough, bulk(None)).bulk_transformed());
+    }
+
+    #[test]
+    fn a_fhir_source_reads_each_file_by_its_extension() {
+        for (name, reader) in [
+            ("Patient.ndjson", Some(Format::Ndjson)),
+            ("drop.zip!/out/Observation.JSONL", Some(Format::Ndjson)),
+            ("bundle.json", Some(Format::FhirBundle)),
+            ("export.v2/notes.txt", None),
+            ("json", None),
+        ] {
+            assert_eq!(Format::Fhir.reader_for(name), reader, "{name}");
+        }
+        assert_eq!(Format::Csv.reader_for("x.json"), Some(Format::Csv));
+    }
+
+    #[test]
+    fn a_format_is_named_as_a_source_file_writes_it() {
+        use Format::*;
+        for format in [Csv, Ndjson, FhirBundle, Hl7v2, Fhir] {
+            assert_eq!(serde_json::to_value(format).unwrap(), format.as_str());
+        }
+    }
+
+    #[test]
+    fn a_fhir_file_source_takes_only_the_passthrough_and_transformed_bulk() {
+        let dir = tempfile::tempdir().unwrap();
+        for t in ["lab_results.py", "fhir_passthrough.py"] {
+            std::fs::write(dir.path().join(t), "def transform(r, c): return r\n").unwrap();
+        }
+        let resolve = |source: Value, transform: &str, delivery: Value| {
+            let mut feed: FeedConfig = serde_json::from_value(json!({
+                "id": "drops", "name": "Drops", "source": source, "format": "fhir",
+                "transform": transform, "delivery": delivery,
+            }))
+            .unwrap();
+            feed.resolve(dir.path()).map(|()| feed)
+        };
+        let folder = json!({"type": "folder", "path": "inbox"});
+        let s3 = json!({"type": "s3", "bucket": "b", "anonymous": true});
+        for source in [&folder, &s3] {
+            let err = resolve(source.clone(), "lab_results.py", json!({})).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "source drops: format fhir reads FHIR resources as they are and needs the passthrough transform (fhir_passthrough.py), not lab_results.py"
+            );
+        }
+        let err = resolve(
+            folder.clone(),
+            "fhir_passthrough.py",
+            json!({"method": "bulk_submit", "bulk_from": "source_objects"}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("bulk_from source_objects"),
+            "{err}"
+        );
+        let feed = resolve(folder, "fhir_passthrough.py", json!({})).unwrap();
+        assert_eq!(feed.format, Format::Fhir);
+        // A database has its own shape, whatever the file says.
+        let database = json!({
+            "type": "database", "url_env": "DB_URL", "cursor_column": "id",
+            "query": "SELECT * FROM labs WHERE id > {cursor} ORDER BY id",
+        });
+        let feed = resolve(database, "lab_results.py", json!({})).unwrap();
+        assert_eq!(feed.format, Format::Ndjson);
     }
 
     fn contact_json(contact: Value) -> Result<FeedConfig, serde_json::Error> {
@@ -2184,6 +2391,59 @@ mod tests {
     const CREDENTIAL_S3: &str = "id: private\nname: P\nsource:\n  type: s3\n  bucket: b\n  credential: lab\nformat: ndjson\ntransform: t.py\n";
     const FOLDER: &str =
         "id: inbox\nname: I\nsource:\n  type: folder\n  path: inbox\ntransform: t.py\n";
+
+    #[test]
+    fn a_source_is_found_reading_each_unchanged_file_once() {
+        let numbered = FOLDER.replace("id: inbox", "id: 123");
+        let dir = root_with(&[
+            ("inbox.yaml", FOLDER),
+            ("notes.yaml", "id: other\nname: N\n"),
+            ("numbered.yml", &numbered),
+        ]);
+        let (sources, base) = (dir.path().join("sources"), dir.path().to_path_buf());
+        let ids = SourceIds::default();
+        let reads = || ids.reads.load(std::sync::atomic::Ordering::Relaxed);
+        let found = find_source(&sources, &base, "inbox", &ids, false).unwrap();
+        assert_eq!(found.unwrap().id, "inbox");
+        assert_eq!(reads(), 3);
+        assert!(
+            find_source(&sources, &base, "inbox", &ids, false)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(reads(), 3, "unchanged files are not read again");
+        // `id: 123` is source "123", as `load` reads it.
+        let found = find_source(&sources, &base, "123", &ids, false).unwrap();
+        assert_eq!(found.unwrap().id, "123");
+        assert_eq!(reads(), 3);
+        // A hand edit is seen.
+        std::fs::write(sources.join("notes.yaml"), FOLDER).unwrap();
+        let err = find_source(&sources, &base, "inbox", &ids, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("duplicate source id inbox"),
+            "{err:#}"
+        );
+        assert_eq!(reads(), 4);
+        // Not YAML: no start could load it, so it is no source's file.
+        std::fs::write(sources.join("notes.yaml"), "id: [inbox\n").unwrap();
+        assert!(
+            find_source(&sources, &base, "inbox", &ids, false)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(reads(), 5);
+        // Nor is a file that is not UTF-8. A strict lookup (a transform save)
+        // still fails on either, as a start would.
+        std::fs::write(sources.join("notes.yaml"), [0xff, 0xfe, b'i', 0, b'd', 0]).unwrap();
+        assert!(
+            find_source(&sources, &base, "inbox", &ids, false)
+                .unwrap()
+                .is_some()
+        );
+        let err = find_source(&sources, &base, "inbox", &ids, true).unwrap_err();
+        assert!(format!("{err:#}").contains("notes.yaml"), "{err:#}");
+        assert_eq!(reads(), 6);
+    }
 
     #[test]
     fn a_legacy_s3_file_refuses_the_load_naming_the_file() {

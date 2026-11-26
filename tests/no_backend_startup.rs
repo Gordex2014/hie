@@ -61,6 +61,7 @@ fn engine(dir: &Path, command: &str) -> Command {
         .env_remove("HIE_DATABASE_URL")
         .env_remove("HIE_SECRET_KEY")
         .env_remove("HIE_SECRET_KEY_FILE")
+        .env_remove("HIE_INSTANCE_ID")
         .env("HIE_LOG", "info");
     c
 }
@@ -156,4 +157,246 @@ async fn a_credential_file_is_skipped_and_the_engine_starts() {
             && logged.contains("the file is skipped"),
         "{logged}"
     );
+}
+
+/// Runs the engine on `dir` until dropped, once it answers.
+async fn serve(dir: &Path, port: u16, log: &str) -> Running {
+    let log = dir.join(log);
+    let output = std::fs::File::create(&log).unwrap();
+    // Restarts need a store that outlives the process: SQLite, also when
+    // the other tests run on PostgreSQL.
+    let mut child = Running(
+        engine(dir, "run")
+            .env_remove("HIE_TEST_DATABASE_URL")
+            .stdout(output.try_clone().unwrap())
+            .stderr(output)
+            .spawn()
+            .unwrap(),
+    );
+    let started = Instant::now();
+    while reqwest::get(format!("http://127.0.0.1:{port}/health"))
+        .await
+        .is_err()
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the engine did not start: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        if let Some(status) = child.0.try_wait().unwrap() {
+            panic!(
+                "the engine exited ({status}): {}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    child
+}
+
+/// The `definition` alerts of source `private`, newest first.
+async fn definition_alerts(port: u16) -> Vec<serde_json::Value> {
+    let alerts: serde_json::Value =
+        reqwest::get(format!("http://127.0.0.1:{port}/api/alerts?source=private"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    alerts["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["kind"] == "definition")
+        .cloned()
+        .collect()
+}
+
+/// The `cleared` events of an alert's webhook, as it lists them.
+fn clears(alert: &serde_json::Value) -> usize {
+    alert["webhook"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event"] == "cleared")
+        .count()
+}
+
+/// The alert a skipped file raised clears at the first start that no longer
+/// skips it, the file fixed or removed, with one `cleared` event.
+#[tokio::test]
+async fn a_skipped_file_alert_clears_once_the_file_is_not_skipped() {
+    for change in ["fixed", "removed"] {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port();
+        root(dir.path(), port);
+        let raised = {
+            let _engine = serve(dir.path(), port, "first.log").await;
+            definition_alerts(port).await
+        };
+        assert_eq!(raised.len(), 1, "{raised:?}");
+        assert!(raised[0]["cleared_at"].is_null(), "{raised:?}");
+        let file = dir.path().join("sources/private.yaml");
+        if change == "fixed" {
+            std::fs::write(&file, PRIVATE_FOLDER).unwrap();
+        } else {
+            std::fs::remove_file(&file).unwrap();
+        }
+        let _engine = serve(dir.path(), port, "second.log").await;
+        let after = definition_alerts(port).await;
+        eprintln!("{change}: the definition alert after the second start: {after:?}");
+        assert_eq!(after.len(), 1, "{change}: {after:?}");
+        assert_eq!(after[0]["id"], raised[0]["id"], "{change}");
+        assert!(
+            !after[0]["cleared_at"].is_null(),
+            "{change}: still open: {after:?}"
+        );
+        assert_eq!(
+            after[0]["cleared_reason"], "private: its definition is no longer skipped",
+            "{change}"
+        );
+        assert_eq!(clears(&after[0]), 1, "{change}: {after:?}");
+    }
+}
+
+const PRIVATE_FOLDER: &str =
+    "id: private\nname: Private\nsource:\n  type: folder\n  path: private-inbox\ntransform: t.py\n";
+
+/// A start that still skips a file of the source keeps its alert open, also
+/// when another file of the same id loads.
+#[tokio::test]
+async fn a_skipped_file_alert_stays_while_a_file_of_the_source_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    root(dir.path(), port);
+    drop(serve(dir.path(), port, "first.log").await);
+    drop(serve(dir.path(), port, "unchanged.log").await);
+    std::fs::write(
+        dir.path().join("sources/private-folder.yaml"),
+        PRIVATE_FOLDER,
+    )
+    .unwrap();
+    let _engine = serve(dir.path(), port, "sibling.log").await;
+    let alerts = definition_alerts(port).await;
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert!(alerts[0]["cleared_at"].is_null(), "{alerts:?}");
+    assert_eq!(clears(&alerts[0]), 0, "{alerts:?}");
+}
+
+/// Another instance on the store, which does not skip the file, leaves the
+/// alert open: it is the instance that skips it that clears it. An alert an
+/// earlier version raised names no instance, and no start clears it: an
+/// instance that skips the file raises its own, and clears only that one.
+#[tokio::test]
+async fn only_the_instance_that_skips_a_file_clears_its_alert() {
+    let a = tempfile::tempdir().unwrap();
+    let a_port = free_port();
+    root(a.path(), a_port);
+    drop(serve(a.path(), a_port, "first.log").await);
+    // Instance b: its own sources, the same store.
+    let b = tempfile::tempdir().unwrap();
+    let b_port = free_port();
+    root(b.path(), b_port);
+    std::fs::remove_file(b.path().join("sources/private.yaml")).unwrap();
+    let database = a.path().join("data/hie.db");
+    std::fs::write(
+        b.path().join("hie.yaml"),
+        format!(
+            "fhir_base_url: http://127.0.0.1:9/fhir
+database: {}
+listen: 127.0.0.1:{b_port}
+",
+            database.display()
+        ),
+    )
+    .unwrap();
+    let open = |port| async move {
+        let alerts = definition_alerts(port).await;
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        alerts[0]["cleared_at"].is_null()
+    };
+    {
+        let _b = serve(b.path(), b_port, "b.log").await;
+        assert!(open(b_port).await, "b cleared a's alert");
+    }
+    // As an earlier version left it.
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute("UPDATE alerts SET raised_by = NULL", [])
+        .unwrap();
+    {
+        let _b = serve(b.path(), b_port, "b-legacy.log").await;
+        assert!(
+            open(b_port).await,
+            "b cleared an alert of an earlier version"
+        );
+    }
+    // a still skips it: it raises its own, and once fixed clears that one.
+    drop(serve(a.path(), a_port, "a-own.log").await);
+    std::fs::write(a.path().join("sources/private.yaml"), PRIVATE_FOLDER).unwrap();
+    let _a = serve(a.path(), a_port, "a-fixed.log").await;
+    let alerts = definition_alerts(a_port).await;
+    assert_eq!(alerts.len(), 2, "{alerts:?}");
+    // Newest first: a's own, cleared once; the earlier version's, open.
+    let open: Vec<bool> = alerts.iter().map(|a| a["cleared_at"].is_null()).collect();
+    assert_eq!(open, [false, true], "{alerts:?}");
+    assert_eq!(clears(&alerts[0]), 1, "{alerts:?}");
+    assert_eq!(clears(&alerts[1]), 0, "{alerts:?}");
+}
+
+/// Two instances on one store that both skip a file of a source each keep an
+/// alert of their own: the one that no longer skips it clears only its own.
+#[tokio::test]
+async fn two_instances_that_skip_a_file_each_keep_their_own_alert() {
+    let a = tempfile::tempdir().unwrap();
+    let a_port = free_port();
+    root(a.path(), a_port);
+    let b = tempfile::tempdir().unwrap();
+    let b_port = free_port();
+    root(b.path(), b_port);
+    let database = a.path().join("data/hie.db");
+    std::fs::write(
+        b.path().join("hie.yaml"),
+        format!(
+            "fhir_base_url: http://127.0.0.1:9/fhir\ndatabase: {}\nlisten: 127.0.0.1:{b_port}\n",
+            database.display()
+        ),
+    )
+    .unwrap();
+    drop(serve(a.path(), a_port, "a.log").await);
+    drop(serve(b.path(), b_port, "b.log").await);
+    std::fs::write(a.path().join("sources/private.yaml"), PRIVATE_FOLDER).unwrap();
+    let _a = serve(a.path(), a_port, "a-fixed.log").await;
+    let alerts = definition_alerts(a_port).await;
+    assert_eq!(alerts.len(), 2, "{alerts:?}");
+    let open: Vec<bool> = alerts.iter().map(|a| a["cleared_at"].is_null()).collect();
+    // Newest first: b's is still open, a's cleared.
+    assert_eq!(open, [true, false], "{alerts:?}");
+    assert_eq!(clears(&alerts[1]), 1, "{alerts:?}");
+}
+
+/// An instance without a stable id (no `HIE_INSTANCE_ID`, a sources directory
+/// it cannot write) is a new one at each start: it raises one alert naming no
+/// instance for a skipped file, and no second one at the next start.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_instance_without_a_stable_id_raises_one_alert_for_a_skipped_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    root(dir.path(), port);
+    let sources = dir.path().join("sources");
+    std::fs::set_permissions(&sources, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(sources.join("probe"), "").is_ok() {
+        // Root writes anyway: the case cannot be made here.
+        let _ = std::fs::remove_file(sources.join("probe"));
+        eprintln!("skipping: the sources directory stays writable");
+        return;
+    }
+    drop(serve(dir.path(), port, "first.log").await);
+    let _engine = serve(dir.path(), port, "second.log").await;
+    let alerts = definition_alerts(port).await;
+    std::fs::set_permissions(&sources, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert!(alerts[0]["cleared_at"].is_null(), "{alerts:?}");
 }

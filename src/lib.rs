@@ -99,6 +99,87 @@ pub fn build(
     )
 }
 
+/// Source files this build could not load: each stays visible as an alert of
+/// this instance, one per source id and instance, until a start of this
+/// instance no longer skips a file of that source (fixed, removed, or loaded
+/// by a build with a secret backend), which clears it. Another instance's
+/// alerts are left to it. One an earlier version raised names no instance, so
+/// no start clears it: the instance it describes may still skip the file.
+/// Retention purges it by age instead. An instance without a stable id is a
+/// new one at each start: it raises an alert naming no instance, and only for
+/// a source with none open, as earlier versions did.
+fn skipped_file_alerts(
+    config: &config::Config,
+    db: &db::Db,
+    alerts: &alerts::Alerter,
+) -> Result<()> {
+    let open = db.open_rule_less_alerts("definition")?;
+    if config.skipped.is_empty() && open.iter().all(|(_, _, by)| by.is_none()) {
+        // Nothing to raise, and nothing raised by an instance to clear.
+        return Ok(());
+    }
+    let Some(owner) =
+        secrets::owner::stable_owner_id(std::env::var("HIE_INSTANCE_ID").ok(), &config.sources_dir)
+    else {
+        for skipped in &config.skipped {
+            alerts.know_source(&skipped.source_id, &skipped.source_name);
+            if db
+                .open_rule_less_alerts_of(&skipped.source_id, "definition")?
+                .is_empty()
+            {
+                alerts.raise(
+                    Some(&skipped.source_id),
+                    "definition",
+                    &skipped_message(skipped),
+                )?;
+            }
+        }
+        return Ok(());
+    };
+    for skipped in &config.skipped {
+        alerts.know_source(&skipped.source_id, &skipped.source_name);
+        // Read again for each file: an earlier file of the same id may have
+        // raised one.
+        let open_of = db.open_rule_less_alerts_of(&skipped.source_id, "definition")?;
+        if open_of
+            .iter()
+            .any(|(_, by)| by.as_deref() == Some(owner.as_str()))
+        {
+            continue;
+        }
+        alerts.raise_as(
+            &skipped.source_id,
+            "definition",
+            &skipped_message(skipped),
+            &owner,
+        )?;
+    }
+    let skipped: std::collections::HashSet<&str> = config
+        .skipped
+        .iter()
+        .map(|s| s.source_id.as_str())
+        .collect();
+    for (id, source, raised_by) in open {
+        if raised_by.as_deref() == Some(owner.as_str()) && !skipped.contains(source.as_str()) {
+            alerts.clear(
+                id,
+                &source,
+                "definition",
+                &format!("{source}: its definition is no longer skipped"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn skipped_message(skipped: &config::SkippedSource) -> String {
+    format!(
+        "{}: {}; the file is skipped",
+        skipped.file.display(),
+        skipped.reason
+    )
+}
+
 /// `build`, with the secret key inputs of the process (`KeySettings::load()`
 /// in production). Refuses to start when the store is sealed and the key is
 /// missing, wrong or malformed, or when the key settings are ambiguous.
@@ -118,24 +199,7 @@ pub fn build_with(
         credentials,
     ));
     let alerts = Arc::new(alerts::Alerter::from_config(db.clone(), &config.alerts));
-    // Source files this build could not load: each stays visible as an alert.
-    for skipped in &config.skipped {
-        alerts.know_source(&skipped.source_id, &skipped.source_name);
-        if db
-            .open_alert(&skipped.source_id, "definition", None)?
-            .is_none()
-        {
-            alerts.raise(
-                Some(&skipped.source_id),
-                "definition",
-                &format!(
-                    "{}: {}; the file is skipped",
-                    skipped.file.display(),
-                    skipped.reason
-                ),
-            )?;
-        }
-    }
+    skipped_file_alerts(config, &db, &alerts)?;
     // Alerts older versions left open after a recovery: closed before any
     // source runs, so none of them stands in for a new outage.
     let closed = db.close_legacy_recoveries()?;

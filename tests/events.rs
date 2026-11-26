@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use hie::config::Format;
 use hie::db::{Admission, Db, Delivery, EventQuery, NewFile, Rule};
 use serde_json::{Value, json};
 
@@ -1037,7 +1038,10 @@ fn load(db: &Db, feed: &str, name: &str, bad: usize, good: usize) -> i64 {
             )
         })
         .collect();
-    match db.admit_file(&new_file(feed, name), Ok(&rows)).unwrap() {
+    match db
+        .admit_file(&new_file(feed, name), Ok(&rows), None)
+        .unwrap()
+    {
         Admission::Admitted(id) => id,
         other => panic!("{other:?}"),
     }
@@ -1909,6 +1913,30 @@ fn an_older_answer_cannot_roll_back_a_records_attempts() {
 }
 
 #[test]
+fn content_is_taken_again_only_under_a_name_the_predicate_accepts() {
+    let db = Db::in_memory().unwrap();
+    let rows = [(1, json!({"resourceType": "Patient", "id": "x"}), None)];
+    let admit = |name: &str| {
+        let reader = Format::Fhir.reader_for(name);
+        let same = move |other: &str| Format::Fhir.reader_for(other) == reader;
+        db.admit_file(
+            &NewFile {
+                sha: "same-bytes",
+                ..new_file("s", name)
+            },
+            Ok(&rows),
+            Some(&same),
+        )
+        .unwrap()
+    };
+    assert!(matches!(admit("x.txt"), Admission::Admitted(_)));
+    let Admission::Admitted(later) = admit("x.ndjson") else {
+        panic!("x.ndjson is read another way than x.txt");
+    };
+    assert_eq!(admit("y.jsonl"), Admission::AlreadyTaken(later));
+}
+
+#[test]
 fn content_taken_meanwhile_is_not_admitted_twice() {
     let db = Db::in_memory().unwrap();
     let first = load(&db, "s", "a", 0, 1);
@@ -1921,6 +1949,7 @@ fn content_taken_meanwhile_is_not_admitted_twice() {
                 ..new_file("s", "copy-of-a")
             },
             Ok(&rows),
+            None,
         )
         .unwrap();
     assert_eq!(again, Admission::AlreadyTaken(first));
@@ -1994,7 +2023,15 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
         |kind: &str, rule: Option<&Rule>| db.insert_alert(Some("s"), kind, "m", rule).unwrap();
     let open_enabled = raise("silence", Some(&enabled));
     let credential = raise("credential", None);
+    // A skipped file's alert, raised by an instance: that instance clears it.
     let definition = raise("definition", None);
+    db.query_json(
+        "UPDATE alerts SET raised_by = 'instance-a' WHERE id = CAST($1 AS BIGINT)",
+        hie::db::params![definition],
+    )
+    .unwrap();
+    // One an earlier version raised names no instance: nothing clears it.
+    let legacy_definition = raise("definition", None);
     let open_disabled = raise("silence", Some(&disabled));
     let open_deleted = raise("silence", Some(&deleted));
     let open_no_rule = raise("unreadable_file", None);
@@ -2042,7 +2079,7 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
         .collect();
     let purged: Vec<_> = purges.into_iter().map(|p| p.join().unwrap()).collect();
     assert_eq!(purged.iter().map(|p| p.events).sum::<usize>(), 5_002);
-    assert_eq!(purged.iter().map(|p| p.alerts).sum::<usize>(), 4);
+    assert_eq!(purged.iter().map(|p| p.alerts).sum::<usize>(), 5);
     assert_eq!(events(&db).len(), 1);
     assert_eq!(
         alert_ids(&db),
@@ -2060,7 +2097,13 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
         totals,
         "the counter never goes down"
     );
-    for gone in [open_disabled, open_deleted, open_no_rule, cleared_old] {
+    for gone in [
+        legacy_definition,
+        open_disabled,
+        open_deleted,
+        open_no_rule,
+        cleared_old,
+    ] {
         assert!(!alert_ids(&db).contains(&gone));
     }
 

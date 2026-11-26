@@ -14,7 +14,7 @@ Available today in the current release. The reasons behind each choice are in [d
 
 - Folder, S3 bucket (private buckets with stored credentials, public and read-only buckets, and buckets that announce objects through an SQS queue), another FHIR server, SQL databases (PostgreSQL, MySQL, SQLite, SQL Server), HL7 v2 over MLLP — see [docs/sources.md](docs/sources.md)
 - FHIR Bulk Data manifests, by URL or uploaded, handed to the Helios FHIR Server with `$bulk-submit` and recorded as one load each from its receipts — see [docs/sources.md](docs/sources.md#manifest)
-- CSV, NDJSON, FHIR Bundle, HL7 v2 and zipped drops of any of them
+- CSV, NDJSON, FHIR Bundle, HL7 v2 and zipped drops of any of them, and FHIR drops that mix NDJSON and Bundle files, each read by its extension
 
 **Transforms**
 

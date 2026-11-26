@@ -18,6 +18,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use zeroize::Zeroizing;
 
 use super::native::NativeStore;
+pub use super::owner::INSTANCE_ID_FILE;
+use super::owner::{OwnTemp, owner_id};
 use super::{Cause, EnvKey, KeySettings, Secrets};
 use crate::config::Config;
 use crate::crypto::{self, ALGORITHM, CHECK_PLAINTEXT, MasterKey, Sealer};
@@ -26,9 +28,6 @@ use crate::db::secrets::CheckRow;
 
 /// The key file made next to a SQLite database when no key is given.
 pub const AUTO_KEY_FILE: &str = "hie-secrets.key";
-/// Where an instance keeps its id among the instances sharing a store, when
-/// `HIE_INSTANCE_ID` is not set.
-pub const INSTANCE_ID_FILE: &str = ".hie-instance-id";
 /// More than a key line ever holds: anything longer is not a key.
 const MAX_KEY_FILE: usize = 128;
 
@@ -704,15 +703,6 @@ fn read_auto(path: &Path) -> Input {
     }
 }
 
-/// Removes the file it names when dropped: a creator's own temporary file.
-struct OwnTemp(PathBuf);
-
-impl Drop for OwnTemp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 /// Why the automatic key file gave no key.
 #[derive(Debug)]
 enum AutoKeyError {
@@ -816,62 +806,6 @@ fn sync_dir(dir: &Path) {
     }
     #[cfg(not(unix))]
     let _ = dir;
-}
-
-/// Who this instance's registrations of sources for secrets belong to:
-/// `HIE_INSTANCE_ID`, else the id kept in the sources directory, made once.
-/// Unlike the per-process lease name, it stays the same across restarts, so
-/// a restart finds and cleans what an earlier run of this instance left.
-pub(crate) fn owner_id(env: Option<String>, sources_dir: &Path) -> String {
-    if let Some(id) = env.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
-        return id;
-    }
-    match stable_id(sources_dir) {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(
-                "secret references: set HIE_INSTANCE_ID, or make {} writable; without a stable id, references left by an earlier run are not cleaned ({e:#})",
-                sources_dir.display()
-            );
-            crate::pipeline::instance_id().to_string()
-        }
-    }
-}
-
-fn stable_id(dir: &Path) -> Result<String> {
-    let path = dir.join(INSTANCE_ID_FILE);
-    let read = |path: &Path| -> Result<Option<String>> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                let id = text.trim().to_string();
-                if id.is_empty() || id.len() > 64 || id.chars().any(char::is_whitespace) {
-                    bail!("{} does not hold an instance id", path.display());
-                }
-                Ok(Some(id))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-        }
-    };
-    if let Some(id) = read(&path)? {
-        return Ok(id);
-    }
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).map_err(|e| anyhow!("no random bytes for an id: {e}"))?;
-    let id = hex::encode(bytes);
-    let temp = dir.join(format!("{INSTANCE_ID_FILE}.{id}.tmp"));
-    {
-        let _own = OwnTemp(temp.clone());
-        std::fs::write(&temp, format!("{id}\n"))
-            .with_context(|| format!("writing {}", temp.display()))?;
-        match std::fs::hard_link(&temp, &path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
-        }
-    }
-    read(&path)?.with_context(|| format!("{} is gone right after it was made", path.display()))
 }
 
 #[cfg(test)]
