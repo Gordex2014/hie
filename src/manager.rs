@@ -38,6 +38,8 @@ pub enum ManagerError {
     InvalidDefinition(String),
     NotFound(String),
     Conflict(String),
+    /// What the request asks has no meaning for this kind of source.
+    NotSupported(String),
     /// Too much running already; the same request may succeed later.
     Busy(String),
     /// The store's write lock was not free; the same request may succeed later.
@@ -201,6 +203,8 @@ pub struct SourceManager {
     /// Makes the next record of a source's birth fail, for tests.
     #[cfg(all(test, feature = "secrets-native"))]
     fail_next_birth: std::sync::atomic::AtomicBool,
+    /// What `manifest` sources' kick-offs are sent with.
+    manifest_client: Arc<crate::manifest::Client>,
 }
 
 impl SourceManager {
@@ -212,6 +216,14 @@ impl SourceManager {
         alerts: Arc<Alerter>,
         secrets: Secrets,
     ) -> Arc<Self> {
+        let manifest_client = Arc::new(
+            crate::manifest::Client::new(
+                &config.fhir_base_url,
+                &config.public_url,
+                fhir.credentials().clone(),
+            )
+            .with_destination(fhir.destination().clone()),
+        );
         Arc::new(Self {
             python: config.python.clone(),
             runtime_dir: runtime_dir.to_path_buf(),
@@ -242,6 +254,7 @@ impl SourceManager {
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
             #[cfg(all(test, feature = "secrets-native"))]
             fail_next_birth: std::sync::atomic::AtomicBool::new(false),
+            manifest_client,
             handover_grace_ms: AtomicU64::new(
                 (config
                     .worker
@@ -257,6 +270,27 @@ impl SourceManager {
     /// Whether this engine tags delivered resources with their source.
     pub fn stamp_source(&self) -> bool {
         self.stamp_source
+    }
+
+    /// What a `manifest` source's kick-offs go through.
+    pub fn manifest_client(&self) -> Arc<crate::manifest::Client> {
+        self.manifest_client.clone()
+    }
+
+    /// Runs `admit` with source `id` as it is, under the source's lock: a
+    /// delete or replace of the source comes before it or after it, never
+    /// during. `NotFound` when there is no such source.
+    pub async fn with_source_locked<T>(
+        &self,
+        id: &str,
+        admit: impl FnOnce(&FeedConfig) -> T,
+    ) -> Result<T, ManagerError> {
+        let lock = self.source_lock(id);
+        let _changing = lock.lock().await;
+        let feed = self
+            .source(id)
+            .ok_or_else(|| ManagerError::NotFound(format!("source {id} not found")))?;
+        Ok(admit(&feed))
     }
 
     /// Whether the FHIR server answers, as this engine sees it.
@@ -347,7 +381,7 @@ impl SourceManager {
             ),
             &self.bulk_dir,
         )?;
-        if self.stamp_source && feed.direct_bulk() {
+        if self.stamp_source && feed.direct_bulk() && !feed.is_manifest() {
             tracing::warn!(
                 feed = %feed.id,
                 "delivery.stamp_source is on, but this source hands HFS its objects untouched ($bulk-submit from the source objects): what it delivers is not tagged; use bulk_from: transformed to tag it"
@@ -472,8 +506,8 @@ impl SourceManager {
     /// Parses a submitted definition, validates it against the base directory and
     /// returns both the form to write (as submitted) and the resolved form to run.
     fn parse(&self, body: &Value) -> Result<(FeedConfig, FeedConfig), ManagerError> {
-        let submitted: FeedConfig = serde_json::from_value(body.clone())
-            .map_err(|e| ManagerError::InvalidDefinition(e.to_string()))?;
+        let submitted = crate::config::definition_from_json(body)
+            .map_err(|e| ManagerError::InvalidDefinition(format!("{e:#}")))?;
         submitted
             .check_written()
             .map_err(|e| ManagerError::InvalidDefinition(format!("{e:#}")))?;
@@ -665,6 +699,12 @@ impl SourceManager {
         {
             anyhow::bail!("recording the birth of {}: a test made it fail", feed.id);
         }
+        // Manifests arrive when someone sends one, not on a schedule: the
+        // source is born without a rule, its birth still recorded.
+        if feed.is_manifest() {
+            self.db.record_birth(&feed.id, force)?;
+            return Ok(None);
+        }
         let rule = Rule {
             id: 0,
             source_id: Some(feed.id.clone()),
@@ -698,12 +738,21 @@ impl SourceManager {
                 submitted.id
             )));
         }
+        // A manifest source's loads are polled by a manifest source only: the
+        // kind stays what it was. One that runs keeps its kind; checked again
+        // under the lock.
+        let changes_kind = |running: &FeedConfig| running.is_manifest() != submitted.is_manifest();
+        if self.source(id).as_ref().is_some_and(changes_kind) {
+            return Err(Self::kind_change(id));
+        }
         let lock = self.source_lock(id);
         let _changing = lock.lock().await;
         // Deleted while this waited for the lock: a replace would publish it
         // again without its birth.
-        if self.source(id).is_none() {
-            return Err(ManagerError::NotFound(format!("source {id} not found")));
+        match self.source(id) {
+            None => return Err(ManagerError::NotFound(format!("source {id} not found"))),
+            Some(running) if changes_kind(&running) => return Err(Self::kind_change(id)),
+            Some(_) => {}
         }
         let secret = self.credential_of(&resolved).await?;
         pause_point!(await self, "manager:after-find");
@@ -722,6 +771,12 @@ impl SourceManager {
         // over (`cleanup_refs`).
         self.start_published(&resolved)?;
         Ok(resolved)
+    }
+
+    fn kind_change(id: &str) -> ManagerError {
+        ManagerError::InvalidDefinition(format!(
+            "source {id}: a replace cannot change the type to or from manifest; delete the source and create one with a new id"
+        ))
     }
 
     /// The definition of `id` as its file holds it, resolved, found as `load`
@@ -958,6 +1013,11 @@ impl SourceManager {
     /// just `{"source": {...}}`. Nothing is taken from the source.
     pub async fn test(&self, body: &Value) -> Result<Probe, ManagerError> {
         let source_value = body.get("source").unwrap_or(body);
+        if source_value.get("type").and_then(Value::as_str) == Some("manifest") {
+            return Err(ManagerError::NotSupported(
+                "a manifest source has no connection to test: manifests are sent to it with POST /api/sources/{id}/manifests".into(),
+            ));
+        }
         let mut source: SourceConfig = serde_json::from_value(source_value.clone())
             .map_err(|e| ManagerError::InvalidDefinition(e.to_string()))?;
         source.resolve(&self.base_dir);

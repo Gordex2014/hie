@@ -3,6 +3,7 @@
 //! (`postgres://...`, for more than one instance or more than one machine).
 //! Placeholders are `$1`, `$2`, ...; SQLite gets them as `?1`, `?2`.
 
+pub mod manifest;
 #[cfg(feature = "secrets-native")]
 pub mod secrets;
 
@@ -214,6 +215,23 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // each kick-off or poll: an answer to a request claimed before the latest
     // change, by this runner or another, changes nothing.
     ("submissions", "epoch", "INTEGER NOT NULL DEFAULT 0"),
+    // A `manifest` source's loads (see `db::manifest`): what the load is (its
+    // kind, request key and submission), whether it is listed yet (0 while its
+    // kick-off is being sent), and the counts its receipts gave.
+    ("files", "manifest", "TEXT"),
+    ("files", "request_id", "TEXT"),
+    ("files", "listed", "INTEGER NOT NULL DEFAULT 1"),
+    ("files", "receipts_sent", "INTEGER NOT NULL DEFAULT 0"),
+    ("files", "receipts_rejected", "INTEGER NOT NULL DEFAULT 0"),
+    ("files", "receipt_failures", "TEXT"),
+    // The load a manifest submission is for, and how far its receipts were read.
+    ("submissions", "load_id", "INTEGER"),
+    ("submissions", "progress", "TEXT"),
+    // When a manifest load was listed; a load recorded otherwise is listed
+    // from its `received_at`.
+    ("files", "listed_at", "INTEGER"),
+    // The instant a check's answer counted the loads listed up to.
+    ("checks", "cutoff_at", "INTEGER"),
 ];
 
 /// How long the store write before an untagged REST request may take: a
@@ -250,9 +268,12 @@ pub struct Stamping {
 }
 
 /// Indexes made after the added columns, since they may name one.
-const ADDED_INDEXES: [&str; 2] = [
+const ADDED_INDEXES: [&str; 4] = [
     "CREATE INDEX IF NOT EXISTS records_submission_id ON records(submission, id)",
     "CREATE INDEX IF NOT EXISTS events_source_kind_at ON events(source_id, kind, at)",
+    // A manifest's request key, once per source, reserved before it is sent.
+    "CREATE UNIQUE INDEX IF NOT EXISTS files_feed_request ON files(feed_id, request_id) WHERE request_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS submissions_load ON submissions(load_id)",
 ];
 
 /// A record that fails: rejected for any reason but `filtered`, which a
@@ -265,11 +286,14 @@ pub const FAILING: &str = "status = 'rejected' AND COALESCE(error_kind, '') <> '
 /// transaction of its own: a build over a large `records` locks that table
 /// alone, and never holds `files` while it waits for another instance's
 /// writes. The failing ones hold only the rows that make a load fail.
-const LOAD_INDEXES: [&str; 4] = [
+const LOAD_INDEXES: [&str; 6] = [
     "CREATE INDEX IF NOT EXISTS files_status_id ON files(status, id)",
     "CREATE INDEX IF NOT EXISTS files_feed_status_id ON files(feed_id, status, id)",
     "CREATE INDEX IF NOT EXISTS records_failing_file ON records(file_id) WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'",
     "CREATE INDEX IF NOT EXISTS records_failing_feed_file ON records(feed_id, file_id) WHERE status = 'rejected' AND COALESCE(error_kind, '') <> 'filtered'",
+    // The manifest loads whose receipts hold a failing outcome.
+    "CREATE INDEX IF NOT EXISTS files_receipts_failing ON files(id) WHERE receipts_rejected > 0",
+    "CREATE INDEX IF NOT EXISTS files_feed_receipts_failing ON files(feed_id, id) WHERE receipts_rejected > 0",
 ];
 
 /// On PostgreSQL only: on SQLite `records_file` already orders by id, the rowid.
@@ -518,7 +542,9 @@ fn storable_name(name: &str) -> Option<&str> {
 /// The files of a source (`$1`) that took this content (`$2`), oldest first:
 /// only the first, unless a predicate on their names is to pick one.
 fn taken_sql(same: Option<&dyn Fn(&str) -> bool>) -> String {
-    let sql = "SELECT id, name FROM files WHERE feed_id = $1 AND sha256 = $2 AND status <> 'duplicate' ORDER BY id";
+    // A manifest load's hash is of its URL or manifest, never content a
+    // file source took.
+    let sql = "SELECT id, name FROM files WHERE feed_id = $1 AND sha256 = $2 AND status <> 'duplicate' AND manifest IS NULL ORDER BY id";
     match same {
         Some(_) => sql.to_string(),
         None => format!("{sql} LIMIT 1"),
@@ -1689,7 +1715,7 @@ impl Db {
     pub fn has_file(&self, feed: &str, name: &str, size: u64) -> Result<bool> {
         Ok(self
             .query_one(
-                "SELECT 1 FROM files WHERE feed_id = $1 AND name = $2 AND size = $3 AND status <> 'duplicate' LIMIT 1",
+                "SELECT 1 FROM files WHERE feed_id = $1 AND name = $2 AND size = $3 AND status <> 'duplicate' AND manifest IS NULL LIMIT 1",
                 &params![feed, name, size],
             )?
             .is_some())
@@ -2065,7 +2091,7 @@ impl Db {
         Ok(self
             .query(
             "SELECT f.id FROM files f
-             WHERE f.feed_id = $1 AND f.status IN ('processing', 'unpacked')
+             WHERE f.feed_id = $1 AND f.status IN ('processing', 'unpacked') AND f.manifest IS NULL
                AND NOT EXISTS (SELECT 1 FROM records r WHERE r.file_id = f.id AND r.status IN ('received', 'pending', 'submitted'))
              ORDER BY f.id",
                 &params![feed],
@@ -2084,7 +2110,7 @@ impl Db {
         self.transaction(|tx| {
                 let lock = format!(
                     "SELECT name, status, failing_reported FROM files
-                     WHERE id = $1 AND status IN ('processing', 'unpacked'){}",
+                     WHERE id = $1 AND status IN ('processing', 'unpacked') AND manifest IS NULL{}",
                     tx.for_update()
                 );
                 let Some(file) = tx.query_one(&lock, &params![candidate])? else {
@@ -2721,7 +2747,9 @@ impl Db {
     }
 
     /// What the store knows about `feed`'s deliveries without the tag, read in
-    /// one statement. Untagged submissions count whatever the source's path
+    /// one statement. A manifest load is one: the FHIR server stores the
+    /// provider's resources as they are (`m_*` statuses, never stamped); a
+    /// kick-off it refused is not. Untagged submissions count whatever the source's path
     /// is now: one nobody polls any more stays open. One that is done is a
     /// bound at its last update; one still to send or running is open, from
     /// whichever version wrote it. A failed one may have left HFS importing (a
@@ -2737,11 +2765,11 @@ impl Db {
                    (SELECT untagged_until FROM source_stamping WHERE feed_id = $1) AS rest,
                    (SELECT MAX(updated_at) FROM submissions
                      WHERE feed_id = $1 AND stamped = 0
-                       AND status = 'done') AS bulk,
+                       AND status IN ('done', 'm_done')) AS bulk,
                    (SELECT COUNT(*) FROM submissions
                      WHERE feed_id = $1 AND stamped = 0
-                       AND (status IN ('kickoff', 'running')
-                            OR (status = 'failed'
+                       AND (status IN ('kickoff', 'running', 'm_sending', 'm_status', 'm_polling')
+                            OR (status IN ('failed', 'm_failed')
                                 AND updated_at >= COALESCE((SELECT CAST(value AS BIGINT) FROM store_meta WHERE key = $2), 0)))) AS open",
                 &params![feed, STAMPING_TRACKED],
             )?
@@ -3176,13 +3204,20 @@ impl Db {
 
     /// Pauses or resumes a source. Paused is an operational state kept here, not
     /// in the source's definition file.
+    /// On PostgreSQL it takes the source's manifest admission lock first
+    /// (`manifest::admission_lock`), so a manifest sent at the same moment is
+    /// admitted either before the pause or not at all; on SQLite the write
+    /// lock already orders them.
     pub fn set_paused(&self, feed: &str, paused: bool, by: Option<&str>) -> Result<()> {
-        self.execute(
-            "INSERT INTO source_state (feed_id, paused, paused_at, paused_by) VALUES ($1, $2, $3, $4)
-             ON CONFLICT(feed_id) DO UPDATE SET paused = excluded.paused, paused_at = excluded.paused_at, paused_by = excluded.paused_by",
-            &params![feed, paused, paused.then(now_ms), if paused { by } else { None }],
-        )
-        .map(drop)
+        self.transaction(|tx| {
+            manifest::admission_lock(tx, feed)?;
+            tx.execute(
+                "INSERT INTO source_state (feed_id, paused, paused_at, paused_by) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT(feed_id) DO UPDATE SET paused = excluded.paused, paused_at = excluded.paused_at, paused_by = excluded.paused_by",
+                &params![feed, paused, paused.then(now_ms), if paused { by } else { None }],
+            )
+            .map(drop)
+        })
     }
 
     /// When and by whom a source was paused, if it is.
@@ -3267,7 +3302,7 @@ impl Db {
     pub fn last_received_at(&self, feed: &str) -> Result<Option<i64>> {
         Ok(self
             .query_one(
-                "SELECT MAX(received_at) FROM files WHERE feed_id = $1 AND status <> 'duplicate'",
+                "SELECT MAX(received_at) FROM files WHERE feed_id = $1 AND status <> 'duplicate' AND listed = 1",
                 &params![feed],
             )?
             .and_then(|r| r.opt_i64(0)))
@@ -3277,7 +3312,7 @@ impl Db {
     pub fn received_between(&self, feed: &str, from: i64, to: i64) -> Result<bool> {
         Ok(self
             .query_one(
-                "SELECT 1 FROM files WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2 AND received_at < $3 LIMIT 1",
+                "SELECT 1 FROM files WHERE feed_id = $1 AND status <> 'duplicate' AND listed = 1 AND received_at >= $2 AND received_at < $3 LIMIT 1",
                 &params![feed, from, to],
             )?
             .is_some())
@@ -4224,16 +4259,6 @@ impl Db {
         )
     }
 
-    fn max_file_id(&self, feed: &str) -> Result<i64> {
-        Ok(self
-            .query_one(
-                "SELECT MAX(id) FROM files WHERE feed_id = $1",
-                &params![feed],
-            )?
-            .and_then(|r| r.opt_i64(0))
-            .unwrap_or(0))
-    }
-
     /// The source's checks waiting for an answer, as they are now: what the scan
     /// about to start answers. Checks recorded after this wait for the next one.
     pub fn pending_checks(&self, feed: &str) -> Result<Vec<i64>> {
@@ -4260,27 +4285,43 @@ impl Db {
         if snapshot.is_empty() {
             return Ok(());
         }
+        // The loads up to `upto`, a manifest load only when listed before
+        // `now`, the answer's cutoff: one listed later (its kick-off was still
+        // being sent) is never the check's, here or in its pages (`check`), which use the same strict
+        // predicate. The cutoff is taken under the source's manifest lock,
+        // which a listing takes too, so a listing commits wholly before or
+        // after it.
         const COUNT: &str = "(SELECT COUNT(*) FROM files WHERE files.feed_id = checks.feed_id
-                               AND files.id > checks.after_file AND files.id <= $3)";
-        let upto = self.max_file_id(feed)?;
-        let now = now_ms();
+                               AND files.id > checks.after_file AND files.id <= $3 AND files.listed = 1
+                               AND (files.listed_at IS NULL OR files.listed_at < $4))";
         let status = match failure {
             Some(_) => "'failed'".to_string(),
             None => format!("CASE WHEN {COUNT} > 0 THEN 'found' ELSE 'nothing_new' END"),
         };
         let sql = format!(
-            "UPDATE checks SET status = {status}, file_count = {COUNT}, upto_file = $3,
+            "UPDATE checks SET status = {status}, file_count = {COUNT}, upto_file = $3, cutoff_at = $4,
                finished_at = CASE WHEN requested_at > $4 THEN requested_at ELSE $4 END,
                reason = $5
              WHERE id = $1 AND feed_id = $2 AND status = 'pending'"
         );
-        for &id in snapshot {
-            self.execute(
-                &sql,
-                &params![id, feed, upto, now, failure.map(CheckFailure::reason)],
-            )?;
-        }
-        Ok(())
+        self.transaction(|tx| {
+            manifest::admission_lock(tx, feed)?;
+            let upto = tx
+                .query_one(
+                    "SELECT MAX(id) FROM files WHERE feed_id = $1",
+                    &params![feed],
+                )?
+                .and_then(|r| r.opt_i64(0))
+                .unwrap_or(0);
+            let now = now_ms();
+            for &id in snapshot {
+                tx.execute(
+                    &sql,
+                    &params![id, feed, upto, now, failure.map(CheckFailure::reason)],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Fails every pending check of the source with the failure's fixed reason,
@@ -4296,8 +4337,9 @@ impl Db {
         self.execute(
             "UPDATE checks SET status = 'failed',
                file_count = (SELECT COUNT(*) FROM files
-                             WHERE files.feed_id = checks.feed_id AND files.id > checks.after_file),
-               upto_file = (SELECT COALESCE(MAX(id), 0) FROM files WHERE feed_id = $1),
+                             WHERE files.feed_id = checks.feed_id AND files.id > checks.after_file AND files.listed = 1
+                               AND (files.listed_at IS NULL OR files.listed_at < $4)),
+               upto_file = (SELECT COALESCE(MAX(id), 0) FROM files WHERE feed_id = $1), cutoff_at = $4,
                finished_at = CASE WHEN requested_at > $4 THEN requested_at ELSE $4 END,
                reason = $2
              WHERE feed_id = $1 AND status = 'pending'
@@ -4314,7 +4356,7 @@ impl Db {
             .query_json(
                 &format!(
                     "SELECT id AS check_id, feed_id AS source, status, {} AS requested_at, {} AS finished_at,
-                            file_count, reason, after_file, upto_file
+                            file_count, reason, after_file, upto_file, cutoff_at
                      FROM checks WHERE id = $1",
                     self.iso("requested_at"),
                     self.iso("finished_at")
@@ -4330,12 +4372,15 @@ impl Db {
         let files = match check["upto_file"].as_i64() {
             Some(upto) => self.query_json(
                 "SELECT id, name, status, duplicate_of FROM files
-                 WHERE feed_id = $1 AND id > $2 AND id <= $3 ORDER BY id LIMIT $4",
+                 WHERE feed_id = $1 AND id > $2 AND id <= $3 AND listed = 1
+                   AND (CAST($5 AS BIGINT) IS NULL OR listed_at IS NULL OR listed_at < CAST($5 AS BIGINT))
+                 ORDER BY id LIMIT $4",
                 params![
                     check["source"].as_str().unwrap_or(""),
                     from,
                     upto,
-                    limit + 1
+                    limit + 1,
+                    check["cutoff_at"].as_i64()
                 ],
             )?,
             None => Vec::new(),
@@ -4350,6 +4395,7 @@ impl Db {
         let object = check.as_object_mut().expect("a row is an object");
         object.remove("after_file");
         object.remove("upto_file");
+        object.remove("cutoff_at");
         if object["file_count"].is_null() {
             object.insert("file_count".into(), json!(0));
         }
@@ -4587,6 +4633,17 @@ impl Db {
             .source_id
             .as_deref()
             .context("a default rule names its source")?;
+        self.birth(feed, Some(rule), force)
+    }
+
+    /// Records the birth of a source that is born without a rule (a
+    /// `manifest` source), as `give_default_rule` does, and adds nothing else.
+    pub fn record_birth(&self, feed: &str, force: bool) -> Result<()> {
+        self.birth(feed, None, force).map(drop)
+    }
+
+    /// `give_default_rule`, with no rule to give when `rule` is `None`.
+    fn birth(&self, feed: &str, rule: Option<&Rule>, force: bool) -> Result<Option<i64>> {
         // A start of a source the store has seen is the common case: answered
         // by a read, with no write transaction, so a start does not wait for
         // the write lock of a SQLite file another instance holds. Births are
@@ -4620,6 +4677,9 @@ impl Db {
                     &params![feed, now_ms()],
                 )? == 1;
                 pause_point!(self, "birth:after-insert");
+                let Some(rule) = rule else {
+                    return Ok(None);
+                };
                 let new = if force {
                     c.query(
                         "SELECT 1 FROM alert_rules WHERE source_id = $1 AND condition = $2 LIMIT 1",
@@ -4678,7 +4738,7 @@ impl Db {
         }
         let files = self
             .query_one(
-                "SELECT COUNT(*) FROM files WHERE feed_id = $1 AND status <> 'duplicate'",
+                "SELECT COUNT(*) FROM files WHERE feed_id = $1 AND status <> 'duplicate' AND listed = 1",
                 &params![feed],
             )?
             .map_or(0, |r| r.i64(0));

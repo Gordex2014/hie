@@ -18,6 +18,8 @@ use crate::transform::{self, Outcome, Transformer};
 use crate::worker::WorkerLimits;
 use tokio::sync::Notify;
 
+mod manifest;
+
 const TRANSFORM_CHUNK: usize = 200;
 /// Records settled per page when a submission's receipts come back.
 const SETTLE_PAGE: usize = 5_000;
@@ -53,6 +55,8 @@ pub struct FeedRunner {
     db: Arc<Db>,
     fhir: Arc<FhirClient>,
     bulk: Option<BulkSubmitter>,
+    /// The FHIR server's side of a `manifest` source's loads.
+    manifest: Option<crate::manifest::Client>,
     transformer: Transformer,
     alerts: Arc<Alerter>,
     started_at: i64,
@@ -142,9 +146,14 @@ impl FeedRunner {
         let transformer = Transformer::new(python, runtime_dir, &feed.transform);
         alerts.know_source(&feed.id, &feed.name);
         let feed_bulk_transformed = feed.bulk_transformed();
-        let bulk = (feed.delivery.method == DeliveryMethod::BulkSubmit).then(|| {
-            BulkSubmitter::new(fhir_base_url, public_url)
-                .with_credentials(fhir.credentials().clone())
+        let bulk = (feed.delivery.method == DeliveryMethod::BulkSubmit && !feed.is_manifest())
+            .then(|| {
+                BulkSubmitter::new(fhir_base_url, public_url)
+                    .with_credentials(fhir.credentials().clone())
+                    .with_destination(fhir.destination().clone())
+            });
+        let manifest = feed.is_manifest().then(|| {
+            crate::manifest::Client::new(fhir_base_url, public_url, fhir.credentials().clone())
                 .with_destination(fhir.destination().clone())
         });
         Self {
@@ -158,6 +167,7 @@ impl FeedRunner {
             db,
             fhir,
             bulk,
+            manifest,
             transformer,
             alerts,
             started_at: now_ms(),
@@ -523,6 +533,9 @@ impl FeedRunner {
     /// A pass that answers the checks of `snapshot`, taken before it started.
     /// Public for tests that drive a scan by hand.
     pub async fn tick_with(&self, snapshot: &[i64]) -> Result<()> {
+        if self.feed.is_manifest() {
+            return self.manifest_pass(snapshot).await;
+        }
         // Without its credential loaded, a source cannot read its store: nothing
         // is listed and nothing is handed over this pass, but what is open is
         // still polled and settled.

@@ -80,12 +80,16 @@ async fn main() -> Result<()> {
             config.fhir_base_url
         );
         for f in &feeds {
+            let via = if f.is_manifest() {
+                "$bulk-submit".to_string()
+            } else {
+                f.transform.display().to_string()
+            };
             println!(
-                "  {} ({}) <- {} via {}",
+                "  {} ({}) <- {} via {via}",
                 f.id,
                 f.name,
                 f.source.describe(),
-                f.transform.display()
             );
             if let Some(contact) = &f.contact {
                 println!("    contact: {contact}");

@@ -41,6 +41,9 @@ pub enum Source {
     FhirServer(FhirServerSource),
     Database(DatabaseSource),
     Mllp(MllpSource),
+    /// A `manifest` source: manifests arrive through the API, never from a
+    /// listing, so there is nothing to list, read or acknowledge.
+    Manifest,
 }
 
 impl Source {
@@ -97,6 +100,7 @@ impl Source {
                 cursor_start.clone(),
                 *max_runs,
             )?),
+            SourceConfig::Manifest { .. } => Source::Manifest,
             SourceConfig::FhirServer {
                 url,
                 types,
@@ -195,6 +199,7 @@ impl Source {
             Source::FhirServer(r) => r.list().await,
             Source::Database(d) => d.list().await,
             Source::Mllp(m) => m.folder.list(),
+            Source::Manifest => Ok(Vec::new()),
         }
     }
 
@@ -205,6 +210,7 @@ impl Source {
             Source::FhirServer(r) => r.fetch(key),
             Source::Database(d) => d.fetch(key),
             Source::Mllp(m) => m.folder.fetch(key),
+            Source::Manifest => bail!("a manifest source has no object {key}"),
         }
     }
 
@@ -216,6 +222,7 @@ impl Source {
             Source::FhirServer(r) => r.acknowledge(key),
             Source::Database(d) => d.acknowledge(key),
             Source::Mllp(m) => m.folder.acknowledge(key, archived_name),
+            Source::Manifest => bail!("a manifest source has no object {key}"),
         }
     }
 }
@@ -908,9 +915,11 @@ impl Source {
     /// succeed (signing).
     pub async fn share(&self, key: &str, ttl: Duration) -> Result<Option<String>> {
         match self {
-            Source::Folder(_) | Source::FhirServer(_) | Source::Database(_) | Source::Mllp(_) => {
-                Ok(None)
-            }
+            Source::Folder(_)
+            | Source::FhirServer(_)
+            | Source::Database(_)
+            | Source::Mllp(_)
+            | Source::Manifest => Ok(None),
             Source::Object(o) => {
                 let path = object_path(key)?;
                 match (&o.signer, &o.public) {
@@ -951,6 +960,7 @@ impl Source {
             Source::Object(o) => o.probe().await?,
             Source::FhirServer(r) => return r.probe(started).await,
             Source::Database(d) => return d.probe(started).await,
+            Source::Manifest => bail!("a manifest source has no connection to test"),
             Source::Mllp(m) => {
                 // Can the port be taken? Then what waits in the spool.
                 if !*m.started.lock().expect("mllp mutex") {

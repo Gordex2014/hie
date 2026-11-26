@@ -1,4 +1,5 @@
 mod loads;
+mod manifests;
 mod paging;
 mod secrets;
 
@@ -65,6 +66,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sources/{id}/pause", post(pause_source))
         .route("/api/sources/{id}/resume", post(resume_source))
         .route("/api/sources/{id}/check-now", post(check_now))
+        .route(
+            "/api/sources/{id}/manifests",
+            post(manifests::submit_manifest),
+        )
         .route("/api/checks/{id}", get(get_check))
         .route("/api/sources/{id}/files", get(list_files))
         .route("/api/sources/{id}/loads", get(list_files))
@@ -128,11 +133,20 @@ async fn health(State(s): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn bulk_manifest(State(s): State<AppState>, Path(token): Path<String>) -> ApiResult {
+async fn bulk_manifest(
+    State(s): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Response, ApiError> {
+    // An uploaded manifest of a `manifest` source: served as stored while its
+    // load is open, gone once its receipts are in.
+    if let Some(upload) = s.db.manifest_upload(&token)? {
+        let text = upload.ok_or_else(|| not_found("submission"))?;
+        return Ok(([(header::CONTENT_TYPE, "application/json")], text).into_response());
+    }
     let submission =
         s.db.submission(&token)?
             .ok_or_else(|| not_found("submission"))?;
-    Ok(Json(submission.manifest))
+    Ok(Json(submission.manifest).into_response())
 }
 
 async fn bulk_file(
@@ -268,6 +282,9 @@ impl From<ManagerError> for ApiError {
             }
             ManagerError::NotFound(m) => ApiError::new(StatusCode::NOT_FOUND, m),
             ManagerError::Conflict(m) => ApiError::new(StatusCode::CONFLICT, m),
+            ManagerError::NotSupported(m) => {
+                ApiError::new(StatusCode::BAD_REQUEST, m).code("not_supported")
+            }
             ManagerError::Busy(m) => ApiError::new(StatusCode::SERVICE_UNAVAILABLE, m).code("busy"),
             ManagerError::StoreBusy => ApiError::store_busy(),
             ManagerError::SecretsUnavailable(m) => ApiError::secrets_unavailable(m),
@@ -314,13 +331,21 @@ fn rejected_and_failing(db: &Db, feed: Option<&str>, since: i64) -> anyhow::Resu
             .and_then(Value::as_i64)
             .unwrap_or(0)
     };
-    Ok((n("rejected"), n("failing")))
+    // A manifest load's failing receipts, by when the load finished.
+    let (_, receipts) = db.receipts_between(feed, since, i64::MAX)?;
+    Ok((n("rejected") + receipts, n("failing") + receipts))
 }
 
 /// A source's definition and its state, as one object.
 fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
     let db = &*s.db;
-    let last = db.last_received_at(&feed.id)?;
+    // A manifest source is read from its own loads: an earlier source with
+    // the id does not make it look received.
+    let last = if feed.is_manifest() {
+        db.last_manifest_received_at(&feed.id)?
+    } else {
+        db.last_received_at(&feed.id)?
+    };
     let paused = db.paused_state(&feed.id)?;
     let lease = db.lease(&feed.id)?;
     let started = s
@@ -345,14 +370,21 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         params![feed.id],
     )?;
     let since = now_ms() - DAY_MS;
-    let (rejected_24h, failing_24h) = rejected_and_failing(db, Some(&feed.id), since)?;
+    // A manifest source's are its receipts': rows an earlier source with the
+    // id rejected are not its own.
+    let (rejected_24h, failing_24h) = if feed.is_manifest() {
+        let (_, failing) = db.receipts_between(Some(&feed.id), since, i64::MAX)?;
+        (failing, failing)
+    } else {
+        rejected_and_failing(db, Some(&feed.id), since)?
+    };
     Ok(json!({
         "id": feed.id,
         "name": feed.name,
         "contact": feed.contact,
         "source": feed.source.describe(),
         "format": feed.format,
-        "transform": feed.transform.display().to_string(),
+        "transform": (!feed.is_manifest()).then(|| feed.transform.display().to_string()),
         "poll_seconds": feed.source.poll_interval().as_secs(),
         "expect_every": feed.expect_every.map(human),
         "state": if state != "paused" && lease.as_ref().is_some_and(|l| l.owner != crate::pipeline::instance_id()) { "standby" } else { state },
@@ -361,13 +393,19 @@ fn source_status(s: &AppState, feed: &FeedConfig) -> anyhow::Result<Value> {
         "lease": lease.map(|l| json!({"owner": l.owner, "until": iso_ms(l.until), "mine": l.owner == crate::pipeline::instance_id()})),
         "instance": crate::pipeline::instance_id(),
         "last_received_at": last.and_then(iso_ms),
-        "records": db.feed_counts(&feed.id)?,
+        "records": if feed.is_manifest() { manifest_records() } else { db.feed_counts(&feed.id)? },
         "rejected_last_24h": rejected_24h,
         "failing_last_24h": failing_24h,
         "last_alert": last_alert.into_iter().next(),
         "stamping": stamping(s, feed)?,
         "definition": s.manager.definition(&feed.id)?,
     }))
+}
+
+/// A manifest source's `records`: all zeros, as it keeps no per-line rows.
+fn manifest_records() -> Value {
+    json!({"received": 0, "pending": 0, "submitted": 0, "sent": 0, "rejected": 0,
+           "files": 0, "duplicate_files": 0})
 }
 
 /// Whether what this instance delivers for `feed` carries the source tag, and
@@ -574,7 +612,8 @@ async fn source_stats(
         None => Zone::utc(),
         Some(name) => Zone::parse(name).map_err(|e| invalid_query("tz", e))?,
     };
-    s.manager
+    let feed = s
+        .manager
         .source(&id)
         .ok_or_else(|| not_found(&format!("source {id}")))?;
     let days = q.days.unwrap_or(14).clamp(1, 366) as u32;
@@ -584,17 +623,20 @@ async fn source_stats(
         &zone,
         days,
         chrono::Utc::now(),
+        feed.is_manifest(),
     )?))
 }
 
 /// A source's figures by local day in `zone`, the last of the `days` being the
-/// one `now` falls in.
+/// one `now` falls in. A `manifest` source's come from its loads' receipts
+/// only: rows an earlier source with the id kept are not its own.
 fn daily_stats(
     db: &Db,
     id: &str,
     zone: &Zone,
     days: u32,
     now: chrono::DateTime<chrono::Utc>,
+    manifest: bool,
 ) -> anyhow::Result<Value> {
     let local = Days::ending_today(zone, now, days);
     let (since, until) = local.span();
@@ -613,7 +655,7 @@ fn daily_stats(
     for row in db.query_json(
         &format!(
             "SELECT {} AS day, COUNT(*) AS n FROM files
-             WHERE feed_id = $1 AND status <> 'duplicate' AND received_at >= $2 AND received_at < $3 GROUP BY 1",
+             WHERE feed_id = $1 AND status <> 'duplicate' AND listed = 1 AND received_at >= $2 AND received_at < $3 GROUP BY 1",
             local.sql_index("received_at")
         ),
         params![id, since, until],
@@ -622,7 +664,10 @@ fn daily_stats(
             by_day[i]["files"] = row["n"].clone();
         }
     }
-    for row in db.query_json(
+    for row in if manifest {
+        Vec::new()
+    } else {
+        db.query_json(
         &format!(
             "SELECT {} AS day, status, COUNT(*) AS n,
                     CAST(COALESCE(SUM(CASE WHEN {FAILING} THEN 1 ELSE 0 END), 0) AS BIGINT) AS failing
@@ -631,11 +676,34 @@ fn daily_stats(
             local.sql_index("updated_at")
         ),
         params![id, since, until],
-    )? {
+    )?
+    } {
         if let (Some(i), Some(status)) = (by_index(&row), row["status"].as_str()) {
             by_day[i][status] = row["n"].clone();
             if status == "rejected" {
                 by_day[i]["failing"] = row["failing"].clone();
+            }
+        }
+    }
+    // A manifest load's receipts, on the day the load finished.
+    for row in db.query_json(
+        &format!(
+            "SELECT {} AS day, CAST(COALESCE(SUM(receipts_sent), 0) AS BIGINT) AS sent,
+                    CAST(COALESCE(SUM(receipts_rejected), 0) AS BIGINT) AS rejected
+             FROM files
+             WHERE feed_id = $1 AND manifest IS NOT NULL AND listed = 1 AND finished_at >= $2 AND finished_at < $3 GROUP BY 1",
+            local.sql_index("finished_at")
+        ),
+        params![id, since, until],
+    )? {
+        if let Some(i) = by_index(&row) {
+            let rejected = row["rejected"].as_i64().unwrap_or(0);
+            for (key, n) in [
+                ("sent", row["sent"].as_i64().unwrap_or(0)),
+                ("rejected", rejected),
+                ("failing", rejected),
+            ] {
+                by_day[i][key] = json!(by_day[i][key].as_i64().unwrap_or(0) + n);
             }
         }
     }
@@ -644,11 +712,12 @@ fn daily_stats(
     let today_json = json!({
         "day": last["day"],
         "files": last["files"],
-        "records": count(db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2 AND f.received_at < $3", params![id, today_since, today_until])?,
+        "records": if manifest { 0 } else { count(db, "SELECT COUNT(r.id) AS n FROM records r JOIN files f ON f.id = r.file_id WHERE r.feed_id = $1 AND f.received_at >= $2 AND f.received_at < $3", params![id, today_since, today_until])? }
+            + count(db, "SELECT CAST(COALESCE(SUM(receipts_sent + receipts_rejected), 0) AS BIGINT) AS n FROM files WHERE feed_id = $1 AND manifest IS NOT NULL AND listed = 1 AND received_at >= $2 AND received_at < $3", params![id, today_since, today_until])?,
         "sent": last["sent"],
         "rejected": last["rejected"],
         "failing": last["failing"],
-        "pending": count(db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status IN ('received', 'pending')", params![id])?,
+        "pending": if manifest { 0 } else { count(db, "SELECT COUNT(*) AS n FROM records WHERE feed_id = $1 AND status IN ('received', 'pending')", params![id])? },
     });
     Ok(
         json!({"source": id, "days": days, "tz": zone.name(), "today": today_json, "by_day": by_day}),
@@ -851,13 +920,46 @@ async fn monitoring_status(State(s): State<AppState>) -> ApiResult {
         sources.push(status);
     }
     let since = now_ms() - DAY_MS;
-    let (rejected, failing) = rejected_and_failing(&s.db, None, since)?;
+    let (rejected, _) = rejected_and_failing(&s.db, None, since)?;
+    // `files`, `sent` and `failing`, and the same figures by source type,
+    // from one read, so the types always add up to the totals: a manifest load under `manifest`, any
+    // other under the type of the source registered under its id now, or
+    // `unregistered`.
+    let mut by_type: std::collections::BTreeMap<&'static str, (i64, i64, i64)> = Default::default();
+    let (mut files, mut sent, mut failing) = (0, 0, 0);
+    for share in s.db.shares_since(since)? {
+        files += share.loads;
+        sent += share.sent;
+        failing += share.failing;
+        let kind = if share.manifest {
+            "manifest"
+        } else {
+            s.manager
+                .source(&share.feed_id)
+                .map_or("unregistered", |f| f.source.type_name())
+        };
+        let entry = by_type.entry(kind).or_default();
+        entry.0 += share.loads;
+        entry.1 += share.sent;
+        entry.2 += share.failing;
+    }
+    let by_source_type: Map<String, Value> = by_type
+        .into_iter()
+        .filter(|(_, (loads, sent, failing))| *loads != 0 || *sent != 0 || *failing != 0)
+        .map(|(kind, (loads, sent, failing))| {
+            (
+                kind.to_string(),
+                json!({"loads": loads, "sent": sent, "failing": failing}),
+            )
+        })
+        .collect();
     let last_24h = json!({
-        "files": count(&s.db, "SELECT COUNT(*) AS n FROM files WHERE status <> 'duplicate' AND received_at >= $1", params![since])?,
-        "sent": count(&s.db, "SELECT COUNT(*) AS n FROM records WHERE status = 'sent' AND updated_at >= $1", params![since])?,
+        "files": files,
+        "sent": sent,
         "rejected": rejected,
         "failing": failing,
         "alerts": count(&s.db, "SELECT COUNT(*) AS n FROM alerts WHERE created_at >= $1", params![since])?,
+        "by_source_type": by_source_type,
     });
     let destination = s.manager.destination().snapshot();
     Ok(Json(json!({
@@ -886,10 +988,13 @@ const LOAD_COLUMNS: &str = "f.id, f.feed_id AS source_id, f.source_name, f.name,
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' THEN 1 ELSE 0 END), 0) AS BIGINT) AS rejected,
                     CAST(COALESCE(SUM(CASE WHEN r.status = 'rejected' AND COALESCE(r.error_kind, '') <> 'filtered' THEN 1 ELSE 0 END), 0) AS BIGINT) AS failing,
                     CAST(COALESCE(SUM(CASE WHEN r.status IN ('received', 'pending', 'submitted') THEN 1 ELSE 0 END), 0) AS BIGINT) AS in_progress,
-                    CASE WHEN f.finished_at IS NULL THEN NULL ELSE f.finished_at - f.received_at END AS took_ms";
+                    CASE WHEN f.finished_at IS NULL THEN NULL ELSE f.finished_at - f.received_at END AS took_ms,
+                    f.manifest AS manifest_meta, f.request_id AS manifest_request_id,
+                    f.receipts_sent AS manifest_sent, f.receipts_rejected AS manifest_rejected";
 
 /// Every `files` column a load row selects, for its `GROUP BY`.
-const LOAD_GROUP: &str = "GROUP BY f.id, f.feed_id, f.source_name, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived, f.finished_at, f.received_at";
+const LOAD_GROUP: &str = "GROUP BY f.id, f.feed_id, f.source_name, f.name, f.status, f.duplicate_of, f.size, f.error, f.source_key, f.archived, f.finished_at, f.received_at,
+                          f.manifest, f.request_id, f.receipts_sent, f.receipts_rejected";
 
 /// The load rows of `ids`, in that order, each with what became of its
 /// records. Each load is read in a statement of its own (its file and its
@@ -902,7 +1007,7 @@ fn load_rows(s: &AppState, ids: &[i64]) -> Result<Vec<Value>, ApiError> {
         &format!(
             "SELECT {LOAD_COLUMNS}, {} AS received_at, {} AS finished_at
              FROM files f LEFT JOIN records r ON r.file_id = f.id
-             WHERE f.id = CAST($1 AS BIGINT) {LOAD_GROUP}",
+             WHERE f.id = CAST($1 AS BIGINT) AND f.listed = 1 {LOAD_GROUP}",
             s.db.iso("f.received_at"),
             s.db.iso("f.finished_at")
         ),
@@ -910,6 +1015,9 @@ fn load_rows(s: &AppState, ids: &[i64]) -> Result<Vec<Value>, ApiError> {
     )?;
     let mut methods: std::collections::HashMap<String, Value> = Default::default();
     for row in &mut rows {
+        if manifest_load(row) {
+            continue;
+        }
         let source = row["source_id"].as_str().unwrap_or_default().to_string();
         row["method"] = methods
             .entry(source)
@@ -926,6 +1034,77 @@ fn load_rows(s: &AppState, ids: &[i64]) -> Result<Vec<Value>, ApiError> {
         row["failed"] = Value::Bool(row["status"] == "unreadable" || failing > 0);
     }
     Ok(rows)
+}
+
+/// Projects a load row of a `manifest` source from what its receipts gave:
+/// no per-line rows, `records` is `sent + rejected`, `failing` is `rejected`.
+/// Every load gets its `manifest` member, `null` but on these. Whether it was
+/// one.
+fn manifest_load(row: &mut Value) -> bool {
+    let Some(object) = row.as_object_mut() else {
+        return false;
+    };
+    let meta = object.remove("manifest_meta").and_then(|m| {
+        m.as_str()
+            .and_then(|t| serde_json::from_str::<Value>(t).ok())
+    });
+    let request_id = object.remove("manifest_request_id").unwrap_or(Value::Null);
+    let sent = object
+        .remove("manifest_sent")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let rejected = object
+        .remove("manifest_rejected")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let Some(meta) = meta.filter(Value::is_object) else {
+        object.insert("manifest".into(), Value::Null);
+        return false;
+    };
+    let size = object.get("size").and_then(Value::as_i64).unwrap_or(0);
+    object.insert("size".into(), crate::db::manifest::shown_size(&meta, size));
+    for (key, value) in [
+        ("records", sent + rejected),
+        ("sent", sent),
+        ("rejected", rejected),
+        ("failing", rejected),
+        ("in_progress", 0),
+    ] {
+        object.insert(key.into(), json!(value));
+    }
+    for key in ["duplicate_of", "source_key", "archived"] {
+        object.insert(key.into(), Value::Null);
+    }
+    object.insert("method".into(), json!("bulk_submit"));
+    object.insert(
+        "failed".into(),
+        json!(object.get("status").and_then(Value::as_str) == Some("unreadable") || rejected > 0),
+    );
+    object.insert(
+        "manifest".into(),
+        json!({
+            "by": meta["by"],
+            "request_id": request_id,
+            "submission_id": meta["submission_id"],
+            "kickoff": meta["kickoff"],
+            "sent_by_type": meta.get("sent_by_type").cloned().unwrap_or_else(|| json!({})),
+            "deleted": meta["deleted"].as_i64().unwrap_or(0),
+        }),
+    );
+    true
+}
+
+/// One load as `GET /api/loads/{id}` answers it, its failures included;
+/// `None` when there is no such load.
+fn load_detail(s: &AppState, file_id: i64) -> Result<Option<Value>, ApiError> {
+    let Some(mut load) = load_rows(s, &[file_id])?.into_iter().next() else {
+        return Ok(None);
+    };
+    load["failures"] = Value::Array(match s.db.manifest_failures(file_id)? {
+        Some(groups) => groups,
+        None => s.db.failure_groups(file_id)?,
+    });
+    Ok(Some(load))
 }
 
 /// The most loads `/api/sources/{id}/loads` lists at once.
@@ -949,7 +1128,7 @@ async fn list_files(
     tokio::task::spawn_blocking(move || {
         let ids: Vec<i64> =
             s.db.query_json(
-                "SELECT id FROM files WHERE feed_id = $1 ORDER BY id DESC LIMIT $2",
+                "SELECT id FROM files WHERE feed_id = $1 AND listed = 1 ORDER BY id DESC LIMIT $2",
                 params![id, limit],
             )?
             .iter()
@@ -966,11 +1145,7 @@ async fn list_files(
 /// purpose included, as kind `filtered`), each with sample rows, so a
 /// person can see what went wrong and retry the rows after a fix.
 async fn get_load(State(s): State<AppState>, Path(file_id): Path<i64>) -> ApiResult {
-    let mut load = load_rows(&s, &[file_id])?
-        .into_iter()
-        .next()
-        .ok_or_else(|| not_found(&format!("load {file_id}")))?;
-    load["failures"] = Value::Array(s.db.failure_groups(file_id)?);
+    let load = load_detail(&s, file_id)?.ok_or_else(|| not_found(&format!("load {file_id}")))?;
     Ok(Json(load))
 }
 
@@ -987,12 +1162,26 @@ async fn retry_load(
     body: Option<Json<RetryBody>>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let reason = body.and_then(|Json(b)| b.reason);
-    let source_id =
-        s.db.query_json("SELECT feed_id FROM files WHERE id = $1", params![file_id])?
-            .into_iter()
-            .next()
-            .and_then(|r| r["feed_id"].as_str().map(str::to_string))
-            .ok_or_else(|| not_found(&format!("load {file_id}")))?;
+    let found =
+        s.db.query_json(
+            "SELECT feed_id, CASE WHEN manifest IS NULL THEN 0 ELSE 1 END AS manifest FROM files WHERE id = $1 AND listed = 1",
+            params![file_id],
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| not_found(&format!("load {file_id}")))?;
+    // A manifest load keeps no rows to put back: it is sent again instead.
+    if found["manifest"] == 1 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "a manifest load cannot be retried; send the manifest again (the same URL or file) to load it again",
+        )
+        .code("not_retryable"));
+    }
+    let source_id = found["feed_id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| not_found(&format!("load {file_id}")))?;
     let retried = s.db.reprocess_rejected(file_id, reason.as_deref())?;
     if retried > 0 {
         let _ = s.manager.check_now(&source_id);
@@ -1621,7 +1810,7 @@ mod tests {
         ]);
         let ny = Zone::parse("America/New_York").unwrap();
         let now = utc("2026-11-02T12:00:00Z");
-        let stats = daily_stats(&db, "lab", &ny, 366, now).unwrap();
+        let stats = daily_stats(&db, "lab", &ny, 366, now, false).unwrap();
         assert_eq!(stats["tz"], "America/New_York");
         assert_eq!(stats["by_day"].as_array().unwrap().len(), 366);
         assert_eq!(stats["by_day"][365]["day"], "2026-11-02");
@@ -1648,7 +1837,7 @@ mod tests {
         assert_eq!(stats["today"]["records"], 1);
 
         // The same rows by UTC day.
-        let stats = daily_stats(&db, "lab", &Zone::utc(), 366, now).unwrap();
+        let stats = daily_stats(&db, "lab", &Zone::utc(), 366, now, false).unwrap();
         assert_eq!(stats["tz"], "UTC");
         for (date, files) in [
             ("2026-03-08", 2),
@@ -1669,7 +1858,7 @@ mod tests {
             ("2026-11-21T05:00:00Z", "rejected"),     // the 21st: tomorrow, not counted
         ]);
         let ny = Zone::parse("America/New_York").unwrap();
-        let stats = daily_stats(&db, "lab", &ny, 2, utc("2026-11-21T04:00:00Z")).unwrap();
+        let stats = daily_stats(&db, "lab", &ny, 2, utc("2026-11-21T04:00:00Z"), false).unwrap();
         assert_eq!(
             stats["today"],
             json!({"day": "2026-11-20", "files": 2, "records": 2, "sent": 1, "rejected": 1, "failing": 1, "pending": 0})
@@ -1694,7 +1883,15 @@ mod tests {
             ("2026-11-20T03:00:00Z", "rejected"),
             ("2026-11-19T03:00:00Z", "filtered"),
         ]);
-        let stats = daily_stats(&db, "lab", &Zone::utc(), 2, utc("2026-11-20T12:00:00Z")).unwrap();
+        let stats = daily_stats(
+            &db,
+            "lab",
+            &Zone::utc(),
+            2,
+            utc("2026-11-20T12:00:00Z"),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             (&stats["today"]["rejected"], &stats["today"]["failing"]),
             (&json!(3), &json!(1))
@@ -1715,11 +1912,19 @@ mod tests {
             ("2026-11-19T18:30:00Z", "sent"),
         ]);
         let kolkata = Zone::parse("Asia/Kolkata").unwrap();
-        let stats = daily_stats(&db, "lab", &kolkata, 2, utc("2026-11-20T06:00:00Z")).unwrap();
+        let stats =
+            daily_stats(&db, "lab", &kolkata, 2, utc("2026-11-20T06:00:00Z"), false).unwrap();
         assert_eq!(stats["by_day"][0]["files"], 1);
         assert_eq!(stats["by_day"][1]["files"], 1);
-        let stats =
-            daily_stats(&db, "lab", &Zone::default(), 2, utc("2026-11-20T06:00:00Z")).unwrap();
+        let stats = daily_stats(
+            &db,
+            "lab",
+            &Zone::default(),
+            2,
+            utc("2026-11-20T06:00:00Z"),
+            false,
+        )
+        .unwrap();
         assert_eq!(stats["tz"], "UTC");
         assert_eq!(stats["by_day"][0]["files"], 2);
         assert_eq!(stats["today"]["files"], 0);

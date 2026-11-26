@@ -547,6 +547,19 @@ pub enum SourceConfig {
         #[serde(default = "default_max_pages")]
         max_runs: usize,
     },
+    /// FHIR Bulk Data manifests a user sends (`POST /api/sources/{id}/manifests`),
+    /// by URL or uploaded: each one is handed to the FHIR server with
+    /// `$bulk-submit`, which fetches the files itself, and recorded as one load
+    /// from its receipts. Nothing is listed or read on a schedule; see
+    /// `crate::manifest`.
+    Manifest {
+        /// Forwarded as `oauthMetadataUrl` in every kick-off of the source.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oauth_metadata_url: Option<String>,
+        /// How often the source polls the FHIR server about its open loads.
+        #[serde(default = "default_manifest_poll_seconds")]
+        poll_seconds: u64,
+    },
     /// An MLLP listener for HL7 v2: every message received is written to `spool`
     /// before it is acknowledged, then picked up from there like a file.
     Mllp {
@@ -628,6 +641,29 @@ fn default_spool() -> PathBuf {
 
 fn default_mllp_poll_seconds() -> u64 {
     2
+}
+
+fn default_manifest_poll_seconds() -> u64 {
+    MANIFEST_POLL_SECONDS
+}
+
+/// How often a `manifest` source polls its open loads unless it says.
+pub const MANIFEST_POLL_SECONDS: u64 = 10;
+
+/// The longest URL a `manifest` source or submission takes, in characters.
+pub const MANIFEST_URL_MAX_CHARS: usize = 2048;
+
+/// Whether `text` is an absolute `http` or `https` URL with a host, of at most
+/// `MANIFEST_URL_MAX_CHARS` characters.
+pub fn absolute_http_url(text: &str) -> bool {
+    text.chars().count() <= MANIFEST_URL_MAX_CHARS && absolute_http_url_any_length(text)
+}
+
+/// Whether `text` is an absolute `http` or `https` URL with a host, however long.
+pub fn absolute_http_url_any_length(text: &str) -> bool {
+    url::Url::parse(text).is_ok_and(|u| {
+        matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
+    })
 }
 
 /// Credentials for a remote FHIR server. Secrets are named by environment
@@ -860,6 +896,7 @@ impl SourceConfig {
             SourceConfig::Mllp { listen, spool, .. } => {
                 format!("mllp://{listen} (spool {})", spool.display())
             }
+            SourceConfig::Manifest { .. } => "manifest".into(),
         }
     }
 
@@ -869,8 +906,26 @@ impl SourceConfig {
             | SourceConfig::S3 { poll_seconds, .. }
             | SourceConfig::FhirServer { poll_seconds, .. }
             | SourceConfig::Database { poll_seconds, .. }
-            | SourceConfig::Mllp { poll_seconds, .. } => Duration::from_secs(*poll_seconds),
+            | SourceConfig::Mllp { poll_seconds, .. }
+            | SourceConfig::Manifest { poll_seconds, .. } => Duration::from_secs(*poll_seconds),
         }
+    }
+
+    /// The source's `type`, as its definition names it.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            SourceConfig::Folder { .. } => "folder",
+            SourceConfig::S3 { .. } => "s3",
+            SourceConfig::FhirServer { .. } => "fhir_server",
+            SourceConfig::Database { .. } => "database",
+            SourceConfig::Mllp { .. } => "mllp",
+            SourceConfig::Manifest { .. } => "manifest",
+        }
+    }
+
+    /// Whether this is a `manifest` source.
+    pub fn is_manifest(&self) -> bool {
+        matches!(self, SourceConfig::Manifest { .. })
     }
 
     /// The stored credential an S3 source is read with, as its definition names it.
@@ -936,6 +991,22 @@ impl SourceConfig {
             }
             if *max_runs == 0 {
                 bail!("database: max_runs must be at least 1");
+            }
+        }
+        if let SourceConfig::Manifest {
+            oauth_metadata_url,
+            poll_seconds,
+        } = self
+        {
+            if !(1..=3600).contains(poll_seconds) {
+                bail!("manifest: source.poll_seconds must be a whole number from 1 to 3600");
+            }
+            if let Some(url) = oauth_metadata_url
+                && !absolute_http_url(url)
+            {
+                bail!(
+                    "manifest: source.oauth_metadata_url must be an absolute http or https URL of at most {MANIFEST_URL_MAX_CHARS} characters"
+                );
             }
         }
         if let SourceConfig::Mllp { listen, .. } = self
@@ -1096,6 +1167,18 @@ impl FeedConfig {
         }
         // What a server, a query or an MLLP sender hands over has its own shape,
         // whatever the file says; and there is no object for $bulk-submit to fetch.
+        // A manifest source has no transform and one delivery: what the FHIR
+        // server fetches is the provider's NDJSON, loaded as it is.
+        if self.source.is_manifest() {
+            self.format = Format::Ndjson;
+            self.delivery = DeliveryConfig {
+                method: DeliveryMethod::BulkSubmit,
+                ..DeliveryConfig::default()
+            };
+            self.transform = PathBuf::new();
+            self.expect_every = None;
+            return Ok(());
+        }
         let fixed = match self.source {
             SourceConfig::FhirServer { .. } => Some(("fhir_server", Format::Ndjson)),
             SourceConfig::Database { .. } => Some(("database", Format::Ndjson)),
@@ -1156,10 +1239,15 @@ impl FeedConfig {
         self.delivery.method == DeliveryMethod::BulkSubmit && !self.bulk_transformed()
     }
 
+    /// Whether this is a `manifest` source: no transform, no files of its own.
+    pub fn is_manifest(&self) -> bool {
+        self.source.is_manifest()
+    }
+
     /// Whether `$bulk-submit` hands HFS the engine's transformed NDJSON rather
     /// than the source objects.
     pub fn bulk_transformed(&self) -> bool {
-        if self.delivery.method != DeliveryMethod::BulkSubmit {
+        if self.delivery.method != DeliveryMethod::BulkSubmit || self.is_manifest() {
             return false;
         }
         match self.delivery.bulk_from {
@@ -1180,10 +1268,170 @@ impl FeedConfig {
             .is_some_and(|n| n == "fhir_passthrough.py")
     }
 
-    /// The source's YAML file, as submitted (paths as given, not resolved).
+    /// The source's YAML file, as submitted (paths as given, not resolved). A
+    /// `manifest` source is written in its one canonical form: id, name,
+    /// contact when set, its `source` block, `format: ndjson` and
+    /// `delivery: {method: bulk_submit}`, and nothing else.
     pub fn to_yaml(&self) -> Result<String> {
+        if let SourceConfig::Manifest {
+            oauth_metadata_url,
+            poll_seconds,
+        } = &self.source
+        {
+            use serde_yaml::{Mapping, Value};
+            let mut source = Mapping::new();
+            source.insert("type".into(), "manifest".into());
+            source.insert("poll_seconds".into(), Value::from(*poll_seconds));
+            if let Some(url) = oauth_metadata_url {
+                source.insert("oauth_metadata_url".into(), url.as_str().into());
+            }
+            let mut delivery = Mapping::new();
+            delivery.insert("method".into(), "bulk_submit".into());
+            let mut top = Mapping::new();
+            top.insert("id".into(), self.id.as_str().into());
+            top.insert("name".into(), self.name.as_str().into());
+            if let Some(contact) = &self.contact {
+                top.insert("contact".into(), contact.as_str().into());
+            }
+            top.insert("source".into(), Value::Mapping(source));
+            top.insert("format".into(), "ndjson".into());
+            top.insert("delivery".into(), Value::Mapping(delivery));
+            return Ok(serde_yaml::to_string(&Value::Mapping(top))?);
+        }
         Ok(serde_yaml::to_string(self)?)
     }
+}
+
+/// Reads a source definition as the API sends it: a `manifest` source by its
+/// own rules (`manifest_definition`), any other as it always was.
+pub fn definition_from_json(body: &serde_json::Value) -> Result<FeedConfig> {
+    if is_manifest_definition(body) {
+        return manifest_definition(body);
+    }
+    Ok(serde_json::from_value(body.clone())?)
+}
+
+/// Reads a source file: a `manifest` source by its own rules
+/// (`manifest_definition`), any other as it always was.
+pub fn definition_from_yaml(text: &str) -> Result<FeedConfig> {
+    // A manifest source is told by its YAML, before anything is converted:
+    // a file that cannot be read as JSON is refused, never read leniently.
+    if let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(text)
+        && raw
+            .get("source")
+            .and_then(|s| s.get("type"))
+            .and_then(serde_yaml::Value::as_str)
+            == Some("manifest")
+    {
+        let json = serde_json::to_value(&raw).context(
+            "a manifest source's definition must hold only what JSON can (string keys, no tags)",
+        )?;
+        return manifest_definition(&json);
+    }
+    Ok(serde_yaml::from_str(text)?)
+}
+
+fn is_manifest_definition(body: &serde_json::Value) -> bool {
+    body.pointer("/source/type").and_then(|t| t.as_str()) == Some("manifest")
+}
+
+/// A `manifest` source's definition, checked on what it holds, before any
+/// default fills it in: no `transform` and no `expect_every` (not even null),
+/// `format` absent or `ndjson`, `delivery` absent or `{method: bulk_submit}`
+/// and nothing else, and only the source members it knows. The same rules
+/// for the API and for files on disk.
+fn manifest_definition(body: &serde_json::Value) -> Result<FeedConfig> {
+    use serde_json::{Value, json};
+    let Some(top) = body.as_object() else {
+        bail!("a source definition is an object");
+    };
+    let id = top.get("id").and_then(Value::as_str).unwrap_or("?");
+    for member in ["transform", "expect_every"] {
+        if top.contains_key(member) {
+            let why = match member {
+                "transform" => {
+                    "a manifest source has no transform: the FHIR server loads the provider's NDJSON as it is"
+                }
+                _ => "no rule is made for a manifest source; create one through /api/alert-rules",
+            };
+            bail!("source {id}: {member} must be absent ({why})");
+        }
+    }
+    match top.get("format") {
+        None => {}
+        Some(Value::String(f)) if f == "ndjson" => {}
+        Some(_) => bail!("source {id}: format must be absent or ndjson for a manifest source"),
+    }
+    match top.get("delivery") {
+        None => {}
+        Some(Value::Object(d)) => {
+            if d.is_empty() {
+                bail!(
+                    "source {id}: delivery must be absent or exactly {{method: bulk_submit}}, not empty"
+                );
+            }
+            for (key, value) in d {
+                if key != "method" {
+                    bail!(
+                        "source {id}: delivery.{key} is not accepted: a manifest source's delivery is exactly {{method: bulk_submit}}"
+                    );
+                }
+                if value != "bulk_submit" {
+                    bail!(
+                        "source {id}: delivery.method must be bulk_submit: a manifest source is always delivered with $bulk-submit"
+                    );
+                }
+            }
+        }
+        Some(_) => bail!("source {id}: delivery must be absent or {{method: bulk_submit}}"),
+    }
+    let Some(source) = top.get("source").and_then(Value::as_object) else {
+        bail!("source {id}: source must be an object");
+    };
+    for key in source.keys() {
+        if !matches!(key.as_str(), "type" | "oauth_metadata_url" | "poll_seconds") {
+            bail!(
+                "source {id}: source.{key} is an unknown member of a manifest source (use oauth_metadata_url or poll_seconds)"
+            );
+        }
+    }
+    let oauth_metadata_url = match source.get("oauth_metadata_url") {
+        None => None,
+        Some(Value::String(url)) => Some(url.clone()),
+        Some(_) => {
+            bail!("source {id}: source.oauth_metadata_url must be an absolute http or https URL")
+        }
+    };
+    let poll_seconds = match source.get("poll_seconds") {
+        None => MANIFEST_POLL_SECONDS,
+        Some(v) => v.as_u64().with_context(|| {
+            format!("source {id}: source.poll_seconds must be a whole number from 1 to 3600")
+        })?,
+    };
+    // Identity and contact are read as for every source; the rest is the
+    // source's one form.
+    let mut typed = serde_json::Map::new();
+    for member in ["id", "name", "contact"] {
+        if let Some(v) = top.get(member) {
+            typed.insert(member.into(), v.clone());
+        }
+    }
+    typed.insert("source".into(), json!({"type": "manifest"}));
+    typed.insert("transform".into(), json!(""));
+    let mut feed: FeedConfig = serde_json::from_value(Value::Object(typed))?;
+    feed.source = SourceConfig::Manifest {
+        oauth_metadata_url,
+        poll_seconds,
+    };
+    feed.format = Format::Ndjson;
+    feed.delivery = DeliveryConfig {
+        method: DeliveryMethod::BulkSubmit,
+        ..DeliveryConfig::default()
+    };
+    feed.source
+        .check()
+        .with_context(|| format!("source {}", feed.id))?;
+    Ok(feed)
 }
 
 /// Loads `hie.yaml` and every source definition in its `sources_dir`.
@@ -1237,7 +1485,7 @@ pub fn load(path: &Path) -> Result<(Config, Vec<FeedConfig>)> {
     let mut ids = HashSet::new();
     for feed_path in source_files(&config.sources_dir)? {
         let text = std::fs::read_to_string(&feed_path)?;
-        let mut feed: FeedConfig = serde_yaml::from_str(&text)
+        let mut feed = definition_from_yaml(&text)
             .with_context(|| format!("parsing {}", feed_path.display()))?;
         if let Err(e) = feed
             .resolve(&base)
@@ -1386,8 +1634,9 @@ pub fn find_source(
             FileId::NotASource(_) => continue,
         }
         let text = String::from_utf8(bytes).expect("an id was read from it as text");
-        let mut feed: FeedConfig =
-            serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        // Parsed as `load` parses it: a manifest source by its own rules.
+        let mut feed =
+            definition_from_yaml(&text).with_context(|| format!("parsing {}", path.display()))?;
         if found.is_some() {
             bail!("duplicate source id {id}");
         }

@@ -9,7 +9,7 @@ The Helios Integration Engine (HIE) moves healthcare data into [HL7® FHIR®](ht
 - **🧾 Every row accounted for**: each record is stored before its file is acknowledged, and keeps its file, line, outcome and reason; nothing is lost when a server is down, and a bad row is rejected on its own with the line and the reason
 - **🔁 Idempotent delivery**: resources go out by id or by business identifier, so a re-sent file updates instead of duplicating; large loads go through `$bulk-submit` and are settled by receipts
 - **🐍 Transforms in Python**: a function that takes one record and returns resources, with terminology lookups against a FHIR terminology server; run in a local Python worker
-- **📡 Sources that fit what customers have**: folders, S3 buckets (private buckets with stored credentials, public, read-only, or announced by SQS), SQL databases, HL7 v2 over MLLP, other FHIR servers; zips unpacked as drops
+- **📡 Sources that fit what customers have**: folders, S3 buckets (private buckets with stored credentials, public, read-only, or announced by SQS), SQL databases, HL7 v2 over MLLP, other FHIR servers, FHIR Bulk Data manifests (by URL or uploaded) that the FHIR server loads with `$bulk-submit`; zips unpacked as drops
 - **🔔 Operable**: alert rules for silence, missing deliveries, rejected shares and unreachable servers; an event log of every attempt and outcome, read with a cursor; Prometheus metrics; an API with scopes behind any OIDC provider; several instances on one store
 
 ## What People Build with HIE
@@ -44,7 +44,7 @@ Then drop `examples/data/labs.csv` into `inbox/lab-results/` and watch `GET /api
 # Documentation
 
 - [Running HIE](docs/running.md) — binary, Docker, environment, the store and several instances
-- [Sources](docs/sources.md) — folder, S3, SQS, FHIR server, database, HL7 v2 over MLLP; formats; zips; delivery methods; alert rules
+- [Sources](docs/sources.md) — folder, S3, SQS, FHIR server, database, HL7 v2 over MLLP, Bulk Data manifests; formats; zips; delivery methods; alert rules
 - [Transforms](docs/transforms.md) — the Python contract, terminology, where transforms run
 - [API and authentication](docs/api.md) — the HTTP API, scopes, the engine's identity towards HFS
 - [Development, tests, release](docs/development.md) — layout, test suites, releasing to the sandbox
