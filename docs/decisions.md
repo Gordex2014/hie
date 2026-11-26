@@ -673,6 +673,21 @@ Several engine instances may share one PostgreSQL. A source is run by the instan
 
 *Amended 2026-11-24:* `files.failing_reported` is the failing count of the load's **last** finish, not the most any finish saw: a load raises its alert again when it finishes with more failing rows than the finish before. A finish that leaves as many changes nothing, as before; but a Retry that fixed rows lowers the mark, so a later regression alerts, even to fewer failing rows than an earlier alert reported (3, fixed to 0, then 1 failing: a second alert). Under the most-seen mark that regression raised nothing. The `rejected_share` clear message shows the share within the limit (9.96% against 10% reads `9.96%`, not `10.0%`).
 
+## 48. A FHIR drop that mixes NDJSON and Bundle files: `format: fhir`, read by extension
+
+**Chosen:** a folder or S3 source may say `format: fhir`. Each loose file and each zip entry is read by its extension: `.ndjson` and `.jsonl` as NDJSON, `.json` as a Bundle (or a single resource). A bulk export manifest (a `.json` object with no string `resourceType`, a string `transactionTime` and an array `output`) is skipped in a zip and, as a loose file, is a load with no records and no alert. A loose file with any other extension is unreadable, with an alert, and archived. The transform must be the passthrough; `bulk_from: source_objects` is refused, and `auto` resolves to `transformed`. Content dedup counts an earlier file only when both names are read the same way (zip, NDJSON, Bundle, other).
+
+**Why:**
+- A FHIR bulk export delivered as a zip can hold NDJSON per resource type next to Bundle files, and one source has one format, so no single source could take the whole drop.
+- The extension is what the exporter wrote and what a person sees; reading the content to guess a reader would turn a broken NDJSON line into a Bundle error, and a file named wrongly would be read one way today and another tomorrow.
+- Passthrough only: the records are already FHIR, and a transform written for one row shape cannot know which reader cut its record. Any other transform is a configuration mistake, refused when the definition is checked, in every build.
+- A foreign loose file is refused rather than left in place: left, it would be listed again on every pass and never be seen; unreadable, it is shown, alerted and archived, like any file that cannot be read.
+- The manifest shape is the FHIR Bulk Data one, narrow enough that a Bundle that lost its `resourceType` is still reported as unreadable rather than skipped.
+- `transformed` for bulk, because HFS reads NDJSON objects and a Bundle file is not one; the engine's NDJSON also carries the rewritten references, and the source tag when `delivery.stamp_source` is on in `hie.yaml`.
+- With the reader chosen by name, renaming a file is how one refused for its extension is sent again; plain content dedup would make the renamed file a duplicate of the refused one. Narrowing the match by the name's reader keeps the store as it is (no new column, `sha256` keeps its meaning) and changes nothing for other formats.
+
+**Cost / not yet:** the extension must be right: an NDJSON file saved as `.json` is unreadable once it holds more than one line of resources (one line is read as that resource), and a `.jsonl` file is missed by a `"*json"` pattern. A reference to a Bundle entry that has no `id` stays `urn:uuid:…`, as with `fhir_bundle`. The same bytes under two names read the same way are still one load, as in every source. A `fhir_bundle` zip still reads a manifest as a Bundle, so it is unreadable there. An engine before this one cannot parse a source file that says `format: fhir`, so rolling back means changing or removing that file first.
+
 ## Not in the prototype
 
 - Connectors besides a folder, S3, another FHIR server, a SQL database and MLLP: MongoDB, Oracle.

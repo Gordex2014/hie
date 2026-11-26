@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use hie::config::Format;
 use hie::db::{Admission, Db, Delivery, EventQuery, NewFile, Rule};
 use serde_json::{Value, json};
 
@@ -1037,7 +1038,10 @@ fn load(db: &Db, feed: &str, name: &str, bad: usize, good: usize) -> i64 {
             )
         })
         .collect();
-    match db.admit_file(&new_file(feed, name), Ok(&rows)).unwrap() {
+    match db
+        .admit_file(&new_file(feed, name), Ok(&rows), None)
+        .unwrap()
+    {
         Admission::Admitted(id) => id,
         other => panic!("{other:?}"),
     }
@@ -1909,6 +1913,30 @@ fn an_older_answer_cannot_roll_back_a_records_attempts() {
 }
 
 #[test]
+fn content_is_taken_again_only_under_a_name_the_predicate_accepts() {
+    let db = Db::in_memory().unwrap();
+    let rows = [(1, json!({"resourceType": "Patient", "id": "x"}), None)];
+    let admit = |name: &str| {
+        let reader = Format::Fhir.reader_for(name);
+        let same = move |other: &str| Format::Fhir.reader_for(other) == reader;
+        db.admit_file(
+            &NewFile {
+                sha: "same-bytes",
+                ..new_file("s", name)
+            },
+            Ok(&rows),
+            Some(&same),
+        )
+        .unwrap()
+    };
+    assert!(matches!(admit("x.txt"), Admission::Admitted(_)));
+    let Admission::Admitted(later) = admit("x.ndjson") else {
+        panic!("x.ndjson is read another way than x.txt");
+    };
+    assert_eq!(admit("y.jsonl"), Admission::AlreadyTaken(later));
+}
+
+#[test]
 fn content_taken_meanwhile_is_not_admitted_twice() {
     let db = Db::in_memory().unwrap();
     let first = load(&db, "s", "a", 0, 1);
@@ -1921,6 +1949,7 @@ fn content_taken_meanwhile_is_not_admitted_twice() {
                 ..new_file("s", "copy-of-a")
             },
             Ok(&rows),
+            None,
         )
         .unwrap();
     assert_eq!(again, Admission::AlreadyTaken(first));

@@ -96,6 +96,9 @@ pub fn instance_id() -> &'static str {
     })
 }
 
+/// Which earlier file names count as the same as a file's (`Db::find_file_by_hash`).
+type SameName = Box<dyn Fn(&str) -> bool>;
+
 impl FeedRunner {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -630,8 +633,10 @@ impl FeedRunner {
         let feed = &self.feed.id;
         let Incoming { key, name, bytes } = incoming;
         let sha = reader::sha256_hex(&bytes);
-
-        if let Some(original) = self.db.find_file_by_hash(feed, &sha)? {
+        let found = self
+            .db
+            .find_file_by_hash(feed, &sha, self.same_reader(&name).as_deref())?;
+        if let Some(original) = found {
             return self
                 .duplicate(&key, &name, &sha, bytes.len() as u64, original)
                 .await;
@@ -658,7 +663,7 @@ impl FeedRunner {
                 source_key: keep.then_some(key.as_str()),
                 origin: keep.then_some(origin),
             },
-            &bytes,
+            self.read(&name, &bytes),
         )?;
         let file_id = match admission {
             Admission::Admitted(id) => id,
@@ -708,26 +713,66 @@ impl FeedRunner {
         self.db.mark_file_archived(id, &archived)
     }
 
-    /// Records a file and reads its records into the store, in one transaction
-    /// (`Db::admit_file`). Returns what was done with it, and `false` when it
-    /// could not be read.
-    fn admit(&self, file: &NewFile, bytes: &[u8]) -> Result<(Admission, bool)> {
+    /// Reads a file or zip entry with the reader its name picks: `None` for a
+    /// bulk export manifest in a `fhir` source, which holds no resources.
+    fn read(&self, name: &str, bytes: &[u8]) -> Result<Option<Vec<reader::SourceRecord>>> {
+        match self.feed.format.reader_for(name) {
+            None => anyhow::bail!("not an NDJSON (.ndjson, .jsonl) or JSON (.json) file"),
+            Some(Format::FhirBundle) if self.feed.format == Format::Fhir => {
+                reader::read_fhir_json(bytes)
+            }
+            Some(format) => reader::read(format, bytes).map(Some),
+        }
+    }
+
+    /// In a `fhir` source the name picks the reader, so content taken before
+    /// counts only under a name read the same way: renaming a file is how one
+    /// read wrongly is sent again.
+    fn same_reader(&self, name: &str) -> Option<SameName> {
+        if self.feed.format != Format::Fhir {
+            return None;
+        }
+        let kind = |name: &str| {
+            let zip = name.to_ascii_lowercase().ends_with(".zip");
+            (zip, Format::Fhir.reader_for(name).filter(|_| !zip))
+        };
+        let this = kind(name);
+        Some(Box::new(move |other| kind(other) == this))
+    }
+
+    /// Records a file and the records read from it into the store, in one
+    /// transaction (`Db::admit_file`). Returns what was done with it, and `false`
+    /// when it could not be read.
+    fn admit(
+        &self,
+        file: &NewFile,
+        read: Result<Option<Vec<reader::SourceRecord>>>,
+    ) -> Result<(Admission, bool)> {
         let feed = &self.feed.id;
         let name = file.name;
-        match reader::read(self.feed.format, bytes) {
+        let same = self.same_reader(name);
+        match read {
             Ok(records) => {
+                let manifest = records.is_none();
                 let rows: Vec<_> = records
+                    .unwrap_or_default()
                     .into_iter()
                     .map(|r| (r.line, r.raw, r.parse_error))
                     .collect();
-                let admission = self.db.admit_file(file, Ok(&rows))?;
+                let admission = self.db.admit_file(file, Ok(&rows), same.as_deref())?;
                 if let Admission::Admitted(_) = admission {
-                    tracing::info!(feed, file = %name, records = rows.len(), "received");
+                    if manifest {
+                        tracing::info!(feed, file = %name, "received a bulk export manifest: no resources to read");
+                    } else {
+                        tracing::info!(feed, file = %name, records = rows.len(), "received");
+                    }
                 }
                 Ok((admission, true))
             }
             Err(e) => {
-                let admission = self.db.admit_file(file, Err(&format!("{e:#}")))?;
+                let admission =
+                    self.db
+                        .admit_file(file, Err(&format!("{e:#}")), same.as_deref())?;
                 if let Admission::Admitted(_) = admission {
                     self.alerts.raise(
                         Some(feed),
@@ -742,7 +787,8 @@ impl FeedRunner {
 
     /// A zip is a drop of several files: every entry whose extension fits the
     /// source's format becomes a load of its own, named `drop.zip!/entry`; the
-    /// zip is recorded as `unpacked` (so it is not read twice) and archived.
+    /// zip is recorded as `unpacked` (so it is not read twice) and archived. In
+    /// a `fhir` source a bulk export manifest is skipped like any other entry.
     async fn unpack(&self, key: &str, name: &str, sha: &str, bytes: Vec<u8>) -> Result<()> {
         let feed = &self.feed.id;
         let container =
@@ -753,6 +799,8 @@ impl FeedRunner {
             Format::Ndjson => &["ndjson", "jsonl"][..],
             Format::FhirBundle => &["json"][..],
             Format::Hl7v2 => &["hl7", "txt"][..],
+            // By its reader, below.
+            Format::Fhir => &[][..],
         };
         let entries =
             match tokio::task::spawn_blocking(move || -> Result<Vec<(String, Vec<u8>)>> {
@@ -795,13 +843,33 @@ impl FeedRunner {
         let mut stage_count = 0usize;
         for (path, data) in entries {
             let extension = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-            if !wanted.contains(&extension.as_str()) {
-                tracing::debug!(feed, file = %name, entry = %path, "entry skipped: not a {:?} file", self.feed.format);
+            let reader = self.feed.format.reader_for(&path);
+            let fits = match self.feed.format {
+                Format::Fhir => reader.is_some(),
+                _ => wanted.contains(&extension.as_str()),
+            };
+            if !fits {
+                tracing::debug!(feed, file = %name, entry = %path, "entry skipped: not a {} file", self.feed.format.as_str());
                 continue;
+            }
+            // A `.json` entry is read first: a manifest is not a load at all.
+            let mut read = None;
+            if self.feed.format == Format::Fhir && reader == Some(Format::FhirBundle) {
+                let early = self.read(&path, &data);
+                if matches!(early, Ok(None)) {
+                    tracing::debug!(feed, file = %name, entry = %path, "entry skipped: a bulk export manifest");
+                    continue;
+                }
+                read = Some(early);
             }
             let entry_name = format!("{name}!/{path}");
             let entry_sha = reader::sha256_hex(&data);
-            if let Some(original) = self.db.find_file_by_hash(feed, &entry_sha)? {
+            let found = self.db.find_file_by_hash(
+                feed,
+                &entry_sha,
+                self.same_reader(&entry_name).as_deref(),
+            )?;
+            if let Some(original) = found {
                 self.db.insert_duplicate(
                     feed,
                     &self.feed.name,
@@ -846,7 +914,7 @@ impl FeedRunner {
                     source_key: staged.as_ref().map(|(key, _)| key.as_str()),
                     origin: staged.as_ref().map(|(_, origin)| *origin),
                 },
-                &data,
+                read.unwrap_or_else(|| self.read(&path, &data)),
             )?;
             if let Admission::AlreadyTaken(original) = admission {
                 // Taken meanwhile: a duplicate. A copy staged on disk goes; one

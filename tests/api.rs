@@ -1306,3 +1306,73 @@ async fn a_stopped_runner_raises_no_outage_for_its_deleted_source() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(outages(), [], "the stopped runner raised an outage alert");
 }
+
+#[tokio::test]
+async fn a_fhir_source_is_created_only_with_the_passthrough() {
+    let Some(python) = python() else {
+        eprintln!("skipping: no Python 3.9+ found (set HIE_TEST_PYTHON)");
+        return;
+    };
+    let urls: Urls = Arc::default();
+    let fhir = serve(Router::new().route("/", post(batch)).with_state(urls)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for d in ["transforms", "sources", "inbox"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    for t in ["lab_results.py", "fhir_passthrough.py"] {
+        std::fs::copy(
+            repo().join("transforms").join(t),
+            root.join("transforms").join(t),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        root.join("hie.yaml"),
+        format!("fhir_base_url: {fhir}\ndatabase: data/hie.db\npython: {python}\n"),
+    )
+    .unwrap();
+    let (config, feeds) = hie::config::load(&root.join("hie.yaml")).unwrap();
+    let (_manager, state) =
+        hie::build(&config, feeds, &repo().join("hie_runtime"), None, None).unwrap();
+    let api = serve(hie::api::router(state)).await;
+    let http = reqwest::Client::new();
+    let create = |transform: &str| {
+        let (http, api) = (http.clone(), api.clone());
+        let definition = json!({
+            "id": "export", "name": "Export",
+            "source": {"type": "folder", "path": "inbox", "poll_seconds": 3600},
+            "format": "fhir", "transform": transform,
+        });
+        async move {
+            http.post(format!("{api}/api/sources"))
+                .json(&definition)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    let refused = create("transforms/lab_results.py").await;
+    assert_eq!(refused.status(), 400);
+    let refused: Value = refused.json().await.unwrap();
+    assert_eq!(refused["code"], "invalid_definition", "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("needs the passthrough transform (fhir_passthrough.py)"),
+        "{refused}"
+    );
+    assert!(!root.join("sources/export.yaml").exists());
+
+    let created = create("transforms/fhir_passthrough.py").await;
+    assert_eq!(created.status(), 201);
+    let created: Value = created.json().await.unwrap();
+    assert_eq!(created["definition"]["format"], "fhir", "{created}");
+    assert!(
+        std::fs::read_to_string(root.join("sources/export.yaml"))
+            .unwrap()
+            .contains("format: fhir")
+    );
+}

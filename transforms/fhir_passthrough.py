@@ -13,7 +13,9 @@ def transform(record, context):
     if not resource_type:
         raise DataError("record is not a FHIR resource (no resourceType)")
     if resource_type == "Bundle":
-        raise DataError("nested Bundle; use format fhir_bundle to split it")
+        raise DataError(
+            "nested Bundle; read it as a Bundle file (format fhir_bundle, or a .json file with format fhir)"
+        )
     if not record.get("id") and not record.get("identifier"):
         raise DataError(f"{resource_type} has neither id nor identifier")
     return record

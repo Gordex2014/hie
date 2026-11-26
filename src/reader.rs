@@ -63,7 +63,24 @@ pub fn read(format: Format, bytes: &[u8]) -> Result<Vec<SourceRecord>> {
         Format::Ndjson => Ok(read_ndjson(&text)),
         Format::FhirBundle => read_fhir_bundle(&text),
         Format::Hl7v2 => Ok(read_hl7v2(&text)),
+        Format::Fhir => {
+            bail!("format fhir has no reader of its own: each file is read by its extension")
+        }
     }
+}
+
+/// Reads a `.json` file of a `fhir` source as a Bundle, or as nothing (`None`)
+/// when it is a bulk export manifest: an object with no string `resourceType`,
+/// a string `transactionTime` and an array `output`.
+pub fn read_fhir_json(bytes: &[u8]) -> Result<Option<Vec<SourceRecord>>> {
+    let doc: Value = serde_json::from_str(&decode_text(bytes)?).context("invalid JSON")?;
+    let manifest = doc.get("resourceType").and_then(Value::as_str).is_none()
+        && doc.get("transactionTime").is_some_and(Value::is_string)
+        && doc.get("output").is_some_and(Value::is_array);
+    if manifest {
+        return Ok(None);
+    }
+    bundle_records(doc).map(Some)
 }
 
 /// Reads HL7 v2 messages, one record each, with the line their `MSH` is on. A
@@ -196,7 +213,10 @@ pub fn read_ndjson(text: &str) -> Vec<SourceRecord> {
 /// entry's `fullUrl` (Synthea writes `urn:uuid:...`) are rewritten to `Type/id`
 /// from the referenced entry's resource.
 pub fn read_fhir_bundle(text: &str) -> Result<Vec<SourceRecord>> {
-    let doc: Value = serde_json::from_str(text).context("invalid JSON")?;
+    bundle_records(serde_json::from_str(text).context("invalid JSON")?)
+}
+
+fn bundle_records(doc: Value) -> Result<Vec<SourceRecord>> {
     let rt = doc.get("resourceType").and_then(Value::as_str);
     match rt {
         None => bail!("JSON has no resourceType"),
