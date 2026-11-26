@@ -83,6 +83,11 @@ impl SecretRow {
     }
 }
 
+/// The longest a credential registration or delete waits on SQLite for another
+/// connection's write lock, per attempt. It waits holding the store's
+/// connection, so every other caller of the store waits with it.
+const SECRET_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Runs `f` once more when the store was busy, and answers `Busy` when it is
 /// busy again.
 pub(crate) fn retry_busy<T>(
@@ -198,6 +203,36 @@ impl Db {
             .collect();
         rows.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(rows)
+    }
+
+    /// Every secret, without values, by name, each with the sources any
+    /// instance has registered for it (deduplicated, by id): one statement.
+    pub fn secret_rows_with_users(&self) -> Result<Vec<(SecretRow, Vec<String>)>> {
+        let columns = SECRET_COLUMNS
+            .split(", ")
+            .map(|c| format!("s.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = self.query(
+            &format!(
+                "SELECT {columns}, r.source_id FROM secrets s \
+                 LEFT JOIN (SELECT DISTINCT secret_id, source_id FROM secret_refs) r ON r.secret_id = s.id \
+                 ORDER BY s.id, r.source_id"
+            ),
+            &[],
+        )?;
+        let mut secrets: Vec<(SecretRow, Vec<String>)> = Vec::new();
+        for r in &rows {
+            let row = SecretRow::from_row(r, false);
+            let source = r.opt_string(9);
+            match secrets.last_mut() {
+                Some((last, users)) if last.id == row.id => users.extend(source),
+                _ => secrets.push((row, source.into_iter().collect())),
+            }
+        }
+        // Sorted here, as `secret_rows` does: the same order on both stores.
+        secrets.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        Ok(secrets)
     }
 
     /// Replaces the sealed value if the revision is still `previous`: the rows
@@ -347,13 +382,47 @@ impl Db {
     }
 
     /// `f` inside BEGIN … COMMIT on this handle's connection; rolled back on any
-    /// error.
+    /// error. It holds the connection's mutex throughout, so on SQLite it waits
+    /// for another connection's write lock at most `SECRET_LOCK_WAIT` (or the
+    /// connection's own wait, when shorter), and gives the connection its own
+    /// wait back before the mutex goes.
     fn secret_tx<T>(
         &self,
         f: impl FnOnce(&mut Conn) -> Result<T, SecretError>,
     ) -> Result<T, SecretError> {
         let mut conn = self.conn.lock().expect("database mutex poisoned");
         let c = &mut *conn;
+        // The connection's own wait, when it was shortened here.
+        let own_wait = match c {
+            Conn::Sqlite(s) => {
+                let own = s
+                    .pragma_query_value(None, "busy_timeout", |r| r.get::<_, i64>(0))
+                    .map(|ms| std::time::Duration::from_millis(u64::try_from(ms).unwrap_or(0)));
+                match own {
+                    Ok(own)
+                        if own > SECRET_LOCK_WAIT && s.busy_timeout(SECRET_LOCK_WAIT).is_ok() =>
+                    {
+                        Some(own)
+                    }
+                    _ => None,
+                }
+            }
+            Conn::Postgres(_) => None,
+        };
+        let result = Self::in_tx(c, f);
+        if let (Some(own), Conn::Sqlite(s)) = (own_wait, &*c) {
+            // A failure here changes no data: the transaction is over.
+            if let Err(e) = s.busy_timeout(own) {
+                tracing::warn!("restoring the store's busy timeout: {e}");
+            }
+        }
+        result
+    }
+
+    fn in_tx<T>(
+        c: &mut Conn,
+        f: impl FnOnce(&mut Conn) -> Result<T, SecretError>,
+    ) -> Result<T, SecretError> {
         c.batch("BEGIN").map_err(SecretError::Store)?;
         match f(c) {
             Ok(v) => match c.batch("COMMIT") {
@@ -515,10 +584,14 @@ mod tests {
         a.set_busy_timeout(std::time::Duration::from_millis(50));
         let blocker = rusqlite::Connection::open(dir.path().join("hie.db")).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
         match a.secret_hold("sec_c", "S", "owner-1") {
             Err(SecretError::Busy) => {}
             other => panic!("expected Busy, got {other:?}"),
         }
+        // A wait shorter than the cap stays as it is.
+        assert!(started.elapsed() < std::time::Duration::from_millis(900));
+        assert_eq!(busy_timeout_ms(&a), 50);
         match a.secret_delete_unless_held("sec_c") {
             Err(SecretError::Busy) => {}
             other => panic!("expected Busy, got {other:?}"),
@@ -555,5 +628,56 @@ mod tests {
             a.secret_hold("sec_none", "S", "one"),
             Err(SecretError::NotFound)
         ));
+    }
+
+    /// The connection's SQLite busy timeout, in milliseconds.
+    fn busy_timeout_ms(db: &Db) -> i64 {
+        db.with(|c| match c {
+            Conn::Sqlite(s) => Ok(s.pragma_query_value(None, "busy_timeout", |r| r.get(0))?),
+            Conn::Postgres(_) => Ok(-1),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_registration_on_a_locked_sqlite_store_holds_the_database_briefly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _b) = two_handles(dir.path());
+        if a.is_postgres() {
+            return;
+        }
+        seed(&a, "sec_w");
+        assert_eq!(busy_timeout_ms(&a), 5000);
+        let blocker = rusqlite::Connection::open(dir.path().join("hie.db")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        match a.secret_hold("sec_w", "S", "owner-1") {
+            Err(SecretError::Busy) => {}
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        let waited = started.elapsed();
+        eprintln!("a registration on a locked store answered Busy after {waited:?}");
+        assert!(
+            waited < std::time::Duration::from_secs(4),
+            "held the database for {waited:?}"
+        );
+        assert_eq!(
+            busy_timeout_ms(&a),
+            5000,
+            "the connection's own wait is back"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        // And after a success and after an answer that is not a lock wait.
+        a.secret_hold("sec_w", "S", "owner-1").unwrap();
+        assert_eq!(busy_timeout_ms(&a), 5000);
+        assert!(matches!(
+            a.secret_delete_unless_held("sec_w"),
+            Err(SecretError::InUse(_))
+        ));
+        assert!(matches!(
+            a.secret_hold("sec_none", "S", "owner-1"),
+            Err(SecretError::NotFound)
+        ));
+        assert_eq!(busy_timeout_ms(&a), 5000);
     }
 }

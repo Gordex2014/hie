@@ -1994,7 +1994,15 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
         |kind: &str, rule: Option<&Rule>| db.insert_alert(Some("s"), kind, "m", rule).unwrap();
     let open_enabled = raise("silence", Some(&enabled));
     let credential = raise("credential", None);
+    // A skipped file's alert, raised by an instance: that instance clears it.
     let definition = raise("definition", None);
+    db.query_json(
+        "UPDATE alerts SET raised_by = 'instance-a' WHERE id = CAST($1 AS BIGINT)",
+        hie::db::params![definition],
+    )
+    .unwrap();
+    // One an earlier version raised names no instance: nothing clears it.
+    let legacy_definition = raise("definition", None);
     let open_disabled = raise("silence", Some(&disabled));
     let open_deleted = raise("silence", Some(&deleted));
     let open_no_rule = raise("unreadable_file", None);
@@ -2042,7 +2050,7 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
         .collect();
     let purged: Vec<_> = purges.into_iter().map(|p| p.join().unwrap()).collect();
     assert_eq!(purged.iter().map(|p| p.events).sum::<usize>(), 5_002);
-    assert_eq!(purged.iter().map(|p| p.alerts).sum::<usize>(), 4);
+    assert_eq!(purged.iter().map(|p| p.alerts).sum::<usize>(), 5);
     assert_eq!(events(&db).len(), 1);
     assert_eq!(
         alert_ids(&db),
@@ -2060,7 +2068,13 @@ async fn old_history_is_purged_except_what_the_engine_still_tracks() {
         totals,
         "the counter never goes down"
     );
-    for gone in [open_disabled, open_deleted, open_no_rule, cleared_old] {
+    for gone in [
+        legacy_definition,
+        open_disabled,
+        open_deleted,
+        open_no_rule,
+        cleared_old,
+    ] {
         assert!(!alert_ids(&db).contains(&gone));
     }
 

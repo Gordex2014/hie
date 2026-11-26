@@ -428,12 +428,34 @@ impl Alerter {
         message: &str,
         rule: Option<&Rule>,
     ) -> Result<Option<i64>> {
+        self.fire_as(feed, kind, message, rule, None)
+    }
+
+    /// Raises an alert without a rule that belongs to instance `owner`: one
+    /// only that instance clears.
+    pub fn raise_as(&self, feed: &str, kind: &str, message: &str, owner: &str) -> Result<()> {
+        self.fire_as(Some(feed), kind, message, None, Some(owner))
+            .map(drop)
+    }
+
+    fn fire_as(
+        &self,
+        feed: Option<&str>,
+        kind: &str,
+        message: &str,
+        rule: Option<&Rule>,
+        raised_by: Option<&str>,
+    ) -> Result<Option<i64>> {
         let wanted = rule.is_none_or(|r| r.channels.iter().any(|c| c == "webhook"));
-        let Some(alert) =
-            self.db
-                .insert_alert_with_webhook(feed, kind, message, rule, now_ms(), |alert| {
-                    self.event("fired", alert, wanted)
-                })?
+        let Some(alert) = self.db.insert_alert_with_webhook(
+            feed,
+            kind,
+            message,
+            rule,
+            raised_by,
+            now_ms(),
+            |alert| self.event("fired", alert, wanted),
+        )?
         else {
             return Ok(None);
         };

@@ -12,6 +12,7 @@ pub mod key;
 pub mod kind;
 #[cfg(feature = "secrets-native")]
 pub mod native;
+pub mod owner;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
